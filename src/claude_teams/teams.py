@@ -198,7 +198,8 @@ def _read_config(name: str, base_dir: Path | None = None) -> TeamConfig:
         json.JSONDecodeError: If the config file is malformed.
 
     """
-    config_path = _teams_dir(base_dir) / name / "config.json"
+    safe_name = validate_safe_name(name, "team name")
+    config_path = _teams_dir(base_dir) / safe_name / "config.json"
     raw = json.loads(config_path.read_text())
     return TeamConfig.model_validate(raw)
 
@@ -229,7 +230,8 @@ def _write_config(name: str, config: TeamConfig, base_dir: Path | None = None) -
         OSError: If file creation or write fails.
 
     """
-    config_dir = _teams_dir(base_dir) / name
+    safe_name = validate_safe_name(name, "team name")
+    config_dir = _teams_dir(base_dir) / safe_name
     data = json.dumps(config.model_dump(by_alias=True), indent=2)
 
     # NOTE(victor): atomic write to avoid partial reads from concurrent agents

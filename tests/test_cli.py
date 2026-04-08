@@ -107,6 +107,12 @@ def test_config_not_found():
     assert "not found" in result.output
 
 
+def test_config_rejects_invalid_team_name():
+    result = runner.invoke(app, ["config", "../bad-team"])
+    assert result.exit_code == 1
+    assert "Invalid team name" in result.output
+
+
 async def test_config_requires_capability(team, monkeypatch):
     name, base_dir, _lead_capability = team
     monkeypatch.setattr(teams, "TEAMS_DIR", base_dir / "teams")

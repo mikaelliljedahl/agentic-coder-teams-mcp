@@ -62,7 +62,12 @@ def _run(awaitable):
 
 
 def _ensure_team_exists(team_name: str) -> None:
-    if not _run(teams.team_exists(team_name)):
+    try:
+        exists = _run(teams.team_exists(team_name))
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    if not exists:
         err_console.print(f"[red]Team {team_name!r} not found.[/red]")
         raise typer.Exit(code=1)
 

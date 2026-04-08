@@ -135,7 +135,8 @@ async def create_task(
 
 
 def _get_task(team_name: str, task_id: str, base_dir: Path | None = None) -> TaskFile:
-    team_dir = _tasks_dir(base_dir) / team_name
+    safe_team_name = validate_safe_name(team_name, "team name")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     fpath = team_dir / f"{task_id}.json"
     raw = json.loads(fpath.read_text())
     return TaskFile(**raw)
@@ -227,7 +228,8 @@ def _update_task(
     metadata: dict | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
-    team_dir = _tasks_dir(base_dir) / team_name
+    safe_team_name = validate_safe_name(team_name, "team name")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     lock_path = team_dir / ".lock"
     fpath = team_dir / f"{task_id}.json"
 
@@ -444,7 +446,8 @@ async def list_tasks(team_name: str, base_dir: Path | None = None) -> list[TaskF
 def _reset_owner_tasks(
     team_name: str, agent_name: str, base_dir: Path | None = None
 ) -> None:
-    team_dir = _tasks_dir(base_dir) / team_name
+    safe_team_name = validate_safe_name(team_name, "team name")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     lock_path = team_dir / ".lock"
 
     with file_lock(lock_path):

@@ -378,7 +378,7 @@ uv sync
 ```bash
 uv run pytest                           # Run all tests
 uv run pytest --cov=claude_teams        # With coverage
-uv run pytest tests/test_server.py -v   # Single module
+uv run pytest tests/test_server_bootstrap.py -v  # Single module
 uv run pytest -k "test_spawn"           # Filter by name
 ```
 

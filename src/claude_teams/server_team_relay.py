@@ -7,6 +7,7 @@ from pathlib import Path
 from claude_teams import messaging
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends import registry
+from claude_teams.teams import validate_safe_name
 from claude_teams.server_runtime import (
     _ONE_SHOT_RESULT_MAX_CHARS,
     _ONE_SHOT_TIMEOUT_S,
@@ -59,10 +60,12 @@ def create_one_shot_result_path(team_name: str, agent_name: str) -> Path:
         Path: Output file path under the team runs directory.
 
     """
-    runs_dir = messaging.TEAMS_DIR / team_name / "runs"
+    safe_team_name = validate_safe_name(team_name, "team name")
+    safe_agent_name = validate_safe_name(agent_name, "agent name")
+    runs_dir = messaging.TEAMS_DIR / safe_team_name / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = int(time.time() * 1000)
-    return runs_dir / f"{agent_name}-{timestamp}.last-message.txt"
+    return runs_dir / f"{safe_agent_name}-{timestamp}.last-message.txt"
 
 
 async def relay_one_shot_result(

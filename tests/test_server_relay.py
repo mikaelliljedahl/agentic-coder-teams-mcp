@@ -7,11 +7,15 @@ from typing import cast
 from unittest.mock import MagicMock
 
 from fastmcp import Client
+import pytest
 
 from claude_teams import messaging
 from claude_teams.backends import registry
 from claude_teams.backends.base import HealthStatus, SpawnResult as BackendSpawnResult
-from claude_teams.server_team_relay import relay_one_shot_result
+from claude_teams.server_team_relay import (
+    create_one_shot_result_path,
+    relay_one_shot_result,
+)
 from tests._server_support import (
     _data,
     _items,
@@ -220,6 +224,12 @@ class TestOneShotBackendRelay:
         assert elapsed < 1.0
         assert len(inbox) == 1
         assert "could not be resolved" in inbox[0]["text"]
+
+    def test_create_one_shot_result_path_rejects_invalid_names(self) -> None:
+        with pytest.raises(ValueError, match="Invalid team name"):
+            create_one_shot_result_path("../bad-team", "worker")
+        with pytest.raises(ValueError, match="Invalid agent name"):
+            create_one_shot_result_path("good-team", "../worker")
 
 
 async def _wait_for_lead_inbox_message(

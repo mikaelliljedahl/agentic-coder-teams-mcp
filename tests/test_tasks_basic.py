@@ -216,6 +216,11 @@ async def test_create_task_rejects_invalid_team_name(tmp_claude_dir: Path) -> No
         await create_task("../bad-team", "Sub", "desc", base_dir=tmp_claude_dir)
 
 
+async def test_get_task_rejects_invalid_team_name(tmp_claude_dir: Path) -> None:
+    with pytest.raises(ValueError, match="Invalid team name"):
+        await get_task("../bad-team", "1", base_dir=tmp_claude_dir)
+
+
 async def test_update_task_rejects_backward_status_transition(
     team_context: tuple[str, Path, Path],
 ) -> None:
@@ -294,3 +299,10 @@ async def test_reset_owner_tasks_preserves_completed_status(
     after = await get_task(team_name, task.id, base_dir=base_dir)
     assert after.status == "completed"
     assert after.owner is None
+
+
+async def test_reset_owner_tasks_rejects_invalid_team_name(
+    tmp_claude_dir: Path,
+) -> None:
+    with pytest.raises(ValueError, match="Invalid team name"):
+        await reset_owner_tasks("../bad-team", "worker", base_dir=tmp_claude_dir)

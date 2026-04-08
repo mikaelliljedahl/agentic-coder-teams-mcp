@@ -184,6 +184,13 @@ class TestWriteConfig:
         tmp_files = list(config_dir.glob("*.tmp"))
         assert tmp_files == [], f"Leaked temp files: {tmp_files}"
 
+    async def test_should_reject_invalid_team_name(self, tmp_claude_dir: Path) -> None:
+        await create_team("atomic2", "sess-1", base_dir=tmp_claude_dir)
+        config = await read_config("atomic2", base_dir=tmp_claude_dir)
+
+        with pytest.raises(ValueError, match="Invalid team name"):
+            await write_config("../bad", config, base_dir=tmp_claude_dir)
+
 
 class TestTeamExists:
     async def test_should_return_true_for_existing_team(
@@ -236,6 +243,12 @@ class TestReadConfig:
         lead = cfg.members[0]
         assert isinstance(lead, LeadMember)
         assert lead.agent_id == "team-lead@roundtrip"
+
+    async def test_read_config_rejects_invalid_team_name(
+        self, tmp_claude_dir: Path
+    ) -> None:
+        with pytest.raises(ValueError, match="Invalid team name"):
+            await read_config("../bad", base_dir=tmp_claude_dir)
 
 
 class TestDeleteTeamValidation:
