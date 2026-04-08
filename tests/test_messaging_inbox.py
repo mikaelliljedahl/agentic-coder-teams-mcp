@@ -14,6 +14,7 @@ from claude_teams.messaging import (
     inbox_path,
     now_iso,
     read_inbox,
+    read_inbox_page,
     read_inbox_filtered,
 )
 from claude_teams.models import InboxMessage
@@ -144,6 +145,30 @@ async def test_read_inbox_applies_limit_and_offset(tmp_claude_dir: Path) -> None
         base_dir=tmp_claude_dir,
     )
 
+    assert [message.text for message in messages] == ["b", "c"]
+
+
+async def test_read_inbox_page_returns_messages_and_total_count(
+    tmp_claude_dir: Path,
+) -> None:
+    for text in ("a", "b", "c"):
+        await append_message(
+            "test-team",
+            "paged-count",
+            InboxMessage(from_="lead", text=text, timestamp=now_iso(), read=False),
+            base_dir=tmp_claude_dir,
+        )
+
+    messages, total_count = await read_inbox_page(
+        "test-team",
+        "paged-count",
+        mark_as_read=False,
+        limit=2,
+        offset=1,
+        base_dir=tmp_claude_dir,
+    )
+
+    assert total_count == 3
     assert [message.text for message in messages] == ["b", "c"]
 
 
@@ -325,6 +350,11 @@ async def test_read_inbox_filtered_applies_limit_to_newest_messages(
 async def test_read_inbox_nonexistent_returns_empty(tmp_claude_dir: Path) -> None:
     messages = await read_inbox("test-team", "ghost", base_dir=tmp_claude_dir)
     assert messages == []
+
+
+def test_inbox_path_rejects_invalid_agent_name(tmp_claude_dir: Path) -> None:
+    with pytest.raises(ValueError, match="Invalid agent name"):
+        inbox_path("test-team", "../other-team/inboxes/bob", base_dir=tmp_claude_dir)
 
 
 async def test_append_message_encrypts_when_master_key_set(

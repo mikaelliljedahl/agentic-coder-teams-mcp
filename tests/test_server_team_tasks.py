@@ -184,6 +184,20 @@ class TestWiring:
 
         assert [item["text"] for item in result["items"]] == ["msg-3", "msg-2"]
 
+    async def test_read_inbox_rejects_invalid_agent_name(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "t5g"})
+        result = await client.call_tool(
+            "read_inbox",
+            {
+                "team_name": "t5g",
+                "agent_name": "../other-team/inboxes/bob",
+            },
+            raise_on_error=False,
+        )
+
+        assert result.is_error is True
+        assert "Invalid agent name" in _text(result)
+
 
 class TestTeamDeleteClearsSession:
     async def test_should_allow_new_team_after_delete(self, client: Client):
@@ -261,6 +275,28 @@ class TestErrorWrapping:
         assert result.is_error is True
         assert "cannot transition" in _text(result).lower()
 
+    async def test_task_update_rejects_invalid_owner(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tew4"})
+        created = _data(
+            await client.call_tool(
+                "task_create",
+                {"team_name": "tew4", "subject": "S", "description": "d"},
+            )
+        )
+
+        result = await client.call_tool(
+            "task_update",
+            {
+                "team_name": "tew4",
+                "task_id": created["id"],
+                "owner": "../other-team/inboxes/bob",
+            },
+            raise_on_error=False,
+        )
+
+        assert result.is_error is True
+        assert "Invalid owner" in _text(result)
+
     async def test_task_list_wraps_nonexistent_team(self, client: Client):
         # Create a team to unlock team-tier tools, then target a different team
         await client.call_tool("team_create", {"team_name": "real-team2"})
@@ -326,3 +362,16 @@ class TestPollInbox:
             )
         )
         assert any(msg["text"] == "instant" for msg in result)
+
+    async def test_should_reject_invalid_agent_name(self, team_client: Client):
+        result = await team_client.call_tool(
+            "poll_inbox",
+            {
+                "team_name": "test-team",
+                "agent_name": "../other-team/inboxes/bob",
+                "timeout_ms": 100,
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "Invalid agent name" in _text(result)

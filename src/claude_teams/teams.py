@@ -32,6 +32,31 @@ def _tasks_dir(base_dir: Path | None = None) -> Path:
     return (base_dir / "tasks") if base_dir else TASKS_DIR
 
 
+def validate_safe_name(name: str, label: str = "name") -> str:
+    """Validate a filesystem-safe team or agent identifier.
+
+    Args:
+        name (str): Identifier to validate.
+        label (str): Human-readable field label for error messages.
+
+    Returns:
+        str: The validated name.
+
+    Raises:
+        ValueError: If the name is empty, too long, or contains unsafe characters.
+
+    """
+    if not _VALID_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid {label}: {name!r}. Use only letters, numbers, hyphens, underscores."
+        )
+    if len(name) > 64:
+        raise ValueError(
+            f"{label.capitalize()} too long ({len(name)} chars, max 64): {name[:20]!r}..."
+        )
+    return name
+
+
 def _team_exists(name: str, base_dir: Path | None = None) -> bool:
     """Check if a team configuration file exists.
 
@@ -84,14 +109,7 @@ def _create_team(
         ValueError: If team name is invalid or exceeds 64 characters.
 
     """
-    if not _VALID_NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid team name: {name!r}. Use only letters, numbers, hyphens, underscores."
-        )
-    if len(name) > 64:
-        raise ValueError(
-            f"Team name too long ({len(name)} chars, max 64): {name[:20]!r}..."
-        )
+    validate_safe_name(name, "team name")
 
     teams_dir = _teams_dir(base_dir)
     tasks_dir = _tasks_dir(base_dir)

@@ -8,7 +8,7 @@ from typing import Literal
 from claude_teams.async_utils import run_blocking
 from claude_teams.filelock import file_lock
 from claude_teams.models import TaskFile
-from claude_teams.teams import _team_exists
+from claude_teams.teams import _team_exists, validate_safe_name
 
 
 _TaskStatus = Literal["pending", "in_progress", "completed", "deleted"]
@@ -301,6 +301,7 @@ def _update_task(
         if active_form is not None:
             task.active_form = active_form
         if owner is not None:
+            validate_safe_name(owner, "owner")
             task.owner = owner
 
         if add_blocks:

@@ -97,6 +97,14 @@ def _resolve_permission_mode(
     return cast(Literal["default", "require_approval", "bypass"], raw)
 
 
+def _validate_agent_name(name: str, label: str = "agent name") -> str:
+    """Validate a safe agent-style identifier and raise ToolError on failure."""
+    try:
+        return teams.validate_safe_name(name, label)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+
 def _normalize_pagination(limit: int, offset: int) -> tuple[int, int]:
     if limit < 1:
         raise ToolError("limit must be >= 1")

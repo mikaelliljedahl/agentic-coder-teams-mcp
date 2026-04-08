@@ -18,6 +18,7 @@ from claude_teams.server_runtime import (
     _require_authenticated_principal,
     _require_lead,
     _strip_ansi,
+    _validate_agent_name,
     logger,
 )
 
@@ -85,6 +86,7 @@ async def poll_inbox(
         raise ToolError(
             f"Authenticated principal {principal['name']!r} cannot poll inbox {agent_name!r}."
         )
+    _validate_agent_name(agent_name)
     msgs = await messaging.read_inbox(
         team_name, agent_name, unread_only=True, mark_as_read=True
     )

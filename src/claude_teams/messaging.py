@@ -2,6 +2,7 @@
 
 import json
 import time
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -17,6 +18,7 @@ from claude_teams.models import (
     TaskAssignment,
     TaskFile,
 )
+from claude_teams.teams import validate_safe_name
 
 TEAMS_DIR = Path.home() / ".claude" / "teams"
 
@@ -48,7 +50,9 @@ def inbox_path(team_name: str, agent_name: str, base_dir: Path | None = None) ->
         Path: Full path to the agent's inbox file.
 
     """
-    return _teams_dir(base_dir) / team_name / "inboxes" / f"{agent_name}.json"
+    safe_team_name = validate_safe_name(team_name, "team name")
+    safe_agent_name = validate_safe_name(agent_name, "agent name")
+    return _teams_dir(base_dir) / safe_team_name / "inboxes" / f"{safe_agent_name}.json"
 
 
 def _ensure_inbox(
@@ -95,6 +99,73 @@ def _serialize_inbox_messages(
     ]
 
 
+def _select_inbox_indices(
+    messages: Sequence[InboxMessage],
+    unread_only: bool,
+    order: Literal["oldest", "newest"],
+) -> list[int]:
+    selected_indices = [
+        index
+        for index, message in enumerate(messages)
+        if not unread_only or not message.read
+    ]
+    if order == "newest":
+        selected_indices.reverse()
+    return selected_indices
+
+
+def _apply_pagination(
+    selected_indices: list[int], limit: int | None, offset: int
+) -> list[int]:
+    paged_indices = selected_indices[offset:] if offset else list(selected_indices)
+    if limit is not None:
+        paged_indices = paged_indices[:limit]
+    return paged_indices
+
+
+def _read_inbox_page(
+    team_name: str,
+    agent_name: str,
+    unread_only: bool = False,
+    mark_as_read: bool = True,
+    limit: int | None = None,
+    offset: int = 0,
+    order: Literal["oldest", "newest"] = "oldest",
+    base_dir: Path | None = None,
+) -> tuple[list[InboxMessage], int]:
+    path = inbox_path(team_name, agent_name, base_dir)
+    if not path.exists():
+        return [], 0
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    if order not in {"oldest", "newest"}:
+        raise ValueError("order must be 'oldest' or 'newest'")
+
+    if mark_as_read:
+        lock_path = path.parent / ".lock"
+        with file_lock(lock_path):
+            all_msgs = _load_inbox_messages(path, team_name)
+            selected_indices = _select_inbox_indices(all_msgs, unread_only, order)
+            total_count = len(selected_indices)
+            paged_indices = _apply_pagination(selected_indices, limit, offset)
+            result = [all_msgs[index] for index in paged_indices]
+
+            if result:
+                for index in paged_indices:
+                    all_msgs[index].read = True
+                path.write_text(
+                    json.dumps(_serialize_inbox_messages(team_name, all_msgs))
+                )
+
+            return result, total_count
+
+    all_msgs = _load_inbox_messages(path, team_name)
+    selected_indices = _select_inbox_indices(all_msgs, unread_only, order)
+    total_count = len(selected_indices)
+    paged_indices = _apply_pagination(selected_indices, limit, offset)
+    return [all_msgs[index] for index in paged_indices], total_count
+
+
 def _read_inbox(
     team_name: str,
     agent_name: str,
@@ -105,50 +176,17 @@ def _read_inbox(
     order: Literal["oldest", "newest"] = "oldest",
     base_dir: Path | None = None,
 ) -> list[InboxMessage]:
-    path = inbox_path(team_name, agent_name, base_dir)
-    if not path.exists():
-        return []
-    if offset < 0:
-        raise ValueError("offset must be >= 0")
-    if order not in {"oldest", "newest"}:
-        raise ValueError("order must be 'oldest' or 'newest'")
-
-    if mark_as_read:
-        lock_path = path.parent / ".lock"
-        with file_lock(lock_path):
-            all_msgs = _load_inbox_messages(path, team_name)
-            selected_indices = [
-                index
-                for index, msg in enumerate(all_msgs)
-                if not unread_only or not msg.read
-            ]
-            if order == "newest":
-                selected_indices.reverse()
-            if offset:
-                selected_indices = selected_indices[offset:]
-            if limit is not None:
-                selected_indices = selected_indices[:limit]
-            result = [all_msgs[index] for index in selected_indices]
-
-            if result:
-                for index in selected_indices:
-                    all_msgs[index].read = True
-                path.write_text(
-                    json.dumps(_serialize_inbox_messages(team_name, all_msgs))
-                )
-
-            return result
-    else:
-        all_msgs = _load_inbox_messages(path, team_name)
-        if unread_only:
-            all_msgs = [msg for msg in all_msgs if not msg.read]
-        if order == "newest":
-            all_msgs = list(reversed(all_msgs))
-        if offset:
-            all_msgs = all_msgs[offset:]
-        if limit is not None:
-            all_msgs = all_msgs[:limit]
-        return list(all_msgs)
+    messages, _total_count = _read_inbox_page(
+        team_name=team_name,
+        agent_name=agent_name,
+        unread_only=unread_only,
+        mark_as_read=mark_as_read,
+        limit=limit,
+        offset=offset,
+        order=order,
+        base_dir=base_dir,
+    )
+    return messages
 
 
 async def read_inbox(
@@ -179,6 +217,45 @@ async def read_inbox(
     """
     return await run_blocking(
         _read_inbox,
+        team_name,
+        agent_name,
+        unread_only,
+        mark_as_read,
+        limit,
+        offset,
+        order,
+        base_dir,
+    )
+
+
+async def read_inbox_page(
+    team_name: str,
+    agent_name: str,
+    unread_only: bool = False,
+    mark_as_read: bool = True,
+    limit: int | None = None,
+    offset: int = 0,
+    order: Literal["oldest", "newest"] = "oldest",
+    base_dir: Path | None = None,
+) -> tuple[list[InboxMessage], int]:
+    """Read inbox messages and total count in a single worker-thread pass.
+
+    Args:
+        team_name (str): Team name.
+        agent_name (str): Agent name.
+        unread_only (bool): Whether to return only unread messages.
+        mark_as_read (bool): Whether returned messages should be marked read.
+        limit (int | None): Maximum number of messages to return.
+        offset (int): Number of messages to skip.
+        order (Literal["oldest", "newest"]): Inbox ordering to use.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        tuple[list[InboxMessage], int]: Page of messages and total count before pagination.
+
+    """
+    return await run_blocking(
+        _read_inbox_page,
         team_name,
         agent_name,
         unread_only,

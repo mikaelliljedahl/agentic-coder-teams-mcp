@@ -18,6 +18,7 @@ from claude_teams.server_runtime import (
     _page_items,
     _require_authenticated_principal,
     _resolve_authenticated_principal,
+    _validate_agent_name,
 )
 
 
@@ -90,6 +91,8 @@ async def task_update(
 
     """
     await _require_authenticated_principal(ctx, team_name, capability)
+    if owner is not None:
+        _validate_agent_name(owner, "owner")
     try:
         task = await tasks.update_task(
             team_name,
@@ -206,15 +209,9 @@ async def read_inbox(
         raise ToolError(
             f"Authenticated principal {principal['name']!r} cannot read inbox {agent_name!r}."
         )
+    _validate_agent_name(agent_name)
     limit, offset = _normalize_pagination(limit, offset)
-    total_msgs = await messaging.read_inbox(
-        team_name,
-        agent_name,
-        unread_only=unread_only,
-        mark_as_read=False,
-        order=order,
-    )
-    msgs = await messaging.read_inbox(
+    msgs, total_count = await messaging.read_inbox_page(
         team_name,
         agent_name,
         unread_only=unread_only,
@@ -224,7 +221,6 @@ async def read_inbox(
         order=order,
     )
     next_offset = offset + limit
-    total_count = len(total_msgs)
     has_more = next_offset < total_count
     return PaginatedInboxMessages.model_validate(
         {
