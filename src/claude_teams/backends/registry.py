@@ -1,3 +1,5 @@
+"""Backend discovery and registry management."""
+
 import importlib
 import importlib.metadata
 import logging
@@ -39,6 +41,7 @@ class BackendRegistry:
     """
 
     def __init__(self) -> None:
+        """Initialize an empty lazy-loading backend registry."""
         self._backends: dict[str, Backend] = {}
         self._loaded: bool = False
 
@@ -89,6 +92,7 @@ class BackendRegistry:
         Args:
             name: Backend identifier.
             backend: Backend instance satisfying the Backend protocol.
+
         """
         self._backends[name] = backend
 
@@ -103,6 +107,7 @@ class BackendRegistry:
 
         Raises:
             KeyError: If no backend with the given name is registered.
+
         """
         self._ensure_loaded()
         if name not in self._backends:
@@ -117,6 +122,7 @@ class BackendRegistry:
 
         Returns:
             list[str]: Sorted list of registered backend names.
+
         """
         self._ensure_loaded()
         return sorted(self._backends.keys())
@@ -129,6 +135,7 @@ class BackendRegistry:
 
         Raises:
             RuntimeError: If no backends are available.
+
         """
         self._ensure_loaded()
         if "claude-code" in self._backends:

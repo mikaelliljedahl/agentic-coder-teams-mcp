@@ -1,3 +1,5 @@
+"""Kimi backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -20,6 +22,7 @@ class KimiBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "kimi-k2",
@@ -32,6 +35,7 @@ class KimiBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "kimi-k2-thinking"
 
@@ -45,6 +49,7 @@ class KimiBackend(BaseBackend):
 
         Returns:
             str: Kimi model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
@@ -61,6 +66,7 @@ class KimiBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -81,5 +87,6 @@ class KimiBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}

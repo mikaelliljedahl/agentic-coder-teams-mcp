@@ -1,3 +1,5 @@
+"""Claude Code backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -13,6 +15,7 @@ class ClaudeCodeBackend(BaseBackend):
 
         Returns:
             bool: Always True.
+
         """
         return True
 
@@ -30,6 +33,7 @@ class ClaudeCodeBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return ["haiku", "sonnet", "opus"]
 
@@ -38,6 +42,7 @@ class ClaudeCodeBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "sonnet"
 
@@ -52,6 +57,7 @@ class ClaudeCodeBackend(BaseBackend):
 
         Raises:
             ValueError: For unsupported model names.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
@@ -60,16 +66,21 @@ class ClaudeCodeBackend(BaseBackend):
             f"Supported: {', '.join(self.supported_models())}"
         )
 
+    def bypass_permission_args(self) -> list[str]:
+        """Use Claude Code's explicit bypass permission mode."""
+        return ["--permission-mode", "bypassPermissions"]
+
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Claude Code CLI command.
 
-        Produces the exact same flags as the original spawner.py build_spawn_command().
+        Produces the canonical Claude Code worker launch command for this project.
 
         Args:
             request: Backend-agnostic spawn parameters.
 
         Returns:
             Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -89,6 +100,7 @@ class ClaudeCodeBackend(BaseBackend):
             request.agent_type,
             "--model",
             model,
+            *self.permission_args(request),
         ]
         if request.plan_mode_required:
             cmd.append("--plan-mode-required")
@@ -102,8 +114,13 @@ class ClaudeCodeBackend(BaseBackend):
 
         Returns:
             Dict with CLAUDECODE and CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS.
+
         """
-        return {
+        env = {
             "CLAUDECODE": "1",
             "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
         }
+        agent_capability = (request.extra or {}).get("agent_capability")
+        if agent_capability:
+            env["CLAUDE_TEAMS_AGENT_CAPABILITY"] = agent_capability
+        return env

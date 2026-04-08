@@ -1,3 +1,5 @@
+"""Aider backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -18,6 +20,7 @@ class AiderBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "claude-3.5-haiku",
@@ -32,6 +35,7 @@ class AiderBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "claude-sonnet-4"
 
@@ -45,10 +49,15 @@ class AiderBackend(BaseBackend):
 
         Returns:
             Aider model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
         return generic_name
+
+    def default_permission_args(self) -> list[str]:
+        """Return default permission-bypass arguments for Aider."""
+        return ["--yes-always"]
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Aider CLI command.
@@ -58,6 +67,7 @@ class AiderBackend(BaseBackend):
 
         Returns:
             Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -67,7 +77,7 @@ class AiderBackend(BaseBackend):
             model,
             "--message",
             request.prompt,
-            "--yes-always",
+            *self.permission_args(request),
         ]
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
@@ -78,5 +88,6 @@ class AiderBackend(BaseBackend):
 
         Returns:
             Empty dict.
+
         """
         return {}

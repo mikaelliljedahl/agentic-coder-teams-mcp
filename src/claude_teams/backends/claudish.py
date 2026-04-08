@@ -1,3 +1,5 @@
+"""Claudish backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -27,6 +29,7 @@ class ClaudishBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "google@gemini-2.5-flash",
@@ -41,6 +44,7 @@ class ClaudishBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "oai@gpt-5.2"
 
@@ -52,10 +56,15 @@ class ClaudishBackend(BaseBackend):
 
         Returns:
             str: Claudish model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
         return generic_name
+
+    def default_permission_args(self) -> list[str]:
+        """Return default permission-bypass arguments for Claudish."""
+        return ["-y"]
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Claudish command for single-shot execution.
@@ -68,6 +77,7 @@ class ClaudishBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -75,7 +85,7 @@ class ClaudishBackend(BaseBackend):
             binary,
             "--model",
             model,
-            "-y",
+            *self.permission_args(request),
             request.prompt,
         ]
 
@@ -87,5 +97,6 @@ class ClaudishBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}

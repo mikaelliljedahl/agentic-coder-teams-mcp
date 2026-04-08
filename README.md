@@ -172,21 +172,22 @@ Tools are organized into three tiers using **progressive disclosure**. At startu
 
 | Tool | Description |
 |------|-------------|
-| `team_create` | Create a new agent team. One team per server session. |
+| `team_create` | Create a new agent team and return the lead capability for later re-attachment. One team per server session. |
+| `team_attach` | Attach a new MCP session to an existing team using a lead or agent capability. |
 | `team_delete` | Delete a team and all its data. Fails if teammates are still active. |
 | `list_backends` | List all available backends and their supported models. |
-| `read_config` | Read team configuration and member list. |
+| `read_config` | Read team configuration and member list (lead capability required). |
 
 ### Tier 1: Team (visible after `team_create`)
 
 | Tool | Description |
 |------|-------------|
-| `spawn_teammate` | Spawn a coding agent via any backend. Specify backend, model, and prompt. |
+| `spawn_teammate` | Spawn a coding agent via any backend. Specify backend, model, prompt, optional absolute `cwd`, and optional `permission_mode`. |
 | `send_message` | Send direct messages, broadcasts, or shutdown/plan-approval responses. |
-| `read_inbox` | Read messages from an agent's inbox (with optional unread-only filter). |
+| `read_inbox` | Read messages from an agent's inbox with pagination metadata, optional unread-only filtering, and `oldest`/`newest` ordering. |
 | `task_create` | Create a new task with auto-incrementing ID. |
 | `task_update` | Update task status, owner, dependencies, or metadata. |
-| `task_list` | List all tasks for a team. |
+| `task_list` | List team tasks in canonical task-ID order with pagination metadata. |
 | `task_get` | Get full details of a specific task. |
 
 ### Tier 2: Teammate (visible after first `spawn_teammate`)
@@ -194,9 +195,66 @@ Tools are organized into three tiers using **progressive disclosure**. At startu
 | Tool | Description |
 |------|-------------|
 | `force_kill_teammate` | Forcibly kill a teammate's process and remove from team. |
+| `check_teammate` | Inspect one teammate's liveness, lead-facing unread messages, unread count, and optional captured output. |
 | `poll_inbox` | Long-poll an inbox for new messages (blocks up to 30 seconds). |
 | `process_shutdown_approved` | Cleanly remove a teammate after graceful shutdown approval. |
 | `health_check` | Check if a teammate's process is still running. |
+
+### Capability model
+
+- `team_create` returns a `lead_capability`. Keep it if you want to attach another MCP session to the same team later.
+- `spawn_teammate` issues a per-agent capability and includes `team_attach(...)` instructions in the worker's bootstrap prompt.
+- A session attached with the lead capability can perform all lead actions.
+- A session attached with an agent capability can perform agent-scoped actions as that agent, but cannot use lead-only tools such as `broadcast`, `force_kill_teammate`, `check_teammate`, or `health_check`.
+
+### Permission modes
+
+- `spawn_teammate` accepts `permission_mode` with three values:
+  - `default`: preserve the backend's normal automation behavior
+  - `require_approval`: strip backend auto-approval flags when supported
+  - `bypass`: require an explicit approval-bypass mode; unsupported backends reject the spawn
+- You can also set `CLAUDE_TEAMS_PERMISSION_MODE` to change the server-wide default when `permission_mode` is omitted.
+- Backends vary in how they implement it. `claude-code` uses `--permission-mode bypassPermissions`; one-shot CLIs such as `codex`, `coder`, `gemini`, `aider`, `amp`, `copilot`, `happy`, `llxprt`, `qwen`, `rovodev`, and `claudish` use their backend-native bypass flags.
+
+### Pagination
+
+- `task_list` and `read_inbox` now return paginated envelopes with:
+  - `items`
+  - `total_count`
+  - `limit`
+  - `offset`
+  - `has_more`
+  - `next_offset`
+- `task_list` keeps its canonical task-ID ordering.
+- `read_inbox` keeps `order="oldest"` by default and also accepts `order="newest"` so recent mail can be fetched from page 1.
+- This avoids unbounded MCP payloads without truncating message or task content.
+
+Example `read_inbox` response:
+
+```json
+{
+  "items": [
+    {
+      "from": "team-lead",
+      "text": "Please review task 7",
+      "timestamp": "2026-04-07T18:22:11.531Z",
+      "read": false,
+      "summary": "review request"
+    }
+  ],
+  "totalCount": 1,
+  "limit": 100,
+  "offset": 0,
+  "hasMore": false
+}
+```
+
+### Optional Inbox Encryption
+
+- Set `CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY` to enable inbox-at-rest encryption.
+- The server derives a per-team inbox key from that master key and encrypts inbox entries on disk.
+- Existing plaintext inbox entries remain readable; they are opportunistically rewritten encrypted on the next modifying inbox operation.
+- If encrypted inbox entries exist and the master key is missing or wrong, inbox reads fail closed.
 
 ---
 
@@ -226,13 +284,13 @@ claude-teams backends
 claude-teams config my-team
 
 # Check if all agents are still running
-claude-teams health my-team --agent worker-1
+claude-teams health my-team worker-1
 
-# Read unread messages for the team lead
-claude-teams inbox my-team --agent team-lead
+# Read the team lead inbox in newest-first order
+claude-teams inbox my-team team-lead --order newest
 
 # Force-kill an unresponsive agent
-claude-teams kill my-team --agent stuck-worker
+claude-teams kill my-team stuck-worker
 ```
 
 ---
@@ -296,9 +354,9 @@ JSON task files stored under `~/.claude/tasks/<team>/`. Tasks support:
 
 The server uses FastMCP's tag-based visibility system to progressively reveal tools as state evolves:
 
-1. **Cold start** -- only 4 bootstrap tools visible (~580 tokens vs ~4000 for all 15)
+1. **Cold start** -- only 5 bootstrap tools visible
 2. **After `team_create`** -- 7 team-tier tools become visible
-3. **After first `spawn_teammate`** -- 4 teammate-tier tools become visible
+3. **After first `spawn_teammate`** -- 5 teammate-tier tools become visible
 4. **After `team_delete`** -- resets back to bootstrap-only
 
 This is transparent to MCP clients -- the server sends `ToolListChangedNotification` automatically.
@@ -318,7 +376,7 @@ uv sync
 ### Running tests
 
 ```bash
-uv run pytest                           # Run all 521 tests
+uv run pytest                           # Run all tests
 uv run pytest --cov=claude_teams        # With coverage
 uv run pytest tests/test_server.py -v   # Single module
 uv run pytest -k "test_spawn"           # Filter by name
@@ -336,16 +394,26 @@ uv run ty check                         # Type check (Astral's ty)
 
 ```
 src/claude_teams/
-├── server.py          # MCP server (FastMCP tools, progressive disclosure)
+├── server.py          # Thin MCP assembly surface and entrypoint
+├── server_runtime.py  # Shared MCP app, auth, pagination, annotations, lifecycle
+├── server_bootstrap.py# Bootstrap-tier tool registration
+├── server_team_spawn.py # Team-tier spawn and message tools
+├── server_team_tasks.py # Team-tier task and inbox tools
+├── server_team_relay.py # One-shot backend relay helpers
+├── server_teammate.py # Teammate-tier tool registration
 ├── cli.py             # Typer CLI commands
+├── async_utils.py     # Thread offload helper for blocking local operations
 ├── models.py          # Pydantic models (TeamConfig, Task, InboxMessage, etc.)
 ├── teams.py           # Team CRUD (config read/write, member management)
 ├── tasks.py           # Task CRUD (create, update, list, dependencies)
 ├── messaging.py       # Inbox operations (read, write, structured messages)
+├── capabilities.py    # Lead/agent capability storage and resolution
+├── inbox_crypto.py    # Optional inbox-at-rest encryption helpers
 ├── filelock.py        # Shared fcntl-based file locking
-├── spawner.py         # Color assignment and spawn utilities
 └── backends/
-    ├── base.py        # Backend protocol + BaseBackend (shared tmux lifecycle)
+    ├── base.py        # Compatibility re-exports for backend contracts/base
+    ├── contracts.py   # Backend protocol and spawn result/request types
+    ├── tmux_base.py   # Shared tmux-backed BaseBackend implementation
     ├── registry.py    # Auto-discovery and registration
     ├── claude_code.py # Claude Code backend
     ├── codex.py       # OpenAI Codex backend
@@ -366,6 +434,8 @@ src/claude_teams/
    - `supported_models() -> list[str]` -- available model names
    - `default_model() -> str` -- default model when none specified
    - `resolve_model(model) -> str` -- map generic tiers to backend-specific names
+   - optionally `default_permission_args() -> list[str]` when the backend normally auto-approves
+   - optionally `bypass_permission_args() -> list[str]` when explicit bypass differs from the default
 3. Set class attributes: `name`, `binary_name`
 4. Add the entry to `_BUILTIN_BACKENDS` in `registry.py`
 5. Add tests in `tests/test_backends/test_your_backend.py`
@@ -448,11 +518,16 @@ Messages follow a structured format. The `send_message` tool supports five messa
 
 | Type | Purpose | Required fields |
 |------|---------|----------------|
-| `message` | Direct agent-to-agent | `recipient`, `content`, `summary` |
-| `broadcast` | Send to all teammates | `content`, `summary` |
+| `message` | Direct message between team members | `recipient`, `content`, `summary` |
+| `broadcast` | Send from `team-lead` to all teammates | `content`, `summary` |
 | `shutdown_request` | Ask agent to stop | `recipient` |
 | `shutdown_response` | Reply to shutdown | `sender`, `request_id`, `approve` |
 | `plan_approval_response` | Approve/reject plan | `recipient`, `request_id`, `approve` |
+
+For `message`, `sender` defaults to `team-lead`; teammates should pass their own
+agent name explicitly when sending direct messages. `broadcast` remains
+lead-only. Sessions attached with a worker capability may send direct
+messages only as that worker unless a lead capability is used.
 
 ### Task state machine
 

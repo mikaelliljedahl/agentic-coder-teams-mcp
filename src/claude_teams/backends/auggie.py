@@ -1,3 +1,5 @@
+"""Auggie backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -20,6 +22,7 @@ class AuggieBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return ["claude-haiku-4.5", "claude-sonnet-4.5", "claude-opus-4.6"]
 
@@ -28,6 +31,7 @@ class AuggieBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "claude-sonnet-4.5"
 
@@ -41,6 +45,7 @@ class AuggieBackend(BaseBackend):
 
         Returns:
             str: Auggie model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
@@ -54,6 +59,7 @@ class AuggieBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -74,5 +80,6 @@ class AuggieBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}

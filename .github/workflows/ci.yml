@@ -6,8 +6,12 @@ on:
   pull_request:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
 
@@ -16,5 +20,11 @@ jobs:
           version: "0.9.26"
 
       - run: uv sync --locked --group dev
+
+      - run: uv run ruff format --check .
+
+      - run: uv run ruff check .
+
+      - run: uv run ty check
 
       - run: uv run pytest

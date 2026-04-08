@@ -1,3 +1,5 @@
+"""Shared Pydantic models for team orchestration state."""
+
 from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
@@ -12,6 +14,7 @@ def _to_camel(name: str) -> str:
 
     Returns:
         str: Field name converted to camelCase.
+
     """
     return to_camel(name.rstrip("_"))
 
@@ -29,6 +32,8 @@ COLOR_PALETTE: list[str] = [
 
 
 class LeadMember(BaseModel):
+    """Serialized team-lead member record."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     agent_id: str
@@ -42,6 +47,8 @@ class LeadMember(BaseModel):
 
 
 class TeammateMember(BaseModel):
+    """Serialized teammate member record."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     agent_id: str
@@ -69,6 +76,7 @@ class TeammateMember(BaseModel):
 
         Returns:
             object: Data with synchronized tmuxPaneId and processHandle fields.
+
         """
         if isinstance(data, dict):
             raw_dict = cast(dict[str, object], data)
@@ -99,6 +107,8 @@ MemberUnion = Annotated[
 
 
 class TeamConfig(BaseModel):
+    """Persistent team configuration."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     name: str
@@ -110,6 +120,8 @@ class TeamConfig(BaseModel):
 
 
 class TaskFile(BaseModel):
+    """Persistent task record."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     id: str
@@ -124,6 +136,8 @@ class TaskFile(BaseModel):
 
 
 class InboxMessage(BaseModel):
+    """Persistent inbox message record."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     from_: str
@@ -134,7 +148,35 @@ class InboxMessage(BaseModel):
     color: str | None = None
 
 
+class PaginatedTaskList(BaseModel):
+    """Paginated task-list response payload."""
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    items: list[TaskFile]
+    total_count: int
+    limit: int
+    offset: int
+    has_more: bool
+    next_offset: int | None = None
+
+
+class PaginatedInboxMessages(BaseModel):
+    """Paginated inbox response payload."""
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    items: list[InboxMessage]
+    total_count: int
+    limit: int
+    offset: int
+    has_more: bool
+    next_offset: int | None = None
+
+
 class IdleNotification(BaseModel):
+    """Structured idle notification message."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     type: Literal["idle_notification"] = "idle_notification"
@@ -144,6 +186,8 @@ class IdleNotification(BaseModel):
 
 
 class TaskAssignment(BaseModel):
+    """Structured task-assignment message."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     type: Literal["task_assignment"] = "task_assignment"
@@ -155,6 +199,8 @@ class TaskAssignment(BaseModel):
 
 
 class ShutdownRequest(BaseModel):
+    """Structured shutdown-request message."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     type: Literal["shutdown_request"] = "shutdown_request"
@@ -165,6 +211,8 @@ class ShutdownRequest(BaseModel):
 
 
 class ShutdownApproved(BaseModel):
+    """Structured graceful-shutdown approval message."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     type: Literal["shutdown_approved"] = "shutdown_approved"
@@ -177,18 +225,33 @@ class ShutdownApproved(BaseModel):
 
 
 class TeamCreateResult(BaseModel):
+    """Result payload returned after team creation."""
+
     team_name: str
     team_file_path: str
     lead_agent_id: str
+    lead_capability: str | None = None
+
+
+class TeamAttachResult(BaseModel):
+    """Result payload returned after team attachment."""
+
+    team_name: str
+    principal_name: str
+    principal_role: Literal["lead", "agent"]
 
 
 class TeamDeleteResult(BaseModel):
+    """Result payload returned after team deletion."""
+
     success: bool
     message: str
     team_name: str
 
 
 class SpawnResult(BaseModel):
+    """Result payload returned after teammate spawn."""
+
     agent_id: str
     name: str
     team_name: str
@@ -196,6 +259,8 @@ class SpawnResult(BaseModel):
 
 
 class BackendInfo(BaseModel):
+    """Backend availability and model metadata."""
+
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
 
     name: str
@@ -206,6 +271,8 @@ class BackendInfo(BaseModel):
 
 
 class SendMessageResult(BaseModel):
+    """Result payload returned after a messaging action."""
+
     success: bool
     message: str
     routing: dict | None = None

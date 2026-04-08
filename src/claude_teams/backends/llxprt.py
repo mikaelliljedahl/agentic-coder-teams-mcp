@@ -1,3 +1,5 @@
+"""LLxprt backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -21,6 +23,7 @@ class LlxprtBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "claude-haiku-4.5",
@@ -33,6 +36,7 @@ class LlxprtBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "claude-sonnet-4.5"
 
@@ -46,10 +50,15 @@ class LlxprtBackend(BaseBackend):
 
         Returns:
             str: LLxprt model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
         return generic_name
+
+    def default_permission_args(self) -> list[str]:
+        """Return default permission-bypass arguments for LLxprt."""
+        return ["-y"]
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the LLxprt CLI command for non-interactive execution.
@@ -59,6 +68,7 @@ class LlxprtBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -68,7 +78,7 @@ class LlxprtBackend(BaseBackend):
             request.prompt,
             "-m",
             model,
-            "-y",
+            *self.permission_args(request),
         ]
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
@@ -79,5 +89,6 @@ class LlxprtBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}

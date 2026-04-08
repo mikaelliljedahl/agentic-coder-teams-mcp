@@ -5,16 +5,18 @@ as the MCP server.  Both the CLI and MCP server can run concurrently thanks
 to ``fcntl.flock()`` guards in the core modules.
 """
 
+import asyncio
 import json
 import os
 import signal
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from claude_teams import messaging, tasks, teams
+from claude_teams import capabilities, messaging, tasks, teams
+from claude_teams.async_utils import run_blocking
 from claude_teams.backends.registry import registry
 from claude_teams.models import TeammateMember
 from claude_teams.server import mcp
@@ -29,19 +31,74 @@ app = typer.Typer(
 console = Console()
 err_console = Console(stderr=True)
 
-# ---------------------------------------------------------------------------
-# Shared options
-# ---------------------------------------------------------------------------
-
 JsonFlag = Annotated[
     bool,
     typer.Option("--json", "-j", help="Output as JSON instead of a table."),
 ]
+CapabilityFlag = Annotated[
+    str,
+    typer.Option(
+        "--capability",
+        help="Lead or agent capability. Falls back to CLAUDE_TEAMS_CAPABILITY.",
+    ),
+]
 
 
-# ---------------------------------------------------------------------------
-# serve
-# ---------------------------------------------------------------------------
+def _resolved_capability(capability: str) -> str:
+    return capability or os.environ.get("CLAUDE_TEAMS_CAPABILITY", "")
+
+
+def _run(awaitable):
+    """Run an awaitable from the synchronous CLI surface.
+
+    Args:
+        awaitable: Awaitable value to execute.
+
+    Returns:
+        object: Awaitable result.
+
+    """
+    return asyncio.run(awaitable)
+
+
+def _ensure_team_exists(team_name: str) -> None:
+    if not _run(teams.team_exists(team_name)):
+        err_console.print(f"[red]Team {team_name!r} not found.[/red]")
+        raise typer.Exit(code=1)
+
+
+def _require_cli_principal(team_name: str, capability: str) -> capabilities.Principal:
+    _ensure_team_exists(team_name)
+    principal = _run(
+        capabilities.resolve_principal(team_name, _resolved_capability(capability))
+    )
+    if principal is None:
+        err_console.print(
+            "[red]This command requires a valid team capability. "
+            "Pass --capability or set CLAUDE_TEAMS_CAPABILITY.[/red]"
+        )
+        raise typer.Exit(code=1)
+    return principal
+
+
+def _require_cli_lead(team_name: str, capability: str) -> capabilities.Principal:
+    principal = _require_cli_principal(team_name, capability)
+    if principal["role"] != "lead":
+        err_console.print("[red]This command requires the team-lead capability.[/red]")
+        raise typer.Exit(code=1)
+    return principal
+
+
+def _require_cli_self_or_lead(
+    team_name: str, agent_name: str, capability: str
+) -> capabilities.Principal:
+    principal = _require_cli_principal(team_name, capability)
+    if principal["role"] == "lead" or principal["name"] == agent_name:
+        return principal
+    err_console.print(
+        f"[red]Authenticated principal {principal['name']!r} cannot access inbox {agent_name!r}.[/red]"
+    )
+    raise typer.Exit(code=1)
 
 
 @app.command()
@@ -49,11 +106,6 @@ def serve() -> None:
     """Start the MCP server."""
     signal.signal(signal.SIGINT, lambda *_: os._exit(0))
     mcp.run()
-
-
-# ---------------------------------------------------------------------------
-# backends
-# ---------------------------------------------------------------------------
 
 
 @app.command()
@@ -65,6 +117,7 @@ def backends(output_json: JsonFlag = False) -> None:
 
     Raises:
         typer.Exit: If no backends are available (exit code 1).
+
     """
     rows: list[dict[str, str | list[str]]] = []
     for name, backend in registry:
@@ -105,30 +158,25 @@ def backends(output_json: JsonFlag = False) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# config
-# ---------------------------------------------------------------------------
-
-
 @app.command()
 def config(
     team_name: Annotated[str, typer.Argument(help="Team name.")],
+    capability: CapabilityFlag = "",
     output_json: JsonFlag = False,
 ) -> None:
     """Show the team configuration.
 
     Args:
         team_name (str): Name of the team.
+        capability (str): Lead capability override or env fallback.
         output_json (bool): Whether to output as JSON instead of a table.
 
     Raises:
         typer.Exit: If team not found (exit code 1).
+
     """
-    try:
-        cfg = teams.read_config(team_name)
-    except FileNotFoundError:
-        err_console.print(f"[red]Team {team_name!r} not found.[/red]")
-        raise typer.Exit(code=1)
+    _require_cli_lead(team_name, capability)
+    cfg = _run(teams.read_config(team_name))
 
     if output_json:
         console.print_json(json.dumps(cfg.model_dump(by_alias=True)))
@@ -159,33 +207,28 @@ def config(
     console.print(table)
 
 
-# ---------------------------------------------------------------------------
-# status
-# ---------------------------------------------------------------------------
-
-
 @app.command()
 def status(
     team_name: Annotated[str, typer.Argument(help="Team name.")],
+    capability: CapabilityFlag = "",
     output_json: JsonFlag = False,
 ) -> None:
     """Show team tasks and member summary.
 
     Args:
         team_name (str): Name of the team.
+        capability (str): Lead capability override or env fallback.
         output_json (bool): Whether to output as JSON instead of a table.
 
     Raises:
         typer.Exit: If team not found or task listing fails (exit code 1).
+
     """
-    try:
-        cfg = teams.read_config(team_name)
-    except FileNotFoundError:
-        err_console.print(f"[red]Team {team_name!r} not found.[/red]")
-        raise typer.Exit(code=1)
+    _require_cli_lead(team_name, capability)
+    cfg = _run(teams.read_config(team_name))
 
     try:
-        task_list = tasks.list_tasks(team_name)
+        task_list = _run(tasks.list_tasks(team_name))
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
@@ -226,18 +269,22 @@ def status(
         console.print("[dim]No tasks.[/dim]")
 
 
-# ---------------------------------------------------------------------------
-# inbox
-# ---------------------------------------------------------------------------
-
-
 @app.command()
 def inbox(
     team_name: Annotated[str, typer.Argument(help="Team name.")],
     agent_name: Annotated[str, typer.Argument(help="Agent name.")],
+    capability: CapabilityFlag = "",
     unread_only: Annotated[
         bool, typer.Option("--unread", "-u", help="Show only unread messages.")
     ] = False,
+    order: Annotated[
+        str,
+        typer.Option(
+            "--order",
+            help="Inbox ordering: oldest or newest.",
+            case_sensitive=False,
+        ),
+    ] = "oldest",
     output_json: JsonFlag = False,
 ) -> None:
     """Read an agent's inbox messages.
@@ -245,14 +292,28 @@ def inbox(
     Args:
         team_name (str): Name of the team.
         agent_name (str): Name of the agent whose inbox to read.
+        capability (str): Lead or matching agent capability override.
         unread_only (bool): Whether to show only unread messages.
+        order (str): Inbox ordering, oldest or newest.
         output_json (bool): Whether to output as JSON instead of a table.
+
     """
-    msgs = messaging.read_inbox(
-        team_name,
-        agent_name,
-        unread_only=unread_only,
-        mark_as_read=False,
+    _require_cli_self_or_lead(team_name, agent_name, capability)
+    normalized_order = order.lower()
+    if normalized_order not in {"oldest", "newest"}:
+        err_console.print("[red]order must be 'oldest' or 'newest'.[/red]")
+        raise typer.Exit(code=1)
+    inbox_order: Literal["oldest", "newest"] = (
+        "newest" if normalized_order == "newest" else "oldest"
+    )
+    msgs = _run(
+        messaging.read_inbox(
+            team_name,
+            agent_name,
+            unread_only=unread_only,
+            mark_as_read=False,
+            order=inbox_order,
+        )
     )
 
     if output_json:
@@ -281,15 +342,11 @@ def inbox(
     console.print(table)
 
 
-# ---------------------------------------------------------------------------
-# health
-# ---------------------------------------------------------------------------
-
-
 @app.command()
 def health(
     team_name: Annotated[str, typer.Argument(help="Team name.")],
     agent_name: Annotated[str, typer.Argument(help="Agent name.")],
+    capability: CapabilityFlag = "",
     output_json: JsonFlag = False,
 ) -> None:
     """Check if a teammate's process is alive.
@@ -297,16 +354,15 @@ def health(
     Args:
         team_name (str): Name of the team.
         agent_name (str): Name of the agent to check.
+        capability (str): Lead capability override or env fallback.
         output_json (bool): Whether to output as JSON instead of a table.
 
     Raises:
         typer.Exit: If team not found, teammate not found, or backend unavailable (exit code 1).
+
     """
-    try:
-        cfg = teams.read_config(team_name)
-    except FileNotFoundError:
-        err_console.print(f"[red]Team {team_name!r} not found.[/red]")
-        raise typer.Exit(code=1)
+    _require_cli_lead(team_name, capability)
+    cfg = _run(teams.read_config(team_name))
 
     member = _find_teammate(cfg, agent_name)
     if member is None:
@@ -322,7 +378,7 @@ def health(
         err_console.print(f"[red]Backend {backend_type!r} not available.[/red]")
         raise typer.Exit(code=1)
 
-    health_status = backend_obj.health_check(process_handle)
+    health_status = _run(run_blocking(backend_obj.health_check, process_handle))
 
     result = {
         "agent_name": agent_name,
@@ -347,15 +403,11 @@ def health(
         console.print(f"  [dim]{health_status.detail}[/dim]")
 
 
-# ---------------------------------------------------------------------------
-# kill
-# ---------------------------------------------------------------------------
-
-
 @app.command()
 def kill(
     team_name: Annotated[str, typer.Argument(help="Team name.")],
     agent_name: Annotated[str, typer.Argument(help="Agent name to kill.")],
+    capability: CapabilityFlag = "",
     output_json: JsonFlag = False,
 ) -> None:
     """Force-kill a teammate and remove from team.
@@ -363,16 +415,15 @@ def kill(
     Args:
         team_name (str): Name of the team.
         agent_name (str): Name of the agent to kill.
+        capability (str): Lead capability override or env fallback.
         output_json (bool): Whether to output as JSON instead of a table.
 
     Raises:
         typer.Exit: If team not found or teammate not found (exit code 1).
+
     """
-    try:
-        cfg = teams.read_config(team_name)
-    except FileNotFoundError:
-        err_console.print(f"[red]Team {team_name!r} not found.[/red]")
-        raise typer.Exit(code=1)
+    _require_cli_lead(team_name, capability)
+    cfg = _run(teams.read_config(team_name))
 
     member = _find_teammate(cfg, agent_name)
     if member is None:
@@ -387,12 +438,13 @@ def kill(
     if process_handle:
         try:
             backend_obj = registry.get(backend_type)
-            backend_obj.kill(process_handle)
+            _run(run_blocking(backend_obj.kill, process_handle))
         except KeyError:
             pass  # backend unavailable; process may already be dead
 
-    teams.remove_member(team_name, agent_name)
-    tasks.reset_owner_tasks(team_name, agent_name)
+    _run(teams.remove_member(team_name, agent_name))
+    _run(capabilities.remove_agent_capability(team_name, agent_name))
+    _run(tasks.reset_owner_tasks(team_name, agent_name))
 
     result = {"success": True, "message": f"{agent_name} has been stopped."}
 
@@ -405,11 +457,6 @@ def kill(
     )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _find_teammate(cfg: teams.TeamConfig, agent_name: str) -> TeammateMember | None:
     """Find a TeammateMember by name in a TeamConfig.
 
@@ -419,6 +466,7 @@ def _find_teammate(cfg: teams.TeamConfig, agent_name: str) -> TeammateMember | N
 
     Returns:
         TeammateMember | None: The teammate if found, None otherwise.
+
     """
     for member in cfg.members:
         if isinstance(member, TeammateMember) and member.name == agent_name:

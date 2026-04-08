@@ -1,3 +1,5 @@
+"""Codex backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -21,6 +23,7 @@ class CodexBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return ["gpt-5.3-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
 
@@ -29,6 +32,7 @@ class CodexBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "gpt-5.3-codex"
 
@@ -42,10 +46,15 @@ class CodexBackend(BaseBackend):
 
         Returns:
             Codex model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
         return generic_name
+
+    def default_permission_args(self) -> list[str]:
+        """Return default permission-bypass arguments for Codex."""
+        return ["--full-auto"]
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Codex CLI command.
@@ -55,6 +64,7 @@ class CodexBackend(BaseBackend):
 
         Returns:
             Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -63,7 +73,7 @@ class CodexBackend(BaseBackend):
             "exec",
             "--model",
             model,
-            "--full-auto",
+            *self.permission_args(request),
             "-C",
             request.cwd,
         ]
@@ -83,5 +93,6 @@ class CodexBackend(BaseBackend):
 
         Returns:
             Empty dict.
+
         """
         return {}
