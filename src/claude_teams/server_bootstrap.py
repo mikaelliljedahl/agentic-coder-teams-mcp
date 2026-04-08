@@ -23,7 +23,7 @@ async def team_create(
     team_name: str,
     ctx: Context,
     description: str = "",
-) -> dict:
+) -> dict[str, object]:
     """Create a team and return the lead capability for this session."""
     ls = _get_lifespan(ctx)
     if ls.get("active_team"):
@@ -50,7 +50,9 @@ async def team_create(
     ).model_dump()
 
 
-async def team_attach(team_name: str, capability: str, ctx: Context) -> dict:
+async def team_attach(
+    team_name: str, capability: str, ctx: Context
+) -> dict[str, object]:
     """Attach this MCP session to an existing team as lead or agent."""
     principal = await capabilities.resolve_principal(team_name, capability)
     if principal is None:
@@ -80,7 +82,9 @@ async def team_attach(team_name: str, capability: str, ctx: Context) -> dict:
     ).model_dump()
 
 
-async def team_delete(team_name: str, ctx: Context, capability: str = "") -> dict:
+async def team_delete(
+    team_name: str, ctx: Context, capability: str = ""
+) -> dict[str, object]:
     """Delete a team and its files. Fails if teammates are still present."""
     await _require_lead(ctx, team_name, capability)
     try:
@@ -97,7 +101,9 @@ async def team_delete(team_name: str, ctx: Context, capability: str = "") -> dic
     return result.model_dump()
 
 
-async def read_config(team_name: str, ctx: Context, capability: str = "") -> dict:
+async def read_config(
+    team_name: str, ctx: Context, capability: str = ""
+) -> dict[str, object]:
     """Read the current team configuration including all members."""
     await _require_lead(ctx, team_name, capability)
     try:
@@ -107,7 +113,7 @@ async def read_config(team_name: str, ctx: Context, capability: str = "") -> dic
     return config.model_dump(by_alias=True)
 
 
-def list_backends(ctx: Context) -> list[dict]:
+def list_backends(ctx: Context) -> list[dict[str, object]]:
     """List all available spawner backends with their supported models."""
     ls = _get_lifespan(ctx)
     reg = ls["registry"]

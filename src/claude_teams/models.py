@@ -1,6 +1,6 @@
 """Shared Pydantic models for team orchestration state."""
 
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal, TypeAlias, cast
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
 from pydantic.alias_generators import to_camel
@@ -30,6 +30,11 @@ COLOR_PALETTE: list[str] = [
     "red",
 ]
 
+TaskMetadataValue: TypeAlias = str | int | float | bool | None
+TaskMetadata: TypeAlias = dict[str, TaskMetadataValue]
+MessageRoutingValue: TypeAlias = str | None
+MessageRouting: TypeAlias = dict[str, MessageRoutingValue]
+
 
 class LeadMember(BaseModel):
     """Serialized team-lead member record."""
@@ -43,7 +48,7 @@ class LeadMember(BaseModel):
     joined_at: int
     tmux_pane_id: str = ""
     cwd: str
-    subscriptions: list = Field(default_factory=list)
+    subscriptions: list[str] = Field(default_factory=list)
 
 
 class TeammateMember(BaseModel):
@@ -61,7 +66,7 @@ class TeammateMember(BaseModel):
     joined_at: int
     tmux_pane_id: str
     cwd: str
-    subscriptions: list = Field(default_factory=list)
+    subscriptions: list[str] = Field(default_factory=list)
     backend_type: str = "claude-code"
     is_active: bool = False
     process_handle: str = ""
@@ -132,7 +137,7 @@ class TaskFile(BaseModel):
     blocks: list[str] = Field(default_factory=list)
     blocked_by: list[str] = Field(default_factory=list)
     owner: str | None = None
-    metadata: dict[str, str | int | float | bool | None] | None = None
+    metadata: TaskMetadata | None = None
 
 
 class InboxMessage(BaseModel):
@@ -275,6 +280,6 @@ class SendMessageResult(BaseModel):
 
     success: bool
     message: str
-    routing: dict | None = None
+    routing: MessageRouting | None = None
     request_id: str | None = None
     target: str | None = None

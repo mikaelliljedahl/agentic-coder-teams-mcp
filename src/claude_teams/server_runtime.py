@@ -115,7 +115,9 @@ def _normalize_pagination(limit: int, offset: int) -> tuple[int, int]:
     return limit, offset
 
 
-def _page_items(items: list[dict], limit: int, offset: int) -> dict:
+def _page_items(
+    items: list[dict[str, object]], limit: int, offset: int
+) -> dict[str, object]:
     total_count = len(items)
     page_items = items[offset : offset + limit]
     next_offset = offset + limit

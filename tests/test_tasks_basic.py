@@ -1,5 +1,6 @@
 """Core task lifecycle tests."""
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -45,7 +46,7 @@ async def test_create_task_excludes_none_owner(
 ) -> None:
     team_name, base_dir, tasks_dir = team_context
     task = await create_task(team_name, "Sub", "desc", base_dir=base_dir)
-    raw = json.loads((tasks_dir / f"{task.id}.json").read_text())
+    raw = json.loads(await asyncio.to_thread((tasks_dir / f"{task.id}.json").read_text))
     assert "owner" not in raw
 
 
@@ -60,7 +61,7 @@ async def test_create_task_with_metadata(
         metadata={"key": "val"},
         base_dir=base_dir,
     )
-    raw = json.loads((tasks_dir / f"{task.id}.json").read_text())
+    raw = json.loads(await asyncio.to_thread((tasks_dir / f"{task.id}.json").read_text))
     assert raw["metadata"] == {"key": "val"}
 
 
@@ -107,7 +108,7 @@ async def test_update_task_sets_owner(team_context: tuple[str, Path, Path]) -> N
         base_dir=base_dir,
     )
     assert updated.owner == "worker-1"
-    raw = json.loads((tasks_dir / f"{task.id}.json").read_text())
+    raw = json.loads(await asyncio.to_thread((tasks_dir / f"{task.id}.json").read_text))
     assert raw["owner"] == "worker-1"
 
 
@@ -117,14 +118,14 @@ async def test_update_task_delete_removes_file(
     team_name, base_dir, tasks_dir = team_context
     task = await create_task(team_name, "Sub", "desc", base_dir=base_dir)
     task_path = tasks_dir / f"{task.id}.json"
-    assert task_path.exists()
+    assert await asyncio.to_thread(task_path.exists)
     result = await update_task(
         team_name,
         task.id,
         status="deleted",
         base_dir=base_dir,
     )
-    assert not task_path.exists()
+    assert not await asyncio.to_thread(task_path.exists)
     assert result.status == "deleted"
 
 

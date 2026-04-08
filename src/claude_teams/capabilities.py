@@ -60,8 +60,10 @@ def _write_capabilities(
     with file_lock(lock_path):
         fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
         try:
-            os.write(fd, json.dumps(data, indent=2).encode())
-            os.close(fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+                temp_file.write(json.dumps(data, indent=2))
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
             fd = -1
             os.replace(tmp_path, path)
         except BaseException:

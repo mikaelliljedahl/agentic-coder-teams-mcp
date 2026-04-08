@@ -14,10 +14,12 @@ from claude_teams.backends import SpawnRequest
 from claude_teams.models import (
     COLOR_PALETTE,
     InboxMessage,
+    MemberUnion,
     SendMessageResult,
     ShutdownApproved,
     SpawnResult,
     TeammateMember,
+    MessageRouting,
 )
 from claude_teams.server_team_relay import (
     build_agent_auth_notice,
@@ -40,7 +42,7 @@ from claude_teams.server_runtime import (
 )
 
 
-def _find_member(config: teams.TeamConfig, member_name: str):
+def _find_member(config: teams.TeamConfig, member_name: str) -> MemberUnion | None:
     """Find a team member by name.
 
     Args:
@@ -86,7 +88,7 @@ async def spawn_teammate_tool(
     plan_mode_required: bool = False,
     permission_mode: Literal["default", "require_approval", "bypass"] | None = None,
     capability: str = "",
-) -> dict:
+) -> dict[str, object]:
     """Spawn a teammate via the selected backend.
 
     Args:
@@ -263,7 +265,7 @@ async def send_message(
     approve: bool | None = None,
     sender: str = "team-lead",
     capability: str = "",
-) -> dict:
+) -> dict[str, object]:
     """Send a team protocol message.
 
     Args:
@@ -315,16 +317,17 @@ async def send_message(
             summary=summary,
             color=sender_color,
         )
+        routing: MessageRouting = {
+            "sender": sender,
+            "target": recipient,
+            "targetColor": target_color,
+            "summary": summary,
+            "content": content,
+        }
         return SendMessageResult(
             success=True,
             message=f"Message sent to {recipient}",
-            routing={
-                "sender": sender,
-                "target": recipient,
-                "targetColor": target_color,
-                "summary": summary,
-                "content": content,
-            },
+            routing=routing,
         ).model_dump(exclude_none=True)
 
     if type == "broadcast":

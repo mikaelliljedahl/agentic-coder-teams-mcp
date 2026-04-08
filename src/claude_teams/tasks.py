@@ -7,7 +7,7 @@ from typing import Literal
 
 from claude_teams.async_utils import run_blocking
 from claude_teams.filelock import file_lock
-from claude_teams.models import TaskFile
+from claude_teams.models import TaskFile, TaskMetadata
 from claude_teams.teams import _team_exists, validate_safe_name
 
 
@@ -73,7 +73,7 @@ def _create_task(
     subject: str,
     description: str,
     active_form: str = "",
-    metadata: dict | None = None,
+    metadata: TaskMetadata | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
     safe_team_name = validate_safe_name(team_name, "team name")
@@ -106,7 +106,7 @@ async def create_task(
     subject: str,
     description: str,
     active_form: str = "",
-    metadata: dict | None = None,
+    metadata: TaskMetadata | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
     """Create a task in a worker thread.
@@ -225,7 +225,7 @@ def _update_task(
     active_form: str | None = None,
     add_blocks: list[str] | None = None,
     add_blocked_by: list[str] | None = None,
-    metadata: dict | None = None,
+    metadata: TaskMetadata | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
     safe_team_name = validate_safe_name(team_name, "team name")
@@ -376,7 +376,7 @@ async def update_task(
     active_form: str | None = None,
     add_blocks: list[str] | None = None,
     add_blocked_by: list[str] | None = None,
-    metadata: dict | None = None,
+    metadata: TaskMetadata | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
     """Update a task in a worker thread.

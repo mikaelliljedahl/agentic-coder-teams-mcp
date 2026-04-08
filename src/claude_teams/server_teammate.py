@@ -53,7 +53,7 @@ async def _resolve_teammate(
 
 async def force_kill_teammate(
     team_name: str, agent_name: str, ctx: Context, capability: str = ""
-) -> dict:
+) -> dict[str, object]:
     """Forcibly kill a teammate and remove it from the team."""
     await _require_lead(ctx, team_name, capability)
     _member, process_handle, backend_type = await _resolve_teammate(
@@ -79,7 +79,7 @@ async def poll_inbox(
     ctx: Context,
     timeout_ms: int = 30000,
     capability: str = "",
-) -> list[dict]:
+) -> list[dict[str, object]]:
     """Poll an inbox for unread messages and mark returned messages as read."""
     principal = await _require_authenticated_principal(ctx, team_name, capability)
     if principal["role"] != "lead" and principal["name"] != agent_name:
@@ -92,9 +92,9 @@ async def poll_inbox(
     )
     if msgs:
         return [msg.model_dump(by_alias=True, exclude_none=True) for msg in msgs]
-    deadline = time.time() + timeout_ms / 1000.0
-    while time.time() < deadline:
-        sleep_seconds = min(0.5, max(0.0, deadline - time.time()))
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        sleep_seconds = min(0.5, max(0.0, deadline - time.monotonic()))
         if sleep_seconds == 0.0:
             break
         await asyncio.sleep(sleep_seconds)
@@ -115,7 +115,7 @@ async def check_teammate(
     include_messages: bool = True,
     max_messages: int = 5,
     capability: str = "",
-) -> dict:
+) -> dict[str, object]:
     """Check teammate status, lead-facing unread messages, and optional output."""
     await _require_lead(ctx, team_name, capability)
     member, process_handle, backend_type = await _resolve_teammate(
@@ -124,7 +124,7 @@ async def check_teammate(
     output_lines = max(1, min(output_lines, 120))
     max_messages = max(1, min(max_messages, 20))
 
-    pending_from: list[dict] = []
+    pending_from: list[dict[str, object]] = []
     if include_messages:
         msgs = await messaging.read_inbox_filtered(
             team_name,
@@ -169,7 +169,7 @@ async def check_teammate(
             except Exception as exc:  # pragma: no cover
                 error = f"output capture failed: {exc}"
 
-    result = {
+    result: dict[str, object] = {
         "name": member.name,
         "backend": backend_type,
         "alive": alive,
@@ -185,7 +185,7 @@ async def check_teammate(
 
 async def process_shutdown_approved(
     team_name: str, agent_name: str, ctx: Context, capability: str = ""
-) -> dict:
+) -> dict[str, object]:
     """Remove a teammate after graceful shutdown approval."""
     await _require_lead(ctx, team_name, capability)
     if agent_name == "team-lead":
@@ -214,7 +214,7 @@ async def process_shutdown_approved(
 
 async def health_check(
     team_name: str, agent_name: str, ctx: Context, capability: str = ""
-) -> dict:
+) -> dict[str, object]:
     """Check if a teammate's process is still running."""
     await _require_lead(ctx, team_name, capability)
     _member, process_handle, backend_type = await _resolve_teammate(

@@ -5,6 +5,7 @@ import fcntl
 import json
 import re
 from pathlib import Path
+from typing import TextIO
 
 import pytest
 
@@ -22,17 +23,17 @@ from claude_teams.models import InboxMessage
 
 async def test_ensure_inbox_creates_directory_and_file(tmp_claude_dir: Path) -> None:
     path = await ensure_inbox("test-team", "alice", base_dir=tmp_claude_dir)
-    assert path.exists()
+    assert await asyncio.to_thread(path.exists)
     assert path.parent.name == "inboxes"
     assert path.name == "alice.json"
-    assert json.loads(path.read_text()) == []
+    assert json.loads(await asyncio.to_thread(path.read_text)) == []
 
 
 async def test_ensure_inbox_idempotent(tmp_claude_dir: Path) -> None:
     await ensure_inbox("test-team", "alice", base_dir=tmp_claude_dir)
     path = await ensure_inbox("test-team", "alice", base_dir=tmp_claude_dir)
-    assert path.exists()
-    assert json.loads(path.read_text()) == []
+    assert await asyncio.to_thread(path.exists)
+    assert json.loads(await asyncio.to_thread(path.read_text)) == []
 
 
 async def test_append_message_accumulates(tmp_claude_dir: Path) -> None:
@@ -45,7 +46,9 @@ async def test_append_message_accumulates(tmp_claude_dir: Path) -> None:
     await append_message("test-team", "bob", msg1, base_dir=tmp_claude_dir)
     await append_message("test-team", "bob", msg2, base_dir=tmp_claude_dir)
     raw = json.loads(
-        inbox_path("test-team", "bob", base_dir=tmp_claude_dir).read_text()
+        await asyncio.to_thread(
+            inbox_path("test-team", "bob", base_dir=tmp_claude_dir).read_text
+        )
     )
     assert len(raw) == 2
 
@@ -60,7 +63,9 @@ async def test_append_message_does_not_overwrite(tmp_claude_dir: Path) -> None:
     await append_message("test-team", "bob", msg1, base_dir=tmp_claude_dir)
     await append_message("test-team", "bob", msg2, base_dir=tmp_claude_dir)
     raw = json.loads(
-        inbox_path("test-team", "bob", base_dir=tmp_claude_dir).read_text()
+        await asyncio.to_thread(
+            inbox_path("test-team", "bob", base_dir=tmp_claude_dir).read_text
+        )
     )
     texts = [message["text"] for message in raw]
     assert "first" in texts
@@ -366,7 +371,9 @@ async def test_append_message_encrypts_when_master_key_set(
     )
     await append_message("test-team", "secure", message, base_dir=tmp_claude_dir)
 
-    raw = inbox_path("test-team", "secure", base_dir=tmp_claude_dir).read_text()
+    raw = await asyncio.to_thread(
+        inbox_path("test-team", "secure", base_dir=tmp_claude_dir).read_text
+    )
     assert "super secret" not in raw
     assert '"enc"' in raw
 
@@ -384,7 +391,8 @@ async def test_read_inbox_supports_plaintext_entries_when_encryption_enabled(
     tmp_claude_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = await ensure_inbox("test-team", "legacy", base_dir=tmp_claude_dir)
-    path.write_text(
+    await asyncio.to_thread(
+        path.write_text,
         json.dumps(
             [
                 {
@@ -394,7 +402,7 @@ async def test_read_inbox_supports_plaintext_entries_when_encryption_enabled(
                     "read": False,
                 }
             ]
-        )
+        ),
     )
     monkeypatch.setenv("CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY", "test-master-key")
 
@@ -437,7 +445,7 @@ async def test_read_inbox_waits_for_lock_before_mark_as_read(
 
     path = inbox_path("test-team", "race", base_dir=tmp_claude_dir)
     lock_path = path.parent / ".lock"
-    lock_path.touch(exist_ok=True)
+    await asyncio.to_thread(lock_path.touch, exist_ok=True)
     completed = asyncio.Event()
 
     async def do_read() -> None:
@@ -449,14 +457,24 @@ async def test_read_inbox_waits_for_lock_before_mark_as_read(
         )
         completed.set()
 
-    with lock_path.open() as lock_file:
+    def _open_and_lock() -> TextIO:
+        lock_file = lock_path.open()
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        return lock_file
+
+    def _unlock_and_close(lock_file: TextIO) -> None:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+    lock_file = await asyncio.to_thread(_open_and_lock)
+    try:
         read_task = asyncio.create_task(do_read())
         await asyncio.sleep(0.1)
         assert not completed.is_set(), (
             "read_inbox(mark_as_read=True) completed without acquiring the inbox lock"
         )
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        await asyncio.to_thread(_unlock_and_close, lock_file)
 
     await asyncio.wait_for(read_task, timeout=5)
 

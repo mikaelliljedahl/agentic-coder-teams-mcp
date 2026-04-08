@@ -6,7 +6,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
 from claude_teams import messaging, tasks
-from claude_teams.models import PaginatedInboxMessages, PaginatedTaskList
+from claude_teams.models import PaginatedInboxMessages, PaginatedTaskList, TaskMetadata
 from claude_teams.server_runtime import (
     _ANN_CREATE,
     _ANN_MUTATE,
@@ -28,9 +28,9 @@ async def task_create(
     description: str,
     ctx: Context,
     active_form: str = "",
-    metadata: dict | None = None,
+    metadata: TaskMetadata | None = None,
     capability: str = "",
-) -> dict:
+) -> dict[str, object]:
     """Create a new task for the team.
 
     Args:
@@ -67,9 +67,9 @@ async def task_update(
     active_form: str | None = None,
     add_blocks: list[str] | None = None,
     add_blocked_by: list[str] | None = None,
-    metadata: dict | None = None,
+    metadata: TaskMetadata | None = None,
     capability: str = "",
-) -> dict:
+) -> dict[str, object]:
     """Update a task and optionally notify a new assignee.
 
     Args:
@@ -123,7 +123,7 @@ async def task_list(
     capability: str = "",
     limit: int = _DEFAULT_PAGE_SIZE,
     offset: int = 0,
-) -> dict:
+) -> dict[str, object]:
     """List team tasks in canonical task-id order with pagination metadata.
 
     Args:
@@ -155,7 +155,7 @@ async def task_list(
 
 async def task_get(
     team_name: str, task_id: str, ctx: Context, capability: str = ""
-) -> dict:
+) -> dict[str, object]:
     """Get full details of a specific task by ID.
 
     Args:
@@ -186,7 +186,7 @@ async def read_inbox(
     offset: int = 0,
     order: Literal["oldest", "newest"] = "oldest",
     capability: str = "",
-) -> dict:
+) -> dict[str, object]:
     """Read inbox messages with pagination metadata and explicit ordering.
 
     Args:

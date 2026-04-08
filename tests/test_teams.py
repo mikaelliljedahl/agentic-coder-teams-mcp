@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import unittest.mock
@@ -39,10 +40,14 @@ class TestCreateTeam:
     ) -> None:
         await create_team("alpha", "sess-1", base_dir=tmp_claude_dir)
 
-        assert (tmp_claude_dir / "teams" / "alpha").is_dir()
-        assert (tmp_claude_dir / "tasks" / "alpha").is_dir()
-        assert (tmp_claude_dir / "tasks" / "alpha" / ".lock").exists()
-        assert not (tmp_claude_dir / "teams" / "alpha" / "inboxes").exists()
+        assert await asyncio.to_thread((tmp_claude_dir / "teams" / "alpha").is_dir)
+        assert await asyncio.to_thread((tmp_claude_dir / "tasks" / "alpha").is_dir)
+        assert await asyncio.to_thread(
+            (tmp_claude_dir / "tasks" / "alpha" / ".lock").exists
+        )
+        assert not await asyncio.to_thread(
+            (tmp_claude_dir / "teams" / "alpha" / "inboxes").exists
+        )
 
     async def test_create_team_config_has_correct_schema(
         self, tmp_claude_dir: Path
@@ -55,7 +60,9 @@ class TestCreateTeam:
         )
 
         raw = json.loads(
-            (tmp_claude_dir / "teams" / "beta" / "config.json").read_text()
+            await asyncio.to_thread(
+                (tmp_claude_dir / "teams" / "beta" / "config.json").read_text
+            )
         )
 
         assert raw["name"] == "beta"
@@ -71,7 +78,9 @@ class TestCreateTeam:
         await create_team("gamma", "sess-7", base_dir=tmp_claude_dir)
 
         raw = json.loads(
-            (tmp_claude_dir / "teams" / "gamma" / "config.json").read_text()
+            await asyncio.to_thread(
+                (tmp_claude_dir / "teams" / "gamma" / "config.json").read_text
+            )
         )
         lead = raw["members"][0]
 
@@ -106,8 +115,8 @@ class TestDeleteTeam:
 
         assert result.success is True
         assert result.team_name == "doomed"
-        assert not (tmp_claude_dir / "teams" / "doomed").exists()
-        assert not (tmp_claude_dir / "tasks" / "doomed").exists()
+        assert not await asyncio.to_thread((tmp_claude_dir / "teams" / "doomed").exists)
+        assert not await asyncio.to_thread((tmp_claude_dir / "tasks" / "doomed").exists)
 
     async def test_delete_team_fails_with_active_members(
         self, tmp_claude_dir: Path
@@ -181,7 +190,7 @@ class TestWriteConfig:
             with pytest.raises(OSError, match="disk full"):
                 await write_config("atomic", config, base_dir=tmp_claude_dir)
 
-        tmp_files = list(config_dir.glob("*.tmp"))
+        tmp_files = await asyncio.to_thread(lambda: list(config_dir.glob("*.tmp")))
         assert tmp_files == [], f"Leaked temp files: {tmp_files}"
 
     async def test_should_reject_invalid_team_name(self, tmp_claude_dir: Path) -> None:

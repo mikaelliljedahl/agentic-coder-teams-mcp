@@ -141,29 +141,20 @@ def _read_inbox_page(
     if order not in {"oldest", "newest"}:
         raise ValueError("order must be 'oldest' or 'newest'")
 
-    if mark_as_read:
-        lock_path = path.parent / ".lock"
-        with file_lock(lock_path):
-            all_msgs = _load_inbox_messages(path, team_name)
-            selected_indices = _select_inbox_indices(all_msgs, unread_only, order)
-            total_count = len(selected_indices)
-            paged_indices = _apply_pagination(selected_indices, limit, offset)
-            result = [all_msgs[index] for index in paged_indices]
+    lock_path = path.parent / ".lock"
+    with file_lock(lock_path):
+        all_msgs = _load_inbox_messages(path, team_name)
+        selected_indices = _select_inbox_indices(all_msgs, unread_only, order)
+        total_count = len(selected_indices)
+        paged_indices = _apply_pagination(selected_indices, limit, offset)
+        result = [all_msgs[index] for index in paged_indices]
 
-            if result:
-                for index in paged_indices:
-                    all_msgs[index].read = True
-                path.write_text(
-                    json.dumps(_serialize_inbox_messages(team_name, all_msgs))
-                )
+        if mark_as_read and result:
+            for index in paged_indices:
+                all_msgs[index].read = True
+            path.write_text(json.dumps(_serialize_inbox_messages(team_name, all_msgs)))
 
-            return result, total_count
-
-    all_msgs = _load_inbox_messages(path, team_name)
-    selected_indices = _select_inbox_indices(all_msgs, unread_only, order)
-    total_count = len(selected_indices)
-    paged_indices = _apply_pagination(selected_indices, limit, offset)
-    return [all_msgs[index] for index in paged_indices], total_count
+        return result, total_count
 
 
 def _read_inbox(
@@ -280,39 +271,28 @@ def _read_inbox_filtered(
     if not path.exists():
         return []
 
-    if mark_as_read:
-        lock_path = path.parent / ".lock"
-        with file_lock(lock_path):
-            all_msgs = _load_inbox_messages(path, team_name)
+    lock_path = path.parent / ".lock"
+    with file_lock(lock_path):
+        all_msgs = _load_inbox_messages(path, team_name)
 
-            selected_indices = []
-            for index, msg in enumerate(all_msgs):
-                if msg.from_ != sender_filter:
-                    continue
-                if unread_only and msg.read:
-                    continue
-                selected_indices.append(index)
+        selected_indices = []
+        for index, msg in enumerate(all_msgs):
+            if msg.from_ != sender_filter:
+                continue
+            if unread_only and msg.read:
+                continue
+            selected_indices.append(index)
 
-            if limit is not None and len(selected_indices) > limit:
-                selected_indices = selected_indices[-limit:]
+        if limit is not None and len(selected_indices) > limit:
+            selected_indices = selected_indices[-limit:]
 
-            result = [all_msgs[index] for index in selected_indices]
-            if result:
-                for index in selected_indices:
-                    all_msgs[index].read = True
-                path.write_text(
-                    json.dumps(_serialize_inbox_messages(team_name, all_msgs))
-                )
+        result = [all_msgs[index] for index in selected_indices]
+        if mark_as_read and result:
+            for index in selected_indices:
+                all_msgs[index].read = True
+            path.write_text(json.dumps(_serialize_inbox_messages(team_name, all_msgs)))
 
-            return result
-
-    all_msgs = _load_inbox_messages(path, team_name)
-    filtered = [msg for msg in all_msgs if msg.from_ == sender_filter]
-    if unread_only:
-        filtered = [msg for msg in filtered if not msg.read]
-    if limit is not None and len(filtered) > limit:
-        filtered = filtered[-limit:]
-    return filtered
+        return result
 
 
 async def read_inbox_filtered(
