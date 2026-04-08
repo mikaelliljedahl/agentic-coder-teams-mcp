@@ -1,3 +1,5 @@
+"""Team configuration persistence helpers."""
+
 import json
 import os
 import re
@@ -6,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from claude_teams.async_utils import run_blocking
 from claude_teams.models import (
     LeadMember,
     TeamConfig,
@@ -29,7 +32,32 @@ def _tasks_dir(base_dir: Path | None = None) -> Path:
     return (base_dir / "tasks") if base_dir else TASKS_DIR
 
 
-def team_exists(name: str, base_dir: Path | None = None) -> bool:
+def validate_safe_name(name: str, label: str = "name") -> str:
+    """Validate a filesystem-safe team or agent identifier.
+
+    Args:
+        name (str): Identifier to validate.
+        label (str): Human-readable field label for error messages.
+
+    Returns:
+        str: The validated name.
+
+    Raises:
+        ValueError: If the name is empty, too long, or contains unsafe characters.
+
+    """
+    if not _VALID_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid {label}: {name!r}. Use only letters, numbers, hyphens, underscores."
+        )
+    if len(name) > 64:
+        raise ValueError(
+            f"{label.capitalize()} too long ({len(name)} chars, max 64): {name[:20]!r}..."
+        )
+    return name
+
+
+def _team_exists(name: str, base_dir: Path | None = None) -> bool:
     """Check if a team configuration file exists.
 
     Args:
@@ -38,12 +66,28 @@ def team_exists(name: str, base_dir: Path | None = None) -> bool:
 
     Returns:
         bool: True if the team's config.json exists.
+
     """
-    config_path = _teams_dir(base_dir) / name / "config.json"
+    safe_name = validate_safe_name(name, "team name")
+    config_path = _teams_dir(base_dir) / safe_name / "config.json"
     return config_path.exists()
 
 
-def create_team(
+async def team_exists(name: str, base_dir: Path | None = None) -> bool:
+    """Check whether a team exists.
+
+    Args:
+        name (str): Team name.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        bool: True when the team config exists.
+
+    """
+    return await run_blocking(_team_exists, name, base_dir)
+
+
+def _create_team(
     name: str,
     session_id: str,
     description: str = "",
@@ -64,15 +108,9 @@ def create_team(
 
     Raises:
         ValueError: If team name is invalid or exceeds 64 characters.
+
     """
-    if not _VALID_NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid team name: {name!r}. Use only letters, numbers, hyphens, underscores."
-        )
-    if len(name) > 64:
-        raise ValueError(
-            f"Team name too long ({len(name)} chars, max 64): {name[:20]!r}..."
-        )
+    validate_safe_name(name, "team name")
 
     teams_dir = _teams_dir(base_dir)
     tasks_dir = _tasks_dir(base_dir)
@@ -115,7 +153,37 @@ def create_team(
     )
 
 
-def read_config(name: str, base_dir: Path | None = None) -> TeamConfig:
+async def create_team(
+    name: str,
+    session_id: str,
+    description: str = "",
+    lead_model: str = "claude-opus-4-6",
+    base_dir: Path | None = None,
+) -> TeamCreateResult:
+    """Create a team in a worker thread.
+
+    Args:
+        name (str): Team name.
+        session_id (str): Lead session identifier.
+        description (str): Team description.
+        lead_model (str): Lead model name.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        TeamCreateResult: Creation result payload.
+
+    """
+    return await run_blocking(
+        _create_team,
+        name,
+        session_id,
+        description,
+        lead_model,
+        base_dir,
+    )
+
+
+def _read_config(name: str, base_dir: Path | None = None) -> TeamConfig:
     """Read and parse a team's configuration file.
 
     Args:
@@ -128,13 +196,29 @@ def read_config(name: str, base_dir: Path | None = None) -> TeamConfig:
     Raises:
         FileNotFoundError: If the team config does not exist.
         json.JSONDecodeError: If the config file is malformed.
+
     """
-    config_path = _teams_dir(base_dir) / name / "config.json"
+    safe_name = validate_safe_name(name, "team name")
+    config_path = _teams_dir(base_dir) / safe_name / "config.json"
     raw = json.loads(config_path.read_text())
     return TeamConfig.model_validate(raw)
 
 
-def write_config(name: str, config: TeamConfig, base_dir: Path | None = None) -> None:
+async def read_config(name: str, base_dir: Path | None = None) -> TeamConfig:
+    """Read a team config in a worker thread.
+
+    Args:
+        name (str): Team name.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        TeamConfig: Parsed team configuration.
+
+    """
+    return await run_blocking(_read_config, name, base_dir)
+
+
+def _write_config(name: str, config: TeamConfig, base_dir: Path | None = None) -> None:
     """Write team configuration to disk atomically.
 
     Args:
@@ -144,8 +228,10 @@ def write_config(name: str, config: TeamConfig, base_dir: Path | None = None) ->
 
     Raises:
         OSError: If file creation or write fails.
+
     """
-    config_dir = _teams_dir(base_dir) / name
+    safe_name = validate_safe_name(name, "team name")
+    config_dir = _teams_dir(base_dir) / safe_name
     data = json.dumps(config.model_dump(by_alias=True), indent=2)
 
     # NOTE(victor): atomic write to avoid partial reads from concurrent agents
@@ -163,7 +249,21 @@ def write_config(name: str, config: TeamConfig, base_dir: Path | None = None) ->
         raise
 
 
-def delete_team(name: str, base_dir: Path | None = None) -> TeamDeleteResult:
+async def write_config(
+    name: str, config: TeamConfig, base_dir: Path | None = None
+) -> None:
+    """Write a team config in a worker thread.
+
+    Args:
+        name (str): Team name.
+        config (TeamConfig): Configuration payload.
+        base_dir (Path | None): Override for the base config directory.
+
+    """
+    await run_blocking(_write_config, name, config, base_dir)
+
+
+def _delete_team(name: str, base_dir: Path | None = None) -> TeamDeleteResult:
     """Delete a team's directories and configuration after validation.
 
     Args:
@@ -176,29 +276,47 @@ def delete_team(name: str, base_dir: Path | None = None) -> TeamDeleteResult:
     Raises:
         RuntimeError: If non-lead members are still present in the team.
         FileNotFoundError: If the team does not exist.
+
     """
-    config = read_config(name, base_dir=base_dir)
+    safe_name = validate_safe_name(name, "team name")
+    config = _read_config(safe_name, base_dir=base_dir)
 
     non_lead = [
         member for member in config.members if isinstance(member, TeammateMember)
     ]
     if non_lead:
         raise RuntimeError(
-            f"Cannot delete team {name!r}: {len(non_lead)} non-lead member(s) still present. "
+            f"Cannot delete team {safe_name!r}: {len(non_lead)} non-lead member(s) still present. "
             "Remove all teammates before deleting."
         )
 
-    shutil.rmtree(_teams_dir(base_dir) / name)
-    shutil.rmtree(_tasks_dir(base_dir) / name)
+    shutil.rmtree(_teams_dir(base_dir) / safe_name)
+    shutil.rmtree(_tasks_dir(base_dir) / safe_name)
 
     return TeamDeleteResult(
         success=True,
-        message=f'Cleaned up directories and worktrees for team "{name}"',
-        team_name=name,
+        message=f'Cleaned up directories and worktrees for team "{safe_name}"',
+        team_name=safe_name,
     )
 
 
-def add_member(name: str, member: TeammateMember, base_dir: Path | None = None) -> None:
+async def delete_team(name: str, base_dir: Path | None = None) -> TeamDeleteResult:
+    """Delete a team in a worker thread.
+
+    Args:
+        name (str): Team name.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        TeamDeleteResult: Deletion result payload.
+
+    """
+    return await run_blocking(_delete_team, name, base_dir)
+
+
+def _add_member(
+    name: str, member: TeammateMember, base_dir: Path | None = None
+) -> None:
     """Add a new teammate member to an existing team.
 
     Args:
@@ -209,16 +327,31 @@ def add_member(name: str, member: TeammateMember, base_dir: Path | None = None) 
     Raises:
         ValueError: If a member with the same name already exists in the team.
         FileNotFoundError: If the team does not exist.
+
     """
-    config = read_config(name, base_dir=base_dir)
+    config = _read_config(name, base_dir=base_dir)
     existing_names = {member_item.name for member_item in config.members}
     if member.name in existing_names:
         raise ValueError(f"Member {member.name!r} already exists in team {name!r}")
     config.members.append(member)
-    write_config(name, config, base_dir=base_dir)
+    _write_config(name, config, base_dir=base_dir)
 
 
-def remove_member(
+async def add_member(
+    name: str, member: TeammateMember, base_dir: Path | None = None
+) -> None:
+    """Add a teammate member in a worker thread.
+
+    Args:
+        name (str): Team name.
+        member (TeammateMember): Member payload.
+        base_dir (Path | None): Override for the base config directory.
+
+    """
+    await run_blocking(_add_member, name, member, base_dir)
+
+
+def _remove_member(
     team_name: str, agent_name: str, base_dir: Path | None = None
 ) -> None:
     """Remove a teammate member from a team by agent name.
@@ -231,9 +364,24 @@ def remove_member(
     Raises:
         ValueError: If attempting to remove the team-lead agent.
         FileNotFoundError: If the team does not exist.
+
     """
     if agent_name == "team-lead":
         raise ValueError("Cannot remove team-lead from team")
-    config = read_config(team_name, base_dir=base_dir)
+    config = _read_config(team_name, base_dir=base_dir)
     config.members = [member for member in config.members if member.name != agent_name]
-    write_config(team_name, config, base_dir=base_dir)
+    _write_config(team_name, config, base_dir=base_dir)
+
+
+async def remove_member(
+    team_name: str, agent_name: str, base_dir: Path | None = None
+) -> None:
+    """Remove a teammate member in a worker thread.
+
+    Args:
+        team_name (str): Team name.
+        agent_name (str): Agent name.
+        base_dir (Path | None): Override for the base config directory.
+
+    """
+    await run_blocking(_remove_member, team_name, agent_name, base_dir)

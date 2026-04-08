@@ -1,3 +1,5 @@
+"""GitHub Copilot backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -34,6 +36,7 @@ class CopilotBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "claude-sonnet-4.5",
@@ -57,6 +60,7 @@ class CopilotBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "claude-sonnet-4.5"
 
@@ -70,6 +74,7 @@ class CopilotBackend(BaseBackend):
 
         Returns:
             str: Copilot CLI model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
@@ -83,6 +88,7 @@ class CopilotBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -92,9 +98,13 @@ class CopilotBackend(BaseBackend):
             request.prompt,
             "--model",
             model,
-            "--yolo",
+            *self.permission_args(request),
             "--no-ask-user",
         ]
+
+    def default_permission_args(self) -> list[str]:
+        """Return default permission-bypass arguments for Copilot."""
+        return ["--yolo"]
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
         """Return Copilot CLI environment variables (none required).
@@ -104,5 +114,6 @@ class CopilotBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}

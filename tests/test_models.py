@@ -10,6 +10,7 @@ from claude_teams.models import (
     ShutdownApproved,
     ShutdownRequest,
     SpawnResult,
+    TeamAttachResult,
     TaskAssignment,
     TaskFile,
     TeamConfig,
@@ -303,8 +304,17 @@ class TestToolReturnModels:
             team_name="t",
             team_file_path="/p",
             lead_agent_id="team-lead@t",
+            lead_capability="secret",
         )
         assert result.team_name == "t"
+
+    def test_team_attach_result(self):
+        result = TeamAttachResult(
+            team_name="t",
+            principal_name="worker",
+            principal_role="agent",
+        )
+        assert result.principal_role == "agent"
 
     def test_team_delete_result(self):
         result = TeamDeleteResult(

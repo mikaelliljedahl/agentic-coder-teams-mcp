@@ -1,3 +1,5 @@
+"""OpenCode backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -18,6 +20,7 @@ class OpenCodeBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "anthropic/claude-sonnet-4",
@@ -31,6 +34,7 @@ class OpenCodeBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "anthropic/claude-sonnet-4"
 
@@ -44,6 +48,7 @@ class OpenCodeBackend(BaseBackend):
 
         Returns:
             OpenCode model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
@@ -57,6 +62,7 @@ class OpenCodeBackend(BaseBackend):
 
         Returns:
             Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -76,5 +82,6 @@ class OpenCodeBackend(BaseBackend):
 
         Returns:
             Empty dict.
+
         """
         return {}

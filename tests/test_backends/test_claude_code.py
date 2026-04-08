@@ -134,6 +134,25 @@ class TestClaudeCodeBuildCommand:
 
         assert "--plan-mode-required" not in cmd
 
+    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
+    def test_includes_bypass_permission_mode_when_requested(self, mock_which):
+        backend = ClaudeCodeBackend()
+        request = _make_request(permission_mode="bypass")
+
+        cmd = backend.build_command(request)
+
+        idx = cmd.index("--permission-mode")
+        assert cmd[idx + 1] == "bypassPermissions"
+
+    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
+    def test_omits_permission_mode_flag_when_require_approval(self, mock_which):
+        backend = ClaudeCodeBackend()
+        request = _make_request(permission_mode="require_approval")
+
+        cmd = backend.build_command(request)
+
+        assert "--permission-mode" not in cmd
+
 
 class TestClaudeCodeBuildEnv:
     def test_returns_claude_env_vars(self):
@@ -145,3 +164,9 @@ class TestClaudeCodeBuildEnv:
         assert env["CLAUDECODE"] == "1"
         assert env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert len(env) == 2
+
+
+class TestClaudeCodePermissionSupport:
+    def test_supports_permission_bypass(self):
+        backend = ClaudeCodeBackend()
+        assert backend.supports_permission_bypass() is True

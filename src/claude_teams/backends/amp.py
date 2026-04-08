@@ -1,3 +1,5 @@
+"""Amp backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -26,6 +28,7 @@ class AmpBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "rush",
@@ -38,6 +41,7 @@ class AmpBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "smart"
 
@@ -51,6 +55,7 @@ class AmpBackend(BaseBackend):
 
         Returns:
             str: Amp agent mode identifier.
+
         """
         if generic_name in self._MODE_MAP:
             return self._MODE_MAP[generic_name]
@@ -68,6 +73,7 @@ class AmpBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         mode = self.resolve_model(request.model)
@@ -76,11 +82,15 @@ class AmpBackend(BaseBackend):
             binary,
             "-x",
             request.prompt,
-            "--dangerously-allow-all",
+            *self.permission_args(request),
         ]
         if mode in ("free", "rush", "smart"):
             cmd.extend(["-m", mode])
         return cmd
+
+    def default_permission_args(self) -> list[str]:
+        """Return default permission-bypass arguments for Amp."""
+        return ["--dangerously-allow-all"]
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
         """Return Amp environment variables (none required).
@@ -90,5 +100,6 @@ class AmpBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}

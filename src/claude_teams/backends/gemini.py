@@ -1,3 +1,5 @@
+"""Gemini backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -21,6 +23,7 @@ class GeminiBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]
 
@@ -29,6 +32,7 @@ class GeminiBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "gemini-2.5-flash"
 
@@ -42,10 +46,15 @@ class GeminiBackend(BaseBackend):
 
         Returns:
             Gemini model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
         return generic_name
+
+    def default_permission_args(self) -> list[str]:
+        """Return default permission-bypass arguments for Gemini."""
+        return ["--yolo"]
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Gemini CLI command.
@@ -55,6 +64,7 @@ class GeminiBackend(BaseBackend):
 
         Returns:
             Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -64,7 +74,7 @@ class GeminiBackend(BaseBackend):
             request.prompt,
             "--model",
             model,
-            "--yolo",
+            *self.permission_args(request),
         ]
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
@@ -75,5 +85,6 @@ class GeminiBackend(BaseBackend):
 
         Returns:
             Empty dict.
+
         """
         return {}

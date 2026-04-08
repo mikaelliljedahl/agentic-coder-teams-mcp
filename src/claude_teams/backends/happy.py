@@ -1,3 +1,5 @@
+"""Happy backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -26,6 +28,7 @@ class HappyBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "haiku",
@@ -38,6 +41,7 @@ class HappyBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "sonnet"
 
@@ -51,10 +55,15 @@ class HappyBackend(BaseBackend):
 
         Returns:
             str: Claude model alias or name.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
         return generic_name
+
+    def default_permission_args(self) -> list[str]:
+        """Return default permission-bypass arguments for Happy."""
+        return ["--yolo"]
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Happy CLI command for non-interactive execution.
@@ -67,6 +76,7 @@ class HappyBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -75,7 +85,7 @@ class HappyBackend(BaseBackend):
             "--print",
             "--model",
             model,
-            "--yolo",
+            *self.permission_args(request),
             request.prompt,
         ]
 
@@ -87,5 +97,6 @@ class HappyBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}

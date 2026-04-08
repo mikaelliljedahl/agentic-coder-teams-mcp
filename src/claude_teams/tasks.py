@@ -1,11 +1,14 @@
+"""Task persistence helpers for file-backed team state."""
+
 import json
 from collections import deque
 from pathlib import Path
 from typing import Literal
 
+from claude_teams.async_utils import run_blocking
 from claude_teams.filelock import file_lock
-from claude_teams.models import TaskFile
-from claude_teams.teams import team_exists
+from claude_teams.models import TaskFile, TaskMetadata
+from claude_teams.teams import _team_exists, validate_safe_name
 
 
 _TaskStatus = Literal["pending", "in_progress", "completed", "deleted"]
@@ -30,20 +33,7 @@ def _flush_pending_writes(pending_writes: dict[Path, TaskFile]) -> None:
 def _would_create_cycle(
     team_dir: Path, from_id: str, to_id: str, pending_edges: dict[str, set[str]]
 ) -> bool:
-    """True if making from_id blocked_by to_id creates a cycle.
-
-    BFS from to_id through blocked_by chains (on-disk + pending);
-    cycle if it reaches from_id.
-
-    Args:
-        team_dir (Path): Directory containing task JSON files.
-        from_id (str): ID of the task that would be blocked.
-        to_id (str): ID of the task that would block from_id.
-        pending_edges (dict[str, set[str]]): In-memory edges not yet written.
-
-    Returns:
-        bool: True if adding the edge would create a circular dependency.
-    """
+    """Return whether adding a dependency edge would create a cycle."""
     visited: set[str] = set()
     queue = deque([to_id])
     while queue:
@@ -66,16 +56,9 @@ def _would_create_cycle(
 
 
 def next_task_id(team_name: str, base_dir: Path | None = None) -> str:
-    """Find the next available integer task ID for a team.
-
-    Args:
-        team_name (str): Name of the team.
-        base_dir (Path | None): Override for the base config directory.
-
-    Returns:
-        str: Next available task ID as a string (e.g., "1", "42").
-    """
-    team_dir = _tasks_dir(base_dir) / team_name
+    """Return the next available integer task ID for a team."""
+    safe_team_name = validate_safe_name(team_name, "team name")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     ids: list[int] = []
     for task_file in team_dir.glob("*.json"):
         try:
@@ -85,40 +68,25 @@ def next_task_id(team_name: str, base_dir: Path | None = None) -> str:
     return str(max(ids) + 1) if ids else "1"
 
 
-def create_task(
+def _create_task(
     team_name: str,
     subject: str,
     description: str,
     active_form: str = "",
-    metadata: dict | None = None,
+    metadata: TaskMetadata | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
-    """Create a new task file on disk for the given team.
-
-    Args:
-        team_name (str): Name of the team that owns the task.
-        subject (str): Brief title for the task.
-        description (str): Detailed description of what needs to be done.
-        active_form (str): Present-tense form displayed during progress.
-        metadata (dict | None): Arbitrary key-value metadata.
-        base_dir (Path | None): Override for the base config directory.
-
-    Returns:
-        TaskFile: The newly created task with its assigned ID.
-
-    Raises:
-        ValueError: If subject is empty or team does not exist.
-    """
+    safe_team_name = validate_safe_name(team_name, "team name")
     if not subject or not subject.strip():
         raise ValueError("Task subject must not be empty")
-    if not team_exists(team_name, base_dir):
-        raise ValueError(f"Team {team_name!r} does not exist")
-    team_dir = _tasks_dir(base_dir) / team_name
+    if not _team_exists(safe_team_name, base_dir):
+        raise ValueError(f"Team {safe_team_name!r} does not exist")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     team_dir.mkdir(parents=True, exist_ok=True)
     lock_path = team_dir / ".lock"
 
     with file_lock(lock_path):
-        task_id = next_task_id(team_name, base_dir)
+        task_id = next_task_id(safe_team_name, base_dir)
         task = TaskFile(
             id=task_id,
             subject=subject,
@@ -133,25 +101,62 @@ def create_task(
     return task
 
 
-def get_task(team_name: str, task_id: str, base_dir: Path | None = None) -> TaskFile:
-    """Read a single task by ID from disk.
+async def create_task(
+    team_name: str,
+    subject: str,
+    description: str,
+    active_form: str = "",
+    metadata: TaskMetadata | None = None,
+    base_dir: Path | None = None,
+) -> TaskFile:
+    """Create a task in a worker thread.
 
     Args:
-        team_name (str): Name of the team.
-        task_id (str): ID of the task to retrieve.
+        team_name (str): Team name.
+        subject (str): Task subject.
+        description (str): Task description.
+        active_form (str): Optional active-form text.
+        metadata (dict | None): Optional metadata payload.
         base_dir (Path | None): Override for the base config directory.
 
     Returns:
-        TaskFile: The requested task object.
+        TaskFile: Newly created task.
 
-    Raises:
-        FileNotFoundError: If the task file does not exist.
-        json.JSONDecodeError: If the task file is malformed.
     """
-    team_dir = _tasks_dir(base_dir) / team_name
+    return await run_blocking(
+        _create_task,
+        team_name,
+        subject,
+        description,
+        active_form,
+        metadata,
+        base_dir,
+    )
+
+
+def _get_task(team_name: str, task_id: str, base_dir: Path | None = None) -> TaskFile:
+    safe_team_name = validate_safe_name(team_name, "team name")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     fpath = team_dir / f"{task_id}.json"
     raw = json.loads(fpath.read_text())
     return TaskFile(**raw)
+
+
+async def get_task(
+    team_name: str, task_id: str, base_dir: Path | None = None
+) -> TaskFile:
+    """Read a task in a worker thread.
+
+    Args:
+        team_name (str): Team name.
+        task_id (str): Task identifier.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        TaskFile: Parsed task payload.
+
+    """
+    return await run_blocking(_get_task, team_name, task_id, base_dir)
 
 
 def _link_dependency(
@@ -163,20 +168,7 @@ def _link_dependency(
     team_dir: Path,
     pending_writes: dict[Path, TaskFile],
 ) -> None:
-    """Add dependency links between tasks in both directions.
-
-    For each *dep_id* in *dep_ids*, appends it to ``task.{forward_field}``
-    and ensures ``task_id`` is added to the other task's ``{inverse_field}``.
-
-    Args:
-        task (TaskFile): The task being updated.
-        task_id (str): ID of the task being updated.
-        dep_ids (list[str]): IDs of tasks to link.
-        forward_field (str): Attribute on *task* (``"blocks"`` or ``"blocked_by"``).
-        inverse_field (str): Attribute on the other task.
-        team_dir (Path): Directory containing task JSON files.
-        pending_writes (dict[Path, TaskFile]): Accumulator for batched writes.
-    """
+    """Link dependency fields on the task and the affected peer tasks."""
     forward_list: list[str] = getattr(task, forward_field)
     existing = set(forward_list)
     for dep_id in dep_ids:
@@ -200,18 +192,7 @@ def _remove_task_references(
     pending_writes: dict[Path, TaskFile],
     fields: tuple[str, ...] = ("blocked_by",),
 ) -> None:
-    """Remove *task_id* from the specified fields across all sibling tasks.
-
-    Iterates every task file in *team_dir* (skipping *task_id* itself) and
-    removes *task_id* from each named list field.
-
-    Args:
-        task_id (str): ID to remove from other tasks' dependency lists.
-        team_dir (Path): Directory containing task JSON files.
-        pending_writes (dict[Path, TaskFile]): Accumulator for batched writes.
-        fields (tuple[str, ...]): Attribute names to clean
-            (e.g. ``("blocked_by",)`` or ``("blocked_by", "blocks")``).
-    """
+    """Remove a task ID from dependency fields across sibling tasks."""
     for task_file in team_dir.glob("*.json"):
         try:
             int(task_file.stem)
@@ -233,7 +214,7 @@ def _remove_task_references(
             pending_writes[task_file] = other
 
 
-def update_task(
+def _update_task(
     team_name: str,
     task_id: str,
     *,
@@ -244,33 +225,11 @@ def update_task(
     active_form: str | None = None,
     add_blocks: list[str] | None = None,
     add_blocked_by: list[str] | None = None,
-    metadata: dict | None = None,
+    metadata: TaskMetadata | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
-    """Update a task with validation and automatic dependency graph updates.
-
-    Args:
-        team_name (str): Name of the team.
-        task_id (str): ID of the task to update.
-        status (_TaskStatus | None): New status ("pending", "in_progress", "completed", "deleted").
-        owner (str | None): New owner agent name.
-        subject (str | None): New subject line.
-        description (str | None): New description text.
-        active_form (str | None): New active form text.
-        add_blocks (list[str] | None): Task IDs that this task should block.
-        add_blocked_by (list[str] | None): Task IDs that should block this task.
-        metadata (dict | None): Metadata keys to merge (set key to None to delete).
-        base_dir (Path | None): Override for the base config directory.
-
-    Returns:
-        TaskFile: The updated task object.
-
-    Raises:
-        ValueError: If status transition is invalid, circular dependency detected,
-            or blocked tasks are incomplete.
-        FileNotFoundError: If the task or referenced tasks do not exist.
-    """
-    team_dir = _tasks_dir(base_dir) / team_name
+    safe_team_name = validate_safe_name(team_name, "team name")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     lock_path = team_dir / ".lock"
     fpath = team_dir / f"{task_id}.json"
 
@@ -346,6 +305,7 @@ def update_task(
         if active_form is not None:
             task.active_form = active_form
         if owner is not None:
+            validate_safe_name(owner, "owner")
             task.owner = owner
 
         if add_blocks:
@@ -405,20 +365,57 @@ def update_task(
     return task
 
 
-def list_tasks(team_name: str, base_dir: Path | None = None) -> list[TaskFile]:
-    """List all tasks for a team, sorted by task ID.
+async def update_task(
+    team_name: str,
+    task_id: str,
+    *,
+    status: _TaskStatus | None = None,
+    owner: str | None = None,
+    subject: str | None = None,
+    description: str | None = None,
+    active_form: str | None = None,
+    add_blocks: list[str] | None = None,
+    add_blocked_by: list[str] | None = None,
+    metadata: TaskMetadata | None = None,
+    base_dir: Path | None = None,
+) -> TaskFile:
+    """Update a task in a worker thread.
 
     Args:
-        team_name (str): Name of the team.
+        team_name (str): Team name.
+        task_id (str): Task identifier.
+        status (_TaskStatus | None): Optional new status.
+        owner (str | None): Optional new owner.
+        subject (str | None): Optional new subject.
+        description (str | None): Optional new description.
+        active_form (str | None): Optional new active-form text.
+        add_blocks (list[str] | None): Task IDs this task blocks.
+        add_blocked_by (list[str] | None): Task IDs blocking this task.
+        metadata (dict | None): Metadata merge payload.
         base_dir (Path | None): Override for the base config directory.
 
     Returns:
-        list[TaskFile]: All task objects sorted by integer ID.
+        TaskFile: Updated task payload.
 
-    Raises:
-        ValueError: If the team does not exist.
     """
-    if not team_exists(team_name, base_dir):
+    return await run_blocking(
+        _update_task,
+        team_name,
+        task_id,
+        status=status,
+        owner=owner,
+        subject=subject,
+        description=description,
+        active_form=active_form,
+        add_blocks=add_blocks,
+        add_blocked_by=add_blocked_by,
+        metadata=metadata,
+        base_dir=base_dir,
+    )
+
+
+def _list_tasks(team_name: str, base_dir: Path | None = None) -> list[TaskFile]:
+    if not _team_exists(team_name, base_dir):
         raise ValueError(f"Team {team_name!r} does not exist")
     team_dir = _tasks_dir(base_dir) / team_name
     tasks: list[TaskFile] = []
@@ -432,17 +429,25 @@ def list_tasks(team_name: str, base_dir: Path | None = None) -> list[TaskFile]:
     return tasks
 
 
-def reset_owner_tasks(
-    team_name: str, agent_name: str, base_dir: Path | None = None
-) -> None:
-    """Reset all non-completed tasks owned by an agent to pending with no owner.
+async def list_tasks(team_name: str, base_dir: Path | None = None) -> list[TaskFile]:
+    """List tasks in a worker thread.
 
     Args:
-        team_name (str): Name of the team.
-        agent_name (str): Name of the agent whose tasks should be reset.
+        team_name (str): Team name.
         base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        list[TaskFile]: Tasks sorted by canonical task ID order.
+
     """
-    team_dir = _tasks_dir(base_dir) / team_name
+    return await run_blocking(_list_tasks, team_name, base_dir)
+
+
+def _reset_owner_tasks(
+    team_name: str, agent_name: str, base_dir: Path | None = None
+) -> None:
+    safe_team_name = validate_safe_name(team_name, "team name")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     lock_path = team_dir / ".lock"
 
     with file_lock(lock_path):
@@ -459,3 +464,17 @@ def reset_owner_tasks(
                 task_file.write_text(
                     json.dumps(task.model_dump(by_alias=True, exclude_none=True))
                 )
+
+
+async def reset_owner_tasks(
+    team_name: str, agent_name: str, base_dir: Path | None = None
+) -> None:
+    """Reset an agent's owned tasks in a worker thread.
+
+    Args:
+        team_name (str): Team name.
+        agent_name (str): Agent name.
+        base_dir (Path | None): Override for the base config directory.
+
+    """
+    await run_blocking(_reset_owner_tasks, team_name, agent_name, base_dir)

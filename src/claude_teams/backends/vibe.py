@@ -1,3 +1,5 @@
+"""Vibe backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -27,6 +29,7 @@ class VibeBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "devstral-2",
@@ -38,6 +41,7 @@ class VibeBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "devstral-2"
 
@@ -51,6 +55,7 @@ class VibeBackend(BaseBackend):
 
         Returns:
             str: Mistral model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
@@ -68,6 +73,7 @@ class VibeBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         return [
@@ -86,5 +92,6 @@ class VibeBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}

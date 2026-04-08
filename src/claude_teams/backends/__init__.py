@@ -1,3 +1,5 @@
+"""Backend package exports and registry access."""
+
 from claude_teams.backends.base import (
     Backend,
     BaseBackend,

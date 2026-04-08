@@ -1,3 +1,5 @@
+"""Goose backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -27,6 +29,7 @@ class GooseBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "claude-haiku-4.5",
@@ -41,6 +44,7 @@ class GooseBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "claude-sonnet-4.5"
 
@@ -54,6 +58,7 @@ class GooseBackend(BaseBackend):
 
         Returns:
             str: Goose model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
@@ -67,6 +72,7 @@ class GooseBackend(BaseBackend):
 
         Returns:
             str | None: Provider name, or None if not a generic tier.
+
         """
         return self._PROVIDER_MAP.get(generic_name)
 
@@ -78,6 +84,7 @@ class GooseBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -104,5 +111,6 @@ class GooseBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}

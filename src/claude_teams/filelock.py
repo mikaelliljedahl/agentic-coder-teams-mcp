@@ -1,3 +1,5 @@
+"""File-based locking helpers for local team state."""
+
 import fcntl
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,6 +14,7 @@ def file_lock(lock_path: Path):
 
     Yields:
         None: Control returns to caller while lock is held.
+
     """
     lock_path.touch(exist_ok=True)
     with open(lock_path) as lock_file:

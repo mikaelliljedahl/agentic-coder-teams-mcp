@@ -95,6 +95,15 @@ class TestCodexBuildCommand:
         assert "-C" in cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
+    def test_omits_full_auto_when_require_approval(self, mock_which):
+        backend = CodexBackend()
+        request = _make_request(permission_mode="require_approval")
+
+        cmd = backend.build_command(request)
+
+        assert "--full-auto" not in cmd
+
+    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
     def test_includes_prompt_as_last_arg(self, mock_which):
         backend = CodexBackend()
         request = _make_request(prompt="fix the bug")
@@ -144,3 +153,9 @@ class TestCodexBuildEnv:
         env = backend.build_env(request)
 
         assert env == {}
+
+
+class TestCodexPermissionSupport:
+    def test_supports_permission_bypass(self):
+        backend = CodexBackend()
+        assert backend.supports_permission_bypass() is True

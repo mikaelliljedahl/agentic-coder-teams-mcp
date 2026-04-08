@@ -1,3 +1,5 @@
+"""Qwen backend integration."""
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -20,6 +22,7 @@ class QwenBackend(BaseBackend):
 
         Returns:
             list[str]: Curated list of supported model identifiers.
+
         """
         return [
             "qwen-turbo",
@@ -36,6 +39,7 @@ class QwenBackend(BaseBackend):
 
         Returns:
             str: Default model identifier for this backend.
+
         """
         return "qwen-plus"
 
@@ -49,10 +53,15 @@ class QwenBackend(BaseBackend):
 
         Returns:
             str: Qwen Code model identifier.
+
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
         return generic_name
+
+    def default_permission_args(self) -> list[str]:
+        """Return default permission-bypass arguments for Qwen."""
+        return ["-y"]
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Qwen Code CLI command for non-interactive execution.
@@ -62,6 +71,7 @@ class QwenBackend(BaseBackend):
 
         Returns:
             list[str]: Command parts list.
+
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
@@ -71,7 +81,7 @@ class QwenBackend(BaseBackend):
             request.prompt,
             "-m",
             model,
-            "-y",
+            *self.permission_args(request),
         ]
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
@@ -82,5 +92,6 @@ class QwenBackend(BaseBackend):
 
         Returns:
             dict[str, str]: Empty dict.
+
         """
         return {}
