@@ -166,7 +166,7 @@ Register your own backend via Python [entry points](https://packaging.python.org
 
 ## MCP Tools
 
-Tools are organized into three tiers using **progressive disclosure**. At startup, only bootstrap tools are visible. Higher tiers unlock as you create teams and spawn teammates. This reduces token cost by ~85% at cold start.
+Tools are organized into three tiers using **progressive disclosure**. At startup, only bootstrap tools are visible. Higher tiers unlock as you create teams and spawn teammates, which keeps the cold-start tool surface small.
 
 ### Tier 0: Bootstrap (always visible)
 
@@ -506,7 +506,7 @@ A `BaseBackend` class provides shared tmux lifecycle management via [`claude-cod
 
 ### FastMCP integration
 
-The server is built on [FastMCP 3.0](https://github.com/jlowin/fastmcp) using:
+The server is built on [FastMCP 3.x](https://github.com/jlowin/fastmcp) using:
 
 - **Lifespan management** -- `_LifespanState` tracks registry, session ID, active team, and teammate state
 - **Tag-based tool visibility** -- tools tagged as `bootstrap`, `team`, or `teammate` with per-session enable/disable
