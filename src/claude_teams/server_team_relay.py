@@ -87,7 +87,7 @@ async def relay_one_shot_result(
         color (str): Agent display color for inbox routing.
 
     """
-    deadline = time.time() + _ONE_SHOT_TIMEOUT_S
+    deadline = time.monotonic() + _ONE_SHOT_TIMEOUT_S
     backend_obj = None
     text = ""
 
@@ -111,7 +111,7 @@ async def relay_one_shot_result(
             )
             return
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         if result_file is not None:
             try:
                 if await run_blocking(result_file.exists):
@@ -126,7 +126,7 @@ async def relay_one_shot_result(
             if not status.alive:
                 break
 
-        sleep_seconds = min(0.5, max(0.0, deadline - time.time()))
+        sleep_seconds = min(0.5, max(0.0, deadline - time.monotonic()))
         if sleep_seconds == 0.0:
             break
         await asyncio.sleep(sleep_seconds)
@@ -150,7 +150,7 @@ async def relay_one_shot_result(
                 exc_info=True,
             )
 
-    if not text and time.time() >= deadline:
+    if not text and time.monotonic() >= deadline:
         await messaging.send_plain_message(
             team_name,
             agent_name,
