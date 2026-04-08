@@ -1,5 +1,7 @@
 """Task and team-lifecycle server tests."""
 
+import time
+
 from fastmcp import Client
 
 from claude_teams import teams
@@ -273,13 +275,16 @@ class TestErrorWrapping:
 
 class TestPollInbox:
     async def test_should_return_empty_on_timeout(self, team_client: Client):
+        start = time.monotonic()
         result = _data(
             await team_client.call_tool(
                 "poll_inbox",
                 {"team_name": "test-team", "agent_name": "nobody", "timeout_ms": 100},
             )
         )
+        elapsed = time.monotonic() - start
         assert result == []
+        assert elapsed < 0.35
 
     async def test_should_return_messages_when_present(self, team_client: Client):
         await team_client.call_tool(

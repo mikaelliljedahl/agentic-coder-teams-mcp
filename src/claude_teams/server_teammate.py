@@ -92,7 +92,10 @@ async def poll_inbox(
         return [msg.model_dump(by_alias=True, exclude_none=True) for msg in msgs]
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
-        await asyncio.sleep(0.5)
+        sleep_seconds = min(0.5, max(0.0, deadline - time.time()))
+        if sleep_seconds == 0.0:
+            break
+        await asyncio.sleep(sleep_seconds)
         msgs = await messaging.read_inbox(
             team_name, agent_name, unread_only=True, mark_as_read=True
         )

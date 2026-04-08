@@ -1,6 +1,7 @@
 """Relay and teammate-introspection server tests."""
 
 import asyncio
+import time
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
@@ -10,6 +11,7 @@ from fastmcp import Client
 from claude_teams import messaging
 from claude_teams.backends import registry
 from claude_teams.backends.base import HealthStatus, SpawnResult as BackendSpawnResult
+from claude_teams.server_team_relay import relay_one_shot_result
 from tests._server_support import (
     _data,
     _items,
@@ -48,18 +50,7 @@ class TestOneShotBackendRelay:
             },
         )
 
-        await asyncio.sleep(0.1)
-
-        inbox = _items(
-            await client.call_tool(
-                "read_inbox",
-                {
-                    "team_name": "oneshot",
-                    "agent_name": "team-lead",
-                    "unread_only": True,
-                },
-            )
-        )
+        inbox = await _wait_for_lead_inbox_message(client, "oneshot", "teammate_result")
         assert len(inbox) == 1
         assert inbox[0]["from"] == "codex-worker"
         assert inbox[0]["summary"] == "teammate_result"
@@ -98,17 +89,10 @@ class TestOneShotBackendRelay:
             },
         )
 
-        await asyncio.sleep(0.1)
-
-        inbox = _items(
-            await client.call_tool(
-                "read_inbox",
-                {
-                    "team_name": "oneshot-alive",
-                    "agent_name": "team-lead",
-                    "unread_only": True,
-                },
-            )
+        inbox = await _wait_for_lead_inbox_message(
+            client,
+            "oneshot-alive",
+            "teammate_result",
         )
         assert len(inbox) == 1
         assert inbox[0]["from"] == "codex-worker"
@@ -139,17 +123,10 @@ class TestOneShotBackendRelay:
             },
         )
 
-        await asyncio.sleep(0.1)
-
-        inbox = _items(
-            await client.call_tool(
-                "read_inbox",
-                {
-                    "team_name": "oneshot-generic",
-                    "agent_name": "team-lead",
-                    "unread_only": True,
-                },
-            )
+        inbox = await _wait_for_lead_inbox_message(
+            client,
+            "oneshot-generic",
+            "teammate_result",
         )
         assert len(inbox) == 1
         assert inbox[0]["from"] == "gemini-worker"
@@ -180,17 +157,10 @@ class TestOneShotBackendRelay:
             },
         )
 
-        await asyncio.sleep(0.1)
-
-        inbox = _items(
-            await client.call_tool(
-                "read_inbox",
-                {
-                    "team_name": "oneshot-ansi",
-                    "agent_name": "team-lead",
-                    "unread_only": True,
-                },
-            )
+        inbox = await _wait_for_lead_inbox_message(
+            client,
+            "oneshot-ansi",
+            "teammate_result",
         )
         assert len(inbox) == 1
         assert "\x1b" not in inbox[0]["text"]
@@ -224,6 +194,59 @@ class TestOneShotBackendRelay:
         )
         # Interactive backends handle their own messaging — no relay message
         assert len(inbox) == 0
+
+    async def test_should_fail_fast_when_backend_missing_and_no_result_file(
+        self, client: Client
+    ):
+        start = time.monotonic()
+        await client.call_tool("team_create", {"team_name": "relay-missing"})
+
+        await relay_one_shot_result(
+            "relay-missing",
+            "worker",
+            "missing-backend",
+            "%missing",
+            None,
+            "blue",
+        )
+
+        inbox = await _wait_for_lead_inbox_message(
+            client,
+            "relay-missing",
+            "teammate_result",
+        )
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1.0
+        assert len(inbox) == 1
+        assert "could not be resolved" in inbox[0]["text"]
+
+
+async def _wait_for_lead_inbox_message(
+    client: Client,
+    team_name: str,
+    expected_summary: str,
+    timeout_seconds: float = 2.0,
+) -> list[dict]:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        inbox = _items(
+            await client.call_tool(
+                "read_inbox",
+                {
+                    "team_name": team_name,
+                    "agent_name": "team-lead",
+                    "unread_only": True,
+                    "mark_as_read": False,
+                },
+            )
+        )
+        if inbox and inbox[0]["summary"] == expected_summary:
+            return inbox
+        await asyncio.sleep(0.05)
+    raise AssertionError(
+        f"Timed out waiting for lead inbox message {expected_summary!r} in {team_name!r}"
+    )
 
 
 class TestCheckTeammate:

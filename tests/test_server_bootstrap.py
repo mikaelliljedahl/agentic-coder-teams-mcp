@@ -230,3 +230,14 @@ class TestListBackends:
         assert result == []
         # Restore for subsequent tests
         registry._backends = {"claude-code": _make_mock_backend("claude-code")}
+
+    async def test_reports_backend_availability_from_backend_check(
+        self, client: Client
+    ):
+        mock_backend = _make_mock_backend("claude-code")
+        mock_backend.is_available.return_value = False
+        registry._backends = {"claude-code": mock_backend}
+
+        result = _data(await client.call_tool("list_backends", {}))
+
+        assert result[0]["available"] is False

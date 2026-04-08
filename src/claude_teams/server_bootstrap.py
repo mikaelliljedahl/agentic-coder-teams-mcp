@@ -116,7 +116,7 @@ def list_backends(ctx: Context) -> list[dict]:
         info = BackendInfo(
             name=name,
             binary=backend_obj.binary_name,
-            available=True,
+            available=backend_obj.is_available(),
             default_model=backend_obj.default_model(),
             supported_models=backend_obj.supported_models(),
         )

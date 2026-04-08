@@ -94,6 +94,19 @@ async def relay_one_shot_result(
         logger.warning(
             "One-shot backend not available for result relay: %s", backend_type
         )
+        if result_file is None:
+            await messaging.send_plain_message(
+                team_name,
+                agent_name,
+                "team-lead",
+                (
+                    f"{agent_name} ({backend_type}) finished, but the backend could not "
+                    "be resolved for output capture."
+                ),
+                summary="teammate_result",
+                color=color,
+            )
+            return
 
     while time.time() < deadline:
         if result_file is not None:
@@ -110,7 +123,10 @@ async def relay_one_shot_result(
             if not status.alive:
                 break
 
-        await asyncio.sleep(0.5)
+        sleep_seconds = min(0.5, max(0.0, deadline - time.time()))
+        if sleep_seconds == 0.0:
+            break
+        await asyncio.sleep(sleep_seconds)
 
     if not text and result_file is not None:
         try:
