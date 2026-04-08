@@ -68,7 +68,8 @@ def _team_exists(name: str, base_dir: Path | None = None) -> bool:
         bool: True if the team's config.json exists.
 
     """
-    config_path = _teams_dir(base_dir) / name / "config.json"
+    safe_name = validate_safe_name(name, "team name")
+    config_path = _teams_dir(base_dir) / safe_name / "config.json"
     return config_path.exists()
 
 
@@ -275,24 +276,25 @@ def _delete_team(name: str, base_dir: Path | None = None) -> TeamDeleteResult:
         FileNotFoundError: If the team does not exist.
 
     """
-    config = _read_config(name, base_dir=base_dir)
+    safe_name = validate_safe_name(name, "team name")
+    config = _read_config(safe_name, base_dir=base_dir)
 
     non_lead = [
         member for member in config.members if isinstance(member, TeammateMember)
     ]
     if non_lead:
         raise RuntimeError(
-            f"Cannot delete team {name!r}: {len(non_lead)} non-lead member(s) still present. "
+            f"Cannot delete team {safe_name!r}: {len(non_lead)} non-lead member(s) still present. "
             "Remove all teammates before deleting."
         )
 
-    shutil.rmtree(_teams_dir(base_dir) / name)
-    shutil.rmtree(_tasks_dir(base_dir) / name)
+    shutil.rmtree(_teams_dir(base_dir) / safe_name)
+    shutil.rmtree(_tasks_dir(base_dir) / safe_name)
 
     return TeamDeleteResult(
         success=True,
-        message=f'Cleaned up directories and worktrees for team "{name}"',
-        team_name=name,
+        message=f'Cleaned up directories and worktrees for team "{safe_name}"',
+        team_name=safe_name,
     )
 
 

@@ -57,7 +57,8 @@ def _would_create_cycle(
 
 def next_task_id(team_name: str, base_dir: Path | None = None) -> str:
     """Return the next available integer task ID for a team."""
-    team_dir = _tasks_dir(base_dir) / team_name
+    safe_team_name = validate_safe_name(team_name, "team name")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     ids: list[int] = []
     for task_file in team_dir.glob("*.json"):
         try:
@@ -75,16 +76,17 @@ def _create_task(
     metadata: dict | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
+    safe_team_name = validate_safe_name(team_name, "team name")
     if not subject or not subject.strip():
         raise ValueError("Task subject must not be empty")
-    if not _team_exists(team_name, base_dir):
-        raise ValueError(f"Team {team_name!r} does not exist")
-    team_dir = _tasks_dir(base_dir) / team_name
+    if not _team_exists(safe_team_name, base_dir):
+        raise ValueError(f"Team {safe_team_name!r} does not exist")
+    team_dir = _tasks_dir(base_dir) / safe_team_name
     team_dir.mkdir(parents=True, exist_ok=True)
     lock_path = team_dir / ".lock"
 
     with file_lock(lock_path):
-        task_id = next_task_id(team_name, base_dir)
+        task_id = next_task_id(safe_team_name, base_dir)
         task = TaskFile(
             id=task_id,
             subject=subject,

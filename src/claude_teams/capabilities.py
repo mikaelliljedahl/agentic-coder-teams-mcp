@@ -35,7 +35,8 @@ class CapabilityStore(TypedDict):
 
 
 def _capabilities_path(team_name: str, base_dir: Path | None = None) -> Path:
-    return teams._teams_dir(base_dir) / team_name / ".capabilities.json"
+    safe_team_name = teams.validate_safe_name(team_name, "team name")
+    return teams._teams_dir(base_dir) / safe_team_name / ".capabilities.json"
 
 
 def _hash_token(token: str) -> str:
@@ -121,6 +122,7 @@ def _issue_agent_capability(
         str: Raw agent capability token.
 
     """
+    teams.validate_safe_name(agent_name, "agent name")
     capability = secrets.token_urlsafe(32)
     data = _read_capabilities(team_name, base_dir)
     data.setdefault("agents", {})[agent_name] = _hash_token(capability)
@@ -156,6 +158,7 @@ def _remove_agent_capability(
         base_dir (Path | None): Override for the base config directory.
 
     """
+    teams.validate_safe_name(agent_name, "agent name")
     data = _read_capabilities(team_name, base_dir)
     data.setdefault("agents", {}).pop(agent_name, None)
     _write_capabilities(team_name, data, base_dir)

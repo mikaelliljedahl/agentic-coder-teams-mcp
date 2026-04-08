@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_teams import capabilities
 from claude_teams.models import LeadMember, TeammateMember
 from claude_teams.teams import (
     add_member,
@@ -198,6 +199,10 @@ class TestTeamExists:
 
         assert await team_exists("ghost", base_dir=tmp_claude_dir) is False
 
+    async def test_should_reject_invalid_team_name(self, tmp_claude_dir: Path) -> None:
+        with pytest.raises(ValueError, match="Invalid team name"):
+            await team_exists("../ghost", base_dir=tmp_claude_dir)
+
 
 class TestRemoveMemberGuard:
     async def test_should_reject_removing_team_lead(self, tmp_claude_dir: Path) -> None:
@@ -231,3 +236,49 @@ class TestReadConfig:
         lead = cfg.members[0]
         assert isinstance(lead, LeadMember)
         assert lead.agent_id == "team-lead@roundtrip"
+
+
+class TestDeleteTeamValidation:
+    async def test_delete_team_rejects_invalid_name(self, tmp_claude_dir: Path) -> None:
+        with pytest.raises(ValueError, match="Invalid team name"):
+            await delete_team("../ghost", base_dir=tmp_claude_dir)
+
+
+class TestCapabilitiesValidation:
+    async def test_initialize_team_capabilities_rejects_invalid_team_name(
+        self, tmp_claude_dir: Path
+    ) -> None:
+        with pytest.raises(ValueError, match="Invalid team name"):
+            await capabilities.initialize_team_capabilities(
+                "../ghost", base_dir=tmp_claude_dir
+            )
+
+    async def test_issue_agent_capability_rejects_invalid_agent_name(
+        self, tmp_claude_dir: Path
+    ) -> None:
+        await create_team("cap-team", "sess-1", base_dir=tmp_claude_dir)
+        await capabilities.initialize_team_capabilities(
+            "cap-team", base_dir=tmp_claude_dir
+        )
+
+        with pytest.raises(ValueError, match="Invalid agent name"):
+            await capabilities.issue_agent_capability(
+                "cap-team",
+                "../bob",
+                base_dir=tmp_claude_dir,
+            )
+
+    async def test_remove_agent_capability_rejects_invalid_agent_name(
+        self, tmp_claude_dir: Path
+    ) -> None:
+        await create_team("cap-team-rm", "sess-1", base_dir=tmp_claude_dir)
+        await capabilities.initialize_team_capabilities(
+            "cap-team-rm", base_dir=tmp_claude_dir
+        )
+
+        with pytest.raises(ValueError, match="Invalid agent name"):
+            await capabilities.remove_agent_capability(
+                "cap-team-rm",
+                "../bob",
+                base_dir=tmp_claude_dir,
+            )

@@ -205,6 +205,15 @@ class TestCapabilities:
             assert result.is_error is True
             assert "team-lead capability" in _text(result)
 
+    async def test_read_config_rejects_invalid_team_name(self, client: Client):
+        result = await client.call_tool(
+            "read_config",
+            {"team_name": "../bad-team"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "Invalid team name" in _text(result)
+
 
 class TestListBackends:
     async def test_returns_registered_backends(self, client: Client):

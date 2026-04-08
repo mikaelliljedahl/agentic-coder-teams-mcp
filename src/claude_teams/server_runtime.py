@@ -216,7 +216,11 @@ async def _resolve_authenticated_principal(
 
 
 async def _ensure_team_exists(team_name: str) -> None:
-    if not await teams.team_exists(team_name):
+    try:
+        safe_team_name = teams.validate_safe_name(team_name, "team name")
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    if not await teams.team_exists(safe_team_name):
         raise ToolError(f"Team {team_name!r} not found")
 
 
