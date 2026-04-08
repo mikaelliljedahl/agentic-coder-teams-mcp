@@ -4,7 +4,7 @@
 
 Multi-backend MCP server for orchestrating teams of agentic coding agents.
 
-**521 tests | 92% coverage | 17 backends | Python 3.12+**
+**575 tests | 92% coverage | 17 backends | Python 3.12+**
 
 </div>
 
@@ -263,13 +263,13 @@ Example `read_inbox` response:
 The `claude-teams` CLI provides terminal commands for inspecting and managing teams. The CLI and MCP server can run concurrently -- they share the same file-based state with `fcntl.flock()` guards.
 
 ```
-claude-teams serve       # Start the MCP server
-claude-teams backends    # List available backends
-claude-teams config TEAM # Show team config
-claude-teams status TEAM # Show member status and task summary
-claude-teams inbox TEAM  # Read an agent's inbox messages
-claude-teams health TEAM # Health-check a teammate's process
-claude-teams kill TEAM   # Force-kill a teammate
+claude-teams serve              # Start the MCP server
+claude-teams backends           # List available backends
+claude-teams config TEAM        # Show team config
+claude-teams status TEAM        # Show member status and task summary
+claude-teams inbox TEAM AGENT   # Read an agent's inbox messages
+claude-teams health TEAM AGENT  # Health-check a teammate's process
+claude-teams kill TEAM AGENT    # Force-kill a teammate
 ```
 
 All commands support `--json` / `-j` for machine-readable output.
