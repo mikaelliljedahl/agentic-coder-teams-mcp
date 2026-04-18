@@ -147,6 +147,8 @@ async def create_task(
 
 def _get_task(team_name: str, task_id: str, base_dir: Path | None = None) -> TaskFile:
     safe_team_name = validate_safe_name(team_name, "team name")
+    if not _team_exists(safe_team_name, base_dir):
+        raise TeamNotFoundValueError(safe_team_name)
     team_dir = _tasks_dir(base_dir) / safe_team_name
     fpath = team_dir / f"{task_id}.json"
     raw = json.loads(fpath.read_text())
@@ -391,6 +393,8 @@ def _update_task(
     base_dir: Path | None = None,
 ) -> TaskFile:
     safe_team_name = validate_safe_name(team_name, "team name")
+    if not _team_exists(safe_team_name, base_dir):
+        raise TeamNotFoundValueError(safe_team_name)
     team_dir = _tasks_dir(base_dir) / safe_team_name
     lock_path = team_dir / ".lock"
     fpath = team_dir / f"{task_id}.json"

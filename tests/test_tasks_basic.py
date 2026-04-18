@@ -220,6 +220,21 @@ async def test_get_task_rejects_invalid_team_name(tmp_claude_dir: Path) -> None:
         await get_task("../bad-team", "1", base_dir=tmp_claude_dir)
 
 
+async def test_get_task_rejects_nonexistent_team(tmp_claude_dir: Path) -> None:
+    with pytest.raises(ValueError, match="does not exist"):
+        await get_task("no-such-team", "1", base_dir=tmp_claude_dir)
+
+
+async def test_update_task_rejects_nonexistent_team(tmp_claude_dir: Path) -> None:
+    with pytest.raises(ValueError, match="does not exist"):
+        await update_task(
+            "no-such-team",
+            "1",
+            TaskUpdateFields(status="completed"),
+            base_dir=tmp_claude_dir,
+        )
+
+
 async def test_update_task_rejects_backward_status_transition(
     team_context: tuple[str, Path, Path],
 ) -> None:

@@ -116,6 +116,8 @@ async def task_update(
     update_fields = fields or TaskUpdateFields()
     try:
         task = await tasks.update_task(team_name, task_id, update_fields)
+    except TeamNotFoundValueError as e:
+        raise ToolError(str(e)) from e
     except FileNotFoundError:
         raise TaskNotFoundToolError(task_id, team_name) from None
     except (
@@ -196,6 +198,8 @@ async def task_get(
     await _require_authenticated_principal(ctx, team_name, capability)
     try:
         task = await tasks.get_task(team_name, task_id)
+    except TeamNotFoundValueError as e:
+        raise ToolError(str(e)) from e
     except FileNotFoundError:
         raise TaskNotFoundToolError(task_id, team_name) from None
     return task.model_dump(by_alias=True, exclude_none=True)
