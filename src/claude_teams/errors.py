@@ -4,9 +4,9 @@ Each class owns its own message template so call sites stay short (TRY003)
 while preserving the exact text downstream tests string-match against.
 
 Inheritance follows the base class the original callsite raised
-(``ValueError``/``RuntimeError``/``KeyError``/``FileNotFoundError``/
-``ToolError``) so ``except`` clauses elsewhere keep matching without
-modification.
+(``ValueError``/``TypeError``/``RuntimeError``/``KeyError``/
+``FileNotFoundError``/``ToolError``) so ``except`` clauses elsewhere keep
+matching without modification.
 """
 
 from collections.abc import Iterable
