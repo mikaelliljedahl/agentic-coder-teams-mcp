@@ -1,5 +1,7 @@
 """Amp backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -14,7 +16,7 @@ class AmpBackend(BaseBackend):
     _name = "amp"
     _binary_name = "amp-cli"
 
-    _MODE_MAP: dict[str, str] = {
+    _MODE_MAP: ClassVar[dict[str, str]] = {
         "fast": "rush",
         "balanced": "smart",
         "powerful": "smart",
@@ -91,15 +93,3 @@ class AmpBackend(BaseBackend):
     def default_permission_args(self) -> list[str]:
         """Return default permission-bypass arguments for Amp."""
         return ["--dangerously-allow-all"]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Amp environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

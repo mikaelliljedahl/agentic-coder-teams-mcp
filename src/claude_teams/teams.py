@@ -9,6 +9,13 @@ import time
 from pathlib import Path
 
 from claude_teams.async_utils import run_blocking
+from claude_teams.errors import (
+    CannotRemoveLeadError,
+    InvalidNameError,
+    MemberAlreadyExistsError,
+    NameTooLongError,
+    TeamHasMembersError,
+)
 from claude_teams.models import (
     LeadMember,
     TeamConfig,
@@ -22,6 +29,7 @@ TEAMS_DIR = CLAUDE_DIR / "teams"
 TASKS_DIR = CLAUDE_DIR / "tasks"
 
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_MAX_NAME_LEN = 64
 
 
 def _teams_dir(base_dir: Path | None = None) -> Path:
@@ -47,13 +55,9 @@ def validate_safe_name(name: str, label: str = "name") -> str:
 
     """
     if not _VALID_NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid {label}: {name!r}. Use only letters, numbers, hyphens, underscores."
-        )
-    if len(name) > 64:
-        raise ValueError(
-            f"{label.capitalize()} too long ({len(name)} chars, max 64): {name[:20]!r}..."
-        )
+        raise InvalidNameError(label, name)
+    if len(name) > _MAX_NAME_LEN:
+        raise NameTooLongError(label, name, _MAX_NAME_LEN)
     return name
 
 
@@ -91,7 +95,7 @@ def _create_team(
     name: str,
     session_id: str,
     description: str = "",
-    lead_model: str = "claude-opus-4-6",
+    lead_model: str = "claude-opus-4-7",
     base_dir: Path | None = None,
 ) -> TeamCreateResult:
     """Create a new team directory structure and configuration file.
@@ -157,7 +161,7 @@ async def create_team(
     name: str,
     session_id: str,
     description: str = "",
-    lead_model: str = "claude-opus-4-6",
+    lead_model: str = "claude-opus-4-7",
     base_dir: Path | None = None,
 ) -> TeamCreateResult:
     """Create a team in a worker thread.
@@ -235,17 +239,18 @@ def _write_config(name: str, config: TeamConfig, base_dir: Path | None = None) -
     data = json.dumps(config.model_dump(by_alias=True), indent=2)
 
     # NOTE(victor): atomic write to avoid partial reads from concurrent agents
-    fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=config_dir, suffix=".tmp")
+    tmp_path = Path(tmp_name)
     try:
         os.write(fd, data.encode())
         os.close(fd)
         fd = -1
-        os.replace(tmp_path, config_dir / "config.json")
+        tmp_path.replace(config_dir / "config.json")
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        if tmp_path.exists():
+            tmp_path.unlink()
         raise
 
 
@@ -285,10 +290,7 @@ def _delete_team(name: str, base_dir: Path | None = None) -> TeamDeleteResult:
         member for member in config.members if isinstance(member, TeammateMember)
     ]
     if non_lead:
-        raise RuntimeError(
-            f"Cannot delete team {safe_name!r}: {len(non_lead)} non-lead member(s) still present. "
-            "Remove all teammates before deleting."
-        )
+        raise TeamHasMembersError(safe_name, len(non_lead))
 
     shutil.rmtree(_teams_dir(base_dir) / safe_name)
     shutil.rmtree(_tasks_dir(base_dir) / safe_name)
@@ -332,7 +334,7 @@ def _add_member(
     config = _read_config(name, base_dir=base_dir)
     existing_names = {member_item.name for member_item in config.members}
     if member.name in existing_names:
-        raise ValueError(f"Member {member.name!r} already exists in team {name!r}")
+        raise MemberAlreadyExistsError(member.name, name)
     config.members.append(member)
     _write_config(name, config, base_dir=base_dir)
 
@@ -367,7 +369,7 @@ def _remove_member(
 
     """
     if agent_name == "team-lead":
-        raise ValueError("Cannot remove team-lead from team")
+        raise CannotRemoveLeadError()
     config = _read_config(team_name, base_dir=base_dir)
     config.members = [member for member in config.members if member.name != agent_name]
     _write_config(team_name, config, base_dir=base_dir)

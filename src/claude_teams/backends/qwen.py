@@ -1,5 +1,7 @@
 """Qwen backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -9,7 +11,7 @@ class QwenBackend(BaseBackend):
     _name = "qwen"
     _binary_name = "qwen"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "qwen-turbo",
         "balanced": "qwen-plus",
         "powerful": "qwen-max",
@@ -83,15 +85,3 @@ class QwenBackend(BaseBackend):
             model,
             *self.permission_args(request),
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Qwen Code environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

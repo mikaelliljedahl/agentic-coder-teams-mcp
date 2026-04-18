@@ -1,6 +1,7 @@
 """Capability token storage and resolution helpers."""
 
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -8,8 +9,9 @@ import tempfile
 from pathlib import Path
 from typing import Literal, TypedDict
 
-from claude_teams.async_utils import run_blocking
 from claude_teams import teams
+from claude_teams.async_utils import run_blocking
+from claude_teams.errors import CapabilityStoreNotFoundError
 from claude_teams.filelock import file_lock
 
 
@@ -46,7 +48,7 @@ def _hash_token(token: str) -> str:
 def _read_capabilities(team_name: str, base_dir: Path | None = None) -> CapabilityStore:
     path = _capabilities_path(team_name, base_dir)
     if not path.exists():
-        raise FileNotFoundError(f"Capability store not found for team {team_name!r}")
+        raise CapabilityStoreNotFoundError(team_name)
     return json.loads(path.read_text())
 
 
@@ -58,19 +60,20 @@ def _write_capabilities(
     lock_path = path.parent / ".capabilities.lock"
 
     with file_lock(lock_path):
-        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        tmp_path = Path(tmp_name)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
                 temp_file.write(json.dumps(data, indent=2))
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
             fd = -1
-            os.replace(tmp_path, path)
+            tmp_path.replace(path)
         except BaseException:
             if fd >= 0:
                 os.close(fd)
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            if tmp_path.exists():
+                tmp_path.unlink()
             raise
 
 
@@ -204,11 +207,11 @@ def _resolve_principal(
         return None
 
     lead = data.get("lead", {})
-    if token_hash == lead.get("hash"):
+    if hmac.compare_digest(token_hash, lead.get("hash") or ""):
         return {"role": "lead", "name": "team-lead"}
 
     for agent_name, stored_hash in data.get("agents", {}).items():
-        if token_hash == stored_hash:
+        if hmac.compare_digest(token_hash, stored_hash or ""):
             return {"role": "agent", "name": agent_name}
 
     return None

@@ -212,7 +212,12 @@ class TestCapabilities:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "Invalid team name" in _text(result)
+        text = _text(result)
+        # ``strict_input_validation=True`` routes inputs through jsonschema, which
+        # surfaces the offending value and failing pattern. The test pins the
+        # schema-level guarantee: path-traversal inputs never reach the tool body.
+        assert "'../bad-team'" in text
+        assert "^[A-Za-z0-9_-]+$" in text
 
 
 class TestListBackends:

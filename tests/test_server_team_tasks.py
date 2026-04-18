@@ -1,6 +1,7 @@
 """Task and team-lifecycle server tests."""
 
 import time
+from pathlib import Path
 
 from fastmcp import Client
 
@@ -25,14 +26,16 @@ class TestWiring:
         assert result["items"][0]["subject"] == "first"
         assert result["items"][1]["subject"] == "second"
 
-    async def test_should_round_trip_send_message_and_read_inbox(self, client: Client):
+    async def test_should_round_trip_send_message_and_read_inbox(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "t5"})
-        await teams.add_member("t5", _make_teammate("bob", "t5"))
+        await teams.add_member("t5", _make_teammate("bob", "t5", tmp_path))
         await client.call_tool(
             "send_message",
             {
                 "team_name": "t5",
-                "type": "message",
+                "message_type": "message",
                 "recipient": "bob",
                 "content": "hello bob",
                 "summary": "greeting",
@@ -48,15 +51,15 @@ class TestWiring:
         assert inbox[0]["from"] == "team-lead"
 
     async def test_should_round_trip_teammate_message_to_team_lead(
-        self, client: Client
+        self, client: Client, tmp_path: Path
     ):
         await client.call_tool("team_create", {"team_name": "t5b"})
-        await teams.add_member("t5b", _make_teammate("worker", "t5b"))
+        await teams.add_member("t5b", _make_teammate("worker", "t5b", tmp_path))
         await client.call_tool(
             "send_message",
             {
                 "team_name": "t5b",
-                "type": "message",
+                "message_type": "message",
                 "sender": "worker",
                 "recipient": "team-lead",
                 "content": "done",
@@ -72,15 +75,17 @@ class TestWiring:
         assert inbox[0]["text"] == "done"
         assert inbox[0]["from"] == "worker"
 
-    async def test_should_round_trip_teammate_message_to_teammate(self, client: Client):
+    async def test_should_round_trip_teammate_message_to_teammate(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "t5c"})
-        await teams.add_member("t5c", _make_teammate("alice", "t5c"))
-        await teams.add_member("t5c", _make_teammate("bob", "t5c"))
+        await teams.add_member("t5c", _make_teammate("alice", "t5c", tmp_path))
+        await teams.add_member("t5c", _make_teammate("bob", "t5c", tmp_path))
         await client.call_tool(
             "send_message",
             {
                 "team_name": "t5c",
-                "type": "message",
+                "message_type": "message",
                 "sender": "alice",
                 "recipient": "bob",
                 "content": "pair with me",
@@ -118,15 +123,17 @@ class TestWiring:
         assert result["nextOffset"] == 2
         assert [item["subject"] for item in result["items"]] == ["one", "two"]
 
-    async def test_read_inbox_returns_pagination_metadata(self, client: Client):
+    async def test_read_inbox_returns_pagination_metadata(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "t5e"})
-        await teams.add_member("t5e", _make_teammate("bob", "t5e"))
+        await teams.add_member("t5e", _make_teammate("bob", "t5e", tmp_path))
         for text in ("msg-1", "msg-2", "msg-3"):
             await client.call_tool(
                 "send_message",
                 {
                     "team_name": "t5e",
-                    "type": "message",
+                    "message_type": "message",
                     "recipient": "bob",
                     "content": text,
                     "summary": text,
@@ -153,15 +160,17 @@ class TestWiring:
         assert result["nextOffset"] == 2
         assert [item["text"] for item in result["items"]] == ["msg-1", "msg-2"]
 
-    async def test_read_inbox_supports_newest_order(self, client: Client):
+    async def test_read_inbox_supports_newest_order(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "t5f"})
-        await teams.add_member("t5f", _make_teammate("bob", "t5f"))
+        await teams.add_member("t5f", _make_teammate("bob", "t5f", tmp_path))
         for text in ("msg-1", "msg-2", "msg-3"):
             await client.call_tool(
                 "send_message",
                 {
                     "team_name": "t5f",
-                    "type": "message",
+                    "message_type": "message",
                     "recipient": "bob",
                     "content": text,
                     "summary": text,
@@ -196,7 +205,12 @@ class TestWiring:
         )
 
         assert result.is_error is True
-        assert "Invalid agent name" in _text(result)
+        text = _text(result)
+        # AgentName uses the same ``^[A-Za-z0-9_-]+$`` pattern as the storage
+        # layer, so jsonschema rejects a path traversal attempt before reaching
+        # any filesystem call.
+        assert "'../other-team/inboxes/bob'" in text
+        assert "^[A-Za-z0-9_-]+$" in text
 
 
 class TestTeamDeleteClearsSession:
@@ -238,7 +252,11 @@ class TestErrorWrapping:
         await client.call_tool("team_create", {"team_name": "tew2"})
         result = await client.call_tool(
             "task_update",
-            {"team_name": "tew2", "task_id": "999", "status": "completed"},
+            {
+                "team_name": "tew2",
+                "task_id": "999",
+                "fields": {"status": "completed"},
+            },
             raise_on_error=False,
         )
         assert result.is_error is True
@@ -265,11 +283,19 @@ class TestErrorWrapping:
         )
         await client.call_tool(
             "task_update",
-            {"team_name": "tew3", "task_id": created["id"], "status": "in_progress"},
+            {
+                "team_name": "tew3",
+                "task_id": created["id"],
+                "fields": {"status": "in_progress"},
+            },
         )
         result = await client.call_tool(
             "task_update",
-            {"team_name": "tew3", "task_id": created["id"], "status": "pending"},
+            {
+                "team_name": "tew3",
+                "task_id": created["id"],
+                "fields": {"status": "pending"},
+            },
             raise_on_error=False,
         )
         assert result.is_error is True
@@ -289,13 +315,18 @@ class TestErrorWrapping:
             {
                 "team_name": "tew4",
                 "task_id": created["id"],
-                "owner": "../other-team/inboxes/bob",
+                "fields": {"owner": "../other-team/inboxes/bob"},
             },
             raise_on_error=False,
         )
 
         assert result.is_error is True
-        assert "Invalid owner" in _text(result)
+        text = _text(result)
+        # ``owner`` lives inside ``TaskUpdateFields`` so wire-level jsonschema
+        # pattern checks no longer fire; validation happens in the tasks layer
+        # via ``validate_safe_name`` which surfaces as a ToolError.
+        assert "'../other-team/inboxes/bob'" in text
+        assert "Invalid owner" in text
 
     async def test_task_list_wraps_nonexistent_team(self, client: Client):
         # Create a team to unlock team-tier tools, then target a different team
@@ -327,7 +358,7 @@ class TestPollInbox:
             "send_message",
             {
                 "team_name": "test-team",
-                "type": "message",
+                "message_type": "message",
                 "recipient": "worker",
                 "content": "wake up",
                 "summary": "nudge",
@@ -349,7 +380,7 @@ class TestPollInbox:
             "send_message",
             {
                 "team_name": "test-team",
-                "type": "message",
+                "message_type": "message",
                 "recipient": "worker",
                 "content": "instant",
                 "summary": "fast",
@@ -374,4 +405,8 @@ class TestPollInbox:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "Invalid agent name" in _text(result)
+        text = _text(result)
+        # jsonschema pattern validation short-circuits poll_inbox before it
+        # touches the inbox filesystem.
+        assert "'../other-team/inboxes/bob'" in text
+        assert "^[A-Za-z0-9_-]+$" in text

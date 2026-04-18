@@ -6,10 +6,21 @@ from pathlib import Path
 from typing import Literal
 
 from claude_teams.async_utils import run_blocking
+from claude_teams.errors import (
+    BlockedTaskStatusError,
+    CyclicTaskBlockedByError,
+    CyclicTaskBlockError,
+    InvalidTaskStatusError,
+    TaskReferenceNotFoundError,
+    TaskSelfBlockedByError,
+    TaskSelfBlockError,
+    TaskStatusRegressionError,
+    TaskSubjectEmptyError,
+    TeamNotFoundValueError,
+)
 from claude_teams.filelock import file_lock
-from claude_teams.models import TaskFile, TaskMetadata
+from claude_teams.models import TaskFile, TaskMetadata, TaskUpdateFields
 from claude_teams.teams import _team_exists, validate_safe_name
-
 
 _TaskStatus = Literal["pending", "in_progress", "completed", "deleted"]
 
@@ -78,9 +89,9 @@ def _create_task(
 ) -> TaskFile:
     safe_team_name = validate_safe_name(team_name, "team name")
     if not subject or not subject.strip():
-        raise ValueError("Task subject must not be empty")
+        raise TaskSubjectEmptyError()
     if not _team_exists(safe_team_name, base_dir):
-        raise ValueError(f"Team {safe_team_name!r} does not exist")
+        raise TeamNotFoundValueError(safe_team_name)
     team_dir = _tasks_dir(base_dir) / safe_team_name
     team_dir.mkdir(parents=True, exist_ok=True)
     lock_path = team_dir / ".lock"
@@ -136,6 +147,8 @@ async def create_task(
 
 def _get_task(team_name: str, task_id: str, base_dir: Path | None = None) -> TaskFile:
     safe_team_name = validate_safe_name(team_name, "team name")
+    if not _team_exists(safe_team_name, base_dir):
+        raise TeamNotFoundValueError(safe_team_name)
     team_dir = _tasks_dir(base_dir) / safe_team_name
     fpath = team_dir / f"{task_id}.json"
     raw = json.loads(fpath.read_text())
@@ -214,153 +227,194 @@ def _remove_task_references(
             pending_writes[task_file] = other
 
 
+def _validate_dependency_additions(
+    team_dir: Path,
+    task_id: str,
+    add_blocks: list[str] | None,
+    add_blocked_by: list[str] | None,
+    pending_edges: dict[str, set[str]],
+) -> None:
+    """Validate requested dependency additions and stage pending edges."""
+    if add_blocks:
+        for blocked_id in add_blocks:
+            if blocked_id == task_id:
+                raise TaskSelfBlockError(task_id)
+            if not (team_dir / f"{blocked_id}.json").exists():
+                raise TaskReferenceNotFoundError(blocked_id)
+        for blocked_id in add_blocks:
+            pending_edges.setdefault(blocked_id, set()).add(task_id)
+
+    if add_blocked_by:
+        for blocked_id in add_blocked_by:
+            if blocked_id == task_id:
+                raise TaskSelfBlockedByError(task_id)
+            if not (team_dir / f"{blocked_id}.json").exists():
+                raise TaskReferenceNotFoundError(blocked_id)
+        for blocked_id in add_blocked_by:
+            pending_edges.setdefault(task_id, set()).add(blocked_id)
+
+    if add_blocks:
+        for blocked_id in add_blocks:
+            if _would_create_cycle(team_dir, blocked_id, task_id, pending_edges):
+                raise CyclicTaskBlockError(task_id, blocked_id)
+
+    if add_blocked_by:
+        for blocked_id in add_blocked_by:
+            if _would_create_cycle(team_dir, task_id, blocked_id, pending_edges):
+                raise CyclicTaskBlockedByError(task_id, blocked_id)
+
+
+def _validate_status_transition(
+    task: TaskFile,
+    new_status: _TaskStatus | None,
+    team_dir: Path,
+    extra_blocked_by: list[str] | None,
+) -> None:
+    """Validate a requested status transition against order and blockers."""
+    if new_status is None or new_status == "deleted":
+        return
+    cur_order = _STATUS_ORDER[task.status]
+    new_order = _STATUS_ORDER.get(new_status)
+    if new_order is None:
+        raise InvalidTaskStatusError(new_status)
+    if new_order < cur_order:
+        raise TaskStatusRegressionError(task.status, new_status)
+    if new_status not in ("in_progress", "completed"):
+        return
+    effective_blocked_by = set(task.blocked_by)
+    if extra_blocked_by:
+        effective_blocked_by.update(extra_blocked_by)
+    for blocker_id in effective_blocked_by:
+        blocker_path = team_dir / f"{blocker_id}.json"
+        if not blocker_path.exists():
+            continue
+        blocker = TaskFile(**json.loads(blocker_path.read_text()))
+        if blocker.status != "completed":
+            raise BlockedTaskStatusError(new_status, blocker_id, blocker.status)
+
+
+def _apply_simple_fields(task: TaskFile, fields: TaskUpdateFields) -> None:
+    """Apply subject/description/active_form/owner updates in place."""
+    if fields.subject is not None:
+        task.subject = fields.subject
+    if fields.description is not None:
+        task.description = fields.description
+    if fields.active_form is not None:
+        task.active_form = fields.active_form
+    if fields.owner is not None:
+        validate_safe_name(fields.owner, "owner")
+        task.owner = fields.owner
+
+
+def _apply_dependency_links(
+    task: TaskFile,
+    task_id: str,
+    fields: TaskUpdateFields,
+    team_dir: Path,
+    pending_writes: dict[Path, TaskFile],
+) -> None:
+    """Apply add_blocks / add_blocked_by edges to task and target records."""
+    if fields.add_blocks:
+        _link_dependency(
+            task,
+            task_id,
+            fields.add_blocks,
+            "blocks",
+            "blocked_by",
+            team_dir,
+            pending_writes,
+        )
+    if fields.add_blocked_by:
+        _link_dependency(
+            task,
+            task_id,
+            fields.add_blocked_by,
+            "blocked_by",
+            "blocks",
+            team_dir,
+            pending_writes,
+        )
+
+
+def _apply_metadata(task: TaskFile, metadata: TaskMetadata | None) -> None:
+    """Merge a metadata payload into the task (None values remove keys)."""
+    if metadata is None:
+        return
+    current = task.metadata or {}
+    for key, value in metadata.items():
+        if value is None:
+            current.pop(key, None)
+        else:
+            current[key] = value
+    task.metadata = current if current else None
+
+
+def _apply_status_mutation(
+    task: TaskFile,
+    new_status: _TaskStatus | None,
+    task_id: str,
+    team_dir: Path,
+    pending_writes: dict[Path, TaskFile],
+) -> None:
+    """Apply a status change and its referential side effects in place."""
+    if new_status is None:
+        return
+    if new_status == "deleted":
+        task.status = "deleted"
+        _remove_task_references(
+            task_id, team_dir, pending_writes, ("blocked_by", "blocks")
+        )
+        return
+    task.status = new_status
+    if new_status == "completed":
+        _remove_task_references(task_id, team_dir, pending_writes, ("blocked_by",))
+
+
+def _persist_task_file(
+    fpath: Path,
+    task: TaskFile,
+    new_status: _TaskStatus | None,
+    pending_writes: dict[Path, TaskFile],
+) -> None:
+    """Flush pending edge writes then persist or delete the primary task file."""
+    if new_status == "deleted":
+        _flush_pending_writes(pending_writes)
+        fpath.unlink()
+        return
+    fpath.write_text(json.dumps(task.model_dump(by_alias=True, exclude_none=True)))
+    _flush_pending_writes(pending_writes)
+
+
 def _update_task(
     team_name: str,
     task_id: str,
+    fields: TaskUpdateFields,
     *,
-    status: _TaskStatus | None = None,
-    owner: str | None = None,
-    subject: str | None = None,
-    description: str | None = None,
-    active_form: str | None = None,
-    add_blocks: list[str] | None = None,
-    add_blocked_by: list[str] | None = None,
-    metadata: TaskMetadata | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
     safe_team_name = validate_safe_name(team_name, "team name")
+    if not _team_exists(safe_team_name, base_dir):
+        raise TeamNotFoundValueError(safe_team_name)
     team_dir = _tasks_dir(base_dir) / safe_team_name
     lock_path = team_dir / ".lock"
     fpath = team_dir / f"{task_id}.json"
 
     with file_lock(lock_path):
-        # --- Phase 1: Read ---
         task = TaskFile(**json.loads(fpath.read_text()))
-
-        # --- Phase 2: Validate (no disk writes) ---
         pending_edges: dict[str, set[str]] = {}
-
-        if add_blocks:
-            for blocked_id in add_blocks:
-                if blocked_id == task_id:
-                    raise ValueError(f"Task {task_id} cannot block itself")
-                if not (team_dir / f"{blocked_id}.json").exists():
-                    raise ValueError(f"Referenced task {blocked_id!r} does not exist")
-            for blocked_id in add_blocks:
-                pending_edges.setdefault(blocked_id, set()).add(task_id)
-
-        if add_blocked_by:
-            for blocked_id in add_blocked_by:
-                if blocked_id == task_id:
-                    raise ValueError(f"Task {task_id} cannot be blocked by itself")
-                if not (team_dir / f"{blocked_id}.json").exists():
-                    raise ValueError(f"Referenced task {blocked_id!r} does not exist")
-            for blocked_id in add_blocked_by:
-                pending_edges.setdefault(task_id, set()).add(blocked_id)
-
-        if add_blocks:
-            for blocked_id in add_blocks:
-                if _would_create_cycle(team_dir, blocked_id, task_id, pending_edges):
-                    raise ValueError(
-                        f"Adding block {task_id} -> {blocked_id} would create a circular dependency"
-                    )
-
-        if add_blocked_by:
-            for blocked_id in add_blocked_by:
-                if _would_create_cycle(team_dir, task_id, blocked_id, pending_edges):
-                    raise ValueError(
-                        f"Adding dependency {task_id} blocked_by {blocked_id} would create a circular dependency"
-                    )
-
-        if status is not None and status != "deleted":
-            cur_order = _STATUS_ORDER[task.status]
-            new_order = _STATUS_ORDER.get(status)
-            if new_order is None:
-                raise ValueError(f"Invalid status: {status!r}")
-            if new_order < cur_order:
-                raise ValueError(
-                    f"Cannot transition from {task.status!r} to {status!r}"
-                )
-            effective_blocked_by = set(task.blocked_by)
-            if add_blocked_by:
-                effective_blocked_by.update(add_blocked_by)
-            if status in ("in_progress", "completed") and effective_blocked_by:
-                for blocker_id in effective_blocked_by:
-                    blocker_path = team_dir / f"{blocker_id}.json"
-                    if blocker_path.exists():
-                        blocker = TaskFile(**json.loads(blocker_path.read_text()))
-                        if blocker.status != "completed":
-                            raise ValueError(
-                                f"Cannot set status to {status!r}: "
-                                f"blocked by task {blocker_id} (status: {blocker.status!r})"
-                            )
-
-        # --- Phase 3: Mutate (in-memory only) ---
         pending_writes: dict[Path, TaskFile] = {}
 
-        if subject is not None:
-            task.subject = subject
-        if description is not None:
-            task.description = description
-        if active_form is not None:
-            task.active_form = active_form
-        if owner is not None:
-            validate_safe_name(owner, "owner")
-            task.owner = owner
-
-        if add_blocks:
-            _link_dependency(
-                task,
-                task_id,
-                add_blocks,
-                "blocks",
-                "blocked_by",
-                team_dir,
-                pending_writes,
-            )
-
-        if add_blocked_by:
-            _link_dependency(
-                task,
-                task_id,
-                add_blocked_by,
-                "blocked_by",
-                "blocks",
-                team_dir,
-                pending_writes,
-            )
-
-        if metadata is not None:
-            current = task.metadata or {}
-            for key, value in metadata.items():
-                if value is None:
-                    current.pop(key, None)
-                else:
-                    current[key] = value
-            task.metadata = current if current else None
-
-        if status is not None and status != "deleted":
-            task.status = status
-            if status == "completed":
-                _remove_task_references(
-                    task_id, team_dir, pending_writes, ("blocked_by",)
-                )
-
-        if status == "deleted":
-            task.status = "deleted"
-            _remove_task_references(
-                task_id, team_dir, pending_writes, ("blocked_by", "blocks")
-            )
-
-        # --- Phase 4: Write ---
-        if status == "deleted":
-            _flush_pending_writes(pending_writes)
-            fpath.unlink()
-        else:
-            fpath.write_text(
-                json.dumps(task.model_dump(by_alias=True, exclude_none=True))
-            )
-            _flush_pending_writes(pending_writes)
+        _validate_dependency_additions(
+            team_dir, task_id, fields.add_blocks, fields.add_blocked_by, pending_edges
+        )
+        _validate_status_transition(
+            task, fields.status, team_dir, fields.add_blocked_by
+        )
+        _apply_simple_fields(task, fields)
+        _apply_dependency_links(task, task_id, fields, team_dir, pending_writes)
+        _apply_metadata(task, fields.metadata)
+        _apply_status_mutation(task, fields.status, task_id, team_dir, pending_writes)
+        _persist_task_file(fpath, task, fields.status, pending_writes)
 
     return task
 
@@ -368,15 +422,8 @@ def _update_task(
 async def update_task(
     team_name: str,
     task_id: str,
+    fields: TaskUpdateFields,
     *,
-    status: _TaskStatus | None = None,
-    owner: str | None = None,
-    subject: str | None = None,
-    description: str | None = None,
-    active_form: str | None = None,
-    add_blocks: list[str] | None = None,
-    add_blocked_by: list[str] | None = None,
-    metadata: TaskMetadata | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
     """Update a task in a worker thread.
@@ -384,14 +431,7 @@ async def update_task(
     Args:
         team_name (str): Team name.
         task_id (str): Task identifier.
-        status (_TaskStatus | None): Optional new status.
-        owner (str | None): Optional new owner.
-        subject (str | None): Optional new subject.
-        description (str | None): Optional new description.
-        active_form (str | None): Optional new active-form text.
-        add_blocks (list[str] | None): Task IDs this task blocks.
-        add_blocked_by (list[str] | None): Task IDs blocking this task.
-        metadata (dict | None): Metadata merge payload.
+        fields (TaskUpdateFields): Field updates to apply.
         base_dir (Path | None): Override for the base config directory.
 
     Returns:
@@ -399,24 +439,13 @@ async def update_task(
 
     """
     return await run_blocking(
-        _update_task,
-        team_name,
-        task_id,
-        status=status,
-        owner=owner,
-        subject=subject,
-        description=description,
-        active_form=active_form,
-        add_blocks=add_blocks,
-        add_blocked_by=add_blocked_by,
-        metadata=metadata,
-        base_dir=base_dir,
+        _update_task, team_name, task_id, fields, base_dir=base_dir
     )
 
 
 def _list_tasks(team_name: str, base_dir: Path | None = None) -> list[TaskFile]:
     if not _team_exists(team_name, base_dir):
-        raise ValueError(f"Team {team_name!r} does not exist")
+        raise TeamNotFoundValueError(team_name)
     team_dir = _tasks_dir(base_dir) / team_name
     tasks: list[TaskFile] = []
     for task_file in team_dir.glob("*.json"):

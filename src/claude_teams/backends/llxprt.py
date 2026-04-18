@@ -1,5 +1,7 @@
 """LLxprt backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -9,7 +11,7 @@ class LlxprtBackend(BaseBackend):
     _name = "llxprt"
     _binary_name = "llxprt"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "claude-haiku-4.5",
         "balanced": "claude-sonnet-4.5",
         "powerful": "claude-opus-4.6",
@@ -80,15 +82,3 @@ class LlxprtBackend(BaseBackend):
             model,
             *self.permission_args(request),
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return LLxprt environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

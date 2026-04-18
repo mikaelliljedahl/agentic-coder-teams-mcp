@@ -9,18 +9,36 @@ description = "Multi-backend MCP server for orchestrating teams of agentic codin
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
-    "fastmcp>=3.2.0,<4",
+    "fastmcp>=3.2.4,<4",
     "typer>=0.24.1,<1",
-    "rich>=14.3.3,<15",
+    "rich>=15.0.0,<16",
     "claude-code-tools>=1.11.1,<2",
-    "cryptography>=46.0.6,<47",
+    "cryptography>=46.0.7,<47",
+]
+
+[project.optional-dependencies]
+# Install with ``pip install claude-teams[otel]`` to enable OpenTelemetry
+# trace export. FastMCP auto-emits tool/resource/prompt spans whenever a
+# global tracer provider is registered; this extra supplies the SDK bits
+# needed to register one that ships spans over OTLP/HTTP.
+otel = [
+    "opentelemetry-api>=1.41,<2",
+    "opentelemetry-sdk>=1.41,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.41,<2",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0.2,<10",
+    "pytest>=9.0.3,<10",
     "pytest-asyncio>=1.3.0,<2",
-    "pytest-cov>=7.0.0,<8",
+    "pytest-cov>=7.1.0,<8",
+    # OTel SDK parts needed to exercise ``telemetry.configure_tracing`` in
+    # tests. End users only install these via the ``[otel]`` extra, but the
+    # dev group always pulls them so we can cover the happy path without
+    # shelling out to ``uv sync --extra otel``.
+    "opentelemetry-api>=1.41,<2",
+    "opentelemetry-sdk>=1.41,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.41,<2",
 ]
 
 [project.scripts]
@@ -32,3 +50,74 @@ packages = ["src/claude_teams"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Full ruleset — ruff subsumes flake8, isort, bandit, pydocstyle, pyupgrade,
+# and pieces of pylint, so one tool/one config replaces the legacy stack.
+select = [
+    "E", "F", "W",   # pycodestyle + pyflakes
+    "I",             # isort (import ordering)
+    "UP",            # pyupgrade (modernize syntax for py312)
+    "B",             # flake8-bugbear (likely bugs)
+    "SIM",           # flake8-simplify
+    "RUF",           # ruff-specific rules
+    "S",             # flake8-bandit (security)
+    "ASYNC",         # flake8-async
+    "PTH",           # flake8-use-pathlib (prefer pathlib over os.path)
+    "PT",            # flake8-pytest-style
+    "TRY",           # tryceratops (exception handling)
+    "N",             # pep8-naming
+    "T20",           # flake8-print (no stray prints)
+    "D",             # pydocstyle
+    "PL",            # pylint subset
+    "C4",            # flake8-comprehensions
+    "RET",           # flake8-return
+    "ARG",           # flake8-unused-arguments
+    "DTZ",           # flake8-datetimez (timezone-aware datetimes)
+    "A",             # flake8-builtins (don't shadow builtins)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.lint.pylint]
+# Calibrated thresholds — not suppression. These reflect the shape of the
+# real code: backend dataclasses/APIs legitimately take many params, the
+# backend dispatch registry has wide branching, and bootstrap/teardown
+# flows run long. Anything egregiously over these still fires.
+max-args = 10
+max-branches = 20
+max-statements = 80
+
+[tool.ruff.lint.per-file-ignores]
+# Tests have their own idioms that aren't bugs: asserts ARE the test API,
+# docstrings per-test are noise, and ``@patch`` decorators inject mocks as
+# args. Production code gets no such leniency.
+"tests/**" = [
+    "D",        # docstrings not required in tests
+    "S101",     # assert is the pytest API
+    "ARG",      # unused fixture args are common
+    "PLR2004",  # magic values read fine in tests
+    "PT019",    # @patch decorators inject mocks as args by design
+    "SIM117",   # nested ``with`` blocks read clearer in setup
+    "PLC0415",  # inline imports for patching are normal
+]
+
+[tool.coverage.run]
+source = ["src/claude_teams"]
+
+[tool.coverage.report]
+# Hard floor the CI guards. Target is 95% — contributors should aim high —
+# but 90% is the minimum that blocks a release. See README "Pull requests"
+# for the target and measurement command.
+fail_under = 90
+show_missing = true
+skip_covered = false
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

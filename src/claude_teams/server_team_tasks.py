@@ -6,7 +6,28 @@ from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
 from claude_teams import messaging, tasks
-from claude_teams.models import PaginatedInboxMessages, PaginatedTaskList, TaskMetadata
+from claude_teams.errors import (
+    BlockedTaskStatusError,
+    CyclicTaskBlockedByError,
+    CyclicTaskBlockError,
+    InboxAccessDeniedError,
+    InvalidNameError,
+    InvalidTaskStatusError,
+    NameTooLongError,
+    TaskNotFoundToolError,
+    TaskReferenceNotFoundError,
+    TaskSelfBlockedByError,
+    TaskSelfBlockError,
+    TaskStatusRegressionError,
+    TaskSubjectEmptyError,
+    TeamNotFoundValueError,
+)
+from claude_teams.models import (
+    PaginatedInboxMessages,
+    PaginatedTaskList,
+    TaskMetadata,
+    TaskUpdateFields,
+)
 from claude_teams.server_runtime import (
     _ANN_CREATE,
     _ANN_MUTATE,
@@ -18,29 +39,39 @@ from claude_teams.server_runtime import (
     _page_items,
     _require_authenticated_principal,
     _resolve_authenticated_principal,
-    _validate_agent_name,
+)
+from claude_teams.server_schema import (
+    ActiveForm,
+    AgentName,
+    Capability,
+    Description,
+    Limit,
+    Offset,
+    Subject,
+    TaskId,
+    TeamName,
 )
 
 
 async def task_create(
-    team_name: str,
-    subject: str,
-    description: str,
+    team_name: TeamName,
+    subject: Subject,
+    description: Description,
     ctx: Context,
-    active_form: str = "",
+    active_form: ActiveForm = "",
     metadata: TaskMetadata | None = None,
-    capability: str = "",
+    capability: Capability = "",
 ) -> dict[str, object]:
     """Create a new task for the team.
 
     Args:
-        team_name (str): Team name.
-        subject (str): Task subject.
-        description (str): Task description.
-        ctx (Context): FastMCP request context.
-        active_form (str): Optional active-form text.
-        metadata (dict | None): Optional metadata payload.
-        capability (str): Optional capability override.
+        team_name: Team name.
+        subject: Task subject.
+        description: Task description.
+        ctx: FastMCP request context.
+        active_form: Optional active-form text.
+        metadata: Optional metadata payload.
+        capability: Optional capability override.
 
     Returns:
         dict: Task payload.
@@ -51,66 +82,62 @@ async def task_create(
         task = await tasks.create_task(
             team_name, subject, description, active_form, metadata
         )
-    except ValueError as e:
-        raise ToolError(str(e))
+    except (
+        InvalidNameError,
+        NameTooLongError,
+        TaskSubjectEmptyError,
+        TeamNotFoundValueError,
+    ) as e:
+        raise ToolError(str(e)) from e
     return task.model_dump(by_alias=True, exclude_none=True)
 
 
 async def task_update(
-    team_name: str,
-    task_id: str,
+    team_name: TeamName,
+    task_id: TaskId,
     ctx: Context,
-    status: Literal["pending", "in_progress", "completed", "deleted"] | None = None,
-    owner: str | None = None,
-    subject: str | None = None,
-    description: str | None = None,
-    active_form: str | None = None,
-    add_blocks: list[str] | None = None,
-    add_blocked_by: list[str] | None = None,
-    metadata: TaskMetadata | None = None,
-    capability: str = "",
+    fields: TaskUpdateFields | None = None,
+    capability: Capability = "",
 ) -> dict[str, object]:
     """Update a task and optionally notify a new assignee.
 
     Args:
-        team_name (str): Team name.
-        task_id (str): Task identifier.
-        ctx (Context): FastMCP request context.
-        status (Literal[...] | None): Optional new status.
-        owner (str | None): Optional new owner.
-        subject (str | None): Optional new subject.
-        description (str | None): Optional new description.
-        active_form (str | None): Optional new active-form text.
-        add_blocks (list[str] | None): Tasks this task blocks.
-        add_blocked_by (list[str] | None): Tasks blocking this task.
-        metadata (dict | None): Metadata merge payload.
-        capability (str): Optional capability override.
+        team_name: Team name.
+        task_id: Task identifier.
+        ctx: FastMCP request context.
+        fields: Optional per-field update payload (status/owner/subject/etc.).
+        capability: Optional capability override.
 
     Returns:
         dict: Updated task payload.
 
     """
     await _require_authenticated_principal(ctx, team_name, capability)
-    if owner is not None:
-        _validate_agent_name(owner, "owner")
+    update_fields = fields or TaskUpdateFields()
     try:
-        task = await tasks.update_task(
-            team_name,
-            task_id,
-            status=status,
-            owner=owner,
-            subject=subject,
-            description=description,
-            active_form=active_form,
-            add_blocks=add_blocks,
-            add_blocked_by=add_blocked_by,
-            metadata=metadata,
-        )
+        task = await tasks.update_task(team_name, task_id, update_fields)
+    except TeamNotFoundValueError as e:
+        raise ToolError(str(e)) from e
     except FileNotFoundError:
-        raise ToolError(f"Task {task_id!r} not found in team {team_name!r}")
-    except ValueError as e:
-        raise ToolError(str(e))
-    if owner is not None and task.owner is not None and task.status != "deleted":
+        raise TaskNotFoundToolError(task_id, team_name) from None
+    except (
+        BlockedTaskStatusError,
+        CyclicTaskBlockedByError,
+        CyclicTaskBlockError,
+        InvalidNameError,
+        InvalidTaskStatusError,
+        NameTooLongError,
+        TaskReferenceNotFoundError,
+        TaskSelfBlockedByError,
+        TaskSelfBlockError,
+        TaskStatusRegressionError,
+    ) as e:
+        raise ToolError(str(e)) from e
+    if (
+        update_fields.owner is not None
+        and task.owner is not None
+        and task.status != "deleted"
+    ):
         principal = await _resolve_authenticated_principal(ctx, team_name, capability)
         assigned_by = principal["name"] if principal is not None else "team-lead"
         await messaging.send_task_assignment(team_name, task, assigned_by=assigned_by)
@@ -118,20 +145,20 @@ async def task_update(
 
 
 async def task_list(
-    team_name: str,
+    team_name: TeamName,
     ctx: Context,
-    capability: str = "",
-    limit: int = _DEFAULT_PAGE_SIZE,
-    offset: int = 0,
+    capability: Capability = "",
+    limit: Limit = _DEFAULT_PAGE_SIZE,
+    offset: Offset = 0,
 ) -> dict[str, object]:
     """List team tasks in canonical task-id order with pagination metadata.
 
     Args:
-        team_name (str): Team name.
-        ctx (Context): FastMCP request context.
-        capability (str): Optional capability override.
-        limit (int): Page size.
-        offset (int): Page offset.
+        team_name: Team name.
+        ctx: FastMCP request context.
+        capability: Optional capability override.
+        limit: Page size.
+        offset: Page offset.
 
     Returns:
         dict: Paginated task envelope.
@@ -141,8 +168,8 @@ async def task_list(
     limit, offset = _normalize_pagination(limit, offset)
     try:
         result = await tasks.list_tasks(team_name)
-    except ValueError as e:
-        raise ToolError(str(e))
+    except (InvalidNameError, NameTooLongError, TeamNotFoundValueError) as e:
+        raise ToolError(str(e)) from e
     paged = _page_items(
         [task.model_dump(by_alias=True, exclude_none=True) for task in result],
         limit,
@@ -154,15 +181,15 @@ async def task_list(
 
 
 async def task_get(
-    team_name: str, task_id: str, ctx: Context, capability: str = ""
+    team_name: TeamName, task_id: TaskId, ctx: Context, capability: Capability = ""
 ) -> dict[str, object]:
     """Get full details of a specific task by ID.
 
     Args:
-        team_name (str): Team name.
-        task_id (str): Task identifier.
-        ctx (Context): FastMCP request context.
-        capability (str): Optional capability override.
+        team_name: Team name.
+        task_id: Task identifier.
+        ctx: FastMCP request context.
+        capability: Optional capability override.
 
     Returns:
         dict: Task payload.
@@ -171,34 +198,36 @@ async def task_get(
     await _require_authenticated_principal(ctx, team_name, capability)
     try:
         task = await tasks.get_task(team_name, task_id)
+    except TeamNotFoundValueError as e:
+        raise ToolError(str(e)) from e
     except FileNotFoundError:
-        raise ToolError(f"Task {task_id!r} not found in team {team_name!r}")
+        raise TaskNotFoundToolError(task_id, team_name) from None
     return task.model_dump(by_alias=True, exclude_none=True)
 
 
 async def read_inbox(
-    team_name: str,
-    agent_name: str,
+    team_name: TeamName,
+    agent_name: AgentName,
     ctx: Context,
     unread_only: bool = False,
     mark_as_read: bool = True,
-    limit: int = _DEFAULT_PAGE_SIZE,
-    offset: int = 0,
+    limit: Limit = _DEFAULT_PAGE_SIZE,
+    offset: Offset = 0,
     order: Literal["oldest", "newest"] = "oldest",
-    capability: str = "",
+    capability: Capability = "",
 ) -> dict[str, object]:
     """Read inbox messages with pagination metadata and explicit ordering.
 
     Args:
-        team_name (str): Team name.
-        agent_name (str): Inbox owner.
-        ctx (Context): FastMCP request context.
-        unread_only (bool): Whether to return only unread messages.
-        mark_as_read (bool): Whether returned messages should be marked read.
-        limit (int): Page size.
-        offset (int): Page offset.
-        order (Literal["oldest", "newest"]): Inbox ordering mode.
-        capability (str): Optional capability override.
+        team_name: Team name.
+        agent_name: Inbox owner.
+        ctx: FastMCP request context.
+        unread_only: Whether to return only unread messages.
+        mark_as_read: Whether returned messages should be marked read.
+        limit: Page size.
+        offset: Page offset.
+        order: Inbox ordering mode.
+        capability: Optional capability override.
 
     Returns:
         dict: Paginated inbox envelope.
@@ -206,10 +235,7 @@ async def read_inbox(
     """
     principal = await _require_authenticated_principal(ctx, team_name, capability)
     if principal["role"] != "lead" and principal["name"] != agent_name:
-        raise ToolError(
-            f"Authenticated principal {principal['name']!r} cannot read inbox {agent_name!r}."
-        )
-    _validate_agent_name(agent_name)
+        raise InboxAccessDeniedError("read", principal["name"], agent_name)
     limit, offset = _normalize_pagination(limit, offset)
     msgs, total_count = await messaging.read_inbox_page(
         team_name,

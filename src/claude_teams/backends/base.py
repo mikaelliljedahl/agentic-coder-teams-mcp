@@ -1,7 +1,6 @@
 """Compatibility exports for backend base types."""
 
 import claude_teams.backends.tmux_base as tmux_base_module
-
 from claude_teams.backends.contracts import (
     Backend,
     CaptureResult,

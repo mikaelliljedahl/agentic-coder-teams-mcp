@@ -1,13 +1,22 @@
 """Shared Pydantic models for team orchestration state."""
 
-from typing import Annotated, Literal, TypeAlias, cast
+from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
 from pydantic.alias_generators import to_camel
 
+from claude_teams.server_schema import (
+    BackendName,
+    Capability,
+    Cwd,
+    ModelName,
+    PermissionModeOpt,
+    SubagentType,
+)
+
 
 def _to_camel(name: str) -> str:
-    """Convert snake_case to camelCase, stripping trailing underscores for reserved words.
+    """Convert snake_case to camelCase, stripping trailing underscores.
 
     Args:
         name (str): Field name in snake_case (may have trailing underscore).
@@ -30,10 +39,10 @@ COLOR_PALETTE: list[str] = [
     "red",
 ]
 
-TaskMetadataValue: TypeAlias = str | int | float | bool | None
-TaskMetadata: TypeAlias = dict[str, TaskMetadataValue]
-MessageRoutingValue: TypeAlias = str | None
-MessageRouting: TypeAlias = dict[str, MessageRoutingValue]
+type TaskMetadataValue = str | int | float | bool | None
+type TaskMetadata = dict[str, TaskMetadataValue]
+type MessageRoutingValue = str | None
+type MessageRouting = dict[str, MessageRoutingValue]
 
 
 class LeadMember(BaseModel):
@@ -138,6 +147,75 @@ class TaskFile(BaseModel):
     blocked_by: list[str] = Field(default_factory=list)
     owner: str | None = None
     metadata: TaskMetadata | None = None
+
+
+class TaskUpdateFields(BaseModel):
+    """Optional per-field update payload for ``update_task`` / ``task_update``.
+
+    Each field is independently optional; set only the attributes you wish to
+    mutate. Fields left as ``None`` are ignored by the update pipeline.
+
+    Attributes:
+        status: New task status, or ``None`` to leave unchanged.
+        owner: New owner agent name, or ``None`` to leave unchanged.
+        subject: New subject, or ``None`` to leave unchanged.
+        description: New description, or ``None`` to leave unchanged.
+        active_form: New active-form text, or ``None`` to leave unchanged.
+        add_blocks: Task IDs this task should additionally block.
+        add_blocked_by: Task IDs that should additionally block this task.
+        metadata: Metadata merge payload (``None`` values inside remove keys).
+
+    """
+
+    status: Literal["pending", "in_progress", "completed", "deleted"] | None = None
+    owner: str | None = None
+    subject: str | None = None
+    description: str | None = None
+    active_form: str | None = None
+    add_blocks: list[str] | None = None
+    add_blocked_by: list[str] | None = None
+    metadata: TaskMetadata | None = None
+
+
+class SpawnOptions(BaseModel):
+    """Optional tuning knobs for ``spawn_teammate`` / ``spawn_teammate_tool``.
+
+    Collects the seven non-identity parameters (working directory, model,
+    backend, subagent type, plan-mode gate, permission override, capability
+    token) into a single payload so the tool signature stays narrow and
+    future additions don't widen the wire surface.
+
+    Every field has a sensible default, matching the prior flat-parameter
+    defaults. Callers may pass an empty object, omit the parameter entirely,
+    or send ``None`` to inherit all defaults. The validation constraints
+    (pattern, length, enum) carry over from the ``server_schema`` aliases,
+    so the generated JSON schema is equivalent to the old flat-param form.
+
+    Attributes:
+        cwd: Absolute working directory for the spawned backend; empty means
+            inherit the server's cwd.
+        model: Generic tier (``fast`` / ``balanced`` / ``powerful``) or a
+            backend-specific identifier.
+        backend: Explicit backend name; empty selects the default backend.
+        subagent_type: Claude Code subagent type recorded in the team config.
+        plan_mode_required: Whether the teammate must enter plan mode before
+            executing work.
+        permission_mode: ``default`` / ``require_approval`` / ``bypass`` or
+            ``None`` to inherit the backend default.
+        capability: Out-of-session capability token; leave empty when the MCP
+            session is already attached.
+
+    """
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    cwd: Cwd = ""
+    model: ModelName = "balanced"
+    backend: BackendName = ""
+    subagent_type: SubagentType = "general-purpose"
+    plan_mode_required: bool = False
+    permission_mode: PermissionModeOpt | None = None
+    capability: Capability = ""
 
 
 class InboxMessage(BaseModel):

@@ -19,7 +19,12 @@ from claude_teams.teams import (
 )
 
 
-def _make_teammate(name: str, team_name: str) -> TeammateMember:
+def _make_teammate(name: str, team_name: str, cwd: str | Path) -> TeammateMember:
+    """Construct a ``TeammateMember`` fixture with an explicit ``cwd``.
+
+    ``cwd`` is required so callers thread a pytest ``tmp_path``-rooted
+    directory through and each test stays filesystem-isolated.
+    """
     return TeammateMember(
         agent_id=f"{name}@{team_name}",
         name=name,
@@ -30,7 +35,7 @@ def _make_teammate(name: str, team_name: str) -> TeammateMember:
         plan_mode_required=False,
         joined_at=int(time.time() * 1000),
         tmux_pane_id="%1",
-        cwd="/tmp",
+        cwd=str(cwd),
     )
 
 
@@ -94,7 +99,7 @@ class TestCreateTeam:
         self, tmp_claude_dir: Path
     ) -> None:
         for bad_name in ["has space", "has.dot", "has/slash", "has\\back"]:
-            with pytest.raises(ValueError):
+            with pytest.raises(ValueError, match="Invalid team name"):
                 await create_team(bad_name, "sess-x", base_dir=tmp_claude_dir)
 
     async def test_should_reject_name_exceeding_max_length(
@@ -122,7 +127,7 @@ class TestDeleteTeam:
         self, tmp_claude_dir: Path
     ) -> None:
         await create_team("busy", "sess-1", base_dir=tmp_claude_dir)
-        mate = _make_teammate("worker", "busy")
+        mate = _make_teammate("worker", "busy", tmp_claude_dir)
         await add_member("busy", mate, base_dir=tmp_claude_dir)
 
         with pytest.raises(RuntimeError):
@@ -132,7 +137,7 @@ class TestDeleteTeam:
 class TestMembers:
     async def test_add_member_appends_to_config(self, tmp_claude_dir: Path) -> None:
         await create_team("squad", "sess-1", base_dir=tmp_claude_dir)
-        mate = _make_teammate("coder", "squad")
+        mate = _make_teammate("coder", "squad", tmp_claude_dir)
         await add_member("squad", mate, base_dir=tmp_claude_dir)
 
         cfg = await read_config("squad", base_dir=tmp_claude_dir)
@@ -143,7 +148,7 @@ class TestMembers:
         self, tmp_claude_dir: Path
     ) -> None:
         await create_team("squad2", "sess-1", base_dir=tmp_claude_dir)
-        mate = _make_teammate("temp", "squad2")
+        mate = _make_teammate("temp", "squad2", tmp_claude_dir)
         await add_member("squad2", mate, base_dir=tmp_claude_dir)
         await remove_member("squad2", "temp", base_dir=tmp_claude_dir)
 
@@ -157,9 +162,9 @@ class TestDuplicateMember:
         self, tmp_claude_dir: Path
     ) -> None:
         await create_team("dup", "sess-1", base_dir=tmp_claude_dir)
-        mate = _make_teammate("worker", "dup")
+        mate = _make_teammate("worker", "dup", tmp_claude_dir)
         await add_member("dup", mate, base_dir=tmp_claude_dir)
-        mate2 = _make_teammate("worker", "dup")
+        mate2 = _make_teammate("worker", "dup", tmp_claude_dir)
         with pytest.raises(ValueError, match="already exists"):
             await add_member("dup", mate2, base_dir=tmp_claude_dir)
 
@@ -167,10 +172,10 @@ class TestDuplicateMember:
         self, tmp_claude_dir: Path
     ) -> None:
         await create_team("reuse", "sess-1", base_dir=tmp_claude_dir)
-        mate = _make_teammate("worker", "reuse")
+        mate = _make_teammate("worker", "reuse", tmp_claude_dir)
         await add_member("reuse", mate, base_dir=tmp_claude_dir)
         await remove_member("reuse", "worker", base_dir=tmp_claude_dir)
-        mate2 = _make_teammate("worker", "reuse")
+        mate2 = _make_teammate("worker", "reuse", tmp_claude_dir)
         await add_member("reuse", mate2, base_dir=tmp_claude_dir)
         cfg = await read_config("reuse", base_dir=tmp_claude_dir)
         assert any(member.name == "worker" for member in cfg.members)
@@ -230,7 +235,7 @@ class TestRemoveMemberGuard:
         self, tmp_claude_dir: Path
     ) -> None:
         await create_team("ok-rm", "sess-1", base_dir=tmp_claude_dir)
-        mate = _make_teammate("temp", "ok-rm")
+        mate = _make_teammate("temp", "ok-rm", tmp_claude_dir)
         await add_member("ok-rm", mate, base_dir=tmp_claude_dir)
         await remove_member("ok-rm", "temp", base_dir=tmp_claude_dir)
         cfg = await read_config("ok-rm", base_dir=tmp_claude_dir)

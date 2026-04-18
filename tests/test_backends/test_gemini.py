@@ -1,28 +1,32 @@
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
-
-from dataclasses import replace
+import pytest
 
 from claude_teams.backends.base import SpawnRequest
-
 from claude_teams.backends.gemini import GeminiBackend
 
 
-_DEFAULT_REQUEST = SpawnRequest(
-    agent_id="worker@team",
-    name="worker",
-    team_name="team",
-    prompt="do stuff",
-    model="gemini-2.5-flash",
-    agent_type="general-purpose",
-    color="blue",
-    cwd="/tmp/work",
-    lead_session_id="sess-1",
-)
+@pytest.fixture
+def _make_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
+    default = SpawnRequest(
+        agent_id="worker@team",
+        name="worker",
+        team_name="team",
+        prompt="do stuff",
+        model="gemini-2.5-flash",
+        agent_type="general-purpose",
+        color="blue",
+        cwd=str(tmp_path),
+        lead_session_id="sess-1",
+    )
 
+    def factory(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
+        return replace(default, **overrides)
 
-def _make_request(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
-    return replace(_DEFAULT_REQUEST, **overrides)
+    return factory
 
 
 class TestGeminiProperties:
@@ -74,7 +78,7 @@ class TestGeminiResolveModel:
 
 class TestGeminiBuildCommand:
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/gemini")
-    def test_produces_correct_flags(self, mock_which):
+    def test_produces_correct_flags(self, mock_which, _make_request):
         backend = GeminiBackend()
         request = _make_request()
 
@@ -86,7 +90,7 @@ class TestGeminiBuildCommand:
         assert "--yolo" in cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/gemini")
-    def test_includes_prompt_value(self, mock_which):
+    def test_includes_prompt_value(self, mock_which, _make_request):
         backend = GeminiBackend()
         request = _make_request(prompt="analyze this")
 
@@ -96,7 +100,7 @@ class TestGeminiBuildCommand:
         assert cmd[idx + 1] == "analyze this"
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/gemini")
-    def test_includes_model_value(self, mock_which):
+    def test_includes_model_value(self, mock_which, _make_request):
         backend = GeminiBackend()
         request = _make_request(model="gemini-2.5-pro")
 
@@ -107,7 +111,7 @@ class TestGeminiBuildCommand:
 
 
 class TestGeminiBuildEnv:
-    def test_returns_empty_dict(self):
+    def test_returns_empty_dict(self, _make_request):
         backend = GeminiBackend()
         request = _make_request()
 

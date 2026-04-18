@@ -1,19 +1,23 @@
 """Relay and teammate-introspection server tests."""
 
 import asyncio
+import logging
 import time
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
-from fastmcp import Client
 import pytest
+from fastmcp import Client
 
 from claude_teams import messaging
 from claude_teams.backends import registry
-from claude_teams.backends.base import HealthStatus, SpawnResult as BackendSpawnResult
+from claude_teams.backends.base import HealthStatus
+from claude_teams.backends.base import SpawnResult as BackendSpawnResult
 from claude_teams.server_team_relay import (
+    _read_result_file,
     create_one_shot_result_path,
+    log_relay_task_exception,
     relay_one_shot_result,
 )
 from tests._server_support import (
@@ -48,9 +52,8 @@ class TestOneShotBackendRelay:
             {
                 "team_name": "oneshot",
                 "name": "codex-worker",
-                "backend": "codex",
-                "model": "gpt-5.3-codex",
                 "prompt": "reply with result",
+                "options": {"backend": "codex", "model": "gpt-5.3-codex"},
             },
         )
 
@@ -87,9 +90,8 @@ class TestOneShotBackendRelay:
             {
                 "team_name": "oneshot-alive",
                 "name": "codex-worker",
-                "backend": "codex",
-                "model": "gpt-5.3-codex",
                 "prompt": "reply with result",
+                "options": {"backend": "codex", "model": "gpt-5.3-codex"},
             },
         )
 
@@ -121,9 +123,8 @@ class TestOneShotBackendRelay:
             {
                 "team_name": "oneshot-generic",
                 "name": "gemini-worker",
-                "backend": "gemini",
-                "model": "gemini-2.5-pro",
                 "prompt": "analyze code",
+                "options": {"backend": "gemini", "model": "gemini-2.5-pro"},
             },
         )
 
@@ -155,9 +156,8 @@ class TestOneShotBackendRelay:
             {
                 "team_name": "oneshot-ansi",
                 "name": "gemini-worker",
-                "backend": "gemini",
-                "model": "gemini-2.5-pro",
                 "prompt": "analyze",
+                "options": {"backend": "gemini", "model": "gemini-2.5-pro"},
             },
         )
 
@@ -179,8 +179,8 @@ class TestOneShotBackendRelay:
             {
                 "team_name": "oneshot-norelay",
                 "name": "claude-worker",
-                "backend": "claude-code",
                 "prompt": "do stuff",
+                "options": {"backend": "claude-code"},
             },
         )
 
@@ -232,6 +232,57 @@ class TestOneShotBackendRelay:
             create_one_shot_result_path("good-team", "../worker")
 
 
+class TestLogRelayTaskException:
+    async def test_skips_cancelled_task(self, caplog: pytest.LogCaptureFixture) -> None:
+        async def _noop() -> None:
+            await asyncio.sleep(10)
+
+        task = asyncio.create_task(_noop())
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        with caplog.at_level(logging.ERROR, logger="claude_teams.server_runtime"):
+            log_relay_task_exception(task)
+
+        assert "One-shot relay task failed" not in caplog.text
+
+    async def test_logs_exception(self, caplog: pytest.LogCaptureFixture) -> None:
+        async def _boom() -> None:
+            msg = "relay exploded"
+            raise RuntimeError(msg)
+
+        task = asyncio.create_task(_boom())
+        with pytest.raises(RuntimeError):
+            await task
+
+        with caplog.at_level(logging.ERROR, logger="claude_teams.server_runtime"):
+            log_relay_task_exception(task)
+
+        assert "One-shot relay task failed" in caplog.text
+        assert "relay exploded" in caplog.text
+
+
+class TestReadResultFile:
+    async def test_returns_empty_and_logs_on_read_error(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A directory satisfies ``exists()`` but raises ``IsADirectoryError``
+        # on ``read_text``, exercising the exception handler without relying
+        # on filesystem permission quirks.
+        bad = tmp_path / "not-a-file"
+        bad.mkdir()
+
+        with caplog.at_level(logging.ERROR, logger="claude_teams.server_runtime"):
+            result = await _read_result_file(bad)
+
+        assert result == ""
+        assert "Failed reading one-shot result file" in caplog.text
+
+    async def test_returns_empty_when_file_missing(self, tmp_path: Path) -> None:
+        assert await _read_result_file(tmp_path / "missing.txt") == ""
+
+
 async def _wait_for_lead_inbox_message(
     client: Client,
     team_name: str,
@@ -254,8 +305,9 @@ async def _wait_for_lead_inbox_message(
         if inbox and inbox[0]["summary"] == expected_summary:
             return inbox
         await asyncio.sleep(0.05)
-    raise AssertionError(
-        f"Timed out waiting for lead inbox message {expected_summary!r} in {team_name!r}"
+    pytest.fail(
+        f"Timed out waiting for lead inbox message "
+        f"{expected_summary!r} in {team_name!r}"
     )
 
 
@@ -419,7 +471,7 @@ class TestCheckTeammate:
                 "send_message",
                 {
                     "team_name": "check-unread",
-                    "type": "message",
+                    "message_type": "message",
                     "recipient": "worker",
                     "content": text,
                     "summary": "task",

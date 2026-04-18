@@ -57,7 +57,7 @@ async def _add_teammate(
         color="blue",
         joined_at=int(time.time() * 1000),
         tmux_pane_id="%42",
-        cwd="/tmp",
+        cwd=str(base_dir),
         backend_type="claude-code",
         process_handle="%42",
     )

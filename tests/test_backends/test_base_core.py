@@ -1,20 +1,20 @@
 """Core BaseBackend type and setup tests."""
 
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from claude_teams.backends.base import Backend, HealthStatus, SpawnRequest, SpawnResult
 from tests.test_backends._base_support import (
-    _StubBackend,
     _make_backend_with_mock_controller,
-    _make_spawn_request,
+    _StubBackend,
 )
 
 
 class TestSpawnRequest:
-    def test_creates_with_all_fields(self):
+    def test_creates_with_all_fields(self, tmp_path: Path):
         req = SpawnRequest(
             agent_id="a@t",
             name="a",
@@ -23,7 +23,7 @@ class TestSpawnRequest:
             model="sonnet",
             agent_type="general-purpose",
             color="blue",
-            cwd="/tmp",
+            cwd=str(tmp_path),
             lead_session_id="sess-1",
         )
         assert req.agent_id == "a@t"
@@ -33,26 +33,29 @@ class TestSpawnRequest:
         assert req.model == "sonnet"
         assert req.agent_type == "general-purpose"
         assert req.color == "blue"
-        assert req.cwd == "/tmp"
+        assert req.cwd == str(tmp_path)
         assert req.lead_session_id == "sess-1"
         assert req.permission_mode == "default"
         assert req.plan_mode_required is False
         assert req.extra is None
 
-    def test_frozen_raises_on_mutation(self):
+    def test_frozen_raises_on_mutation(self, _make_spawn_request):
         req = _make_spawn_request()
         with pytest.raises(FrozenInstanceError):
-            setattr(req, "name", "other")
+            # ``setattr`` still triggers ``__setattr__`` on a frozen dataclass,
+            # so the runtime guard fires identically to direct assignment while
+            # keeping static type checkers out of a known-bad-by-design path.
+            setattr(req, "name", "other")  # noqa: B010
 
-    def test_plan_mode_required_default_false(self):
+    def test_plan_mode_required_default_false(self, _make_spawn_request):
         req = _make_spawn_request()
         assert req.plan_mode_required is False
 
-    def test_extra_accepts_dict(self):
+    def test_extra_accepts_dict(self, _make_spawn_request):
         req = _make_spawn_request(extra={"key": "val"})
         assert req.extra == {"key": "val"}
 
-    def test_permission_mode_defaults_to_default(self):
+    def test_permission_mode_defaults_to_default(self, _make_spawn_request):
         req = _make_spawn_request()
         assert req.permission_mode == "default"
 
@@ -71,7 +74,9 @@ class TestSpawnResult:
     def test_frozen_raises_on_mutation(self):
         result = SpawnResult(process_handle="%1", backend_type="codex")
         with pytest.raises(FrozenInstanceError):
-            setattr(result, "process_handle", "%2")
+            # Use ``setattr`` so static checkers don't flag the intentional
+            # frozen-mutation probe; runtime guard still fires.
+            setattr(result, "process_handle", "%2")  # noqa: B010
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +101,9 @@ class TestHealthStatus:
     def test_frozen_raises_on_mutation(self):
         health = HealthStatus(alive=True)
         with pytest.raises(FrozenInstanceError):
-            setattr(health, "alive", False)
+            # Use ``setattr`` so static checkers don't flag the intentional
+            # frozen-mutation probe; runtime guard still fires.
+            setattr(health, "alive", False)  # noqa: B010
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +162,7 @@ class TestBaseBackendIsInteractive:
 
 
 class TestBaseBackendPermissionArgs:
-    def test_default_mode_uses_backend_defaults(self):
+    def test_default_mode_uses_backend_defaults(self, _make_spawn_request):
         class _AutoApproveBackend(_StubBackend):
             def default_permission_args(self) -> list[str]:
                 return ["--auto"]
@@ -163,7 +170,7 @@ class TestBaseBackendPermissionArgs:
         backend = _AutoApproveBackend()
         assert backend.permission_args(_make_spawn_request()) == ["--auto"]
 
-    def test_require_approval_strips_backend_default_flags(self):
+    def test_require_approval_strips_backend_default_flags(self, _make_spawn_request):
         class _AutoApproveBackend(_StubBackend):
             def default_permission_args(self) -> list[str]:
                 return ["--auto"]
@@ -172,7 +179,7 @@ class TestBaseBackendPermissionArgs:
         request = _make_spawn_request(permission_mode="require_approval")
         assert backend.permission_args(request) == []
 
-    def test_bypass_raises_when_backend_does_not_support_it(self):
+    def test_bypass_raises_when_backend_does_not_support_it(self, _make_spawn_request):
         backend = _StubBackend()
         request = _make_spawn_request(permission_mode="bypass")
         with pytest.raises(ValueError, match="permission_mode='bypass'"):

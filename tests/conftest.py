@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-pytest_plugins = ["tests._server_support"]
+pytest_plugins = ["tests._server_support", "tests.test_backends._base_support"]
 
 
 @pytest.fixture

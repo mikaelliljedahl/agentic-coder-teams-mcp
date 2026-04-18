@@ -1,5 +1,7 @@
 """Goose backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -9,14 +11,14 @@ class GooseBackend(BaseBackend):
     _name = "goose"
     _binary_name = "goose"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "claude-haiku-4.5",
         "balanced": "claude-sonnet-4.5",
         "powerful": "claude-opus-4.6",
     }
 
     # Goose uses provider:model pairs. Default to anthropic provider.
-    _PROVIDER_MAP: dict[str, str] = {
+    _PROVIDER_MAP: ClassVar[dict[str, str]] = {
         "fast": "anthropic",
         "balanced": "anthropic",
         "powerful": "anthropic",
@@ -102,15 +104,3 @@ class GooseBackend(BaseBackend):
         if provider:
             cmd.extend(["--provider", provider])
         return cmd
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Goose environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

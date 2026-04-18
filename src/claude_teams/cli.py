@@ -18,8 +18,16 @@ from rich.table import Table
 from claude_teams import capabilities, messaging, tasks, teams
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends.registry import registry
+from claude_teams.errors import (
+    BackendNotRegisteredError,
+    InvalidNameError,
+    NameTooLongError,
+    TeamNotFoundValueError,
+)
 from claude_teams.models import TeammateMember
 from claude_teams.server import mcp
+
+_INBOX_SUMMARY_TRUNC_LEN = 80
 
 app = typer.Typer(
     name="claude-teams",
@@ -64,7 +72,7 @@ def _run(awaitable):
 def _ensure_team_exists(team_name: str) -> None:
     try:
         exists = _run(teams.team_exists(team_name))
-    except ValueError as exc:
+    except (InvalidNameError, NameTooLongError) as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
     if not exists:
@@ -101,7 +109,8 @@ def _require_cli_self_or_lead(
     if principal["role"] == "lead" or principal["name"] == agent_name:
         return principal
     err_console.print(
-        f"[red]Authenticated principal {principal['name']!r} cannot access inbox {agent_name!r}.[/red]"
+        f"[red]Authenticated principal {principal['name']!r} "
+        f"cannot access inbox {agent_name!r}.[/red]"
     )
     raise typer.Exit(code=1)
 
@@ -234,9 +243,9 @@ def status(
 
     try:
         task_list = _run(tasks.list_tasks(team_name))
-    except ValueError as exc:
+    except (InvalidNameError, NameTooLongError, TeamNotFoundValueError) as exc:
         err_console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     if output_json:
         payload = {
@@ -341,7 +350,9 @@ def inbox(
     for msg in msgs:
         read_mark = "[green]yes[/green]" if msg.read else "[red]no[/red]"
         display = msg.summary or (
-            msg.text[:80] + "..." if len(msg.text) > 80 else msg.text
+            msg.text[:_INBOX_SUMMARY_TRUNC_LEN] + "..."
+            if len(msg.text) > _INBOX_SUMMARY_TRUNC_LEN
+            else msg.text
         )
         table.add_row(msg.from_, read_mark, msg.timestamp, display)
     console.print(table)
@@ -363,7 +374,8 @@ def health(
         output_json (bool): Whether to output as JSON instead of a table.
 
     Raises:
-        typer.Exit: If team not found, teammate not found, or backend unavailable (exit code 1).
+        typer.Exit: If team not found, teammate not found, or backend
+            unavailable (exit code 1).
 
     """
     _require_cli_lead(team_name, capability)
@@ -379,9 +391,9 @@ def health(
 
     try:
         backend_obj = registry.get(backend_type)
-    except KeyError:
+    except BackendNotRegisteredError:
         err_console.print(f"[red]Backend {backend_type!r} not available.[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     health_status = _run(run_blocking(backend_obj.health_check, process_handle))
 
@@ -398,7 +410,8 @@ def health(
 
     if health_status.alive:
         console.print(
-            f"[green]{agent_name}[/green] is [bold green]alive[/bold green] ({backend_type})"
+            f"[green]{agent_name}[/green] is [bold green]alive[/bold green] "
+            f"({backend_type})"
         )
     else:
         console.print(
@@ -444,7 +457,7 @@ def kill(
         try:
             backend_obj = registry.get(backend_type)
             _run(run_blocking(backend_obj.kill, process_handle))
-        except KeyError:
+        except BackendNotRegisteredError:
             pass  # backend unavailable; process may already be dead
 
     _run(teams.remove_member(team_name, agent_name))

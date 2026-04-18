@@ -1,5 +1,7 @@
 """OpenCode backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -9,7 +11,7 @@ class OpenCodeBackend(BaseBackend):
     _name = "opencode"
     _binary_name = "opencode"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "anthropic/claude-haiku-3.5",
         "balanced": "anthropic/claude-sonnet-4",
         "powerful": "anthropic/claude-opus-4",
@@ -73,15 +75,3 @@ class OpenCodeBackend(BaseBackend):
             model,
             request.prompt,
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return OpenCode environment variables (none required).
-
-        Args:
-            request: Backend-agnostic spawn parameters.
-
-        Returns:
-            Empty dict.
-
-        """
-        return {}

@@ -3,13 +3,18 @@
 import json
 import time
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
 
 from claude_teams.async_utils import run_blocking
+from claude_teams.errors import (
+    InvalidInboxOffsetError,
+    InvalidInboxOrderError,
+    TaskAssignmentNoOwnerError,
+)
 from claude_teams.filelock import file_lock
 from claude_teams.inbox_crypto import decrypt_entry, encrypt_entry
 from claude_teams.models import (
@@ -22,9 +27,31 @@ from claude_teams.teams import validate_safe_name
 
 TEAMS_DIR = Path.home() / ".claude" / "teams"
 
+_INBOX_MAX_MESSAGES = 500
+
 
 def _teams_dir(base_dir: Path | None = None) -> Path:
     return (base_dir / "teams") if base_dir else TEAMS_DIR
+
+
+def _compact_messages(messages: list[InboxMessage]) -> list[InboxMessage]:
+    """Drop oldest read messages when the inbox exceeds the retention cap.
+
+    Unread messages are preserved in all cases — they represent work the
+    recipient hasn't acknowledged, so dropping them would silently lose
+    signal. Read messages are replayable history and are evicted FIFO to
+    keep each inbox file bounded and avoid O(N) rewrite costs growing
+    without limit.
+    """
+    if len(messages) <= _INBOX_MAX_MESSAGES:
+        return messages
+    unread_count = sum(1 for m in messages if not m.read)
+    if unread_count >= _INBOX_MAX_MESSAGES:
+        return [m for m in messages if not m.read]
+    keep_read = _INBOX_MAX_MESSAGES - unread_count
+    read_indices = [i for i, m in enumerate(messages) if m.read]
+    kept_read = set(read_indices[-keep_read:]) if keep_read else set()
+    return [m for i, m in enumerate(messages) if not m.read or i in kept_read]
 
 
 def now_iso() -> str:
@@ -34,7 +61,7 @@ def now_iso() -> str:
         str: ISO timestamp string (e.g., "2024-01-15T14:30:45.123Z").
 
     """
-    dt = datetime.now(timezone.utc)
+    dt = datetime.now(UTC)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
@@ -137,9 +164,9 @@ def _read_inbox_page(
     if not path.exists():
         return [], 0
     if offset < 0:
-        raise ValueError("offset must be >= 0")
+        raise InvalidInboxOffsetError()
     if order not in {"oldest", "newest"}:
-        raise ValueError("order must be 'oldest' or 'newest'")
+        raise InvalidInboxOrderError()
 
     lock_path = path.parent / ".lock"
     with file_lock(lock_path):
@@ -242,7 +269,8 @@ async def read_inbox_page(
         base_dir (Path | None): Override for the base config directory.
 
     Returns:
-        tuple[list[InboxMessage], int]: Page of messages and total count before pagination.
+        tuple[list[InboxMessage], int]: Page of messages and total count
+            before pagination.
 
     """
     return await run_blocking(
@@ -343,6 +371,7 @@ def _append_message(
     with file_lock(lock_path):
         all_msgs = _load_inbox_messages(path, team_name)
         all_msgs.append(message)
+        all_msgs = _compact_messages(all_msgs)
         path.write_text(json.dumps(_serialize_inbox_messages(team_name, all_msgs)))
 
 
@@ -473,7 +502,7 @@ def _send_task_assignment(
     base_dir: Path | None = None,
 ) -> None:
     if task.owner is None:
-        raise ValueError("Cannot send task assignment: task has no owner")
+        raise TaskAssignmentNoOwnerError()
     payload = TaskAssignment(
         task_id=task.id,
         subject=task.subject,

@@ -15,8 +15,8 @@ from claude_teams.messaging import (
     inbox_path,
     now_iso,
     read_inbox,
-    read_inbox_page,
     read_inbox_filtered,
+    read_inbox_page,
 )
 from claude_teams.models import InboxMessage
 
@@ -365,7 +365,10 @@ def test_inbox_path_rejects_invalid_agent_name(tmp_claude_dir: Path) -> None:
 async def test_append_message_encrypts_when_master_key_set(
     tmp_claude_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY", "test-master-key")
+    monkeypatch.setenv(
+        "CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY",
+        "test-master-key-must-be-32-plus-chars",
+    )
     message = InboxMessage(
         from_="lead", text="super secret", timestamp=now_iso(), read=False, summary="s"
     )
@@ -404,7 +407,10 @@ async def test_read_inbox_supports_plaintext_entries_when_encryption_enabled(
             ]
         ),
     )
-    monkeypatch.setenv("CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY", "test-master-key")
+    monkeypatch.setenv(
+        "CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY",
+        "test-master-key-must-be-32-plus-chars",
+    )
 
     messages = await read_inbox(
         "test-team",
@@ -419,7 +425,10 @@ async def test_read_inbox_supports_plaintext_entries_when_encryption_enabled(
 async def test_read_inbox_raises_without_master_key_for_encrypted_entries(
     tmp_claude_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY", "test-master-key")
+    monkeypatch.setenv(
+        "CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY",
+        "test-master-key-must-be-32-plus-chars",
+    )
     message = InboxMessage(
         from_="lead", text="top secret", timestamp=now_iso(), read=False, summary="s"
     )
@@ -477,6 +486,99 @@ async def test_read_inbox_waits_for_lock_before_mark_as_read(
         await asyncio.to_thread(_unlock_and_close, lock_file)
 
     await asyncio.wait_for(read_task, timeout=5)
+
+
+async def test_append_raises_when_master_key_below_min_length(
+    tmp_claude_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A master key shorter than 32 chars must be rejected, not silently used.
+
+    Short keys slide through HKDF without error but give the attacker a
+    brute-forceable input space. The gate surfaces the misconfiguration
+    loudly on the first encrypted write.
+    """
+    from claude_teams.errors import InboxMasterKeyTooShortError
+
+    monkeypatch.setenv("CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY", "too-short-key")
+    message = InboxMessage(
+        from_="lead", text="payload", timestamp=now_iso(), read=False, summary="s"
+    )
+    with pytest.raises(InboxMasterKeyTooShortError, match="at least 32 characters"):
+        await append_message("test-team", "short-key", message, base_dir=tmp_claude_dir)
+
+
+def test_compact_messages_preserves_all_unread() -> None:
+    """Compaction must never drop unread messages — they encode pending work.
+
+    When the inbox overflows but unread already equals or exceeds the cap,
+    the compactor returns unread-only; read messages are evicted wholesale.
+    """
+    from claude_teams.messaging import _INBOX_MAX_MESSAGES, _compact_messages
+
+    unread_count = _INBOX_MAX_MESSAGES + 5
+    unread = [
+        InboxMessage(
+            from_="lead", text=f"u{i}", timestamp=now_iso(), read=False, summary="s"
+        )
+        for i in range(unread_count)
+    ]
+    read = [
+        InboxMessage(
+            from_="lead", text=f"r{i}", timestamp=now_iso(), read=True, summary="s"
+        )
+        for i in range(10)
+    ]
+    result = _compact_messages(unread + read)
+    assert len(result) == unread_count
+    assert all(not m.read for m in result)
+
+
+def test_compact_messages_drops_oldest_read_first() -> None:
+    """Compaction keeps newest read messages and all unread, in their order.
+
+    Verifies the FIFO eviction rule: when the inbox overflows but unread is
+    sparse, the oldest read messages are evicted first and the newest
+    ``keep_read`` read messages are retained alongside all unread.
+    """
+    from claude_teams.messaging import _INBOX_MAX_MESSAGES, _compact_messages
+
+    unread = [
+        InboxMessage(
+            from_="lead", text=f"u{i}", timestamp=now_iso(), read=False, summary="s"
+        )
+        for i in range(5)
+    ]
+    read_excess = _INBOX_MAX_MESSAGES
+    read = [
+        InboxMessage(
+            from_="lead", text=f"r{i}", timestamp=now_iso(), read=True, summary="s"
+        )
+        for i in range(read_excess)
+    ]
+    result = _compact_messages(unread + read)
+    assert len(result) == _INBOX_MAX_MESSAGES
+    assert sum(1 for m in result if not m.read) == 5
+    retained_read_texts = {m.text for m in result if m.read}
+    # The oldest read message (r0) must be evicted; the newest (r{N-1}) retained.
+    assert "r0" not in retained_read_texts
+    assert f"r{read_excess - 1}" in retained_read_texts
+
+
+def test_compact_messages_below_cap_is_noop() -> None:
+    """Under the cap, compaction returns the input list unchanged."""
+    from claude_teams.messaging import _compact_messages
+
+    msgs = [
+        InboxMessage(
+            from_="lead",
+            text=f"m{i}",
+            timestamp=now_iso(),
+            read=i % 2 == 0,
+            summary="s",
+        )
+        for i in range(10)
+    ]
+    assert _compact_messages(msgs) is msgs
 
 
 def test_now_iso_format() -> None:

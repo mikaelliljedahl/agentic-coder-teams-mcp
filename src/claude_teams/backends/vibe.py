@@ -1,5 +1,7 @@
 """Vibe backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -15,7 +17,7 @@ class VibeBackend(BaseBackend):
     _name = "vibe"
     _binary_name = "vibe"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "devstral-small",
         "balanced": "devstral-2",
         "powerful": "devstral-2",
@@ -83,15 +85,3 @@ class VibeBackend(BaseBackend):
             "--output",
             "text",
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Vibe environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

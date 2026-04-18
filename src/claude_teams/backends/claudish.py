@@ -1,5 +1,7 @@
 """Claudish backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -15,7 +17,7 @@ class ClaudishBackend(BaseBackend):
     _name = "claudish"
     _binary_name = "claudish"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "google@gemini-2.5-flash",
         "balanced": "oai@gpt-5.2",
         "powerful": "google@gemini-3-pro",
@@ -88,15 +90,3 @@ class ClaudishBackend(BaseBackend):
             *self.permission_args(request),
             request.prompt,
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Claudish environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

@@ -1,5 +1,5 @@
 import json
-
+from pathlib import Path
 
 from claude_teams.models import (
     COLOR_PALETTE,
@@ -10,9 +10,9 @@ from claude_teams.models import (
     ShutdownApproved,
     ShutdownRequest,
     SpawnResult,
-    TeamAttachResult,
     TaskAssignment,
     TaskFile,
+    TeamAttachResult,
     TeamConfig,
     TeamCreateResult,
     TeamDeleteResult,
@@ -42,15 +42,15 @@ class TestColorPalette:
 
 
 class TestLeadMember:
-    def test_serializes_with_camel_case_aliases(self):
+    def test_serializes_with_camel_case_aliases(self, tmp_path: Path):
         lead = LeadMember(
             agent_id="team-lead@my-team",
             name="team-lead",
             agent_type="team-lead",
-            model="claude-opus-4-6",
+            model="claude-opus-4-7",
             joined_at=1770398183858,
             tmux_pane_id="",
-            cwd="/tmp/work",
+            cwd=str(tmp_path),
         )
         data = lead.model_dump(by_alias=True)
         assert data["agentId"] == "team-lead@my-team"
@@ -59,35 +59,35 @@ class TestLeadMember:
         assert data["tmuxPaneId"] == ""
         assert data["subscriptions"] == []
 
-    def test_deserializes_from_camel_case_json(self):
+    def test_deserializes_from_camel_case_json(self, tmp_path: Path):
         raw = {
             "agentId": "team-lead@my-team",
             "name": "team-lead",
             "agentType": "team-lead",
-            "model": "claude-opus-4-6",
+            "model": "claude-opus-4-7",
             "joinedAt": 1770398183858,
             "tmuxPaneId": "",
-            "cwd": "/tmp/work",
+            "cwd": str(tmp_path),
             "subscriptions": [],
         }
         lead = LeadMember.model_validate(raw)
         assert lead.agent_id == "team-lead@my-team"
         assert lead.joined_at == 1770398183858
 
-    def test_default_tmux_pane_id_is_empty(self):
+    def test_default_tmux_pane_id_is_empty(self, tmp_path: Path):
         lead = LeadMember(
             agent_id="team-lead@t",
             name="team-lead",
             agent_type="team-lead",
             model="sonnet",
             joined_at=0,
-            cwd="/tmp",
+            cwd=str(tmp_path),
         )
         assert lead.tmux_pane_id == ""
 
 
 class TestTeammateMember:
-    def test_serializes_with_all_fields(self):
+    def test_serializes_with_all_fields(self, tmp_path: Path):
         mate = TeammateMember(
             agent_id="worker@my-team",
             name="worker",
@@ -98,7 +98,7 @@ class TestTeammateMember:
             plan_mode_required=False,
             joined_at=1770398210601,
             tmux_pane_id="%34",
-            cwd="/tmp/work",
+            cwd=str(tmp_path),
             backend_type="tmux",
             is_active=False,
         )
@@ -109,7 +109,7 @@ class TestTeammateMember:
         assert data["backendType"] == "tmux"
         assert data["isActive"] is False
 
-    def test_defaults(self):
+    def test_defaults(self, tmp_path: Path):
         mate = TeammateMember(
             agent_id="w@t",
             name="w",
@@ -119,7 +119,7 @@ class TestTeammateMember:
             color="blue",
             joined_at=0,
             tmux_pane_id="%1",
-            cwd="/tmp",
+            cwd=str(tmp_path),
         )
         assert mate.plan_mode_required is False
         assert mate.backend_type == "claude-code"
@@ -128,14 +128,14 @@ class TestTeammateMember:
 
 
 class TestTeamConfig:
-    def test_round_trip_with_lead_only(self):
+    def test_round_trip_with_lead_only(self, tmp_path: Path):
         lead = LeadMember(
             agent_id="team-lead@test",
             name="team-lead",
             agent_type="team-lead",
-            model="claude-opus-4-6",
+            model="claude-opus-4-7",
             joined_at=1770398183858,
-            cwd="/tmp",
+            cwd=str(tmp_path),
         )
         config = TeamConfig(
             name="test",
@@ -151,7 +151,8 @@ class TestTeamConfig:
         assert raw["leadSessionId"] == "abc-123"
         assert len(raw["members"]) == 1
 
-    def test_deserializes_mixed_members(self):
+    def test_deserializes_mixed_members(self, tmp_path: Path):
+        cwd = str(tmp_path)
         raw = {
             "name": "test",
             "description": "",
@@ -166,7 +167,7 @@ class TestTeamConfig:
                     "model": "opus",
                     "joinedAt": 100,
                     "tmuxPaneId": "",
-                    "cwd": "/tmp",
+                    "cwd": cwd,
                     "subscriptions": [],
                 },
                 {
@@ -179,7 +180,7 @@ class TestTeamConfig:
                     "planModeRequired": False,
                     "joinedAt": 200,
                     "tmuxPaneId": "%5",
-                    "cwd": "/tmp",
+                    "cwd": cwd,
                     "subscriptions": [],
                     "backendType": "tmux",
                     "isActive": False,

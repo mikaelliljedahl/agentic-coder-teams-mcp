@@ -1,6 +1,7 @@
 """Team messaging and validation server tests."""
 
 import json
+from pathlib import Path
 
 from fastmcp import Client
 
@@ -30,7 +31,7 @@ class TestErrorPropagation:
         await client.call_tool("team_create", {"team_name": "t_msg"})
         result = await client.call_tool(
             "send_message",
-            {"team_name": "t_msg", "type": "bogus"},
+            {"team_name": "t_msg", "message_type": "bogus"},
             raise_on_error=False,
         )
         assert result.is_error is True
@@ -50,8 +51,7 @@ class TestDeletedTaskGuard:
             {
                 "team_name": "t2",
                 "task_id": created["id"],
-                "status": "deleted",
-                "owner": "worker",
+                "fields": {"status": "deleted", "owner": "worker"},
             },
         )
         inbox = _items(
@@ -73,7 +73,11 @@ class TestDeletedTaskGuard:
         )
         await client.call_tool(
             "task_update",
-            {"team_name": "t2b", "task_id": created["id"], "owner": "worker"},
+            {
+                "team_name": "t2b",
+                "task_id": created["id"],
+                "fields": {"owner": "worker"},
+            },
         )
         inbox = _items(
             await client.call_tool(
@@ -88,15 +92,17 @@ class TestDeletedTaskGuard:
 
 class TestShutdownResponseSender:
     async def test_should_populate_correct_from_and_pane_id_on_approve(
-        self, client: Client
+        self, client: Client, tmp_path: Path
     ):
         await client.call_tool("team_create", {"team_name": "t3"})
-        await teams.add_member("t3", _make_teammate("worker", "t3", pane_id="%42"))
+        await teams.add_member(
+            "t3", _make_teammate("worker", "t3", tmp_path, pane_id="%42")
+        )
         await client.call_tool(
             "send_message",
             {
                 "team_name": "t3",
-                "type": "shutdown_response",
+                "message_type": "shutdown_response",
                 "sender": "worker",
                 "request_id": "req-1",
                 "approve": True,
@@ -114,14 +120,16 @@ class TestShutdownResponseSender:
         assert payload["paneId"] == "%42"
         assert payload["requestId"] == "req-1"
 
-    async def test_should_attribute_rejection_to_sender(self, client: Client):
+    async def test_should_attribute_rejection_to_sender(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "t3b"})
-        await teams.add_member("t3b", _make_teammate("rebel", "t3b"))
+        await teams.add_member("t3b", _make_teammate("rebel", "t3b", tmp_path))
         await client.call_tool(
             "send_message",
             {
                 "team_name": "t3b",
-                "type": "shutdown_response",
+                "message_type": "shutdown_response",
                 "sender": "rebel",
                 "request_id": "req-2",
                 "approve": False,
@@ -139,14 +147,16 @@ class TestShutdownResponseSender:
 
 
 class TestPlanApprovalSender:
-    async def test_should_use_sender_as_from_on_approve(self, client: Client):
+    async def test_should_use_sender_as_from_on_approve(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "t_plan"})
-        await teams.add_member("t_plan", _make_teammate("dev", "t_plan"))
+        await teams.add_member("t_plan", _make_teammate("dev", "t_plan", tmp_path))
         await client.call_tool(
             "send_message",
             {
                 "team_name": "t_plan",
-                "type": "plan_approval_response",
+                "message_type": "plan_approval_response",
                 "sender": "team-lead",
                 "recipient": "dev",
                 "request_id": "plan-1",
@@ -164,14 +174,16 @@ class TestPlanApprovalSender:
         assert payload["type"] == "plan_approval"
         assert payload["approved"] is True
 
-    async def test_should_use_sender_as_from_on_reject(self, client: Client):
+    async def test_should_use_sender_as_from_on_reject(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "t_plan2"})
-        await teams.add_member("t_plan2", _make_teammate("dev2", "t_plan2"))
+        await teams.add_member("t_plan2", _make_teammate("dev2", "t_plan2", tmp_path))
         await client.call_tool(
             "send_message",
             {
                 "team_name": "t_plan2",
-                "type": "plan_approval_response",
+                "message_type": "plan_approval_response",
                 "sender": "team-lead",
                 "recipient": "dev2",
                 "approve": False,
@@ -189,14 +201,14 @@ class TestPlanApprovalSender:
 
 
 class TestSendMessageValidation:
-    async def test_should_reject_empty_content(self, client: Client):
+    async def test_should_reject_empty_content(self, client: Client, tmp_path: Path):
         await client.call_tool("team_create", {"team_name": "tv1"})
-        await teams.add_member("tv1", _make_teammate("bob", "tv1"))
+        await teams.add_member("tv1", _make_teammate("bob", "tv1", tmp_path))
         result = await client.call_tool(
             "send_message",
             {
                 "team_name": "tv1",
-                "type": "message",
+                "message_type": "message",
                 "recipient": "bob",
                 "content": "",
                 "summary": "hi",
@@ -206,14 +218,14 @@ class TestSendMessageValidation:
         assert result.is_error is True
         assert "content" in _text(result).lower()
 
-    async def test_should_reject_empty_summary(self, client: Client):
+    async def test_should_reject_empty_summary(self, client: Client, tmp_path: Path):
         await client.call_tool("team_create", {"team_name": "tv2"})
-        await teams.add_member("tv2", _make_teammate("bob", "tv2"))
+        await teams.add_member("tv2", _make_teammate("bob", "tv2", tmp_path))
         result = await client.call_tool(
             "send_message",
             {
                 "team_name": "tv2",
-                "type": "message",
+                "message_type": "message",
                 "recipient": "bob",
                 "content": "hi",
                 "summary": "",
@@ -229,7 +241,7 @@ class TestSendMessageValidation:
             "send_message",
             {
                 "team_name": "tv3",
-                "type": "message",
+                "message_type": "message",
                 "recipient": "",
                 "content": "hi",
                 "summary": "hi",
@@ -245,7 +257,7 @@ class TestSendMessageValidation:
             "send_message",
             {
                 "team_name": "tv4",
-                "type": "message",
+                "message_type": "message",
                 "recipient": "ghost",
                 "content": "hi",
                 "summary": "hi",
@@ -255,14 +267,16 @@ class TestSendMessageValidation:
         assert result.is_error is True
         assert "ghost" in _text(result)
 
-    async def test_should_reject_nonexistent_sender(self, client: Client):
+    async def test_should_reject_nonexistent_sender(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "tv4b"})
-        await teams.add_member("tv4b", _make_teammate("bob", "tv4b"))
+        await teams.add_member("tv4b", _make_teammate("bob", "tv4b", tmp_path))
         result = await client.call_tool(
             "send_message",
             {
                 "team_name": "tv4b",
-                "type": "message",
+                "message_type": "message",
                 "sender": "ghost",
                 "recipient": "bob",
                 "content": "hi",
@@ -273,14 +287,14 @@ class TestSendMessageValidation:
         assert result.is_error is True
         assert "ghost" in _text(result)
 
-    async def test_should_pass_target_color(self, client: Client):
+    async def test_should_pass_target_color(self, client: Client, tmp_path: Path):
         await client.call_tool("team_create", {"team_name": "tv5"})
-        await teams.add_member("tv5", _make_teammate("bob", "tv5"))
+        await teams.add_member("tv5", _make_teammate("bob", "tv5", tmp_path))
         result = await client.call_tool(
             "send_message",
             {
                 "team_name": "tv5",
-                "type": "message",
+                "message_type": "message",
                 "recipient": "bob",
                 "content": "hey",
                 "summary": "greet",
@@ -295,7 +309,7 @@ class TestSendMessageValidation:
             "send_message",
             {
                 "team_name": "tv6",
-                "type": "broadcast",
+                "message_type": "broadcast",
                 "content": "hello",
                 "summary": "",
             },
@@ -304,14 +318,16 @@ class TestSendMessageValidation:
         assert result.is_error is True
         assert "summary" in _text(result).lower()
 
-    async def test_should_reject_broadcast_from_non_lead(self, client: Client):
+    async def test_should_reject_broadcast_from_non_lead(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "tv6b"})
-        await teams.add_member("tv6b", _make_teammate("worker", "tv6b"))
+        await teams.add_member("tv6b", _make_teammate("worker", "tv6b", tmp_path))
         result = await client.call_tool(
             "send_message",
             {
                 "team_name": "tv6b",
-                "type": "broadcast",
+                "message_type": "broadcast",
                 "sender": "worker",
                 "content": "hello",
                 "summary": "status",
@@ -325,7 +341,11 @@ class TestSendMessageValidation:
         await client.call_tool("team_create", {"team_name": "tv7"})
         result = await client.call_tool(
             "send_message",
-            {"team_name": "tv7", "type": "shutdown_request", "recipient": "team-lead"},
+            {
+                "team_name": "tv7",
+                "message_type": "shutdown_request",
+                "recipient": "team-lead",
+            },
             raise_on_error=False,
         )
         assert result.is_error is True
@@ -335,7 +355,11 @@ class TestSendMessageValidation:
         await client.call_tool("team_create", {"team_name": "tv8"})
         result = await client.call_tool(
             "send_message",
-            {"team_name": "tv8", "type": "shutdown_request", "recipient": "ghost"},
+            {
+                "team_name": "tv8",
+                "message_type": "shutdown_request",
+                "recipient": "ghost",
+            },
             raise_on_error=False,
         )
         assert result.is_error is True
@@ -343,9 +367,11 @@ class TestSendMessageValidation:
 
 
 class TestTeamDeleteErrorWrapping:
-    async def test_should_reject_delete_with_active_members(self, client: Client):
+    async def test_should_reject_delete_with_active_members(
+        self, client: Client, tmp_path: Path
+    ):
         await client.call_tool("team_create", {"team_name": "td1"})
-        await teams.add_member("td1", _make_teammate("worker", "td1"))
+        await teams.add_member("td1", _make_teammate("worker", "td1", tmp_path))
         result = await client.call_tool(
             "team_delete",
             {"team_name": "td1"},
@@ -364,6 +390,93 @@ class TestTeamDeleteErrorWrapping:
         assert "Traceback" not in _text(result)
 
 
+class TestShutdownResponseValidation:
+    async def test_should_reject_when_approve_flag_missing(
+        self, client: Client, tmp_path: Path
+    ):
+        """Omitting ``approve`` must raise rather than silently defaulting.
+
+        Guards against a client forgetting the flag and leaving the lead
+        holding a stale approval request — the handler converts that into a
+        typed ``ShutdownResponseApprovalRequiredError`` surfaced to the caller.
+        """
+        await client.call_tool("team_create", {"team_name": "ts_resp1"})
+        await teams.add_member(
+            "ts_resp1", _make_teammate("worker", "ts_resp1", tmp_path)
+        )
+        result = await client.call_tool(
+            "send_message",
+            {
+                "team_name": "ts_resp1",
+                "message_type": "shutdown_response",
+                "sender": "worker",
+                "request_id": "req-x",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "approve" in _text(result).lower()
+
+    async def test_should_reject_when_sender_not_team_member(self, client: Client):
+        """A sender not on the roster must be rejected even when the caller is lead.
+
+        The approval branch publishes the sender's pane/backend handles to
+        the lead; allowing an unknown sender through would fabricate a
+        ``ShutdownApproved`` with empty handles. The guard fires a
+        ``NotTeamMemberError`` identifying the Sender role.
+        """
+        await client.call_tool("team_create", {"team_name": "ts_resp2"})
+        result = await client.call_tool(
+            "send_message",
+            {
+                "team_name": "ts_resp2",
+                "message_type": "shutdown_response",
+                "sender": "ghost",
+                "request_id": "req-y",
+                "approve": True,
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        text = _text(result)
+        assert "ghost" in text
+        assert "Sender" in text
+
+
+class TestBroadcastRecipientLimit:
+    async def test_should_reject_broadcast_exceeding_recipient_cap(
+        self, client: Client, tmp_path: Path
+    ):
+        """Broadcasting to more than 50 teammates is rejected up-front.
+
+        The cap bounds a single call because each delivery grabs a per-inbox
+        file lock; teams that legitimately exceed it should switch to
+        targeted messages. We bypass ``spawn_teammate`` by injecting members
+        through ``teams.add_member`` so the test exercises only the cap
+        check, not backend startup.
+        """
+        await client.call_tool("team_create", {"team_name": "tbc1"})
+        for i in range(51):
+            await teams.add_member(
+                "tbc1",
+                _make_teammate(f"w{i:02d}", "tbc1", tmp_path, pane_id=f"%{100 + i}"),
+            )
+        result = await client.call_tool(
+            "send_message",
+            {
+                "team_name": "tbc1",
+                "message_type": "broadcast",
+                "content": "ping",
+                "summary": "status",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        text = _text(result)
+        assert "51" in text
+        assert "50" in text
+
+
 class TestPlanApprovalValidation:
     async def test_should_reject_plan_approval_to_nonexistent_recipient(
         self, client: Client
@@ -373,7 +486,7 @@ class TestPlanApprovalValidation:
             "send_message",
             {
                 "team_name": "tp1",
-                "type": "plan_approval_response",
+                "message_type": "plan_approval_response",
                 "recipient": "ghost",
                 "approve": True,
             },
@@ -390,7 +503,7 @@ class TestPlanApprovalValidation:
             "send_message",
             {
                 "team_name": "tp2",
-                "type": "plan_approval_response",
+                "message_type": "plan_approval_response",
                 "recipient": "",
                 "approve": True,
             },

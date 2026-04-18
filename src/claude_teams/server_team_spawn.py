@@ -1,6 +1,7 @@
 """Team-tier spawn and messaging MCP tools."""
 
 import asyncio
+import contextlib
 import time
 from pathlib import Path
 from typing import Literal
@@ -11,23 +12,38 @@ from fastmcp.exceptions import ToolError
 from claude_teams import capabilities, messaging, teams
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends import SpawnRequest
+from claude_teams.errors import (
+    BackendNotRegisteredError,
+    BackendSpawnFailedError,
+    BroadcastSenderError,
+    BroadcastSummaryEmptyToolError,
+    BroadcastTooManyRecipientsError,
+    MemberAlreadyExistsError,
+    MessageContentEmptyToolError,
+    MessageRecipientEmptyToolError,
+    MessageSummaryEmptyToolError,
+    NoBackendsAvailableError,
+    NotTeamMemberError,
+    PermissionBypassUnsupportedToolError,
+    PlanRecipientEmptyToolError,
+    ReservedAgentNameError,
+    ShutdownRecipientEmptyToolError,
+    ShutdownResponseApprovalRequiredError,
+    ShutdownSelfError,
+    UnknownMessageTypeError,
+    UnsupportedBackendModelError,
+)
 from claude_teams.models import (
     COLOR_PALETTE,
     InboxMessage,
     MemberUnion,
+    MessageRouting,
     SendMessageResult,
     ShutdownApproved,
+    SpawnOptions,
     SpawnResult,
     TeammateMember,
-    MessageRouting,
 )
-from claude_teams.server_team_relay import (
-    build_agent_auth_notice,
-    create_one_shot_result_path,
-    log_relay_task_exception,
-    relay_one_shot_result,
-)
-from claude_teams.teams import _VALID_NAME_RE
 from claude_teams.server_runtime import (
     _ANN_CREATE,
     _ANN_MUTATE,
@@ -38,7 +54,22 @@ from claude_teams.server_runtime import (
     _require_sender_or_lead,
     _resolve_permission_mode,
     _resolve_spawn_cwd,
-    logger,
+)
+from claude_teams.server_schema import (
+    AgentName,
+    Capability,
+    MessageContent,
+    MessageSummary,
+    Prompt,
+    RequestId,
+    SenderName,
+    TeamName,
+)
+from claude_teams.server_team_relay import (
+    build_agent_auth_notice,
+    create_one_shot_result_path,
+    log_relay_task_exception,
+    relay_one_shot_result,
 )
 
 
@@ -77,86 +108,74 @@ async def _assign_color(team_name: str) -> str:
 
 
 async def spawn_teammate_tool(
-    team_name: str,
-    name: str,
-    prompt: str,
+    team_name: TeamName,
+    name: AgentName,
+    prompt: Prompt,
     ctx: Context,
-    cwd: str = "",
-    model: str = "balanced",
-    backend: str = "",
-    subagent_type: str = "general-purpose",
-    plan_mode_required: bool = False,
-    permission_mode: Literal["default", "require_approval", "bypass"] | None = None,
-    capability: str = "",
+    options: SpawnOptions | None = None,
 ) -> dict[str, object]:
     """Spawn a teammate via the selected backend.
 
-    Args:
-        team_name (str): Team name.
-        name (str): New teammate name.
-        prompt (str): Initial prompt to send to the teammate.
-        ctx (Context): FastMCP request context.
-        cwd (str): Optional absolute working directory.
-        model (str): Generic or backend-specific model name.
-        backend (str): Explicit backend name or empty for default.
-        subagent_type (str): Agent subtype to record in config.
-        plan_mode_required (bool): Whether plan mode is required.
-        permission_mode (Literal["default", "require_approval", "bypass"] | None):
-            Permission behavior override.
-        capability (str): Optional lead capability override.
+    Emits an indeterminate-progress heartbeat every 15 seconds while the
+    backend spawn is in flight. One-shot backends (codex, qwen, gemini)
+    can take several minutes to return; the heartbeat prevents the call
+    from appearing silent. Quick spawns (interactive backends) finish
+    before the first tick fires, so short-lived spawns emit no progress
+    events at all — the request/response lifecycle is enough for those.
 
-    Returns:
-        dict: Spawn result payload.
+    Args:
+        team_name: Team the new teammate joins.
+        name: Member name for the new teammate (must be unique within the team
+            and not equal to the reserved ``team-lead``).
+        prompt: Initial prompt delivered to the teammate via its inbox.
+        ctx: FastMCP request context (injected).
+        options: Optional tuning knobs (backend, model, cwd, subagent_type,
+            plan_mode_required, permission_mode, capability). Omit to accept
+            all defaults.
 
     """
-    await _require_lead(ctx, team_name, capability)
+    opts = options or SpawnOptions()
+
+    await _require_lead(ctx, team_name, opts.capability)
     ls = _get_lifespan(ctx)
     reg = ls["registry"]
 
-    if backend:
+    if opts.backend:
         try:
-            backend_obj = reg.get(backend)
-        except KeyError as exc:
-            raise ToolError(str(exc))
+            backend_obj = reg.get(opts.backend)
+        except BackendNotRegisteredError as exc:
+            raise ToolError(str(exc)) from exc
     else:
         try:
             backend_obj = reg.get(reg.default_backend())
-        except (RuntimeError, KeyError) as exc:
-            raise ToolError(str(exc))
+        except (NoBackendsAvailableError, BackendNotRegisteredError) as exc:
+            raise ToolError(str(exc)) from exc
 
     try:
-        resolved_model = await run_blocking(backend_obj.resolve_model, model)
-    except ValueError as exc:
-        raise ToolError(str(exc))
+        resolved_model = await run_blocking(backend_obj.resolve_model, opts.model)
+    except UnsupportedBackendModelError as exc:
+        raise ToolError(str(exc)) from exc
 
-    resolved_permission_mode = _resolve_permission_mode(permission_mode)
+    resolved_permission_mode = _resolve_permission_mode(opts.permission_mode)
     if resolved_permission_mode == "bypass" and not await run_blocking(
         backend_obj.supports_permission_bypass
     ):
-        raise ToolError(
-            f"Backend {backend_obj.name!r} does not support permission_mode='bypass'."
-        )
+        raise PermissionBypassUnsupportedToolError(backend_obj.name)
 
-    if not _VALID_NAME_RE.match(name):
-        raise ToolError(
-            f"Invalid agent name: {name!r}. Use only letters, numbers, hyphens, underscores."
-        )
-    if len(name) > 64:
-        raise ToolError(f"Agent name too long ({len(name)} chars, max 64)")
     if name == "team-lead":
-        raise ToolError("Agent name 'team-lead' is reserved")
+        raise ReservedAgentNameError()
 
-    resolved_cwd = await run_blocking(_resolve_spawn_cwd, cwd)
+    resolved_cwd = await run_blocking(_resolve_spawn_cwd, opts.cwd)
     color = await _assign_color(team_name)
 
     member = TeammateMember(
         agent_id=f"{name}@{team_name}",
         name=name,
-        agent_type=subagent_type,
+        agent_type=opts.subagent_type,
         model=resolved_model,
         prompt=prompt,
         color=color,
-        plan_mode_required=plan_mode_required,
+        plan_mode_required=opts.plan_mode_required,
         joined_at=int(time.time() * 1000),
         tmux_pane_id="",
         cwd=resolved_cwd,
@@ -167,8 +186,8 @@ async def spawn_teammate_tool(
 
     try:
         await teams.add_member(team_name, member)
-    except ValueError as exc:
-        raise ToolError(str(exc))
+    except MemberAlreadyExistsError as exc:
+        raise ToolError(str(exc)) from exc
 
     agent_capability = await capabilities.issue_agent_capability(team_name, name)
     await messaging.ensure_inbox(team_name, name)
@@ -195,20 +214,48 @@ async def spawn_teammate_tool(
         team_name=team_name,
         prompt=prompt,
         model=resolved_model,
-        agent_type=subagent_type,
+        agent_type=opts.subagent_type,
         color=color,
         cwd=resolved_cwd,
-        lead_session_id=ls["session_id"],
+        lead_session_id=ctx.session_id,
         permission_mode=resolved_permission_mode,
-        plan_mode_required=plan_mode_required,
+        plan_mode_required=opts.plan_mode_required,
         extra=extra,
     )
+
+    async def _spawn_heartbeat() -> None:
+        """Emit an indeterminate-progress pulse every 15s until cancelled.
+
+        Uses ``total=None`` so the client renders this as ongoing-but-
+        unknown-duration work (typically a spinner, not a percentage
+        bar). The elapsed-seconds count in the message gives the user
+        a concrete "how long has this been going?" signal without
+        implying a known completion target.
+        """
+        elapsed = 0
+        while True:
+            await asyncio.sleep(15)
+            elapsed += 15
+            await ctx.report_progress(
+                progress=elapsed,
+                total=None,
+                message=(
+                    f"Still spawning {backend_obj.name!r} for {name!r} "
+                    f"({elapsed}s elapsed)..."
+                ),
+            )
+
+    heartbeat_task = asyncio.create_task(_spawn_heartbeat())
     try:
         spawn_result = await run_blocking(backend_obj.spawn, request)
     except Exception as exc:
         await teams.remove_member(team_name, name)
         await capabilities.remove_agent_capability(team_name, name)
-        raise ToolError(f"Backend spawn failed: {exc}")
+        raise BackendSpawnFailedError(exc) from exc
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
 
     config = await teams.read_config(team_name)
     for config_member in config.members:
@@ -218,8 +265,8 @@ async def spawn_teammate_tool(
             break
     await teams.write_config(team_name, config)
 
-    if not ls["has_teammates"]:
-        ls["has_teammates"] = True
+    if not await ctx.get_state("has_teammates"):
+        await ctx.set_state("has_teammates", True)
         await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
 
     if not backend_obj.is_interactive:
@@ -227,8 +274,15 @@ async def spawn_teammate_tool(
             await run_blocking(
                 backend_obj.retain_pane_after_exit, spawn_result.process_handle
             )
-        except Exception:
-            logger.debug("Failed to set remain-on-exit for %s", name, exc_info=True)
+        except Exception as exc:
+            await ctx.debug(
+                f"Failed to set remain-on-exit for {name!r}: {exc}",
+                extra={
+                    "team": team_name,
+                    "agent": name,
+                    "backend": backend_obj.name,
+                },
+            )
         relay_task = asyncio.create_task(
             relay_one_shot_result(
                 team_name=team_name,
@@ -248,10 +302,229 @@ async def spawn_teammate_tool(
     ).model_dump()
 
 
-async def send_message(
+async def _handle_plain_message(
     team_name: str,
     ctx: Context,
-    type: Literal[
+    recipient: str,
+    content: str,
+    summary: str,
+    sender: str,
+    capability: str,
+) -> dict[str, object]:
+    """Handle ``message_type='message'`` — addressed plain message."""
+    await _require_sender_or_lead(ctx, team_name, sender, capability)
+    if not content:
+        raise MessageContentEmptyToolError()
+    if not summary:
+        raise MessageSummaryEmptyToolError()
+    if not recipient:
+        raise MessageRecipientEmptyToolError()
+    config = await teams.read_config(team_name)
+    sender_member = _find_member(config, sender)
+    if sender_member is None:
+        raise NotTeamMemberError("Sender", sender, team_name)
+    recipient_member = _find_member(config, recipient)
+    if recipient_member is None:
+        raise NotTeamMemberError("Recipient", recipient, team_name)
+    target_color = (
+        recipient_member.color if isinstance(recipient_member, TeammateMember) else None
+    )
+    sender_color = (
+        sender_member.color if isinstance(sender_member, TeammateMember) else None
+    )
+    await messaging.send_plain_message(
+        team_name,
+        sender,
+        recipient,
+        content,
+        summary=summary,
+        color=sender_color,
+    )
+    routing: MessageRouting = {
+        "sender": sender,
+        "target": recipient,
+        "targetColor": target_color,
+        "summary": summary,
+        "content": content,
+    }
+    return SendMessageResult(
+        success=True,
+        message=f"Message sent to {recipient}",
+        routing=routing,
+    ).model_dump(exclude_none=True)
+
+
+_BROADCAST_RECIPIENT_LIMIT = 50
+
+
+async def _handle_broadcast(
+    team_name: str,
+    ctx: Context,
+    content: str,
+    summary: str,
+    sender: str,
+    capability: str,
+) -> dict[str, object]:
+    """Handle ``message_type='broadcast'`` — lead-only fan-out to teammates.
+
+    Recipient fan-out is capped at ``_BROADCAST_RECIPIENT_LIMIT``. Each
+    delivery acquires a per-inbox file lock, so a broadcast to a large team
+    could monopolise the messaging lane; the cap keeps a single call
+    bounded. Teams that legitimately exceed the cap should send targeted
+    messages instead.
+    """
+    await _require_lead(ctx, team_name, capability)
+    if not summary:
+        raise BroadcastSummaryEmptyToolError()
+    if sender != "team-lead":
+        raise BroadcastSenderError()
+    config = await teams.read_config(team_name)
+    teammates = [m for m in config.members if isinstance(m, TeammateMember)]
+    if len(teammates) > _BROADCAST_RECIPIENT_LIMIT:
+        raise BroadcastTooManyRecipientsError(
+            len(teammates), _BROADCAST_RECIPIENT_LIMIT
+        )
+    for member in teammates:
+        await messaging.send_plain_message(
+            team_name,
+            "team-lead",
+            member.name,
+            content,
+            summary=summary,
+            color=None,
+        )
+    return SendMessageResult(
+        success=True,
+        message=f"Broadcast sent to {len(teammates)} teammate(s)",
+    ).model_dump(exclude_none=True)
+
+
+async def _handle_shutdown_request(
+    team_name: str,
+    ctx: Context,
+    recipient: str,
+    content: str,
+    capability: str,
+) -> dict[str, object]:
+    """Handle ``message_type='shutdown_request'`` — lead asks teammate to exit."""
+    await _require_lead(ctx, team_name, capability)
+    if not recipient:
+        raise ShutdownRecipientEmptyToolError()
+    if recipient == "team-lead":
+        raise ShutdownSelfError()
+    config = await teams.read_config(team_name)
+    member_names = {member.name for member in config.members}
+    if recipient not in member_names:
+        raise NotTeamMemberError("Recipient", recipient, team_name)
+    req_id = await messaging.send_shutdown_request(team_name, recipient, reason=content)
+    return SendMessageResult(
+        success=True,
+        message=f"Shutdown request sent to {recipient}",
+        request_id=req_id,
+        target=recipient,
+    ).model_dump(exclude_none=True)
+
+
+async def _handle_shutdown_response(
+    team_name: str,
+    ctx: Context,
+    request_id: str,
+    approve: bool | None,
+    content: str,
+    sender: str,
+    capability: str,
+) -> dict[str, object]:
+    """Handle ``message_type='shutdown_response'`` — teammate accepts or rejects.
+
+    ``approve`` must be set to ``True`` or ``False`` explicitly; a missing
+    value (``None``) is rejected so that a client omitting the flag cannot
+    silently fall through to the rejection branch and leave the lead with a
+    stale approval request. The sender must be a registered teammate — the
+    approval path publishes backend/pane identifiers the lead uses to clean
+    up the process, so an unknown sender would otherwise fabricate a
+    ``ShutdownApproved`` payload with empty handles.
+    """
+    await _require_sender_or_lead(ctx, team_name, sender, capability)
+    if approve is None:
+        raise ShutdownResponseApprovalRequiredError()
+    config = await teams.read_config(team_name)
+    member = None
+    for config_member in config.members:
+        if isinstance(config_member, TeammateMember) and config_member.name == sender:
+            member = config_member
+            break
+    if member is None:
+        raise NotTeamMemberError("Sender", sender, team_name)
+    if approve is True:
+        payload = ShutdownApproved(
+            request_id=request_id,
+            from_=sender,
+            timestamp=messaging.now_iso(),
+            pane_id=member.tmux_pane_id,
+            backend_type=member.backend_type,
+            process_handle=member.process_handle or member.tmux_pane_id,
+        )
+        await messaging.send_structured_message(team_name, sender, "team-lead", payload)
+        return SendMessageResult(
+            success=True,
+            message=f"Shutdown approved for request {request_id}",
+        ).model_dump(exclude_none=True)
+    await messaging.send_plain_message(
+        team_name,
+        sender,
+        "team-lead",
+        content or "Shutdown rejected",
+        summary="shutdown_rejected",
+    )
+    return SendMessageResult(
+        success=True,
+        message=f"Shutdown rejected for request {request_id}",
+    ).model_dump(exclude_none=True)
+
+
+async def _handle_plan_approval_response(
+    team_name: str,
+    ctx: Context,
+    recipient: str,
+    content: str,
+    approve: bool | None,
+    sender: str,
+    capability: str,
+) -> dict[str, object]:
+    """Handle ``message_type='plan_approval_response'`` — plan approval or rejection."""
+    await _require_sender_or_lead(ctx, team_name, sender, capability)
+    if not recipient:
+        raise PlanRecipientEmptyToolError()
+    config = await teams.read_config(team_name)
+    member_names = {member.name for member in config.members}
+    if recipient not in member_names:
+        raise NotTeamMemberError("Recipient", recipient, team_name)
+    if approve:
+        await messaging.send_plain_message(
+            team_name,
+            sender,
+            recipient,
+            '{"type":"plan_approval","approved":true}',
+            summary="plan_approved",
+        )
+    else:
+        await messaging.send_plain_message(
+            team_name,
+            sender,
+            recipient,
+            content or "Plan rejected",
+            summary="plan_rejected",
+        )
+    return SendMessageResult(
+        success=True,
+        message=f"Plan {'approved' if approve else 'rejected'} for {recipient}",
+    ).model_dump(exclude_none=True)
+
+
+async def send_message(
+    team_name: TeamName,
+    ctx: Context,
+    message_type: Literal[
         "message",
         "broadcast",
         "shutdown_request",
@@ -259,209 +532,74 @@ async def send_message(
         "plan_approval_response",
     ],
     recipient: str = "",
-    content: str = "",
-    summary: str = "",
-    request_id: str = "",
+    content: MessageContent = "",
+    summary: MessageSummary = "",
+    request_id: RequestId = "",
     approve: bool | None = None,
-    sender: str = "team-lead",
-    capability: str = "",
+    sender: SenderName = "team-lead",
+    capability: Capability = "",
 ) -> dict[str, object]:
     """Send a team protocol message.
 
+    Dispatches to a per-type handler. Each handler owns its own validation,
+    lookups, and response shape — ``send_message`` itself is a thin router
+    to keep the branch count low and make each protocol message type
+    independently testable.
+
     Args:
-        team_name (str): Team name.
-        ctx (Context): FastMCP request context.
-        type (Literal[...]): Message type.
-        recipient (str): Target member when applicable.
-        content (str): Message body or rejection reason.
-        summary (str): Summary text for plain messages.
-        request_id (str): Request identifier for response types.
-        approve (bool | None): Approval flag for response types.
-        sender (str): Logical sender identity.
-        capability (str): Optional capability override.
+        team_name: Team name.
+        ctx: FastMCP request context.
+        message_type: Message type.
+        recipient: Target member when applicable.
+        content: Message body or rejection reason.
+        summary: Summary text for plain messages.
+        request_id: Request identifier for response types.
+        approve: Approval flag for response types.
+        sender: Logical sender identity.
+        capability: Optional capability override.
 
     Returns:
         dict: Send result payload.
 
     """
-    if type == "message":
-        await _require_sender_or_lead(ctx, team_name, sender, capability)
-        if not content:
-            raise ToolError("Message content must not be empty")
-        if not summary:
-            raise ToolError("Message summary must not be empty")
-        if not recipient:
-            raise ToolError("Message recipient must not be empty")
-        config = await teams.read_config(team_name)
-        sender_member = _find_member(config, sender)
-        if sender_member is None:
-            raise ToolError(f"Sender {sender!r} is not a member of team {team_name!r}")
-        recipient_member = _find_member(config, recipient)
-        if recipient_member is None:
-            raise ToolError(
-                f"Recipient {recipient!r} is not a member of team {team_name!r}"
-            )
-        target_color = (
-            recipient_member.color
-            if isinstance(recipient_member, TeammateMember)
-            else None
+    if message_type == "message":
+        return await _handle_plain_message(
+            team_name, ctx, recipient, content, summary, sender, capability
         )
-        sender_color = (
-            sender_member.color if isinstance(sender_member, TeammateMember) else None
+    if message_type == "broadcast":
+        return await _handle_broadcast(
+            team_name, ctx, content, summary, sender, capability
         )
-        await messaging.send_plain_message(
-            team_name,
-            sender,
-            recipient,
-            content,
-            summary=summary,
-            color=sender_color,
+    if message_type == "shutdown_request":
+        return await _handle_shutdown_request(
+            team_name, ctx, recipient, content, capability
         )
-        routing: MessageRouting = {
-            "sender": sender,
-            "target": recipient,
-            "targetColor": target_color,
-            "summary": summary,
-            "content": content,
-        }
-        return SendMessageResult(
-            success=True,
-            message=f"Message sent to {recipient}",
-            routing=routing,
-        ).model_dump(exclude_none=True)
-
-    if type == "broadcast":
-        await _require_lead(ctx, team_name, capability)
-        if not summary:
-            raise ToolError("Broadcast summary must not be empty")
-        if sender != "team-lead":
-            raise ToolError("Broadcast sender must be 'team-lead'")
-        config = await teams.read_config(team_name)
-        count = 0
-        for member in config.members:
-            if isinstance(member, TeammateMember):
-                await messaging.send_plain_message(
-                    team_name,
-                    "team-lead",
-                    member.name,
-                    content,
-                    summary=summary,
-                    color=None,
-                )
-                count += 1
-        return SendMessageResult(
-            success=True,
-            message=f"Broadcast sent to {count} teammate(s)",
-        ).model_dump(exclude_none=True)
-
-    if type == "shutdown_request":
-        await _require_lead(ctx, team_name, capability)
-        if not recipient:
-            raise ToolError("Shutdown request recipient must not be empty")
-        if recipient == "team-lead":
-            raise ToolError("Cannot send shutdown request to team-lead")
-        config = await teams.read_config(team_name)
-        member_names = {member.name for member in config.members}
-        if recipient not in member_names:
-            raise ToolError(
-                f"Recipient {recipient!r} is not a member of team {team_name!r}"
-            )
-        req_id = await messaging.send_shutdown_request(
-            team_name, recipient, reason=content
+    if message_type == "shutdown_response":
+        return await _handle_shutdown_response(
+            team_name, ctx, request_id, approve, content, sender, capability
         )
-        return SendMessageResult(
-            success=True,
-            message=f"Shutdown request sent to {recipient}",
-            request_id=req_id,
-            target=recipient,
-        ).model_dump(exclude_none=True)
-
-    if type == "shutdown_response":
-        await _require_sender_or_lead(ctx, team_name, sender, capability)
-        if approve:
-            config = await teams.read_config(team_name)
-            member = None
-            for config_member in config.members:
-                if (
-                    isinstance(config_member, TeammateMember)
-                    and config_member.name == sender
-                ):
-                    member = config_member
-                    break
-            pane_id = member.tmux_pane_id if member else ""
-            process_handle = (
-                (member.process_handle or member.tmux_pane_id) if member else ""
-            )
-            backend_type = member.backend_type if member else "tmux"
-            payload = ShutdownApproved(
-                request_id=request_id,
-                from_=sender,
-                timestamp=messaging.now_iso(),
-                pane_id=pane_id,
-                backend_type=backend_type,
-                process_handle=process_handle,
-            )
-            await messaging.send_structured_message(
-                team_name, sender, "team-lead", payload
-            )
-            return SendMessageResult(
-                success=True,
-                message=f"Shutdown approved for request {request_id}",
-            ).model_dump(exclude_none=True)
-        await messaging.send_plain_message(
-            team_name,
-            sender,
-            "team-lead",
-            content or "Shutdown rejected",
-            summary="shutdown_rejected",
+    if message_type == "plan_approval_response":
+        return await _handle_plan_approval_response(
+            team_name, ctx, recipient, content, approve, sender, capability
         )
-        return SendMessageResult(
-            success=True,
-            message=f"Shutdown rejected for request {request_id}",
-        ).model_dump(exclude_none=True)
-
-    if type == "plan_approval_response":
-        await _require_sender_or_lead(ctx, team_name, sender, capability)
-        if not recipient:
-            raise ToolError("Plan approval recipient must not be empty")
-        config = await teams.read_config(team_name)
-        member_names = {member.name for member in config.members}
-        if recipient not in member_names:
-            raise ToolError(
-                f"Recipient {recipient!r} is not a member of team {team_name!r}"
-            )
-        if approve:
-            await messaging.send_plain_message(
-                team_name,
-                sender,
-                recipient,
-                '{"type":"plan_approval","approved":true}',
-                summary="plan_approved",
-            )
-        else:
-            await messaging.send_plain_message(
-                team_name,
-                sender,
-                recipient,
-                content or "Plan rejected",
-                summary="plan_rejected",
-            )
-        return SendMessageResult(
-            success=True,
-            message=f"Plan {'approved' if approve else 'rejected'} for {recipient}",
-        ).model_dump(exclude_none=True)
-
-    raise ToolError(f"Unknown message type: {type}")
+    raise UnknownMessageTypeError(message_type)
 
 
 def register_team_spawn_tools(mcp: FastMCP) -> None:
     """Register team-tier spawn and messaging tools.
 
+    ``spawn_teammate`` carries a generous 15-minute timeout because one-shot
+    backends can take several minutes to return; other tools inherit the
+    default FastMCP request timeout.
+
     Args:
         mcp (FastMCP): MCP server instance.
 
     """
-    mcp.tool(name="spawn_teammate", tags={_TAG_TEAM}, annotations=_ANN_CREATE)(
-        spawn_teammate_tool
-    )
+    mcp.tool(
+        name="spawn_teammate",
+        tags={_TAG_TEAM},
+        annotations=_ANN_CREATE,
+        timeout=900.0,
+    )(spawn_teammate_tool)
     mcp.tool(tags={_TAG_TEAM}, annotations=_ANN_MUTATE)(send_message)
