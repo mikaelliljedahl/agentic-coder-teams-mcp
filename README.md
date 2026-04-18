@@ -4,7 +4,7 @@
 
 Multi-backend MCP server for orchestrating teams of agentic coding agents.
 
-**636 tests | 92% coverage | 17 backends | Python 3.12+**
+**644 tests | 93% coverage | 17 backends | Python 3.12+**
 
 </div>
 
@@ -19,9 +19,12 @@ https://github.com/user-attachments/assets/531ada0a-6c36-45cd-8144-a092bb9f9a19
 - [Installation](#installation)
 - [Supported Backends](#supported-backends)
 - [MCP Tools](#mcp-tools)
+- [MCP Prompts](#mcp-prompts)
+- [Skills](#skills)
 - [CLI Reference](#cli-reference)
 - [How It Works](#how-it-works)
 - [Development](#development)
+  - [Observability](#observability)
 - [Contributing](#contributing)
 - [Architecture Deep Dive](#architecture-deep-dive)
 - [Acknowledgments](#acknowledgments)
@@ -41,6 +44,9 @@ This MCP server reimplements that protocol as a standalone [Model Context Protoc
 - Coordinate work through shared task lists with dependency tracking
 - Send messages between agents (direct, broadcast, shutdown requests)
 - Monitor agent health and force-kill unresponsive agents
+- Drive common lead operations with templated MCP **prompts** (`status_check`, `health_sweep`, `task_handoff`, `wrap_up`, `unblock_teammate`)
+- Surface agent **skills** to any connected client via a bundled team-orchestration skill and per-backend skill roots
+- Export traces over OTLP when the optional `[otel]` extra is installed
 - Use any MCP-compatible client as the orchestrator
 
 ---
@@ -259,6 +265,64 @@ Example `read_inbox` response:
 
 ---
 
+## MCP Prompts
+
+Templated prompts let clients drive common team-lead operations without
+re-writing orchestration instructions each time. All prompts are tagged
+`team`, so they become visible alongside team-tier tools after
+`team_create` or `team_attach` via the same progressive-disclosure
+mechanism.
+
+| Prompt | Description | Arguments |
+|--------|-------------|-----------|
+| `status_check` | Check a teammate's health, current task, and blockers. | `team`, `teammate` |
+| `health_sweep` | Run health check across all teammates and flag issues. | `team` |
+| `task_handoff` | Hand off completed work from one teammate to another. | `team`, `from_teammate`, `to_teammate`, optional `context` |
+| `wrap_up` | Collect all task results and prepare a team summary. | `team` |
+| `unblock_teammate` | Send a targeted message to unblock a stuck teammate. | `team`, `teammate`, optional `hint` |
+
+Each prompt returns an assistant-prefilled conversation that skips
+preamble and drives the model straight into the supporting tool calls.
+
+---
+
+## Skills
+
+The server acts as a skill provider for connected clients, surfacing
+agentic-skills content alongside its tools.
+
+### Bundled skill
+
+The server ships with `team-orchestration/SKILL.md`, a complete guide to
+leading a team through this MCP server: lifecycle, delegation patterns,
+coordination, monitoring, and teardown. It is served to any client that
+supports agent skills.
+
+### Custom backend skill roots
+
+Beyond FastMCP's built-in providers for Claude, Codex, Copilot, Cursor,
+Gemini, Goose, OpenCode, and VSCode, this server registers nine
+additional `SkillsDirectoryProvider`s covering the remaining backends in
+the registry:
+
+| Backend | Skill roots (in lookup order) |
+|---------|-------------------------------|
+| `amp` | `~/.config/amp/skills/`, `~/.config/agents/skills/`, `~/.claude/skills/` |
+| `auggie` | `~/.augment/skills/`, `~/.claude/skills/`, `~/.agents/skills/` |
+| `coder` | `~/.code/skills/`, `~/.codex/skills/` |
+| `goose` | `~/.agents/skills/`, `~/.goose/skills/`, `~/.claude/skills/` |
+| `kimi` | `~/.kimi/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, `~/.config/agents/skills/`, `~/.agents/skills/` |
+| `llxprt` | `~/.llxprt/skills/` |
+| `qwen` | `~/.qwen/skills/` |
+| `rovodev` | `~/.rovodev/skills/` |
+| `vibe` | `~/.vibe/skills/` |
+
+Earlier roots win on name collision. The `goose` override exists because
+FastMCP's built-in `GooseSkillsProvider` points at a path Block Goose
+does not actually use.
+
+---
+
 ## CLI Reference
 
 The `claude-teams` CLI provides terminal commands for inspecting and managing teams. The CLI and MCP server can run concurrently -- they share the same file-based state with `fcntl.flock()` guards.
@@ -353,10 +417,10 @@ JSON task files stored under `~/.claude/tasks/<team>/`. Tasks support:
 
 ### Progressive tool disclosure
 
-The server uses FastMCP's tag-based visibility system to progressively reveal tools as state evolves:
+The server uses FastMCP's tag-based visibility system to progressively reveal tools and prompts as state evolves:
 
-1. **Cold start** -- only 5 bootstrap tools visible
-2. **After `team_create`** -- 7 team-tier tools become visible
+1. **Cold start** -- only 5 bootstrap tools visible; team-tagged prompts hidden
+2. **After `team_create`** -- 7 team-tier tools and 5 team-tagged prompts become visible
 3. **After first `spawn_teammate`** -- 5 teammate-tier tools become visible
 4. **After `team_delete`** -- resets back to bootstrap-only
 
@@ -391,35 +455,66 @@ uv run ruff check                       # Lint
 uv run ty check                         # Type check (Astral's ty)
 ```
 
+### Observability
+
+OpenTelemetry tracing is optional. Install the extra and set the usual
+OTel environment variables — FastMCP emits server spans for every tool,
+prompt, and resource invocation once a tracer provider is registered.
+
+```bash
+uv sync --extra otel
+# Or with pip
+pip install 'claude-teams[otel]'
+```
+
+Configuration (standard OTel environment variables):
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `OTEL_SERVICE_NAME` | Service name stamped on every span | `claude-teams` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector endpoint | unset (no export) |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Auth headers for the collector | unset |
+| `OTEL_SDK_DISABLED` | Set to `true`/`1` to disable without uninstalling | unset |
+
+If the `otel` extra is not installed, telemetry setup is a silent no-op
+and the server runs normally.
+
 ### Project structure
 
 ```
 src/claude_teams/
-├── server.py          # Thin MCP assembly surface and entrypoint
-├── server_runtime.py  # Shared MCP app, auth, pagination, annotations, lifecycle
-├── server_bootstrap.py# Bootstrap-tier tool registration
+├── server.py            # Thin MCP assembly surface and entrypoint
+├── server_runtime.py    # Shared MCP app, auth, pagination, annotations, lifecycle
+├── server_schema.py     # Reusable validated parameter types for tools/prompts
+├── server_bootstrap.py  # Bootstrap-tier tool registration
 ├── server_team_spawn.py # Team-tier spawn and message tools
 ├── server_team_tasks.py # Team-tier task and inbox tools
 ├── server_team_relay.py # One-shot backend relay helpers
-├── server_teammate.py # Teammate-tier tool registration
-├── cli.py             # Typer CLI commands
-├── async_utils.py     # Thread offload helper for blocking local operations
-├── models.py          # Pydantic models (TeamConfig, Task, InboxMessage, etc.)
-├── teams.py           # Team CRUD (config read/write, member management)
-├── tasks.py           # Task CRUD (create, update, list, dependencies)
-├── messaging.py       # Inbox operations (read, write, structured messages)
-├── capabilities.py    # Lead/agent capability storage and resolution
-├── inbox_crypto.py    # Optional inbox-at-rest encryption helpers
-├── filelock.py        # Shared fcntl-based file locking
+├── server_teammate.py   # Teammate-tier tool registration
+├── server_prompts.py    # Team-tier MCP prompt templates
+├── skill_providers.py   # Custom SkillsDirectoryProvider table for non-default backends
+├── telemetry.py         # Optional OpenTelemetry tracer-provider setup
+├── errors.py            # Central exception taxonomy
+├── cli.py               # Typer CLI commands
+├── async_utils.py       # Thread offload helper for blocking local operations
+├── models.py            # Pydantic models (TeamConfig, Task, InboxMessage, etc.)
+├── teams.py             # Team CRUD (config read/write, member management)
+├── tasks.py             # Task CRUD (create, update, list, dependencies)
+├── messaging.py         # Inbox operations (read, write, structured messages)
+├── capabilities.py      # Lead/agent capability storage and resolution
+├── inbox_crypto.py      # Optional inbox-at-rest encryption helpers
+├── filelock.py          # Shared fcntl-based file locking
+├── skills/
+│   └── team-orchestration/SKILL.md  # Bundled team-orchestration skill
 └── backends/
-    ├── base.py        # Compatibility re-exports for backend contracts/base
-    ├── contracts.py   # Backend protocol and spawn result/request types
-    ├── tmux_base.py   # Shared tmux-backed BaseBackend implementation
-    ├── registry.py    # Auto-discovery and registration
-    ├── claude_code.py # Claude Code backend
-    ├── codex.py       # OpenAI Codex backend
-    ├── gemini.py      # Gemini CLI backend
-    └── ...            # 14 more backend implementations
+    ├── base.py          # Compatibility re-exports for backend contracts/base
+    ├── contracts.py     # Backend protocol and spawn result/request types
+    ├── tmux_base.py     # Shared tmux-backed BaseBackend implementation
+    ├── registry.py      # Auto-discovery and registration
+    ├── claude_code.py   # Claude Code backend
+    ├── codex.py         # OpenAI Codex backend
+    ├── gemini.py        # Gemini CLI backend
+    └── ...              # 14 more backend implementations
 ```
 
 ---

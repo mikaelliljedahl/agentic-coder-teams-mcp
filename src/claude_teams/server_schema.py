@@ -5,7 +5,7 @@ Each alias wraps a primitive type with a ``pydantic.Field`` that carries:
 - validation constraints (length, pattern, range) that fire before the
   tool body runs, replacing prior hand-written checks.
 
-Centralizing these keeps parameter semantics consistent across the seven
+Centralizing these keeps parameter semantics consistent across the five
 registration modules and makes FastMCP's generated JSON schema uniform
 for clients that introspect the tool surface.
 """
@@ -198,7 +198,7 @@ SubagentType = Annotated[
         examples=["general-purpose", "executor", "code-reviewer", "debugger"],
     ),
 ]
-"""Subagent type string written to ``team.json``."""
+"""Subagent type string written to ``config.json``."""
 
 PermissionModeOpt = Literal["default", "require_approval", "bypass"]
 """Permission behavior override accepted by ``spawn_teammate``."""
