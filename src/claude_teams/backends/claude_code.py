@@ -59,7 +59,7 @@ class ClaudeCodeBackend(BaseBackend):
             Claude Code model identifier.
 
         Raises:
-            ValueError: For unsupported model names.
+            UnsupportedBackendModelError: For unsupported model names.
 
         """
         if generic_name in self._MODEL_MAP:

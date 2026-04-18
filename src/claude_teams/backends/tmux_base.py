@@ -75,7 +75,7 @@ class BaseBackend:
             str: Resolved binary path.
 
         Raises:
-            FileNotFoundError: If the binary is not on PATH.
+            BackendBinaryNotFoundError: If the binary is not on PATH.
 
         """
         path = shutil.which(self._binary_name)

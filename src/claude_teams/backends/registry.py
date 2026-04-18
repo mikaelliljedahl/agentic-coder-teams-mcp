@@ -107,7 +107,8 @@ class BackendRegistry:
             The Backend instance.
 
         Raises:
-            KeyError: If no backend with the given name is registered.
+            BackendNotRegisteredError: If no backend with the given name is
+                registered.
 
         """
         self._ensure_loaded()
@@ -132,7 +133,7 @@ class BackendRegistry:
             'claude-code' if available, else the first available backend.
 
         Raises:
-            RuntimeError: If no backends are available.
+            NoBackendsAvailableError: If no backends are available.
 
         """
         self._ensure_loaded()
