@@ -1,5 +1,7 @@
 """Rovo Dev backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -14,7 +16,7 @@ class RovoDevBackend(BaseBackend):
     _name = "rovodev"
     _binary_name = "acli"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "gpt-5-mini-2025-08-07",
         "balanced": "gpt-5-2025-08-07",
         "powerful": "claude-opus-4-20250918",
@@ -91,15 +93,3 @@ class RovoDevBackend(BaseBackend):
             *self.permission_args(request),
             request.prompt,
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Rovo Dev environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

@@ -1,27 +1,32 @@
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
-from dataclasses import replace
+import pytest
 
 from claude_teams.backends.base import SpawnRequest
-
 from claude_teams.backends.llxprt import LlxprtBackend
 
 
-_DEFAULT_REQUEST = SpawnRequest(
-    agent_id="worker@team",
-    name="worker",
-    team_name="team",
-    prompt="do stuff",
-    model="claude-sonnet-4.5",
-    agent_type="general-purpose",
-    color="blue",
-    cwd="/tmp/work",
-    lead_session_id="sess-1",
-)
+@pytest.fixture
+def _make_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
+    default = SpawnRequest(
+        agent_id="worker@team",
+        name="worker",
+        team_name="team",
+        prompt="do stuff",
+        model="claude-sonnet-4.5",
+        agent_type="general-purpose",
+        color="blue",
+        cwd=str(tmp_path),
+        lead_session_id="sess-1",
+    )
 
+    def factory(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
+        return replace(default, **overrides)
 
-def _make_request(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
-    return replace(_DEFAULT_REQUEST, **overrides)
+    return factory
 
 
 class TestLlxprtProperties:
@@ -73,7 +78,7 @@ class TestLlxprtResolveModel:
 
 class TestLlxprtBuildCommand:
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/llxprt")
-    def test_produces_prompt_command(self, _mock_which):
+    def test_produces_prompt_command(self, _mock_which, _make_request):
         backend = LlxprtBackend()
         request = _make_request()
 
@@ -85,7 +90,7 @@ class TestLlxprtBuildCommand:
         assert "-y" in cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/llxprt")
-    def test_includes_prompt_after_p_flag(self, _mock_which):
+    def test_includes_prompt_after_p_flag(self, _mock_which, _make_request):
         backend = LlxprtBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -95,7 +100,7 @@ class TestLlxprtBuildCommand:
         assert cmd[idx + 1] == "fix the bug"
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/llxprt")
-    def test_resolves_generic_model(self, _mock_which):
+    def test_resolves_generic_model(self, _mock_which, _make_request):
         backend = LlxprtBackend()
         request = _make_request(model="powerful")
 
@@ -106,7 +111,7 @@ class TestLlxprtBuildCommand:
 
 
 class TestLlxprtBuildEnv:
-    def test_returns_empty_dict(self):
+    def test_returns_empty_dict(self, _make_request):
         backend = LlxprtBackend()
         request = _make_request()
         assert backend.build_env(request) == {}

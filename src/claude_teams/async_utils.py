@@ -2,13 +2,11 @@
 
 import asyncio
 from collections.abc import Callable
-from typing import ParamSpec, TypeVar
-
-P = ParamSpec("P")
-T = TypeVar("T")
 
 
-async def run_blocking(fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> T:
+async def run_blocking[**P, T](
+    fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+) -> T:
     """Run a blocking function in a worker thread.
 
     Args:

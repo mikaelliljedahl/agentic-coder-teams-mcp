@@ -1,20 +1,35 @@
 """Runtime BaseBackend controller-operation tests."""
 
+import shlex
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from claude_teams.backends.base import SpawnResult
+from claude_teams.backends.base import SpawnRequest, SpawnResult
 from tests.test_backends._base_support import (
     _InvalidEnvBackend,
     _make_backend_with_mock_controller,
-    _make_spawn_request,
+    _StubBackend,
 )
+
+
+class _DangerousEnvBackend(_StubBackend):
+    """Stub backend returning a shell-metacharacter env value.
+
+    Used to verify ``build_env`` values are routed through ``shlex.quote``
+    before being interpolated into the pane startup command.
+    """
+
+    def build_env(self, request: SpawnRequest) -> dict[str, str]:
+        return {"DANGER": "$(whoami); :"}
 
 
 class TestBaseBackendSpawn:
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_returns_spawn_result_on_success(self, _mock_which: MagicMock):
+    def test_returns_spawn_result_on_success(
+        self, _mock_which: MagicMock, _make_spawn_request
+    ):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = "remote:1.2"
         request = _make_spawn_request()
@@ -26,7 +41,9 @@ class TestBaseBackendSpawn:
         assert result.backend_type == "stub"
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_calls_launch_cli_with_full_command(self, _mock_which: MagicMock):
+    def test_calls_launch_cli_with_full_command(
+        self, _mock_which: MagicMock, _make_spawn_request
+    ):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = "remote:1.0"
         request = _make_spawn_request()
@@ -40,7 +57,9 @@ class TestBaseBackendSpawn:
         assert "stub-cli" in full_cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_raises_runtime_error_when_launch_fails(self, _mock_which: MagicMock):
+    def test_raises_runtime_error_when_launch_fails(
+        self, _mock_which: MagicMock, _make_spawn_request
+    ):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = None
         request = _make_spawn_request()
@@ -49,7 +68,9 @@ class TestBaseBackendSpawn:
             backend.spawn(request)
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_includes_env_prefix_in_command(self, _mock_which: MagicMock):
+    def test_includes_env_prefix_in_command(
+        self, _mock_which: MagicMock, _make_spawn_request
+    ):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = "remote:1.0"
         request = _make_spawn_request()
@@ -60,7 +81,9 @@ class TestBaseBackendSpawn:
         assert "STUB_MODE=" in full_cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_rejects_invalid_env_var_name(self, _mock_which: MagicMock):
+    def test_rejects_invalid_env_var_name(
+        self, _mock_which: MagicMock, _make_spawn_request
+    ):
         backend = _InvalidEnvBackend()
         request = _make_spawn_request()
 
@@ -300,4 +323,72 @@ class TestBaseBackendExecuteInPane:
             "long cmd",
             pane_id="%42",
             timeout=120,
+        )
+
+
+# ---------------------------------------------------------------------------
+# BaseBackend.spawn — shlex.quote regression contract
+# ---------------------------------------------------------------------------
+
+
+class TestBaseBackendSpawnQuotingContract:
+    """Lock the shell-quoting contract so prompt/cwd/env are never interpolated.
+
+    ``BaseBackend.spawn`` concatenates a string command that tmux runs in a
+    shell, so *every* user-controlled argument must be ``shlex.quote``d.
+    Dropping any of these quotes silently turns a prompt containing
+    ``$(rm -rf /)`` into live command substitution. These tests re-parse
+    the launched command with ``shlex.split`` and assert the dangerous
+    tokens reappear as a single argv element, proving the quoting held.
+    """
+
+    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
+    def test_prompt_metacharacters_are_shell_quoted(
+        self, _mock_which: MagicMock, _make_spawn_request
+    ):
+        backend, mock_ctrl = _make_backend_with_mock_controller()
+        mock_ctrl.launch_cli.return_value = "remote:1.0"
+        dangerous = "$(rm -rf /); echo `id`; && :"
+        request = _make_spawn_request(prompt=dangerous)
+
+        backend.spawn(request)
+
+        full_cmd = mock_ctrl.launch_cli.call_args[0][0]
+        parsed = shlex.split(full_cmd)
+        assert dangerous in parsed, (
+            f"prompt was not preserved as a single argv token: {parsed!r}"
+        )
+
+    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
+    def test_cwd_with_spaces_is_shell_quoted(
+        self, _mock_which: MagicMock, tmp_path: Path, _make_spawn_request
+    ):
+        backend, mock_ctrl = _make_backend_with_mock_controller()
+        mock_ctrl.launch_cli.return_value = "remote:1.0"
+        spaced = str(tmp_path / "has space" / "dir")
+        request = _make_spawn_request(cwd=spaced)
+
+        backend.spawn(request)
+
+        full_cmd = mock_ctrl.launch_cli.call_args[0][0]
+        parsed = shlex.split(full_cmd)
+        assert parsed[0] == "cd"
+        assert parsed[1] == spaced
+
+    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
+    def test_env_var_values_are_shell_quoted(
+        self, _mock_which: MagicMock, _make_spawn_request
+    ):
+        backend = _DangerousEnvBackend()
+        mock_ctrl = MagicMock()
+        backend._controller = mock_ctrl
+        mock_ctrl.launch_cli.return_value = "remote:1.0"
+        request = _make_spawn_request()
+
+        backend.spawn(request)
+
+        full_cmd = mock_ctrl.launch_cli.call_args[0][0]
+        parsed = shlex.split(full_cmd)
+        assert "DANGER=$(whoami); :" in parsed, (
+            f"env value was not preserved as a single argv token: {parsed!r}"
         )

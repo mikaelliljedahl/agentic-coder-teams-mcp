@@ -3,9 +3,10 @@
 import importlib
 import importlib.metadata
 import logging
-from typing import Iterator
+from collections.abc import Iterator
 
 from claude_teams.backends.base import Backend
+from claude_teams.errors import BackendNotRegisteredError, NoBackendsAvailableError
 
 logger = logging.getLogger(__name__)
 
@@ -111,10 +112,7 @@ class BackendRegistry:
         """
         self._ensure_loaded()
         if name not in self._backends:
-            available = ", ".join(sorted(self._backends.keys()))
-            raise KeyError(
-                f"Backend {name!r} not found. Available: {available or '(none)'}"
-            )
+            raise BackendNotRegisteredError(name, self._backends.keys())
         return self._backends[name]
 
     def list_available(self) -> list[str]:
@@ -143,9 +141,7 @@ class BackendRegistry:
         available = self.list_available()
         if available:
             return available[0]
-        raise RuntimeError(
-            "No backends available. Install at least one agentic CLI tool."
-        )
+        raise NoBackendsAvailableError()
 
     def __iter__(self) -> Iterator[tuple[str, Backend]]:
         """Yield (name, backend) tuples for all registered backends."""

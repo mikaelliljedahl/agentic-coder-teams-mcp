@@ -17,7 +17,7 @@ def file_lock(lock_path: Path):
 
     """
     lock_path.touch(exist_ok=True)
-    with open(lock_path) as lock_file:
+    with lock_path.open() as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield

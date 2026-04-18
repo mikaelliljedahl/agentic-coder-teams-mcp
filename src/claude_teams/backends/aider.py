@@ -1,5 +1,7 @@
 """Aider backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -9,7 +11,7 @@ class AiderBackend(BaseBackend):
     _name = "aider"
     _binary_name = "aider"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "claude-3.5-haiku",
         "balanced": "claude-sonnet-4",
         "powerful": "claude-opus-4",
@@ -79,15 +81,3 @@ class AiderBackend(BaseBackend):
             request.prompt,
             *self.permission_args(request),
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Aider environment variables (none required).
-
-        Args:
-            request: Backend-agnostic spawn parameters.
-
-        Returns:
-            Empty dict.
-
-        """
-        return {}

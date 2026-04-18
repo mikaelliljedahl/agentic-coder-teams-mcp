@@ -1,5 +1,7 @@
 """Kimi backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -9,7 +11,7 @@ class KimiBackend(BaseBackend):
     _name = "kimi"
     _binary_name = "kimi"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "kimi-k2",
         "balanced": "kimi-k2-thinking",
         "powerful": "kimi-k2-thinking-turbo",
@@ -78,15 +80,3 @@ class KimiBackend(BaseBackend):
             "-m",
             model,
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Kimi environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

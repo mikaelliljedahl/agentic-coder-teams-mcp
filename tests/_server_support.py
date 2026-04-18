@@ -9,16 +9,29 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastmcp import Client
-from mcp.types import TextContent
+from mcp.types import TextContent, TextResourceContents
 
 from claude_teams import messaging, tasks, teams
 from claude_teams.backends import registry
-from claude_teams.backends.base import HealthStatus, SpawnResult as BackendSpawnResult
+from claude_teams.backends.base import HealthStatus
+from claude_teams.backends.base import SpawnResult as BackendSpawnResult
 from claude_teams.models import TeammateMember
 from claude_teams.server import mcp
 
 
-def _make_teammate(name: str, team_name: str, pane_id: str = "%1") -> TeammateMember:
+def _make_teammate(
+    name: str,
+    team_name: str,
+    cwd: str | Path,
+    pane_id: str = "%1",
+) -> TeammateMember:
+    """Construct a ``TeammateMember`` fixture with an explicit ``cwd``.
+
+    ``cwd`` is a required positional argument so callers can't accidentally
+    fall back to a shared ``/tmp`` path — pass ``str(tmp_path)`` from a
+    pytest test to guarantee per-test isolation if the field is ever read
+    for real filesystem work.
+    """
     return TeammateMember(
         agent_id=f"{name}@{team_name}",
         name=name,
@@ -29,7 +42,7 @@ def _make_teammate(name: str, team_name: str, pane_id: str = "%1") -> TeammateMe
         plan_mode_required=False,
         joined_at=int(time.time() * 1000),
         tmux_pane_id=pane_id,
-        cwd="/tmp",
+        cwd=str(cwd),
     )
 
 
@@ -86,8 +99,14 @@ async def client(
 
 
 @pytest.fixture
-async def team_client(client: Client) -> AsyncGenerator[Client, None]:
-    """Client with a team created and a teammate spawned."""
+async def team_client(client: Client) -> Client:
+    """Client with a team created and a teammate spawned.
+
+    Returns the already-set-up client directly — no ``yield`` because this
+    fixture has no teardown of its own. All cleanup (registry reset, tmp-path
+    scrubbing) is owned by the upstream ``client`` fixture's ``async with``
+    block.
+    """
     await client.call_tool("team_create", {"team_name": "test-team"})
     await client.call_tool(
         "spawn_teammate",
@@ -97,7 +116,7 @@ async def team_client(client: Client) -> AsyncGenerator[Client, None]:
             "prompt": "help out",
         },
     )
-    yield client
+    return client
 
 
 def _text(result) -> str:
@@ -105,6 +124,24 @@ def _text(result) -> str:
     item = result.content[0]
     assert isinstance(item, TextContent)
     return item.text
+
+
+def _content_text(block) -> str:
+    """Narrow a prompt/resource content union to its textual variant.
+
+    Used by prompt-render and read_resource tests where the payload is a
+    single content block — ``message.content`` for ``GetPromptResult`` (a
+    ``TextContent | ImageContent | AudioContent | ResourceLink |
+    EmbeddedResource`` union) or ``result[0]`` for ``read_resource`` (a
+    ``TextResourceContents | BlobResourceContents`` union). Both of the
+    textual variants expose ``.text``; this helper narrows to them so type
+    checkers stop flagging the attribute access and non-text blocks raise
+    a typed ``AssertionError`` instead of a runtime ``AttributeError``.
+    """
+    assert isinstance(block, (TextContent, TextResourceContents)), (
+        f"expected TextContent or TextResourceContents, got {type(block).__name__}"
+    )
+    return block.text
 
 
 def _data(result):

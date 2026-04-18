@@ -1,28 +1,32 @@
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
-
-from dataclasses import replace
+import pytest
 
 from claude_teams.backends.base import SpawnRequest
-
 from claude_teams.backends.opencode import OpenCodeBackend
 
 
-_DEFAULT_REQUEST = SpawnRequest(
-    agent_id="worker@team",
-    name="worker",
-    team_name="team",
-    prompt="do stuff",
-    model="anthropic/claude-sonnet-4",
-    agent_type="general-purpose",
-    color="blue",
-    cwd="/tmp/work",
-    lead_session_id="sess-1",
-)
+@pytest.fixture
+def _make_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
+    default = SpawnRequest(
+        agent_id="worker@team",
+        name="worker",
+        team_name="team",
+        prompt="do stuff",
+        model="anthropic/claude-sonnet-4",
+        agent_type="general-purpose",
+        color="blue",
+        cwd=str(tmp_path),
+        lead_session_id="sess-1",
+    )
 
+    def factory(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
+        return replace(default, **overrides)
 
-def _make_request(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
-    return replace(_DEFAULT_REQUEST, **overrides)
+    return factory
 
 
 class TestOpenCodeProperties:
@@ -75,7 +79,7 @@ class TestOpenCodeResolveModel:
 
 class TestOpenCodeBuildCommand:
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/opencode")
-    def test_produces_run_command(self, mock_which):
+    def test_produces_run_command(self, mock_which, _make_request):
         backend = OpenCodeBackend()
         request = _make_request()
 
@@ -86,7 +90,7 @@ class TestOpenCodeBuildCommand:
         assert "--model" in cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/opencode")
-    def test_includes_prompt_as_last_arg(self, mock_which):
+    def test_includes_prompt_as_last_arg(self, mock_which, _make_request):
         backend = OpenCodeBackend()
         request = _make_request(prompt="implement feature")
 
@@ -95,7 +99,7 @@ class TestOpenCodeBuildCommand:
         assert cmd[-1] == "implement feature"
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/opencode")
-    def test_includes_model_value(self, mock_which):
+    def test_includes_model_value(self, mock_which, _make_request):
         backend = OpenCodeBackend()
         request = _make_request(model="balanced")
 
@@ -106,7 +110,7 @@ class TestOpenCodeBuildCommand:
 
 
 class TestOpenCodeBuildEnv:
-    def test_returns_empty_dict(self):
+    def test_returns_empty_dict(self, _make_request):
         backend = OpenCodeBackend()
         request = _make_request()
 

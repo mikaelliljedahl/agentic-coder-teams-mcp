@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from claude_teams.models import TaskUpdateFields
 from claude_teams.tasks import (
     create_task,
     get_task,
@@ -90,7 +91,7 @@ async def test_update_task_changes_status(
     updated = await update_task(
         team_name,
         task.id,
-        status="in_progress",
+        TaskUpdateFields(status="in_progress"),
         base_dir=base_dir,
     )
     assert updated.status == "in_progress"
@@ -104,7 +105,7 @@ async def test_update_task_sets_owner(team_context: tuple[str, Path, Path]) -> N
     updated = await update_task(
         team_name,
         task.id,
-        owner="worker-1",
+        TaskUpdateFields(owner="worker-1"),
         base_dir=base_dir,
     )
     assert updated.owner == "worker-1"
@@ -122,7 +123,7 @@ async def test_update_task_delete_removes_file(
     result = await update_task(
         team_name,
         task.id,
-        status="deleted",
+        TaskUpdateFields(status="deleted"),
         base_dir=base_dir,
     )
     assert not await asyncio.to_thread(task_path.exists)
@@ -152,8 +153,7 @@ async def test_reset_owner_tasks_reverts_status(
     await update_task(
         team_name,
         task.id,
-        owner="w",
-        status="in_progress",
+        TaskUpdateFields(owner="w", status="in_progress"),
         base_dir=base_dir,
     )
     await reset_owner_tasks(team_name, "w", base_dir=base_dir)
@@ -171,15 +171,13 @@ async def test_reset_owner_tasks_only_affects_matching_owner(
     await update_task(
         team_name,
         task_one.id,
-        owner="w1",
-        status="in_progress",
+        TaskUpdateFields(owner="w1", status="in_progress"),
         base_dir=base_dir,
     )
     await update_task(
         team_name,
         task_two.id,
-        owner="w2",
-        status="in_progress",
+        TaskUpdateFields(owner="w2", status="in_progress"),
         base_dir=base_dir,
     )
     await reset_owner_tasks(team_name, "w1", base_dir=base_dir)
@@ -227,9 +225,19 @@ async def test_update_task_rejects_backward_status_transition(
 ) -> None:
     team_name, base_dir, _tasks_dir = team_context
     task = await create_task(team_name, "Sub", "desc", base_dir=base_dir)
-    await update_task(team_name, task.id, status="in_progress", base_dir=base_dir)
+    await update_task(
+        team_name,
+        task.id,
+        TaskUpdateFields(status="in_progress"),
+        base_dir=base_dir,
+    )
     with pytest.raises(ValueError, match="Cannot transition"):
-        await update_task(team_name, task.id, status="pending", base_dir=base_dir)
+        await update_task(
+            team_name,
+            task.id,
+            TaskUpdateFields(status="pending"),
+            base_dir=base_dir,
+        )
 
 
 async def test_update_task_rejects_completed_to_in_progress(
@@ -237,10 +245,25 @@ async def test_update_task_rejects_completed_to_in_progress(
 ) -> None:
     team_name, base_dir, _tasks_dir = team_context
     task = await create_task(team_name, "Sub", "desc", base_dir=base_dir)
-    await update_task(team_name, task.id, status="in_progress", base_dir=base_dir)
-    await update_task(team_name, task.id, status="completed", base_dir=base_dir)
+    await update_task(
+        team_name,
+        task.id,
+        TaskUpdateFields(status="in_progress"),
+        base_dir=base_dir,
+    )
+    await update_task(
+        team_name,
+        task.id,
+        TaskUpdateFields(status="completed"),
+        base_dir=base_dir,
+    )
     with pytest.raises(ValueError, match="Cannot transition"):
-        await update_task(team_name, task.id, status="in_progress", base_dir=base_dir)
+        await update_task(
+            team_name,
+            task.id,
+            TaskUpdateFields(status="in_progress"),
+            base_dir=base_dir,
+        )
 
 
 async def test_update_task_allows_forward_status_transition(
@@ -251,14 +274,14 @@ async def test_update_task_allows_forward_status_transition(
     updated = await update_task(
         team_name,
         task.id,
-        status="in_progress",
+        TaskUpdateFields(status="in_progress"),
         base_dir=base_dir,
     )
     assert updated.status == "in_progress"
     completed = await update_task(
         team_name,
         task.id,
-        status="completed",
+        TaskUpdateFields(status="completed"),
         base_dir=base_dir,
     )
     assert completed.status == "completed"
@@ -272,7 +295,7 @@ async def test_update_task_allows_pending_to_completed(
     updated = await update_task(
         team_name,
         task.id,
-        status="completed",
+        TaskUpdateFields(status="completed"),
         base_dir=base_dir,
     )
     assert updated.status == "completed"
@@ -291,11 +314,15 @@ async def test_reset_owner_tasks_preserves_completed_status(
     await update_task(
         team_name,
         task.id,
-        owner="w",
-        status="in_progress",
+        TaskUpdateFields(owner="w", status="in_progress"),
         base_dir=base_dir,
     )
-    await update_task(team_name, task.id, status="completed", base_dir=base_dir)
+    await update_task(
+        team_name,
+        task.id,
+        TaskUpdateFields(status="completed"),
+        base_dir=base_dir,
+    )
     await reset_owner_tasks(team_name, "w", base_dir=base_dir)
     after = await get_task(team_name, task.id, base_dir=base_dir)
     assert after.status == "completed"

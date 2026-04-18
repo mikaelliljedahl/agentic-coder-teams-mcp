@@ -1,7 +1,11 @@
 """Shared helpers for BaseBackend tests."""
 
+from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
@@ -36,23 +40,30 @@ class _InvalidEnvBackend(_StubBackend):
         return {"INVALID-KEY": "val"}
 
 
-_DEFAULT_REQUEST = SpawnRequest(
-    agent_id="worker@team",
-    name="worker",
-    team_name="team",
-    prompt="do stuff",
-    model="default",
-    agent_type="general-purpose",
-    color="blue",
-    cwd="/tmp",
-    lead_session_id="sess-1",
-)
+@pytest.fixture
+def _make_spawn_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
+    """Factory yielding ``SpawnRequest`` instances rooted at ``tmp_path``.
 
+    Exposed as a fixture (not a module-level function) so each test body
+    that takes it gets its own per-test-isolated ``cwd`` — no shared
+    ``/tmp`` placeholder leaks across tests.
+    """
+    default = SpawnRequest(
+        agent_id="worker@team",
+        name="worker",
+        team_name="team",
+        prompt="do stuff",
+        model="default",
+        agent_type="general-purpose",
+        color="blue",
+        cwd=str(tmp_path),
+        lead_session_id="sess-1",
+    )
 
-def _make_spawn_request(
-    **overrides: str | bool | dict[str, str] | None,
-) -> SpawnRequest:
-    return replace(_DEFAULT_REQUEST, **overrides)
+    def factory(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
+        return replace(default, **overrides)
+
+    return factory
 
 
 def _make_backend_with_mock_controller() -> tuple[_StubBackend, MagicMock]:

@@ -1,5 +1,7 @@
 """GitHub Copilot backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -9,7 +11,7 @@ class CopilotBackend(BaseBackend):
     _name = "copilot"
     _binary_name = "copilot"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "claude-haiku-4.5",
         "balanced": "claude-sonnet-4.5",
         "powerful": "claude-opus-4.6",
@@ -105,15 +107,3 @@ class CopilotBackend(BaseBackend):
     def default_permission_args(self) -> list[str]:
         """Return default permission-bypass arguments for Copilot."""
         return ["--yolo"]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Copilot CLI environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

@@ -17,3 +17,5 @@ venv/
 .omc
 docs/
 .coverage
+.remember
+FORK_INTEGRATION_ARCHITECTURE_PLAN.md

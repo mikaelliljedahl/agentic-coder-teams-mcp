@@ -3,7 +3,6 @@
 import logging
 import os
 import re
-import uuid
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
@@ -14,6 +13,21 @@ from mcp.types import ToolAnnotations
 
 from claude_teams import capabilities, teams
 from claude_teams.backends import BackendRegistry, registry
+from claude_teams.errors import (
+    AuthenticationRequiredError,
+    CwdMissingError,
+    CwdNotAbsoluteError,
+    CwdNotDirectoryError,
+    InvalidNameError,
+    InvalidPermissionModeError,
+    LeadCapabilityRequiredError,
+    NameTooLongError,
+    PaginationLimitTooLargeError,
+    PaginationLimitTooSmallError,
+    PaginationOffsetNegativeError,
+    PrincipalActingAsOtherError,
+    TeamNotFoundToolError,
+)
 from claude_teams.models import TeammateMember
 
 _TAG_BOOTSTRAP = "bootstrap"
@@ -77,11 +91,11 @@ def _resolve_spawn_cwd(cwd: str) -> str:
 
     candidate = Path(cwd).expanduser()
     if not candidate.is_absolute():
-        raise ToolError(f"cwd must be an absolute path, got: {cwd!r}")
+        raise CwdNotAbsoluteError(cwd)
     if not candidate.exists():
-        raise ToolError(f"cwd does not exist: {candidate}")
+        raise CwdMissingError(candidate)
     if not candidate.is_dir():
-        raise ToolError(f"cwd is not a directory: {candidate}")
+        raise CwdNotDirectoryError(candidate)
     return str(candidate)
 
 
@@ -90,28 +104,17 @@ def _resolve_permission_mode(
 ) -> Literal["default", "require_approval", "bypass"]:
     raw = permission_mode or os.environ.get("CLAUDE_TEAMS_PERMISSION_MODE", "default")
     if raw not in _PERMISSION_MODES:
-        supported = ", ".join(sorted(_PERMISSION_MODES))
-        raise ToolError(
-            f"Invalid permission mode {raw!r}. Supported values: {supported}."
-        )
+        raise InvalidPermissionModeError(raw, _PERMISSION_MODES)
     return cast(Literal["default", "require_approval", "bypass"], raw)
-
-
-def _validate_agent_name(name: str, label: str = "agent name") -> str:
-    """Validate a safe agent-style identifier and raise ToolError on failure."""
-    try:
-        return teams.validate_safe_name(name, label)
-    except ValueError as exc:
-        raise ToolError(str(exc)) from exc
 
 
 def _normalize_pagination(limit: int, offset: int) -> tuple[int, int]:
     if limit < 1:
-        raise ToolError("limit must be >= 1")
+        raise PaginationLimitTooSmallError()
     if limit > _MAX_PAGE_SIZE:
-        raise ToolError(f"limit must be <= {_MAX_PAGE_SIZE}")
+        raise PaginationLimitTooLargeError(_MAX_PAGE_SIZE)
     if offset < 0:
-        raise ToolError("offset must be >= 0")
+        raise PaginationOffsetNegativeError()
     return limit, offset
 
 
@@ -133,28 +136,21 @@ def _page_items(
 
 
 class _LifespanState(TypedDict):
+    """Server-scoped (per-process) state shared across all client sessions.
+
+    Per-session state (active team, principal identity, teammate presence
+    flag) lives in ``ctx.set_state``/``get_state``/``delete_state`` which
+    FastMCP auto-namespaces by ``ctx.session_id``. Storing per-session
+    concepts here would clobber across concurrent HTTP/SSE sessions.
+    """
+
     registry: BackendRegistry
-    session_id: str
-    active_team: str | None
-    has_teammates: bool
-    principal_name: str | None
-    principal_role: Literal["lead", "agent"] | None
-    lead_capability: str | None
 
 
 @lifespan
-async def app_lifespan(server):
+async def app_lifespan(_server):
     """Initialize and manage the MCP server lifespan."""
-    session_id = str(uuid.uuid4())
-    yield {
-        "registry": registry,
-        "session_id": session_id,
-        "active_team": None,
-        "has_teammates": False,
-        "principal_name": None,
-        "principal_role": None,
-        "lead_capability": None,
-    }
+    yield {"registry": registry}
 
 
 mcp = FastMCP(
@@ -164,8 +160,18 @@ mcp = FastMCP(
         "Manages team creation, teammate spawning, messaging, and task tracking."
     ),
     lifespan=app_lifespan,
+    # Only ``ToolError``/``ResourceError``/``PromptError`` strings reach the
+    # client; unexpected exceptions surface as a generic "internal error"
+    # message while the full traceback still lands in server logs. Prevents
+    # filesystem paths, stack frames, and credential fragments from leaking
+    # into LLM-visible tool results.
+    mask_error_details=True,
+    # Fail fast on type-mismatched inputs instead of silently coercing
+    # (e.g. ``"10"`` → ``10``). Surfaces client bugs immediately instead of
+    # letting them propagate as subtly-wrong values into team state.
+    strict_input_validation=True,
 )
-mcp.enable(tags={_TAG_BOOTSTRAP}, only=True, components={"tool"})
+mcp.enable(tags={_TAG_BOOTSTRAP}, only=True, components={"tool", "prompt"})
 
 
 def _get_lifespan(ctx: Context) -> _LifespanState:
@@ -174,42 +180,61 @@ def _get_lifespan(ctx: Context) -> _LifespanState:
 
 
 async def _set_session_principal(
-    ls: _LifespanState,
+    ctx: Context,
     team_name: str,
     principal_name: str,
     principal_role: Literal["lead", "agent"],
     *,
     lead_capability: str | None = None,
 ) -> None:
-    ls["active_team"] = team_name
-    ls["principal_name"] = principal_name
-    ls["principal_role"] = principal_role
-    ls["lead_capability"] = lead_capability if principal_role == "lead" else None
+    """Persist the authenticated principal on the per-session context store."""
+    await ctx.set_state("active_team", team_name)
+    await ctx.set_state("principal_name", principal_name)
+    await ctx.set_state("principal_role", principal_role)
+    await ctx.set_state(
+        "lead_capability",
+        lead_capability if principal_role == "lead" else None,
+    )
 
     config = await teams.read_config(team_name)
-    ls["has_teammates"] = any(
-        isinstance(member, TeammateMember) for member in config.members
+    await ctx.set_state(
+        "has_teammates",
+        any(isinstance(member, TeammateMember) for member in config.members),
     )
 
 
-def _resolve_session_principal(
+async def _clear_session_principal(ctx: Context) -> None:
+    """Drop all per-session principal keys, used on team deletion/detach."""
+    for key in (
+        "active_team",
+        "principal_name",
+        "principal_role",
+        "lead_capability",
+        "has_teammates",
+    ):
+        await ctx.delete_state(key)
+
+
+async def _resolve_session_principal(
     ctx: Context, team_name: str
 ) -> capabilities.Principal | None:
-    ls = _get_lifespan(ctx)
-    if ls.get("active_team") != team_name:
+    active_team = await ctx.get_state("active_team")
+    if active_team != team_name:
         return None
-    if ls.get("principal_name") is None or ls.get("principal_role") is None:
+    principal_name = await ctx.get_state("principal_name")
+    principal_role = await ctx.get_state("principal_role")
+    if principal_name is None or principal_role is None:
         return None
     return {
-        "name": cast(str, ls["principal_name"]),
-        "role": cast(Literal["lead", "agent"], ls["principal_role"]),
+        "name": cast(str, principal_name),
+        "role": cast(Literal["lead", "agent"], principal_role),
     }
 
 
 async def _resolve_authenticated_principal(
     ctx: Context, team_name: str, capability: str = ""
 ) -> capabilities.Principal | None:
-    session_principal = _resolve_session_principal(ctx, team_name)
+    session_principal = await _resolve_session_principal(ctx, team_name)
     if session_principal is not None:
         return session_principal
     if capability:
@@ -220,10 +245,10 @@ async def _resolve_authenticated_principal(
 async def _ensure_team_exists(team_name: str) -> None:
     try:
         safe_team_name = teams.validate_safe_name(team_name, "team name")
-    except ValueError as exc:
+    except (InvalidNameError, NameTooLongError) as exc:
         raise ToolError(str(exc)) from exc
     if not await teams.team_exists(safe_team_name):
-        raise ToolError(f"Team {team_name!r} not found")
+        raise TeamNotFoundToolError(team_name)
 
 
 async def _require_authenticated_principal(
@@ -232,9 +257,7 @@ async def _require_authenticated_principal(
     await _ensure_team_exists(team_name)
     principal = await _resolve_authenticated_principal(ctx, team_name, capability)
     if principal is None:
-        raise ToolError(
-            "This action requires an attached team session or a valid capability."
-        )
+        raise AuthenticationRequiredError()
     return principal
 
 
@@ -243,7 +266,7 @@ async def _require_lead(
 ) -> capabilities.Principal:
     principal = await _require_authenticated_principal(ctx, team_name, capability)
     if principal["role"] != "lead":
-        raise ToolError("This action requires the team-lead capability.")
+        raise LeadCapabilityRequiredError()
     return principal
 
 
@@ -254,7 +277,5 @@ async def _require_sender_or_lead(
     if principal["role"] == "lead":
         return principal
     if principal["name"] != sender:
-        raise ToolError(
-            f"Authenticated principal {principal['name']!r} cannot act as {sender!r}."
-        )
+        raise PrincipalActingAsOtherError(principal["name"], sender)
     return principal

@@ -1,5 +1,7 @@
 """Codex backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -9,7 +11,7 @@ class CodexBackend(BaseBackend):
     _name = "codex"
     _binary_name = "codex"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "gpt-5.1-codex-mini",
         "balanced": "gpt-5.3-codex",
         "powerful": "gpt-5.1-codex-max",
@@ -84,15 +86,3 @@ class CodexBackend(BaseBackend):
 
         cmd.append(request.prompt)
         return cmd
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Codex environment variables (none required).
-
-        Args:
-            request: Backend-agnostic spawn parameters.
-
-        Returns:
-            Empty dict.
-
-        """
-        return {}

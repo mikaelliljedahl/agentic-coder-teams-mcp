@@ -1,6 +1,9 @@
 """Claude Code backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
+from claude_teams.errors import UnsupportedBackendModelError
 
 
 class ClaudeCodeBackend(BaseBackend):
@@ -19,7 +22,7 @@ class ClaudeCodeBackend(BaseBackend):
         """
         return True
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "haiku",
         "balanced": "sonnet",
         "powerful": "opus",
@@ -61,9 +64,8 @@ class ClaudeCodeBackend(BaseBackend):
         """
         if generic_name in self._MODEL_MAP:
             return self._MODEL_MAP[generic_name]
-        raise ValueError(
-            f"Unsupported model {generic_name!r} for claude-code. "
-            f"Supported: {', '.join(self.supported_models())}"
+        raise UnsupportedBackendModelError(
+            generic_name, "claude-code", self.supported_models()
         )
 
     def bypass_permission_args(self) -> list[str]:

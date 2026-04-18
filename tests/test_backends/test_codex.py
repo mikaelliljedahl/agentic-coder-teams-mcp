@@ -1,28 +1,32 @@
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
-
-from dataclasses import replace
+import pytest
 
 from claude_teams.backends.base import SpawnRequest
-
 from claude_teams.backends.codex import CodexBackend
 
 
-_DEFAULT_REQUEST = SpawnRequest(
-    agent_id="worker@team",
-    name="worker",
-    team_name="team",
-    prompt="do stuff",
-    model="gpt-5.3-codex",
-    agent_type="general-purpose",
-    color="blue",
-    cwd="/tmp/work",
-    lead_session_id="sess-1",
-)
+@pytest.fixture
+def _make_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
+    default = SpawnRequest(
+        agent_id="worker@team",
+        name="worker",
+        team_name="team",
+        prompt="do stuff",
+        model="gpt-5.3-codex",
+        agent_type="general-purpose",
+        color="blue",
+        cwd=str(tmp_path),
+        lead_session_id="sess-1",
+    )
 
+    def factory(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
+        return replace(default, **overrides)
 
-def _make_request(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
-    return replace(_DEFAULT_REQUEST, **overrides)
+    return factory
 
 
 class TestCodexProperties:
@@ -82,7 +86,7 @@ class TestCodexResolveModel:
 
 class TestCodexBuildCommand:
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_produces_exec_command(self, mock_which):
+    def test_produces_exec_command(self, mock_which, _make_request):
         backend = CodexBackend()
         request = _make_request()
 
@@ -95,7 +99,7 @@ class TestCodexBuildCommand:
         assert "-C" in cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_omits_full_auto_when_require_approval(self, mock_which):
+    def test_omits_full_auto_when_require_approval(self, mock_which, _make_request):
         backend = CodexBackend()
         request = _make_request(permission_mode="require_approval")
 
@@ -104,7 +108,7 @@ class TestCodexBuildCommand:
         assert "--full-auto" not in cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_includes_prompt_as_last_arg(self, mock_which):
+    def test_includes_prompt_as_last_arg(self, mock_which, _make_request):
         backend = CodexBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -113,30 +117,32 @@ class TestCodexBuildCommand:
         assert cmd[-1] == "fix the bug"
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_includes_cwd_flag(self, mock_which):
+    def test_includes_cwd_flag(self, mock_which, _make_request, tmp_path: Path):
         backend = CodexBackend()
-        request = _make_request(cwd="/my/project")
+        project_dir = str(tmp_path / "my" / "project")
+        request = _make_request(cwd=project_dir)
 
         cmd = backend.build_command(request)
 
         idx = cmd.index("-C")
-        assert cmd[idx + 1] == "/my/project"
+        assert cmd[idx + 1] == project_dir
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_includes_output_file_flag_when_extra_path_provided(self, mock_which):
+    def test_includes_output_file_flag_when_extra_path_provided(
+        self, mock_which, _make_request, tmp_path: Path
+    ):
         backend = CodexBackend()
-        request = _make_request(
-            extra={"output_last_message_path": "/tmp/codex-last-message.txt"}
-        )
+        output_path = str(tmp_path / "codex-last-message.txt")
+        request = _make_request(extra={"output_last_message_path": output_path})
 
         cmd = backend.build_command(request)
 
         assert "--output-last-message" in cmd
         idx = cmd.index("--output-last-message")
-        assert cmd[idx + 1] == "/tmp/codex-last-message.txt"
+        assert cmd[idx + 1] == output_path
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_excludes_output_file_flag_when_no_extra(self, mock_which):
+    def test_excludes_output_file_flag_when_no_extra(self, mock_which, _make_request):
         backend = CodexBackend()
         request = _make_request()
 
@@ -146,7 +152,7 @@ class TestCodexBuildCommand:
 
 
 class TestCodexBuildEnv:
-    def test_returns_empty_dict(self):
+    def test_returns_empty_dict(self, _make_request):
         backend = CodexBackend()
         request = _make_request()
 

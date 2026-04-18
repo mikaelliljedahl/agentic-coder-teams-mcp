@@ -1,27 +1,32 @@
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
-from dataclasses import replace
-
-from claude_teams.backends.base import SpawnRequest
+import pytest
 
 from claude_teams.backends.amp import AmpBackend
+from claude_teams.backends.base import SpawnRequest
 
 
-_DEFAULT_REQUEST = SpawnRequest(
-    agent_id="worker@team",
-    name="worker",
-    team_name="team",
-    prompt="do stuff",
-    model="smart",
-    agent_type="general-purpose",
-    color="blue",
-    cwd="/tmp/work",
-    lead_session_id="sess-1",
-)
+@pytest.fixture
+def _make_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
+    default = SpawnRequest(
+        agent_id="worker@team",
+        name="worker",
+        team_name="team",
+        prompt="do stuff",
+        model="smart",
+        agent_type="general-purpose",
+        color="blue",
+        cwd=str(tmp_path),
+        lead_session_id="sess-1",
+    )
 
+    def factory(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
+        return replace(default, **overrides)
 
-def _make_request(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
-    return replace(_DEFAULT_REQUEST, **overrides)
+    return factory
 
 
 class TestAmpProperties:
@@ -78,7 +83,7 @@ class TestAmpResolveModel:
 
 class TestAmpBuildCommand:
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/amp-cli")
-    def test_produces_execute_command(self, _mock_which):
+    def test_produces_execute_command(self, _mock_which, _make_request):
         backend = AmpBackend()
         request = _make_request()
 
@@ -89,7 +94,7 @@ class TestAmpBuildCommand:
         assert "--dangerously-allow-all" in cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/amp-cli")
-    def test_includes_prompt_after_x_flag(self, _mock_which):
+    def test_includes_prompt_after_x_flag(self, _mock_which, _make_request):
         backend = AmpBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -99,7 +104,7 @@ class TestAmpBuildCommand:
         assert cmd[idx + 1] == "fix the bug"
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/amp-cli")
-    def test_includes_mode_flag_for_known_mode(self, _mock_which):
+    def test_includes_mode_flag_for_known_mode(self, _mock_which, _make_request):
         backend = AmpBackend()
         request = _make_request(model="fast")
 
@@ -110,7 +115,7 @@ class TestAmpBuildCommand:
         assert cmd[idx + 1] == "rush"
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/amp-cli")
-    def test_omits_mode_flag_for_unknown_model(self, _mock_which):
+    def test_omits_mode_flag_for_unknown_model(self, _mock_which, _make_request):
         backend = AmpBackend()
         request = _make_request(model="some-unknown-model")
 
@@ -120,7 +125,7 @@ class TestAmpBuildCommand:
 
 
 class TestAmpBuildEnv:
-    def test_returns_empty_dict(self):
+    def test_returns_empty_dict(self, _make_request):
         backend = AmpBackend()
         request = _make_request()
         assert backend.build_env(request) == {}

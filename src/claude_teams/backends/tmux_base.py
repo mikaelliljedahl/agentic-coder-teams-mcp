@@ -7,11 +7,17 @@ from typing import cast
 from claude_code_tools.tmux_cli_controller import TmuxCLIController
 
 from claude_teams.backends.contracts import (
+    _SAFE_ENV_KEY,
     CaptureResult,
     HealthStatus,
     SpawnRequest,
     SpawnResult,
-    _SAFE_ENV_KEY,
+)
+from claude_teams.errors import (
+    BackendBinaryNotFoundError,
+    InvalidEnvVarNameError,
+    PermissionBypassUnsupportedValueError,
+    TmuxPaneCreationError,
 )
 
 
@@ -74,10 +80,7 @@ class BaseBackend:
         """
         path = shutil.which(self._binary_name)
         if path is None:
-            raise FileNotFoundError(
-                f"Could not find '{self._binary_name}' on PATH. "
-                f"Install {self._name} or add it to PATH."
-            )
+            raise BackendBinaryNotFoundError(self._binary_name, self._name)
         return path
 
     def default_permission_args(self) -> list[str]:
@@ -110,9 +113,7 @@ class BaseBackend:
         if request.permission_mode == "bypass":
             args = self.bypass_permission_args()
             if not args:
-                raise ValueError(
-                    f"Backend {self.name!r} does not support permission_mode='bypass'."
-                )
+                raise PermissionBypassUnsupportedValueError(self.name)
             return args
         return self.default_permission_args()
 
@@ -135,7 +136,7 @@ class BaseBackend:
 
         for key in env_vars:
             if not _SAFE_ENV_KEY.match(key):
-                raise ValueError(f"Invalid environment variable name: {key!r}")
+                raise InvalidEnvVarNameError(key)
 
         env_prefix = " ".join(
             f"{key}={shlex.quote(value)}" for key, value in env_vars.items()
@@ -149,10 +150,7 @@ class BaseBackend:
 
         pane_id = self.controller.launch_cli(full_cmd)
         if pane_id is None:
-            raise RuntimeError(
-                f"Failed to create tmux pane for agent {request.name!r}. "
-                "Ensure tmux is running and tmux-cli is available."
-            )
+            raise TmuxPaneCreationError(request.name)
         return SpawnResult(process_handle=pane_id, backend_type=self._name)
 
     def health_check(self, handle: str) -> HealthStatus:
@@ -293,19 +291,23 @@ class BaseBackend:
         raise NotImplementedError
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Build additional environment variables.
+        """Build additional environment variables for the spawned backend.
+
+        Default implementation returns an empty dict. Subclasses override
+        only when they need to export custom environment variables. The
+        ``request`` parameter is unused in the default but is part of the
+        contract so overrides can customize based on spawn inputs (e.g.,
+        reading ``request.extra``).
 
         Args:
             request (SpawnRequest): Backend-agnostic spawn parameters.
 
         Returns:
-            dict[str, str]: Environment mapping.
-
-        Raises:
-            NotImplementedError: Always, subclasses must override.
+            dict[str, str]: Environment mapping. Empty by default.
 
         """
-        raise NotImplementedError
+        _ = request
+        return {}
 
     def supported_models(self) -> list[str]:
         """Return supported model identifiers.

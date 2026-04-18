@@ -1,5 +1,7 @@
 """Gemini backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -9,7 +11,7 @@ class GeminiBackend(BaseBackend):
     _name = "gemini"
     _binary_name = "gemini"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "gemini-2.5-flash",
         "balanced": "gemini-2.5-pro",
         "powerful": "gemini-2.5-pro",
@@ -76,15 +78,3 @@ class GeminiBackend(BaseBackend):
             model,
             *self.permission_args(request),
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Gemini environment variables (none required).
-
-        Args:
-            request: Backend-agnostic spawn parameters.
-
-        Returns:
-            Empty dict.
-
-        """
-        return {}

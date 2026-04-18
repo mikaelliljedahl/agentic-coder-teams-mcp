@@ -1,29 +1,32 @@
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from dataclasses import replace
-
 from claude_teams.backends.base import SpawnRequest
-
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 
 
-_DEFAULT_REQUEST = SpawnRequest(
-    agent_id="worker@team",
-    name="worker",
-    team_name="team",
-    prompt="do stuff",
-    model="sonnet",
-    agent_type="general-purpose",
-    color="blue",
-    cwd="/tmp/work",
-    lead_session_id="sess-1",
-)
+@pytest.fixture
+def _make_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
+    default = SpawnRequest(
+        agent_id="worker@team",
+        name="worker",
+        team_name="team",
+        prompt="do stuff",
+        model="sonnet",
+        agent_type="general-purpose",
+        color="blue",
+        cwd=str(tmp_path),
+        lead_session_id="sess-1",
+    )
 
+    def factory(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
+        return replace(default, **overrides)
 
-def _make_request(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
-    return replace(_DEFAULT_REQUEST, **overrides)
+    return factory
 
 
 class TestClaudeCodeProperties:
@@ -88,13 +91,13 @@ class TestClaudeCodeResolveModel:
 
     def test_raises_for_empty_string(self):
         backend = ClaudeCodeBackend()
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Unsupported model"):
             backend.resolve_model("")
 
 
 class TestClaudeCodeBuildCommand:
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_produces_correct_flags(self, mock_which):
+    def test_produces_correct_flags(self, mock_which, _make_request):
         backend = ClaudeCodeBackend()
         request = _make_request()
 
@@ -117,7 +120,7 @@ class TestClaudeCodeBuildCommand:
         assert cmd[idx + 1] == "sonnet"
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_includes_plan_mode_required_when_set(self, mock_which):
+    def test_includes_plan_mode_required_when_set(self, mock_which, _make_request):
         backend = ClaudeCodeBackend()
         request = _make_request(plan_mode_required=True)
 
@@ -126,7 +129,7 @@ class TestClaudeCodeBuildCommand:
         assert "--plan-mode-required" in cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_excludes_plan_mode_required_when_false(self, mock_which):
+    def test_excludes_plan_mode_required_when_false(self, mock_which, _make_request):
         backend = ClaudeCodeBackend()
         request = _make_request(plan_mode_required=False)
 
@@ -135,7 +138,9 @@ class TestClaudeCodeBuildCommand:
         assert "--plan-mode-required" not in cmd
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_includes_bypass_permission_mode_when_requested(self, mock_which):
+    def test_includes_bypass_permission_mode_when_requested(
+        self, mock_which, _make_request
+    ):
         backend = ClaudeCodeBackend()
         request = _make_request(permission_mode="bypass")
 
@@ -145,7 +150,9 @@ class TestClaudeCodeBuildCommand:
         assert cmd[idx + 1] == "bypassPermissions"
 
     @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_omits_permission_mode_flag_when_require_approval(self, mock_which):
+    def test_omits_permission_mode_flag_when_require_approval(
+        self, mock_which, _make_request
+    ):
         backend = ClaudeCodeBackend()
         request = _make_request(permission_mode="require_approval")
 
@@ -155,7 +162,7 @@ class TestClaudeCodeBuildCommand:
 
 
 class TestClaudeCodeBuildEnv:
-    def test_returns_claude_env_vars(self):
+    def test_returns_claude_env_vars(self, _make_request):
         backend = ClaudeCodeBackend()
         request = _make_request()
 

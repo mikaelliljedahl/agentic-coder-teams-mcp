@@ -1,5 +1,7 @@
 """Happy backend integration."""
 
+from typing import ClassVar
+
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -14,7 +16,7 @@ class HappyBackend(BaseBackend):
     _name = "happy"
     _binary_name = "happy"
 
-    _MODEL_MAP: dict[str, str] = {
+    _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "haiku",
         "balanced": "sonnet",
         "powerful": "opus",
@@ -88,15 +90,3 @@ class HappyBackend(BaseBackend):
             *self.permission_args(request),
             request.prompt,
         ]
-
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Return Happy environment variables (none required).
-
-        Args:
-            request (SpawnRequest): Backend-agnostic spawn parameters.
-
-        Returns:
-            dict[str, str]: Empty dict.
-
-        """
-        return {}

@@ -4,7 +4,7 @@
 
 Multi-backend MCP server for orchestrating teams of agentic coding agents.
 
-**575 tests | 92% coverage | 17 backends | Python 3.12+**
+**636 tests | 92% coverage | 17 backends | Python 3.12+**
 
 </div>
 
@@ -64,6 +64,7 @@ uv sync
 - **Python 3.12+**
 - **[tmux](https://github.com/tmux/tmux)** - agents spawn in tmux panes
 - At least one supported agentic CLI on your `PATH` (e.g., `claude`, `codex`, `gemini`)
+- **Platform**: Linux or macOS. tmux has no native Windows port; on Windows, run the server inside WSL2, Cygwin, or MSYS2. MCP *clients* on Windows work fine against a server running elsewhere.
 
 ### 3. Verify backends
 
@@ -461,8 +462,8 @@ class MyBackend(BaseBackend):
     def build_command(self, request: SpawnRequest) -> list[str]:
         return [self.binary_name, "--model", request.model, "--prompt", request.prompt]
 
-    def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        return {}
+    # build_env is inherited from BaseBackend and returns {} by default.
+    # Override only when your backend needs to export custom env vars.
 ```
 
 Or register externally via the `claude_teams.backends` entry point group in your package's `pyproject.toml`:

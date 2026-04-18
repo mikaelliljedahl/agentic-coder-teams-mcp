@@ -1,6 +1,7 @@
 """Teammate-tier MCP tools for runtime control and inspection."""
 
 import asyncio
+import logging
 import time
 
 from fastmcp import Context, FastMCP
@@ -9,6 +10,14 @@ from fastmcp.exceptions import ToolError
 from claude_teams import capabilities, messaging, tasks, teams
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends import registry
+from claude_teams.errors import (
+    BackendNotRegisteredError,
+    InboxAccessDeniedError,
+    NoProcessHandleError,
+    ShutdownLeadError,
+    TeammateNotFoundToolError,
+    TeamNotFoundToolError,
+)
 from claude_teams.models import TeammateMember
 from claude_teams.server_runtime import (
     _ANN_DESTRUCTIVE,
@@ -18,19 +27,34 @@ from claude_teams.server_runtime import (
     _require_authenticated_principal,
     _require_lead,
     _strip_ansi,
-    _validate_agent_name,
-    logger,
 )
+from claude_teams.server_schema import (
+    AgentName,
+    Capability,
+    MaxMessages,
+    OutputLines,
+    TeamName,
+    TimeoutMs,
+)
+
+logger = logging.getLogger(__name__)
 
 
 async def _resolve_teammate(
     team_name: str, agent_name: str
 ) -> tuple[TeammateMember, str | None, str]:
-    """Look up a teammate and resolve process handle and backend type."""
+    """Look up a teammate and resolve process handle and backend type.
+
+    Legacy configs persisted ``backend_type='tmux'`` before the backend
+    registry split tmux-based CLIs by tool. Rewrite those to ``claude-code``
+    so they dispatch to the modern registry entry; new writes always record
+    the concrete backend id. Emit a debug log so operators can tell when a
+    stale config is still being migrated on the fly.
+    """
     try:
         config = await teams.read_config(team_name)
     except FileNotFoundError:
-        raise ToolError(f"Team {team_name!r} not found")
+        raise TeamNotFoundToolError(team_name) from None
 
     member = None
     for config_member in config.members:
@@ -41,18 +65,26 @@ async def _resolve_teammate(
             member = config_member
             break
     if member is None:
-        raise ToolError(f"Teammate {agent_name!r} not found in team {team_name!r}")
+        raise TeammateNotFoundToolError(agent_name, team_name)
 
     process_handle = member.process_handle or member.tmux_pane_id
     backend_type = member.backend_type
     if backend_type == "tmux":
+        logger.debug(
+            "Rewriting legacy backend_type='tmux' to 'claude-code' for %s/%s",
+            team_name,
+            agent_name,
+        )
         backend_type = "claude-code"
 
     return member, process_handle, backend_type
 
 
 async def force_kill_teammate(
-    team_name: str, agent_name: str, ctx: Context, capability: str = ""
+    team_name: TeamName,
+    agent_name: AgentName,
+    ctx: Context,
+    capability: Capability = "",
 ) -> dict[str, object]:
     """Forcibly kill a teammate and remove it from the team."""
     await _require_lead(ctx, team_name, capability)
@@ -64,7 +96,7 @@ async def force_kill_teammate(
         try:
             backend_obj = registry.get(backend_type)
             await run_blocking(backend_obj.kill, process_handle)
-        except KeyError:
+        except BackendNotRegisteredError:
             pass
 
     await teams.remove_member(team_name, agent_name)
@@ -74,19 +106,16 @@ async def force_kill_teammate(
 
 
 async def poll_inbox(
-    team_name: str,
-    agent_name: str,
+    team_name: TeamName,
+    agent_name: AgentName,
     ctx: Context,
-    timeout_ms: int = 30000,
-    capability: str = "",
+    timeout_ms: TimeoutMs = 30000,
+    capability: Capability = "",
 ) -> list[dict[str, object]]:
     """Poll an inbox for unread messages and mark returned messages as read."""
     principal = await _require_authenticated_principal(ctx, team_name, capability)
     if principal["role"] != "lead" and principal["name"] != agent_name:
-        raise ToolError(
-            f"Authenticated principal {principal['name']!r} cannot poll inbox {agent_name!r}."
-        )
-    _validate_agent_name(agent_name)
+        raise InboxAccessDeniedError("poll", principal["name"], agent_name)
     msgs = await messaging.read_inbox(
         team_name, agent_name, unread_only=True, mark_as_read=True
     )
@@ -107,22 +136,20 @@ async def poll_inbox(
 
 
 async def check_teammate(
-    team_name: str,
-    agent_name: str,
+    team_name: TeamName,
+    agent_name: AgentName,
     ctx: Context,
     include_output: bool = False,
-    output_lines: int = 20,
+    output_lines: OutputLines = 20,
     include_messages: bool = True,
-    max_messages: int = 5,
-    capability: str = "",
+    max_messages: MaxMessages = 5,
+    capability: Capability = "",
 ) -> dict[str, object]:
     """Check teammate status, lead-facing unread messages, and optional output."""
     await _require_lead(ctx, team_name, capability)
     member, process_handle, backend_type = await _resolve_teammate(
         team_name, agent_name
     )
-    output_lines = max(1, min(output_lines, 120))
-    max_messages = max(1, min(max_messages, 20))
 
     pending_from: list[dict[str, object]] = []
     if include_messages:
@@ -153,8 +180,8 @@ async def check_teammate(
     else:
         try:
             backend_obj = registry.get(backend_type)
-        except KeyError as exc:
-            raise ToolError(str(exc))
+        except BackendNotRegisteredError as exc:
+            raise ToolError(str(exc)) from exc
 
         status = await run_blocking(backend_obj.health_check, process_handle)
         alive = status.alive
@@ -184,12 +211,15 @@ async def check_teammate(
 
 
 async def process_shutdown_approved(
-    team_name: str, agent_name: str, ctx: Context, capability: str = ""
+    team_name: TeamName,
+    agent_name: AgentName,
+    ctx: Context,
+    capability: Capability = "",
 ) -> dict[str, object]:
     """Remove a teammate after graceful shutdown approval."""
     await _require_lead(ctx, team_name, capability)
     if agent_name == "team-lead":
-        raise ToolError("Cannot process shutdown for team-lead")
+        raise ShutdownLeadError()
     _member, process_handle, backend_type = await _resolve_teammate(
         team_name, agent_name
     )
@@ -197,14 +227,19 @@ async def process_shutdown_approved(
         try:
             backend_obj = registry.get(backend_type)
             await run_blocking(backend_obj.kill, process_handle)
-        except KeyError:
+        except BackendNotRegisteredError:
             pass
         except Exception as exc:  # pragma: no cover
-            logger.warning(
-                "Failed to clean up %s process handle %s during shutdown approval: %s",
-                backend_type,
-                process_handle,
-                exc,
+            await ctx.warning(
+                f"Failed to clean up {backend_type} process handle "
+                f"{process_handle!r} during shutdown approval of {agent_name!r}: "
+                f"{exc}",
+                extra={
+                    "team": team_name,
+                    "agent": agent_name,
+                    "backend": backend_type,
+                    "process_handle": process_handle,
+                },
             )
     await teams.remove_member(team_name, agent_name)
     await capabilities.remove_agent_capability(team_name, agent_name)
@@ -213,7 +248,10 @@ async def process_shutdown_approved(
 
 
 async def health_check(
-    team_name: str, agent_name: str, ctx: Context, capability: str = ""
+    team_name: TeamName,
+    agent_name: AgentName,
+    ctx: Context,
+    capability: Capability = "",
 ) -> dict[str, object]:
     """Check if a teammate's process is still running."""
     await _require_lead(ctx, team_name, capability)
@@ -222,12 +260,12 @@ async def health_check(
     )
 
     if not process_handle:
-        raise ToolError(f"No process handle for teammate {agent_name!r}")
+        raise NoProcessHandleError(agent_name)
 
     try:
         backend_obj = registry.get(backend_type)
-    except KeyError as exc:
-        raise ToolError(str(exc))
+    except BackendNotRegisteredError as exc:
+        raise ToolError(str(exc)) from exc
 
     status = await run_blocking(backend_obj.health_check, process_handle)
     return {
@@ -239,9 +277,18 @@ async def health_check(
 
 
 def register_teammate_tools(mcp: FastMCP) -> None:
-    """Register teammate-tier tools on the FastMCP app."""
+    """Register teammate-tier tools on the FastMCP app.
+
+    ``poll_inbox`` carries a timeout that comfortably exceeds the maximum
+    ``timeout_ms`` argument so the tool can honour the caller's deadline
+    without the transport cutting it short.
+    """
     mcp.tool(tags={_TAG_TEAMMATE}, annotations=_ANN_DESTRUCTIVE)(force_kill_teammate)
-    mcp.tool(tags={_TAG_TEAMMATE}, annotations=_ANN_READ_WITH_SIDE_EFFECTS)(poll_inbox)
+    mcp.tool(
+        tags={_TAG_TEAMMATE},
+        annotations=_ANN_READ_WITH_SIDE_EFFECTS,
+        timeout=360.0,
+    )(poll_inbox)
     mcp.tool(tags={_TAG_TEAMMATE}, annotations=_ANN_READ_WITH_SIDE_EFFECTS)(
         check_teammate
     )

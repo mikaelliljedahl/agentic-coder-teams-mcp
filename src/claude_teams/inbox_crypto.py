@@ -9,9 +9,17 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from claude_teams.errors import (
+    DecryptedInboxNotObjectError,
+    InboxDecryptError,
+    InboxEncryptionKeyMissingError,
+    InboxMasterKeyTooShortError,
+    MalformedEncryptedInboxEntryError,
+)
 
 _MASTER_KEY_ENV = "CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY"
 _HKDF_SALT = b"claude-teams-inbox-v1"
+_MIN_MASTER_KEY_LEN = 32
 
 
 def encryption_enabled() -> bool:
@@ -27,9 +35,9 @@ def encryption_enabled() -> bool:
 def _derive_fernet(team_name: str) -> Fernet:
     master_key = os.environ.get(_MASTER_KEY_ENV)
     if not master_key:
-        raise RuntimeError(
-            f"Inbox encryption key is required for this inbox, but {_MASTER_KEY_ENV} is not set."
-        )
+        raise InboxEncryptionKeyMissingError(_MASTER_KEY_ENV)
+    if len(master_key) < _MIN_MASTER_KEY_LEN:
+        raise InboxMasterKeyTooShortError(_MASTER_KEY_ENV, _MIN_MASTER_KEY_LEN)
 
     derived = HKDF(
         algorithm=hashes.SHA256(),
@@ -84,16 +92,14 @@ def decrypt_entry(team_name: str, payload: dict[str, object]) -> dict[str, objec
 
     token = encrypted_dict.get("token")
     if not isinstance(token, str):
-        raise RuntimeError("Malformed encrypted inbox entry: missing ciphertext token.")
+        raise MalformedEncryptedInboxEntryError()
 
     try:
         plaintext = _derive_fernet(team_name).decrypt(token.encode())
     except InvalidToken as exc:
-        raise RuntimeError(
-            "Unable to decrypt inbox entry with the configured encryption key."
-        ) from exc
+        raise InboxDecryptError() from exc
 
     data = json.loads(plaintext)
     if not isinstance(data, dict):
-        raise RuntimeError("Decrypted inbox entry must be a JSON object.")
+        raise DecryptedInboxNotObjectError()
     return data

@@ -9,6 +9,7 @@ from fastmcp import Client
 from claude_teams import teams
 from claude_teams.backends import registry
 from claude_teams.backends.base import HealthStatus
+from claude_teams.errors import UnsupportedBackendModelError
 from claude_teams.models import TeammateMember
 from tests._server_support import (
     _data,
@@ -29,8 +30,8 @@ class TestProcessShutdownGuard:
 
 
 class TestProcessShutdownCleanup:
-    async def test_kills_via_correct_backend(self, team_client: Client):
-        mate = _make_teammate("graceful", "test-team", pane_id="%55")
+    async def test_kills_via_correct_backend(self, team_client: Client, tmp_path: Path):
+        mate = _make_teammate("graceful", "test-team", tmp_path, pane_id="%55")
         mate.backend_type = "claude-code"
         mate.process_handle = "%55"
         await teams.add_member("test-team", mate)
@@ -49,9 +50,9 @@ class TestProcessShutdownCleanup:
         mock_backend.kill.assert_called_once_with("%55")
 
     async def test_legacy_tmux_backend_type_maps_to_claude_code(
-        self, team_client: Client
+        self, team_client: Client, tmp_path: Path
     ):
-        mate = _make_teammate("legacy", "test-team", pane_id="%56")
+        mate = _make_teammate("legacy", "test-team", tmp_path, pane_id="%56")
         mate.backend_type = "tmux"
         mate.process_handle = "%56"
         await teams.add_member("test-team", mate)
@@ -69,8 +70,10 @@ class TestProcessShutdownCleanup:
         assert result["success"] is True
         mock_backend.kill.assert_called_once_with("%56")
 
-    async def test_skips_cleanup_when_backend_unavailable(self, team_client: Client):
-        mate = _make_teammate("orphaned", "test-team", pane_id="%57")
+    async def test_skips_cleanup_when_backend_unavailable(
+        self, team_client: Client, tmp_path: Path
+    ):
+        mate = _make_teammate("orphaned", "test-team", tmp_path, pane_id="%57")
         mate.backend_type = "nonexistent"
         mate.process_handle = "%57"
         await teams.add_member("test-team", mate)
@@ -146,7 +149,7 @@ class TestSpawnWithBackend:
                     "team_name": "sb1",
                     "name": "coder",
                     "prompt": "write code",
-                    "backend": "claude-code",
+                    "options": {"backend": "claude-code"},
                 },
             )
         )
@@ -204,7 +207,7 @@ class TestSpawnWithBackend:
                 "team_name": "sb3",
                 "name": "coder",
                 "prompt": "write code",
-                "backend": "nonexistent-backend",
+                "options": {"backend": "nonexistent-backend"},
             },
             raise_on_error=False,
         )
@@ -225,7 +228,7 @@ class TestSpawnWithBackend:
                 "team_name": "sb-cwd",
                 "name": "coder",
                 "prompt": "write code",
-                "cwd": str(tmp_path),
+                "options": {"cwd": str(tmp_path)},
             },
         )
 
@@ -249,7 +252,7 @@ class TestSpawnWithBackend:
                 "team_name": "sb-cwd-relative",
                 "name": "coder",
                 "prompt": "write code",
-                "cwd": "relative/path",
+                "options": {"cwd": "relative/path"},
             },
             raise_on_error=False,
         )
@@ -266,7 +269,7 @@ class TestSpawnWithBackend:
                 "team_name": "sb-cwd-missing",
                 "name": "coder",
                 "prompt": "write code",
-                "cwd": str(tmp_path / "missing"),
+                "options": {"cwd": str(tmp_path / "missing")},
             },
             raise_on_error=False,
         )
@@ -286,7 +289,7 @@ class TestSpawnWithBackend:
                 "team_name": "sb4",
                 "name": "coder",
                 "prompt": "write code",
-                "model": "fast",
+                "options": {"model": "fast"},
             },
         )
         mock_backend.resolve_model.assert_called_with("fast")
@@ -296,7 +299,9 @@ class TestSpawnWithBackend:
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
         original_side_effect = mock_backend.resolve_model.side_effect
-        mock_backend.resolve_model.side_effect = ValueError("Unsupported model 'bogus'")
+        mock_backend.resolve_model.side_effect = UnsupportedBackendModelError(
+            "bogus", "claude-code", ["fast", "sonnet"]
+        )
 
         result = await client.call_tool(
             "spawn_teammate",
@@ -304,7 +309,7 @@ class TestSpawnWithBackend:
                 "team_name": "sb5",
                 "name": "coder",
                 "prompt": "write code",
-                "model": "bogus",
+                "options": {"model": "bogus"},
             },
             raise_on_error=False,
         )
@@ -328,7 +333,7 @@ class TestSpawnWithBackend:
                 "team_name": "sb6",
                 "name": "coder",
                 "prompt": "write code",
-                "permission_mode": "bypass",
+                "options": {"permission_mode": "bypass"},
             },
         )
 
@@ -349,7 +354,7 @@ class TestSpawnWithBackend:
                 "team_name": "sb7",
                 "name": "coder",
                 "prompt": "write code",
-                "permission_mode": "bypass",
+                "options": {"permission_mode": "bypass"},
             },
             raise_on_error=False,
         )
@@ -358,8 +363,8 @@ class TestSpawnWithBackend:
 
 
 class TestForceKillWithBackend:
-    async def test_kills_via_correct_backend(self, team_client: Client):
-        mate = _make_teammate("victim", "test-team", pane_id="%77")
+    async def test_kills_via_correct_backend(self, team_client: Client, tmp_path: Path):
+        mate = _make_teammate("victim", "test-team", tmp_path, pane_id="%77")
         mate.backend_type = "claude-code"
         mate.process_handle = "%77"
         await teams.add_member("test-team", mate)
@@ -378,9 +383,9 @@ class TestForceKillWithBackend:
         mock_backend.kill.assert_called_once_with("%77")
 
     async def test_legacy_tmux_backend_type_maps_to_claude_code(
-        self, team_client: Client
+        self, team_client: Client, tmp_path: Path
     ):
-        mate = _make_teammate("oldmate", "test-team", pane_id="%88")
+        mate = _make_teammate("oldmate", "test-team", tmp_path, pane_id="%88")
         mate.backend_type = "tmux"
         mate.process_handle = "%88"
         await teams.add_member("test-team", mate)
@@ -407,8 +412,10 @@ class TestForceKillWithBackend:
         assert result.is_error is True
         assert "ghost" in _text(result)
 
-    async def test_skips_kill_when_backend_unavailable(self, team_client: Client):
-        mate = _make_teammate("orphan", "test-team", pane_id="%99")
+    async def test_skips_kill_when_backend_unavailable(
+        self, team_client: Client, tmp_path: Path
+    ):
+        mate = _make_teammate("orphan", "test-team", tmp_path, pane_id="%99")
         mate.backend_type = "nonexistent"
         mate.process_handle = "%99"
         await teams.add_member("test-team", mate)
