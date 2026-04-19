@@ -77,8 +77,7 @@ class TestAuggieResolveModel:
 
 
 class TestAuggieBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/auggie")
-    def test_produces_print_command(self, _mock_which, _make_request):
+    def test_produces_print_command(self, _make_request):
         backend = AuggieBackend()
         request = _make_request()
 
@@ -89,8 +88,7 @@ class TestAuggieBuildCommand:
         assert "--model" in cmd
         assert "--print" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/auggie")
-    def test_includes_prompt_after_i_flag(self, _mock_which, _make_request):
+    def test_includes_prompt_after_i_flag(self, _make_request):
         backend = AuggieBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -99,8 +97,7 @@ class TestAuggieBuildCommand:
         idx = cmd.index("-i")
         assert cmd[idx + 1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/auggie")
-    def test_includes_model_flag(self, _mock_which, _make_request):
+    def test_includes_model_flag(self, _make_request):
         backend = AuggieBackend()
         request = _make_request(model="powerful")
 
@@ -118,8 +115,7 @@ class TestAuggieBuildEnv:
 
 
 class TestAuggieAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/auggie")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = AuggieBackend()
         assert backend.is_available() is True
 

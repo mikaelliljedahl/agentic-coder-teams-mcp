@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from claude_teams.backends.base import Backend
+from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.backends.registry import BackendRegistry
 
 
@@ -62,11 +63,14 @@ class TestRegistryDiscovery:
 class TestRegistryManualRegister:
     def test_register_and_get(self):
         reg = BackendRegistry()
-        mock = _make_mock_backend("custom")
-        reg.register("custom", mock)
+        # Real backend instance: if register/get ever grows a Protocol check,
+        # a MagicMock would pretend to conform and hide the regression.
+        backend = ClaudeCodeBackend()
+        reg.register("custom", backend)
 
         result = reg.get("custom")
-        assert result is mock
+        assert result is backend
+        assert result.name == "claude-code"
 
     def test_get_raises_key_error_for_unknown_name(self):
         reg = BackendRegistry()
@@ -166,18 +170,26 @@ class TestRegistryEntryPoints:
     def test_loads_entry_point_backend(self):
         reg = BackendRegistry()
 
+        # Real Backend subclass: the prior MagicMock chain silently passed
+        # even if registry ever tightened to reject non-Protocol-conforming
+        # classes. Here, the class is actually instantiated and its real
+        # is_available() is what decides registration.
+        class _RealEP(ClaudeCodeBackend):
+            _name = "custom-ep"
+
+            def is_available(self) -> bool:
+                return True
+
         mock_ep = MagicMock()
         mock_ep.name = "custom-ep"
-        mock_cls = MagicMock()
-        mock_instance = _make_mock_backend("custom-ep")
-        mock_cls.return_value = mock_instance
-        mock_ep.load.return_value = mock_cls
+        mock_ep.load.return_value = _RealEP
 
         with patch("claude_teams.backends.base.shutil.which", return_value=None):
             with patch("importlib.metadata.entry_points", return_value=[mock_ep]):
                 available = reg.list_available()
 
         assert "custom-ep" in available
+        assert isinstance(reg.get("custom-ep"), _RealEP)
 
     def test_skips_entry_point_when_already_registered(self):
         reg = BackendRegistry()

@@ -2,7 +2,13 @@
 
 from typing import ClassVar
 
-from claude_teams.backends.base import BaseBackend, SpawnRequest
+from claude_teams.backends._agent_discovery import discover_goose_recipes
+from claude_teams.backends.base import (
+    AgentProfile,
+    AgentSelectSpec,
+    BaseBackend,
+    SpawnRequest,
+)
 
 
 class GooseBackend(BaseBackend):
@@ -23,6 +29,19 @@ class GooseBackend(BaseBackend):
         "balanced": "anthropic",
         "powerful": "anthropic",
     }
+
+    _AGENT_SELECT_SPEC: ClassVar[AgentSelectSpec] = AgentSelectSpec(
+        flag="--recipe",
+        value_template="{path}",
+    )
+
+    def agent_select_spec(self) -> AgentSelectSpec | None:
+        """Goose selects a recipe by filesystem path via ``--recipe <path>``."""
+        return self._AGENT_SELECT_SPEC
+
+    def discover_agents(self, cwd: str) -> list[AgentProfile]:
+        """Walk ``$GOOSE_RECIPE_PATH`` for recipe files."""
+        return discover_goose_recipes(cwd)
 
     def supported_models(self) -> list[str]:
         """Return supported Goose model names.
@@ -103,4 +122,5 @@ class GooseBackend(BaseBackend):
         ]
         if provider:
             cmd.extend(["--provider", provider])
+        cmd.extend(self._agent_args(request))
         return cmd

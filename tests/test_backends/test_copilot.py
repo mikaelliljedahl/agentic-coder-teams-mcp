@@ -87,8 +87,7 @@ class TestCopilotResolveModel:
 
 
 class TestCopilotBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/copilot")
-    def test_produces_prompt_command(self, mock_which, _make_request):
+    def test_produces_prompt_command(self, _make_request):
         backend = CopilotBackend()
         request = _make_request()
 
@@ -100,8 +99,7 @@ class TestCopilotBuildCommand:
         assert "--yolo" in cmd
         assert "--no-ask-user" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/copilot")
-    def test_includes_prompt_after_p_flag(self, mock_which, _make_request):
+    def test_includes_prompt_after_p_flag(self, _make_request):
         backend = CopilotBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -110,8 +108,7 @@ class TestCopilotBuildCommand:
         idx = cmd.index("-p")
         assert cmd[idx + 1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/copilot")
-    def test_includes_model_flag(self, mock_which, _make_request):
+    def test_includes_model_flag(self, _make_request):
         backend = CopilotBackend()
         request = _make_request(model="gpt-5")
 
@@ -120,8 +117,7 @@ class TestCopilotBuildCommand:
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "gpt-5"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/copilot")
-    def test_resolves_generic_model(self, mock_which, _make_request):
+    def test_resolves_generic_model(self, _make_request):
         backend = CopilotBackend()
         request = _make_request(model="powerful")
 
@@ -142,8 +138,7 @@ class TestCopilotBuildEnv:
 
 
 class TestCopilotAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/copilot")
-    def test_available_when_binary_found(self, mock_which):
+    def test_available_when_binary_found(self):
         backend = CopilotBackend()
         assert backend.is_available() is True
 

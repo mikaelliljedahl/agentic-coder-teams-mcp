@@ -8,8 +8,11 @@ from claude_code_tools.tmux_cli_controller import TmuxCLIController
 
 from claude_teams.backends.contracts import (
     _SAFE_ENV_KEY,
+    AgentProfile,
+    AgentSelectSpec,
     CaptureResult,
     HealthStatus,
+    ReasoningEffortSpec,
     SpawnRequest,
     SpawnResult,
 )
@@ -289,6 +292,79 @@ class BaseBackend:
 
         """
         raise NotImplementedError
+
+    def reasoning_effort_spec(self) -> ReasoningEffortSpec | None:
+        """Return the backend's reasoning-effort spec.
+
+        Default is ``None`` (backend does not expose a reasoning-effort knob).
+        Supporting backends override this to publish their flag syntax and the
+        fixed enum of accepted values.
+
+        Returns:
+            Spec describing flag + accepted values, or ``None``.
+
+        """
+        return None
+
+    def agent_select_spec(self) -> AgentSelectSpec | None:
+        """Return the backend's agent-selection spec.
+
+        Default is ``None`` (backend does not support launching a named agent
+        profile). Supporting backends override this to publish the flag and
+        value template their CLI accepts.
+
+        Returns:
+            Spec describing flag + value template, or ``None``.
+
+        """
+        return None
+
+    def discover_agents(self, cwd: str) -> list[AgentProfile]:
+        """Enumerate agent profiles available to this backend.
+
+        Default is an empty list. Backends that support profile selection
+        override this to scan the filesystem (``.claude/agents/*.md``), parse
+        configuration (``~/.codex/config.toml``), or walk env-var path lists
+        (``$GOOSE_RECIPE_PATH``). ``cwd`` anchors project-local discovery so
+        per-project profiles surface alongside user-global ones.
+
+        Args:
+            cwd: Absolute path anchoring project-local discovery.
+
+        Returns:
+            Discovered profiles, possibly empty.
+
+        """
+        _ = cwd
+        return []
+
+    def _agent_args(self, request: SpawnRequest) -> list[str]:
+        """Build ``agent_profile``-related CLI args, if selection is active.
+
+        Re-discovers profiles from ``request.cwd`` so the resolved path is
+        available for the spec's ``value_template``. The server layer is
+        responsible for validating that ``request.agent_profile`` names a
+        discovered profile before reaching this point; a missing match here
+        produces an empty list rather than raising so the build stays pure.
+
+        Args:
+            request: Backend-agnostic spawn parameters.
+
+        Returns:
+            Two-element flag/value pair for the resolved profile, or an
+            empty list if no profile is set, the backend lacks a spec, or
+            no discovered profile matches.
+
+        """
+        if not request.agent_profile:
+            return []
+        spec = self.agent_select_spec()
+        if spec is None:
+            return []
+        for profile in self.discover_agents(request.cwd):
+            if profile.name == request.agent_profile:
+                return spec.build_args(profile)
+        return []
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
         """Build additional environment variables for the spawned backend.

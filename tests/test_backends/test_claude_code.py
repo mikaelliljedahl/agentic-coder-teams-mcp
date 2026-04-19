@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -96,8 +95,7 @@ class TestClaudeCodeResolveModel:
 
 
 class TestClaudeCodeBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_produces_correct_flags(self, mock_which, _make_request):
+    def test_produces_correct_flags(self, _make_request):
         backend = ClaudeCodeBackend()
         request = _make_request()
 
@@ -119,8 +117,7 @@ class TestClaudeCodeBuildCommand:
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "sonnet"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_includes_plan_mode_required_when_set(self, mock_which, _make_request):
+    def test_includes_plan_mode_required_when_set(self, _make_request):
         backend = ClaudeCodeBackend()
         request = _make_request(plan_mode_required=True)
 
@@ -128,8 +125,7 @@ class TestClaudeCodeBuildCommand:
 
         assert "--plan-mode-required" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_excludes_plan_mode_required_when_false(self, mock_which, _make_request):
+    def test_excludes_plan_mode_required_when_false(self, _make_request):
         backend = ClaudeCodeBackend()
         request = _make_request(plan_mode_required=False)
 
@@ -137,10 +133,7 @@ class TestClaudeCodeBuildCommand:
 
         assert "--plan-mode-required" not in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_includes_bypass_permission_mode_when_requested(
-        self, mock_which, _make_request
-    ):
+    def test_includes_bypass_permission_mode_when_requested(self, _make_request):
         backend = ClaudeCodeBackend()
         request = _make_request(permission_mode="bypass")
 
@@ -149,10 +142,7 @@ class TestClaudeCodeBuildCommand:
         idx = cmd.index("--permission-mode")
         assert cmd[idx + 1] == "bypassPermissions"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claude")
-    def test_omits_permission_mode_flag_when_require_approval(
-        self, mock_which, _make_request
-    ):
+    def test_omits_permission_mode_flag_when_require_approval(self, _make_request):
         backend = ClaudeCodeBackend()
         request = _make_request(permission_mode="require_approval")
 
@@ -177,3 +167,96 @@ class TestClaudeCodePermissionSupport:
     def test_supports_permission_bypass(self):
         backend = ClaudeCodeBackend()
         assert backend.supports_permission_bypass() is True
+
+
+class TestClaudeCodeReasoningEffort:
+    def test_spec_advertises_effort_flag_and_options(self):
+        backend = ClaudeCodeBackend()
+        spec = backend.reasoning_effort_spec()
+        assert spec is not None
+        assert spec.flag == "--effort"
+        assert spec.options == frozenset({"low", "medium", "high", "max"})
+
+    def test_build_command_appends_effort_when_set(self, _make_request):
+        backend = ClaudeCodeBackend()
+        request = _make_request(reasoning_effort="high")
+
+        cmd = backend.build_command(request)
+
+        assert "--effort" in cmd
+        idx = cmd.index("--effort")
+        assert cmd[idx + 1] == "high"
+
+    def test_build_command_omits_effort_flag_when_none(self, _make_request):
+        backend = ClaudeCodeBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert "--effort" not in cmd
+
+
+class TestClaudeCodeAgentSelect:
+    def test_spec_advertises_agent_flag(self):
+        backend = ClaudeCodeBackend()
+        spec = backend.agent_select_spec()
+        assert spec is not None
+        assert spec.flag == "--agent"
+        assert spec.value_template == "{name}"
+
+    def test_discover_finds_project_agents(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        agents_dir = tmp_path / ".claude" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "reviewer.md").write_text("reviewer")
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = ClaudeCodeBackend()
+        profiles = backend.discover_agents(str(tmp_path))
+
+        names = [p.name for p in profiles]
+        assert "reviewer" in names
+
+    def test_build_command_appends_agent_flag_when_discovered(
+        self,
+        _make_request,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        agents_dir = tmp_path / ".claude" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "reviewer.md").write_text("reviewer")
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = ClaudeCodeBackend()
+        request = _make_request(cwd=str(tmp_path), agent_profile="reviewer")
+
+        cmd = backend.build_command(request)
+
+        assert "--agent" in cmd
+        idx = cmd.index("--agent")
+        assert cmd[idx + 1] == "reviewer"
+
+    def test_build_command_omits_agent_flag_when_profile_none(self, _make_request):
+        backend = ClaudeCodeBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert "--agent" not in cmd
+
+    def test_build_command_omits_agent_flag_when_profile_undiscovered(
+        self,
+        _make_request,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = ClaudeCodeBackend()
+        request = _make_request(cwd=str(tmp_path), agent_profile="ghost")
+
+        cmd = backend.build_command(request)
+
+        assert "--agent" not in cmd

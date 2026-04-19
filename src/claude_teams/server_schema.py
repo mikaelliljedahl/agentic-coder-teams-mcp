@@ -200,6 +200,41 @@ SubagentType = Annotated[
 ]
 """Subagent type string written to ``config.json``."""
 
+ReasoningEffort = Annotated[
+    str,
+    Field(
+        description=(
+            "Backend-specific reasoning-effort value. Accepted values vary per "
+            "backend: Claude (low/medium/high/max), Codex and Coder "
+            "(low/medium/high/xhigh), Amp (free/rush/smart), Kimi "
+            "(kimi-k2/kimi-k2-thinking/kimi-k2-thinking-turbo). Backends that "
+            "do not expose a reasoning-effort dial will reject any value. Call "
+            "``list_backends`` for each backend's current set."
+        ),
+        min_length=1,
+        max_length=64,
+    ),
+]
+"""Reasoning-effort selector; per-backend enum validated at spawn time."""
+
+AgentProfileName = Annotated[
+    str,
+    Field(
+        description=(
+            "Backend-specific agent/persona profile name to launch with. "
+            "Supporting backends discover profiles differently: Claude and "
+            "Claudish scan ``.claude/agents/*.md`` (project + user-home); "
+            "Codex and Coder parse ``[agents.*]`` tables from ``config.toml``; "
+            "Goose walks directories listed in ``$GOOSE_RECIPE_PATH``. Call "
+            "``list_agents`` to enumerate what is currently discoverable for a "
+            "given backend and cwd."
+        ),
+        min_length=1,
+        max_length=128,
+    ),
+]
+"""Agent-profile selector; per-backend discovery validated at spawn time."""
+
 PermissionModeOpt = Literal["default", "require_approval", "bypass"]
 """Permission behavior override accepted by ``spawn_teammate``."""
 

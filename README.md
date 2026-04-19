@@ -183,13 +183,14 @@ Tools are organized into three tiers using **progressive disclosure**. At startu
 | `team_attach` | Attach a new MCP session to an existing team using a lead or agent capability. |
 | `team_delete` | Delete a team and all its data. Fails if teammates are still active. |
 | `list_backends` | List all available backends and their supported models. |
+| `list_agents` | List discoverable agent/persona profiles for a backend. Returns `supported=false` when the backend has no profile-selection mechanism; otherwise enumerates profiles visible from the given `cwd`. |
 | `read_config` | Read team configuration and member list (lead capability required). |
 
 ### Tier 1: Team (visible after `team_create`)
 
 | Tool | Description |
 |------|-------------|
-| `spawn_teammate` | Spawn a coding agent via any backend. Specify backend, model, prompt, optional absolute `cwd`, and optional `permission_mode`. |
+| `spawn_teammate` | Spawn a coding agent via any backend. Specify backend, model, prompt, optional absolute `cwd`, and optional `permission_mode`, `agent_profile`, and `reasoning_effort` (see [Agent profile and reasoning effort](#agent-profile-and-reasoning-effort) for backend support). |
 | `send_message` | Send direct messages, broadcasts, or shutdown/plan-approval responses. |
 | `read_inbox` | Read messages from an agent's inbox with pagination metadata, optional unread-only filtering, and `oldest`/`newest` ordering. |
 | `task_create` | Create a new task with auto-incrementing ID. |
@@ -222,6 +223,34 @@ Tools are organized into three tiers using **progressive disclosure**. At startu
   - `bypass`: require an explicit approval-bypass mode; unsupported backends reject the spawn
 - You can also set `CLAUDE_TEAMS_PERMISSION_MODE` to change the server-wide default when `permission_mode` is omitted.
 - Backends vary in how they implement it. `claude-code` uses `--permission-mode bypassPermissions`; one-shot CLIs such as `codex`, `coder`, `gemini`, `aider`, `amp`, `copilot`, `happy`, `llxprt`, `qwen`, `rovodev`, and `claudish` use their backend-native bypass flags.
+
+### Agent profile and reasoning effort
+
+`spawn_teammate` accepts two optional backend-specific tuning fields. Both are validated server-side and rejected with a clear error when the resolved backend does not expose the relevant mechanism, so cross-backend code paths stay safe.
+
+**`agent_profile`** — named persona / recipe selection. Discover what's available with `list_agents(backend_name, cwd)`; the response reports `supported=false` when the backend has no profile mechanism, otherwise returns discovered profile names and their on-disk paths.
+
+| Backend | Flag | Source of profiles |
+|---------|------|--------------------|
+| `claude-code` | `--agent <name>` | `.claude/agents/*.md` under project and user home |
+| `claudish` | `--agent <name>` | `.claude/agents/*.md` (same Claude-style layout) |
+| `codex` | `-c 'agents.<name>.config_file="<path>"'` | `[agents.*]` tables in `~/.codex/config.toml` and project config |
+| `coder` | `-c 'agents.<name>.config_file="<path>"'` | `[agents.*]` tables in `~/.coder/config.toml` and project config |
+| `goose` | `--recipe <path>` | Recipe files on `$GOOSE_RECIPE_PATH` |
+
+Other backends reject `agent_profile` with `AgentSelectUnsupportedToolError`. Unknown names (even on supported backends) are rejected with `UnknownAgentProfileToolError`.
+
+**`reasoning_effort`** — effort-ladder selection. Options are backend-specific; pass a value from the backend's option set below.
+
+| Backend | Flag | Options | Notes |
+|---------|------|---------|-------|
+| `claude-code` | `--effort <value>` | `low`, `medium`, `high`, `max` | Dedicated dial; independent of `model`. |
+| `codex` | `-c model_reasoning_effort=<value>` | `low`, `medium`, `high`, `xhigh` | Dedicated dial. |
+| `coder` | `-c model_reasoning_effort=<value>` | `low`, `medium`, `high`, `xhigh` | Dedicated dial. |
+| `kimi` | `-m <variant>` | `kimi-k2`, `kimi-k2-thinking`, `kimi-k2-thinking-turbo` | Overrides `model`: on Kimi, the thinking variants *are* the effort ladder. |
+| `amp` | `-m <mode>` | `free`, `rush`, `smart` | Overrides `model`: Amp's agent modes combine effort, model, and tool selection. |
+
+Other backends reject `reasoning_effort` with `ReasoningEffortUnsupportedToolError`. Values outside the backend's option set are rejected with `InvalidReasoningEffortToolError`.
 
 ### Pagination
 

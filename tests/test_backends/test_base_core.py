@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from claude_code_tools.tmux_cli_controller import TmuxCLIController
 
 from claude_teams.backends.base import Backend, HealthStatus, SpawnRequest, SpawnResult
 from tests.test_backends._base_support import (
@@ -145,7 +146,7 @@ class TestBaseBackendController:
 
     def test_accepts_injected_controller(self):
         backend = _StubBackend()
-        mock_ctrl = MagicMock()
+        mock_ctrl = MagicMock(spec=TmuxCLIController)
         backend._controller = mock_ctrl
         assert backend.controller is mock_ctrl
 

@@ -82,8 +82,7 @@ class TestAmpResolveModel:
 
 
 class TestAmpBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/amp-cli")
-    def test_produces_execute_command(self, _mock_which, _make_request):
+    def test_produces_execute_command(self, _make_request):
         backend = AmpBackend()
         request = _make_request()
 
@@ -93,8 +92,7 @@ class TestAmpBuildCommand:
         assert "-x" in cmd
         assert "--dangerously-allow-all" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/amp-cli")
-    def test_includes_prompt_after_x_flag(self, _mock_which, _make_request):
+    def test_includes_prompt_after_x_flag(self, _make_request):
         backend = AmpBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -103,8 +101,7 @@ class TestAmpBuildCommand:
         idx = cmd.index("-x")
         assert cmd[idx + 1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/amp-cli")
-    def test_includes_mode_flag_for_known_mode(self, _mock_which, _make_request):
+    def test_includes_mode_flag_for_known_mode(self, _make_request):
         backend = AmpBackend()
         request = _make_request(model="fast")
 
@@ -114,8 +111,7 @@ class TestAmpBuildCommand:
         idx = cmd.index("-m")
         assert cmd[idx + 1] == "rush"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/amp-cli")
-    def test_omits_mode_flag_for_unknown_model(self, _mock_which, _make_request):
+    def test_omits_mode_flag_for_unknown_model(self, _make_request):
         backend = AmpBackend()
         request = _make_request(model="some-unknown-model")
 
@@ -132,8 +128,7 @@ class TestAmpBuildEnv:
 
 
 class TestAmpAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/amp-cli")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = AmpBackend()
         assert backend.is_available() is True
 
@@ -141,3 +136,30 @@ class TestAmpAvailability:
     def test_unavailable_when_binary_not_found(self, _mock_which):
         backend = AmpBackend()
         assert backend.is_available() is False
+
+
+class TestAmpReasoningEffort:
+    def test_spec_advertises_m_flag_and_mode_options(self):
+        backend = AmpBackend()
+        spec = backend.reasoning_effort_spec()
+        assert spec is not None
+        assert spec.flag == "-m"
+        assert spec.options == frozenset({"free", "rush", "smart"})
+
+    def test_effort_overrides_resolved_model_on_m_flag(self, _make_request):
+        backend = AmpBackend()
+        request = _make_request(model="fast", reasoning_effort="free")
+
+        cmd = backend.build_command(request)
+
+        idx = cmd.index("-m")
+        assert cmd[idx + 1] == "free"
+
+    def test_without_effort_falls_back_to_resolved_model(self, _make_request):
+        backend = AmpBackend()
+        request = _make_request(model="fast")
+
+        cmd = backend.build_command(request)
+
+        idx = cmd.index("-m")
+        assert cmd[idx + 1] == "rush"

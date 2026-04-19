@@ -1,9 +1,13 @@
 """Bootstrap and capability server tests."""
 
+from pathlib import Path
+from unittest.mock import patch
+
 from fastmcp import Client
 
 from claude_teams import teams
 from claude_teams.backends import registry
+from claude_teams.backends.base import AgentProfile, AgentSelectSpec
 from claude_teams.server import mcp
 from tests._server_support import (
     _data,
@@ -23,6 +27,7 @@ class TestProgressiveDisclosure:
         assert "team_attach" in names
         assert "team_delete" in names
         assert "list_backends" in names
+        assert "list_agents" in names
         assert "read_config" in names
         # Team-tier tools should NOT be visible
         assert "spawn_teammate" not in names
@@ -238,12 +243,19 @@ class TestListBackends:
         assert "claude-code" in names
 
     async def test_returns_empty_when_no_backends(self, client: Client):
-        # Clear all backends from registry
+        # Exercise the real discovery path: reset the loaded flag, stub out
+        # both binary-on-PATH lookup and entry-point plugin discovery, then
+        # let the registry run its actual code. Previously the dict-mutation
+        # short-circuited all of this — a regression that broke discovery
+        # while leaving _backends empty in tests would still have passed.
+        registry._loaded = False
         registry._backends = {}
-        result = _data(await client.call_tool("list_backends", {}))
+        with (
+            patch("claude_teams.backends.base.shutil.which", return_value=None),
+            patch("importlib.metadata.entry_points", return_value=[]),
+        ):
+            result = _data(await client.call_tool("list_backends", {}))
         assert result == []
-        # Restore for subsequent tests
-        registry._backends = {"claude-code": _make_mock_backend("claude-code")}
 
     async def test_reports_backend_availability_from_backend_check(
         self, client: Client
@@ -255,3 +267,91 @@ class TestListBackends:
         result = _data(await client.call_tool("list_backends", {}))
 
         assert result[0]["available"] is False
+
+
+class TestListAgents:
+    async def test_returns_unsupported_when_backend_has_no_spec(self, client: Client):
+        result = _data(
+            await client.call_tool("list_agents", {"backend_name": "claude-code"})
+        )
+
+        assert result["backend"] == "claude-code"
+        assert result["supported"] is False
+        assert result["profiles"] == []
+        assert result["cwd"]
+
+    async def test_returns_profiles_when_backend_supports_selection(
+        self, client: Client
+    ):
+        mock = _make_mock_backend("claude-code")
+        mock.agent_select_spec.return_value = AgentSelectSpec(
+            flag="--agent", value_template="{name}"
+        )
+        mock.discover_agents.return_value = [
+            AgentProfile(name="reviewer", path="/abs/reviewer.md")
+        ]
+        registry._backends = {"claude-code": mock}
+
+        result = _data(
+            await client.call_tool("list_agents", {"backend_name": "claude-code"})
+        )
+
+        assert result["supported"] is True
+        assert result["profiles"] == [{"name": "reviewer", "path": "/abs/reviewer.md"}]
+
+    async def test_returns_empty_profiles_when_supported_but_none_discovered(
+        self, client: Client
+    ):
+        mock = _make_mock_backend("claude-code")
+        mock.agent_select_spec.return_value = AgentSelectSpec(
+            flag="--agent", value_template="{name}"
+        )
+        mock.discover_agents.return_value = []
+        registry._backends = {"claude-code": mock}
+
+        result = _data(
+            await client.call_tool("list_agents", {"backend_name": "claude-code"})
+        )
+
+        assert result["supported"] is True
+        assert result["profiles"] == []
+
+    async def test_rejects_unknown_backend(self, client: Client):
+        result = await client.call_tool(
+            "list_agents",
+            {"backend_name": "not-a-backend"},
+            raise_on_error=False,
+        )
+
+        assert result.is_error is True
+
+    async def test_passes_explicit_cwd_to_discover(
+        self, client: Client, tmp_path: Path
+    ):
+        mock = _make_mock_backend("claude-code")
+        mock.agent_select_spec.return_value = AgentSelectSpec(
+            flag="--agent", value_template="{name}"
+        )
+        # Return a non-empty list so we can verify profiles flow through
+        # the whole pipeline — prior version only checked call args, which
+        # would pass even if the tool dropped the profiles on the floor.
+        mock.discover_agents.return_value = [
+            AgentProfile(name="scoped-a", path=str(tmp_path / "scoped-a.md")),
+            AgentProfile(name="scoped-b", path=str(tmp_path / "scoped-b.md")),
+        ]
+        registry._backends = {"claude-code": mock}
+
+        result = _data(
+            await client.call_tool(
+                "list_agents",
+                {"backend_name": "claude-code", "cwd": str(tmp_path)},
+            )
+        )
+
+        mock.discover_agents.assert_called_once_with(str(tmp_path))
+        assert result["cwd"] == str(tmp_path)
+        assert result["supported"] is True
+        assert result["profiles"] == [
+            {"name": "scoped-a", "path": str(tmp_path / "scoped-a.md")},
+            {"name": "scoped-b", "path": str(tmp_path / "scoped-b.md")},
+        ]

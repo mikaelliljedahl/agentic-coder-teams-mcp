@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from claude_teams.backends.base import BaseBackend, SpawnRequest
+from claude_teams.backends.base import BaseBackend, ReasoningEffortSpec, SpawnRequest
 
 
 class KimiBackend(BaseBackend):
@@ -16,6 +16,20 @@ class KimiBackend(BaseBackend):
         "balanced": "kimi-k2-thinking",
         "powerful": "kimi-k2-thinking-turbo",
     }
+
+    _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
+        flag="-m",
+        value_template="{value}",
+        options=frozenset({"kimi-k2", "kimi-k2-thinking", "kimi-k2-thinking-turbo"}),
+    )
+
+    def reasoning_effort_spec(self) -> ReasoningEffortSpec | None:
+        """Kimi expresses effort through the ``-m`` model variant selector.
+
+        Setting ``reasoning_effort`` overrides whatever ``model`` would resolve
+        to — on Kimi the thinking variants ARE the effort ladder.
+        """
+        return self._REASONING_EFFORT_SPEC
 
     def supported_models(self) -> list[str]:
         """Return supported Kimi model names.
@@ -71,7 +85,7 @@ class KimiBackend(BaseBackend):
 
         """
         binary = self.discover_binary()
-        model = self.resolve_model(request.model)
+        model = request.reasoning_effort or self.resolve_model(request.model)
         return [
             binary,
             "--print",

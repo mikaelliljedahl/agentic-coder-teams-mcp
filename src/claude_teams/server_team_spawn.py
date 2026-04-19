@@ -13,11 +13,13 @@ from claude_teams import capabilities, messaging, teams
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends import SpawnRequest
 from claude_teams.errors import (
+    AgentSelectUnsupportedToolError,
     BackendNotRegisteredError,
     BackendSpawnFailedError,
     BroadcastSenderError,
     BroadcastSummaryEmptyToolError,
     BroadcastTooManyRecipientsError,
+    InvalidReasoningEffortToolError,
     MemberAlreadyExistsError,
     MessageContentEmptyToolError,
     MessageRecipientEmptyToolError,
@@ -26,10 +28,12 @@ from claude_teams.errors import (
     NotTeamMemberError,
     PermissionBypassUnsupportedToolError,
     PlanRecipientEmptyToolError,
+    ReasoningEffortUnsupportedToolError,
     ReservedAgentNameError,
     ShutdownRecipientEmptyToolError,
     ShutdownResponseApprovalRequiredError,
     ShutdownSelfError,
+    UnknownAgentProfileToolError,
     UnknownMessageTypeError,
     UnsupportedBackendModelError,
 )
@@ -88,6 +92,42 @@ def _find_member(config: teams.TeamConfig, member_name: str) -> MemberUnion | No
         if member.name == member_name:
             return member
     return None
+
+
+async def _validate_reasoning_effort(backend_obj, effort: str | None) -> None:
+    """Validate reasoning_effort against the backend's spec.
+
+    Raises:
+        ReasoningEffortUnsupportedToolError: Backend does not expose a spec.
+        InvalidReasoningEffortToolError: Value is outside the spec's options.
+
+    """
+    if effort is None:
+        return
+    spec = await run_blocking(backend_obj.reasoning_effort_spec)
+    if spec is None:
+        raise ReasoningEffortUnsupportedToolError(backend_obj.name)
+    if effort not in spec.options:
+        raise InvalidReasoningEffortToolError(backend_obj.name, effort, spec.options)
+
+
+async def _validate_agent_profile(backend_obj, profile: str | None, cwd: str) -> None:
+    """Validate agent_profile against the backend's spec and current discovery.
+
+    Raises:
+        AgentSelectUnsupportedToolError: Backend lacks an agent_select_spec.
+        UnknownAgentProfileToolError: Name not among discovered profiles.
+
+    """
+    if profile is None:
+        return
+    spec = await run_blocking(backend_obj.agent_select_spec)
+    if spec is None:
+        raise AgentSelectUnsupportedToolError(backend_obj.name)
+    profiles = await run_blocking(backend_obj.discover_agents, cwd)
+    names = [p.name for p in profiles]
+    if profile not in names:
+        raise UnknownAgentProfileToolError(backend_obj.name, profile, names)
 
 
 async def _assign_color(team_name: str) -> str:
@@ -162,10 +202,13 @@ async def spawn_teammate_tool(
     ):
         raise PermissionBypassUnsupportedToolError(backend_obj.name)
 
+    await _validate_reasoning_effort(backend_obj, opts.reasoning_effort)
+
     if name == "team-lead":
         raise ReservedAgentNameError()
 
     resolved_cwd = await run_blocking(_resolve_spawn_cwd, opts.cwd)
+    await _validate_agent_profile(backend_obj, opts.agent_profile, resolved_cwd)
     color = await _assign_color(team_name)
 
     member = TeammateMember(
@@ -220,6 +263,8 @@ async def spawn_teammate_tool(
         lead_session_id=ctx.session_id,
         permission_mode=resolved_permission_mode,
         plan_mode_required=opts.plan_mode_required,
+        reasoning_effort=opts.reasoning_effort,
+        agent_profile=opts.agent_profile,
         extra=extra,
     )
 

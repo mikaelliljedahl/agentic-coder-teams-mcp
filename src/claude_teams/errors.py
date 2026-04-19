@@ -451,6 +451,50 @@ class PermissionBypassUnsupportedToolError(ToolError):
         )
 
 
+class ReasoningEffortUnsupportedToolError(ToolError):
+    """Raised when ``reasoning_effort`` is set for a backend that lacks the dial."""
+
+    def __init__(self, backend_name: str) -> None:
+        """Build the message from the backend that does not expose effort."""
+        super().__init__(
+            f"Backend {backend_name!r} does not accept a reasoning_effort value."
+        )
+
+
+class InvalidReasoningEffortToolError(ToolError):
+    """Raised when a ``reasoning_effort`` value is outside a backend's accepted set."""
+
+    def __init__(self, backend_name: str, value: str, supported: Iterable[str]) -> None:
+        """Build the message from the backend, rejected value, and valid options."""
+        supported_str = ", ".join(sorted(supported))
+        super().__init__(
+            f"Invalid reasoning_effort {value!r} for {backend_name}. "
+            f"Supported: {supported_str}"
+        )
+
+
+class AgentSelectUnsupportedToolError(ToolError):
+    """Raised when ``agent_profile`` is set for a backend that lacks selection."""
+
+    def __init__(self, backend_name: str) -> None:
+        """Build the message from the backend that does not support selection."""
+        super().__init__(
+            f"Backend {backend_name!r} does not support agent profile selection."
+        )
+
+
+class UnknownAgentProfileToolError(ToolError):
+    """Raised when an ``agent_profile`` value is not among discovered profiles."""
+
+    def __init__(self, backend_name: str, value: str, supported: Iterable[str]) -> None:
+        """Build the message from the backend, rejected value, and discovered names."""
+        supported_str = ", ".join(sorted(supported)) or "(none discovered)"
+        super().__init__(
+            f"Unknown agent profile {value!r} for {backend_name}. "
+            f"Available: {supported_str}"
+        )
+
+
 class ReservedAgentNameError(ToolError):
     """Raised when a spawn request uses the reserved ``team-lead`` name."""
 

@@ -84,8 +84,7 @@ class TestQwenResolveModel:
 
 
 class TestQwenBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/qwen")
-    def test_produces_prompt_command(self, _mock_which, _make_request):
+    def test_produces_prompt_command(self, _make_request):
         backend = QwenBackend()
         request = _make_request()
 
@@ -96,8 +95,7 @@ class TestQwenBuildCommand:
         assert "-m" in cmd
         assert "-y" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/qwen")
-    def test_includes_prompt_after_p_flag(self, _mock_which, _make_request):
+    def test_includes_prompt_after_p_flag(self, _make_request):
         backend = QwenBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -106,8 +104,7 @@ class TestQwenBuildCommand:
         idx = cmd.index("-p")
         assert cmd[idx + 1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/qwen")
-    def test_includes_model_after_m_flag(self, _mock_which, _make_request):
+    def test_includes_model_after_m_flag(self, _make_request):
         backend = QwenBackend()
         request = _make_request(model="qwen-max")
 
@@ -116,8 +113,7 @@ class TestQwenBuildCommand:
         idx = cmd.index("-m")
         assert cmd[idx + 1] == "qwen-max"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/qwen")
-    def test_resolves_generic_model(self, _mock_which, _make_request):
+    def test_resolves_generic_model(self, _make_request):
         backend = QwenBackend()
         request = _make_request(model="fast")
 
@@ -135,8 +131,7 @@ class TestQwenBuildEnv:
 
 
 class TestQwenAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/qwen")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = QwenBackend()
         assert backend.is_available() is True
 

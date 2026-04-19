@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -78,8 +77,7 @@ class TestOpenCodeResolveModel:
 
 
 class TestOpenCodeBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/opencode")
-    def test_produces_run_command(self, mock_which, _make_request):
+    def test_produces_run_command(self, _make_request):
         backend = OpenCodeBackend()
         request = _make_request()
 
@@ -89,8 +87,7 @@ class TestOpenCodeBuildCommand:
         assert "run" in cmd
         assert "--model" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/opencode")
-    def test_includes_prompt_as_last_arg(self, mock_which, _make_request):
+    def test_includes_prompt_as_last_arg(self, _make_request):
         backend = OpenCodeBackend()
         request = _make_request(prompt="implement feature")
 
@@ -98,8 +95,7 @@ class TestOpenCodeBuildCommand:
 
         assert cmd[-1] == "implement feature"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/opencode")
-    def test_includes_model_value(self, mock_which, _make_request):
+    def test_includes_model_value(self, _make_request):
         backend = OpenCodeBackend()
         request = _make_request(model="balanced")
 

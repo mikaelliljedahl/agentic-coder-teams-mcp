@@ -81,8 +81,7 @@ class TestVibeResolveModel:
 
 
 class TestVibeBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/vibe")
-    def test_produces_prompt_command(self, _mock_which, _make_request):
+    def test_produces_prompt_command(self, _make_request):
         backend = VibeBackend()
         request = _make_request()
 
@@ -93,8 +92,7 @@ class TestVibeBuildCommand:
         assert "--output" in cmd
         assert "text" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/vibe")
-    def test_includes_prompt_after_p_flag(self, _mock_which, _make_request):
+    def test_includes_prompt_after_p_flag(self, _make_request):
         backend = VibeBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -103,8 +101,7 @@ class TestVibeBuildCommand:
         idx = cmd.index("-p")
         assert cmd[idx + 1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/vibe")
-    def test_does_not_include_model_flag(self, _mock_which, _make_request):
+    def test_does_not_include_model_flag(self, _make_request):
         backend = VibeBackend()
         request = _make_request(model="powerful")
 
@@ -113,8 +110,7 @@ class TestVibeBuildCommand:
         assert "--model" not in cmd
         assert "-m" not in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/vibe")
-    def test_output_format_is_text(self, _mock_which, _make_request):
+    def test_output_format_is_text(self, _make_request):
         backend = VibeBackend()
         request = _make_request()
 
@@ -132,8 +128,7 @@ class TestVibeBuildEnv:
 
 
 class TestVibeAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/vibe")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = VibeBackend()
         assert backend.is_available() is True
 

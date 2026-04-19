@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -77,8 +76,7 @@ class TestGeminiResolveModel:
 
 
 class TestGeminiBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/gemini")
-    def test_produces_correct_flags(self, mock_which, _make_request):
+    def test_produces_correct_flags(self, _make_request):
         backend = GeminiBackend()
         request = _make_request()
 
@@ -89,8 +87,7 @@ class TestGeminiBuildCommand:
         assert "--model" in cmd
         assert "--yolo" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/gemini")
-    def test_includes_prompt_value(self, mock_which, _make_request):
+    def test_includes_prompt_value(self, _make_request):
         backend = GeminiBackend()
         request = _make_request(prompt="analyze this")
 
@@ -99,8 +96,7 @@ class TestGeminiBuildCommand:
         idx = cmd.index("--prompt")
         assert cmd[idx + 1] == "analyze this"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/gemini")
-    def test_includes_model_value(self, mock_which, _make_request):
+    def test_includes_model_value(self, _make_request):
         backend = GeminiBackend()
         request = _make_request(model="gemini-2.5-pro")
 
@@ -118,3 +114,19 @@ class TestGeminiBuildEnv:
         env = backend.build_env(request)
 
         assert env == {}
+
+
+class TestGeminiReasoningEffort:
+    def test_spec_is_none_for_unsupported_backend(self):
+        backend = GeminiBackend()
+        assert backend.reasoning_effort_spec() is None
+
+
+class TestGeminiAgentSelect:
+    def test_spec_is_none_for_unsupported_backend(self):
+        backend = GeminiBackend()
+        assert backend.agent_select_spec() is None
+
+    def test_discover_returns_empty(self, tmp_path: Path):
+        backend = GeminiBackend()
+        assert backend.discover_agents(str(tmp_path)) == []

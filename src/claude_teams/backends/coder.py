@@ -2,7 +2,14 @@
 
 from typing import ClassVar
 
-from claude_teams.backends.base import BaseBackend, SpawnRequest
+from claude_teams.backends._agent_discovery import discover_codex_style_agents
+from claude_teams.backends.base import (
+    AgentProfile,
+    AgentSelectSpec,
+    BaseBackend,
+    ReasoningEffortSpec,
+    SpawnRequest,
+)
 
 
 class CoderBackend(BaseBackend):
@@ -16,6 +23,29 @@ class CoderBackend(BaseBackend):
         "balanced": "claude-sonnet-4.5",
         "powerful": "claude-opus-4.6",
     }
+
+    _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
+        flag="-c",
+        value_template="model_reasoning_effort={value}",
+        options=frozenset({"low", "medium", "high", "xhigh"}),
+    )
+
+    _AGENT_SELECT_SPEC: ClassVar[AgentSelectSpec] = AgentSelectSpec(
+        flag="-c",
+        value_template='agents.{name}.config_file="{path}"',
+    )
+
+    def reasoning_effort_spec(self) -> ReasoningEffortSpec | None:
+        """Coder inherits Codex's ``-c`` config override for reasoning effort."""
+        return self._REASONING_EFFORT_SPEC
+
+    def agent_select_spec(self) -> AgentSelectSpec | None:
+        """Coder selects an agent via the same ``-c`` override as Codex."""
+        return self._AGENT_SELECT_SPEC
+
+    def discover_agents(self, cwd: str) -> list[AgentProfile]:
+        """Parse ``[agents.*]`` tables from ``~/.coder/config.toml`` and project."""
+        return discover_codex_style_agents(cwd, "coder")
 
     def supported_models(self) -> list[str]:
         """Return supported Coder model names.
@@ -79,11 +109,15 @@ class CoderBackend(BaseBackend):
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
-        return [
+        cmd = [
             binary,
             "exec",
             "-m",
             model,
             *self.permission_args(request),
-            request.prompt,
         ]
+        if request.reasoning_effort:
+            cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
+        cmd.extend(self._agent_args(request))
+        cmd.append(request.prompt)
+        return cmd

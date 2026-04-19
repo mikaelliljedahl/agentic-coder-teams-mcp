@@ -2,7 +2,14 @@
 
 from typing import ClassVar
 
-from claude_teams.backends.base import BaseBackend, SpawnRequest
+from claude_teams.backends._agent_discovery import discover_claude_agents
+from claude_teams.backends.base import (
+    AgentProfile,
+    AgentSelectSpec,
+    BaseBackend,
+    ReasoningEffortSpec,
+    SpawnRequest,
+)
 from claude_teams.errors import UnsupportedBackendModelError
 
 
@@ -30,6 +37,29 @@ class ClaudeCodeBackend(BaseBackend):
         "sonnet": "sonnet",
         "opus": "opus",
     }
+
+    _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
+        flag="--effort",
+        value_template="{value}",
+        options=frozenset({"low", "medium", "high", "max"}),
+    )
+
+    _AGENT_SELECT_SPEC: ClassVar[AgentSelectSpec] = AgentSelectSpec(
+        flag="--agent",
+        value_template="{name}",
+    )
+
+    def reasoning_effort_spec(self) -> ReasoningEffortSpec | None:
+        """Claude Code exposes reasoning effort via a dedicated ``--effort`` flag."""
+        return self._REASONING_EFFORT_SPEC
+
+    def agent_select_spec(self) -> AgentSelectSpec | None:
+        """Claude Code accepts a profile by name via ``--agent <name>``."""
+        return self._AGENT_SELECT_SPEC
+
+    def discover_agents(self, cwd: str) -> list[AgentProfile]:
+        """Scan ``.claude/agents/*.md`` under the project and user-home roots."""
+        return discover_claude_agents(cwd)
 
     def supported_models(self) -> list[str]:
         """Return supported Claude Code model short-names.
@@ -106,6 +136,9 @@ class ClaudeCodeBackend(BaseBackend):
         ]
         if request.plan_mode_required:
             cmd.append("--plan-mode-required")
+        if request.reasoning_effort:
+            cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
+        cmd.extend(self._agent_args(request))
         return cmd
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:

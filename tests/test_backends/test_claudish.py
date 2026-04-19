@@ -82,8 +82,7 @@ class TestClaudishResolveModel:
 
 
 class TestClaudishBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claudish")
-    def test_produces_single_shot_command(self, _mock_which, _make_request):
+    def test_produces_single_shot_command(self, _make_request):
         backend = ClaudishBackend()
         request = _make_request()
 
@@ -93,8 +92,7 @@ class TestClaudishBuildCommand:
         assert "--model" in cmd
         assert "-y" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claudish")
-    def test_includes_prompt_as_last_arg(self, _mock_which, _make_request):
+    def test_includes_prompt_as_last_arg(self, _make_request):
         backend = ClaudishBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -102,8 +100,7 @@ class TestClaudishBuildCommand:
 
         assert cmd[-1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claudish")
-    def test_includes_model_with_provider_syntax(self, _mock_which, _make_request):
+    def test_includes_model_with_provider_syntax(self, _make_request):
         backend = ClaudishBackend()
         request = _make_request(model="google@gemini-3-pro")
 
@@ -112,8 +109,7 @@ class TestClaudishBuildCommand:
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "google@gemini-3-pro"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claudish")
-    def test_resolves_generic_model(self, _mock_which, _make_request):
+    def test_resolves_generic_model(self, _make_request):
         backend = ClaudishBackend()
         request = _make_request(model="fast")
 
@@ -131,8 +127,7 @@ class TestClaudishBuildEnv:
 
 
 class TestClaudishAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/claudish")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = ClaudishBackend()
         assert backend.is_available() is True
 
@@ -140,3 +135,70 @@ class TestClaudishAvailability:
     def test_unavailable_when_binary_not_found(self, _mock_which):
         backend = ClaudishBackend()
         assert backend.is_available() is False
+
+
+class TestClaudishAgentSelect:
+    def test_spec_advertises_agent_flag(self):
+        backend = ClaudishBackend()
+        spec = backend.agent_select_spec()
+        assert spec is not None
+        assert spec.flag == "--agent"
+        assert spec.value_template == "{name}"
+
+    def test_discover_finds_project_agents(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        agents_dir = tmp_path / ".claude" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "planner.md").write_text("planner")
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = ClaudishBackend()
+        profiles = backend.discover_agents(str(tmp_path))
+
+        names = [p.name for p in profiles]
+        assert "planner" in names
+
+    def test_build_command_appends_agent_flag_when_discovered(
+        self,
+        _make_request,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        agents_dir = tmp_path / ".claude" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "planner.md").write_text("planner")
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = ClaudishBackend()
+        request = _make_request(cwd=str(tmp_path), agent_profile="planner", prompt="go")
+
+        cmd = backend.build_command(request)
+
+        assert "--agent" in cmd
+        idx = cmd.index("--agent")
+        assert cmd[idx + 1] == "planner"
+        assert cmd[-1] == "go"
+
+    def test_build_command_omits_agent_flag_when_profile_none(self, _make_request):
+        backend = ClaudishBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert "--agent" not in cmd
+
+    def test_build_command_omits_agent_flag_when_profile_undiscovered(
+        self,
+        _make_request,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = ClaudishBackend()
+        request = _make_request(cwd=str(tmp_path), agent_profile="ghost")
+
+        cmd = backend.build_command(request)
+
+        assert "--agent" not in cmd

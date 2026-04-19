@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -78,8 +77,7 @@ class TestAiderResolveModel:
 
 
 class TestAiderBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/aider")
-    def test_produces_correct_flags(self, mock_which, _make_request):
+    def test_produces_correct_flags(self, _make_request):
         backend = AiderBackend()
         request = _make_request()
 
@@ -90,8 +88,7 @@ class TestAiderBuildCommand:
         assert "--message" in cmd
         assert "--yes-always" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/aider")
-    def test_includes_prompt_in_message_flag(self, mock_which, _make_request):
+    def test_includes_prompt_in_message_flag(self, _make_request):
         backend = AiderBackend()
         request = _make_request(prompt="write tests")
 
@@ -100,8 +97,7 @@ class TestAiderBuildCommand:
         idx = cmd.index("--message")
         assert cmd[idx + 1] == "write tests"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/aider")
-    def test_includes_model_value(self, mock_which, _make_request):
+    def test_includes_model_value(self, _make_request):
         backend = AiderBackend()
         request = _make_request(model="balanced")
 
