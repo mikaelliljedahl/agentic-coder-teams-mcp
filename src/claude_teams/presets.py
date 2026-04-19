@@ -24,8 +24,11 @@ per-member fields follow the same precedence rule: explicit preset
 fields override template defaults.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
+
+from claude_teams.errors import PresetEmptyMembersError
+from claude_teams.templates import McpServerConfig
 
 PermissionModeOpt = Literal["default", "require_approval", "bypass"]
 
@@ -90,9 +93,11 @@ class TeamPreset:
             latter summarizes the preset itself while this one becomes
             part of the created team's persistent metadata.
         members: Ordered tuple of ``PresetMemberSpec`` entries. Order
-            determines spawn order, which in turn determines color
-            assignment (``_assign_color`` walks teammates in config
-            order).
+            determines spawn order; each member is assigned the next
+            palette color. ``_assign_color`` counts teammates already
+            persisted on the team and indexes ``COLOR_PALETTE`` by
+            ``count % len(palette)``, so the first spawned member of a
+            new team gets ``COLOR_PALETTE[0]``.
         skill_roots: Forward-compat metadata for Feature G; absolute
             filesystem paths injected as per-team skill roots once
             backend-layer support lands.
@@ -106,7 +111,7 @@ class TeamPreset:
     team_description: str = ""
     members: tuple[PresetMemberSpec, ...] = ()
     skill_roots: tuple[str, ...] = ()
-    mcp_servers: tuple[dict[str, object], ...] = field(default_factory=tuple)
+    mcp_servers: tuple[McpServerConfig, ...] = ()
 
 
 # Module-level registry. Tests reset via their ``_reset_registry`` fixtures;
@@ -124,7 +129,16 @@ def register_preset(preset: TeamPreset) -> None:
     Args:
         preset: Preset to register.
 
+    Raises:
+        PresetEmptyMembersError: ``preset.members`` is empty. A preset
+            that expands to zero teammates would create a lead-only
+            team, which collapses the whole point of the composition
+            pattern — surface the mistake at registration time rather
+            than at expansion time so plugin authors fail fast.
+
     """
+    if not preset.members:
+        raise PresetEmptyMembersError(preset.name)
     _registry[preset.name] = preset
 
 

@@ -56,6 +56,7 @@ from claude_teams.server_team_relay import (
     build_agent_auth_notice,
     create_one_shot_result_path,
     log_relay_task_exception,
+    log_retain_pane_failure,
     relay_one_shot_result,
 )
 
@@ -91,6 +92,7 @@ def _build_spawn_dependencies() -> SpawnDependencies:
         relay_one_shot_result=relay_one_shot_result,
         create_one_shot_result_path=create_one_shot_result_path,
         log_relay_task_exception=log_relay_task_exception,
+        log_retain_pane_failure=log_retain_pane_failure,
     )
 
 
@@ -121,9 +123,10 @@ async def spawn_teammate_tool(
             and not equal to the reserved ``team-lead``).
         prompt: Initial prompt delivered to the teammate via its inbox.
         ctx: FastMCP request context (injected).
-        options: Optional tuning knobs (backend, model, cwd, subagent_type,
-            plan_mode_required, permission_mode, capability). Omit to accept
-            all defaults.
+        options: Optional tuning knobs (backend, model, cwd,
+            subagent_type, reasoning_effort, agent_profile,
+            plan_mode_required, permission_mode, template, capability).
+            Omit to accept all defaults.
 
     """
     opts = options or SpawnOptions()

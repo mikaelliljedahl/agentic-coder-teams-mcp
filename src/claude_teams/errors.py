@@ -136,6 +136,36 @@ class MemberAlreadyExistsError(ValueError):
         super().__init__(f"Member {member_name!r} already exists in team {team_name!r}")
 
 
+class TeamAlreadyExistsError(ValueError):
+    """Raised when team creation targets a name that already has a config on disk.
+
+    The domain layer raises this so the callers (MCP bootstrap, CLI,
+    preset expansion) can decide how to surface the collision without
+    silently overwriting an in-flight team.
+    """
+
+    def __init__(self, team_name: str) -> None:
+        """Build the message from the colliding team name."""
+        super().__init__(f"Team {team_name!r} already exists")
+
+
+class PresetEmptyMembersError(ValueError):
+    """Raised when a preset is registered without any ``PresetMemberSpec`` entries.
+
+    A zero-member preset would expand to a team with no teammates,
+    which collapses the whole point of the preset composition pattern.
+    Surface the mistake at registration rather than at expansion time
+    so plugin authors fail fast.
+    """
+
+    def __init__(self, preset_name: str) -> None:
+        """Build the message from the offending preset name."""
+        super().__init__(
+            f"Preset {preset_name!r} has no members; presets must declare "
+            "at least one PresetMemberSpec to be useful."
+        )
+
+
 class CannotRemoveLeadError(ValueError):
     """Raised when someone tries to remove the reserved ``team-lead``."""
 
@@ -352,6 +382,22 @@ class TeamNotFoundToolError(ToolError):
     def __init__(self, team_name: str) -> None:
         """Build the message from the missing team name."""
         super().__init__(f"Team {team_name!r} not found")
+
+
+class TeamAlreadyExistsToolError(ToolError):
+    """Raised when team creation targets an existing team (MCP-facing).
+
+    Mirrors ``TeamNotFoundToolError``'s convention so both ends of the
+    team-lookup lifecycle surface a typed ToolError the MCP client can
+    distinguish from generic backend errors.
+    """
+
+    def __init__(self, team_name: str) -> None:
+        """Build the message from the colliding team name."""
+        super().__init__(
+            f"Team {team_name!r} already exists. Choose a new name or "
+            f"delete the existing team first."
+        )
 
 
 class CwdNotAbsoluteError(ToolError):
@@ -682,5 +728,13 @@ class PresetMemberSpawnFailedError(ToolError):
     """
 
     def __init__(self, member_name: str, cause: BaseException) -> None:
-        """Build the message from the failing member and root cause."""
-        super().__init__(f"Preset expansion failed on member {member_name!r}: {cause}")
+        """Build the message from the failing member and root cause.
+
+        Includes the cause's class name so log consumers that only see
+        the outer message can tell a template-resolution failure apart
+        from a backend-spawn failure without chasing ``__cause__``.
+        """
+        super().__init__(
+            f"Preset expansion failed on member {member_name!r} "
+            f"({type(cause).__name__}): {cause}"
+        )

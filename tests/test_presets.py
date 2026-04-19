@@ -3,6 +3,7 @@
 import pytest
 
 from claude_teams import presets
+from claude_teams.errors import PresetEmptyMembersError
 from claude_teams.presets import PresetMemberSpec, TeamPreset
 
 
@@ -74,6 +75,27 @@ class TestRegister:
         # itself having to attempt a mutation the type system forbids.
         assert TeamPreset.__dataclass_params__.frozen is True
 
+    def test_rejects_empty_members(self):
+        """``register_preset`` fails fast on a zero-member preset.
+
+        A preset with no members would expand into a lead-only team,
+        collapsing the whole point of the composition pattern. The
+        registry enforces non-emptiness at registration time so plugin
+        authors see the mistake before they try to launch the preset.
+        """
+        with pytest.raises(PresetEmptyMembersError, match="no members"):
+            presets.register_preset(
+                TeamPreset(
+                    name="empty-preset",
+                    description="no members — should be rejected",
+                    members=(),
+                )
+            )
+        # Failed registration must not leave a partial entry behind;
+        # otherwise ``get_preset`` would return an unusable preset.
+        with pytest.raises(KeyError):
+            presets.get_preset("empty-preset")
+
 
 class TestGetPreset:
     def test_returns_registered_preset(self):
@@ -86,7 +108,13 @@ class TestGetPreset:
 
 class TestUnregister:
     def test_removes_registered_preset(self):
-        presets.register_preset(TeamPreset(name="temp", description="x"))
+        presets.register_preset(
+            TeamPreset(
+                name="temp",
+                description="x",
+                members=(PresetMemberSpec(name="solo", prompt="do"),),
+            )
+        )
         presets.unregister_preset("temp")
         with pytest.raises(KeyError):
             presets.get_preset("temp")
@@ -151,6 +179,7 @@ class TestForwardCompatMetadata:
         p = TeamPreset(
             name="g-ready",
             description="x",
+            members=(PresetMemberSpec(name="solo", prompt="do"),),
             skill_roots=("/abs/skills/team",),
         )
         presets.register_preset(p)

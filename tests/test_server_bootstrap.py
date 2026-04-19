@@ -1,5 +1,6 @@
 """Bootstrap and capability server tests."""
 
+import logging
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -9,10 +10,18 @@ from fastmcp import Client
 
 from claude_teams import presets, teams, templates
 from claude_teams.backends import registry
-from claude_teams.backends.base import AgentProfile, AgentSelectSpec
+from claude_teams.backends.base import AgentProfile, AgentSelectSpec, HealthStatus
+from claude_teams.backends.base import SpawnResult as BackendSpawnResult
+from claude_teams.errors import (
+    BackendSpawnFailedError,
+    PresetMemberSpawnFailedError,
+    TeamAlreadyExistsError,
+)
 from claude_teams.models import TeammateMember
+from claude_teams.orchestration import expand_preset_core
 from claude_teams.presets import PresetMemberSpec, TeamPreset
 from claude_teams.server import mcp
+from claude_teams.server_team_spawn import _build_spawn_dependencies
 from claude_teams.templates import AgentTemplate
 from tests._server_support import (
     _data,
@@ -544,6 +553,44 @@ class TestCreateTeamFromPreset:
         # Error surface enumerates available presets.
         assert "review-and-fix" in text
 
+    async def test_collision_with_existing_team_surfaces_tool_error(
+        self, client: Client
+    ):
+        """MCP wrapper translates ``TeamAlreadyExistsError`` into the tool error.
+
+        Pre-seeds a team on disk by calling ``teams.create_team`` directly
+        (bypassing the MCP session's ``active_team`` bookkeeping), then
+        drives ``create_team_from_preset`` with the same name. The domain
+        error raised inside ``expand_preset_core`` must surface as the
+        discoverable ``TeamAlreadyExistsToolError`` payload — the error
+        message includes the colliding name and the remediation path so
+        clients can branch on the typed surface rather than parsing a
+        generic failure.
+        """
+        await teams.create_team(
+            name="taken-name",
+            session_id="other-session",
+            description="pre-existing team",
+        )
+
+        result = await client.call_tool(
+            "create_team_from_preset",
+            {
+                "preset_name": "review-and-fix",
+                "team_name": "taken-name",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        text = _text(result)
+        assert "taken-name" in text
+        assert "already exists" in text
+
+        # Pre-existing team survives the failed expansion attempt — the
+        # core docstring promises no rollback of a team we didn't create.
+        cfg = await teams.read_config("taken-name")
+        assert cfg.description == "pre-existing team"
+
     async def test_custom_preset_with_explicit_member_overrides(self, client: Client):
         presets.register_preset(
             TeamPreset(
@@ -575,3 +622,236 @@ class TestCreateTeamFromPreset:
         )
         # Explicit beats template default.
         assert alpha.agent_type == "executor"
+
+    async def test_member_spawn_failure_persists_team_and_earlier_members(
+        self, client: Client
+    ):
+        """Mid-fan-out failure leaves team and already-spawned members intact.
+
+        Locks the non-transactional expansion contract at the MCP boundary:
+        the call returns an error naming the failing member, and a follow-up
+        ``read_config`` still sees the team plus every member spawned before
+        the failure. Without this guarantee a partial expansion would either
+        leak a hidden team or roll back successful work without surfacing it.
+        """
+        mock = cast(MagicMock, registry._backends["claude-code"])
+        # side_effect as an iterable runs one entry per call. First member
+        # spawns cleanly, second raises — exercising the mid-fan-out branch.
+        mock.spawn.side_effect = [
+            BackendSpawnResult(process_handle="%ok", backend_type="claude-code"),
+            RuntimeError("synthetic spawn failure for second member"),
+        ]
+
+        presets.register_preset(
+            TeamPreset(
+                name="failure-duo",
+                description="Two-member preset; second member crashes on spawn.",
+                team_description="Non-transactional expansion contract.",
+                members=(
+                    PresetMemberSpec(
+                        name="ok-one", prompt="succeeds", template="executor"
+                    ),
+                    PresetMemberSpec(name="boom", prompt="fails", template="executor"),
+                ),
+            )
+        )
+
+        result = await client.call_tool(
+            "create_team_from_preset",
+            {"preset_name": "failure-duo", "team_name": "fail-team"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        # Error names the failing member so the operator knows exactly which
+        # one to retry via ``spawn_teammate``.
+        assert "boom" in _text(result)
+
+        # Non-transactional contract: team persists after the failure.
+        cfg = await teams.read_config("fail-team")
+        names = {m.name for m in cfg.members}
+        assert "team-lead" in names
+        # First member succeeded — stays persisted.
+        assert "ok-one" in names
+        # Failing member was rolled back inside ``spawn_teammate_core``'s
+        # BackendSpawnFailedError branch; only the preset-level wrap surfaces
+        # to the caller, but the partially-added member record is gone.
+        assert "boom" not in names
+
+
+class TestExpandPresetCoreFailure:
+    """Core-level expansion contract: failure path without the MCP wrapper.
+
+    Exercises ``expand_preset_core`` directly so a future refactor that
+    swaps in transactional rollback fails here explicitly rather than
+    changing observable behaviour behind the MCP boundary. The companion
+    MCP-level test in ``TestCreateTeamFromPreset`` pins the same contract
+    from the client side.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_registry(self):
+        yield
+        presets._seed_builtin_presets()
+        templates._seed_builtin_templates()
+
+    async def test_partial_failure_raises_named_error_and_persists_team(
+        self, client: Client
+    ):
+        """Direct ``expand_preset_core`` call: typed error + team persistence."""
+        # The ``client`` fixture is depended on for its side effects only
+        # (monkeypatched ``TEAMS_DIR``/``TASKS_DIR`` and the mocked backend
+        # registry). The test drives the orchestration core directly instead
+        # of going through ``client.call_tool``, which is what makes this
+        # the core-layer contract test.
+        _ = client
+
+        mock = cast(MagicMock, registry._backends["claude-code"])
+        mock.spawn.side_effect = [
+            BackendSpawnResult(process_handle="%ok", backend_type="claude-code"),
+            RuntimeError("boom"),
+        ]
+
+        presets.register_preset(
+            TeamPreset(
+                name="core-failure-duo",
+                description="Core-level partial failure.",
+                team_description="Non-transactional core contract.",
+                members=(
+                    PresetMemberSpec(name="first", prompt="ok", template="executor"),
+                    PresetMemberSpec(
+                        name="second", prompt="crash", template="executor"
+                    ),
+                ),
+            )
+        )
+        preset = presets.get_preset("core-failure-duo")
+
+        with pytest.raises(PresetMemberSpawnFailedError) as exc_info:
+            await expand_preset_core(
+                registry=registry,
+                preset=preset,
+                team_name="core-fail-team",
+                session_id="test-session",
+                description="desc",
+                deps=_build_spawn_dependencies(),
+            )
+
+        # Typed error names the failing member for targeted retry.
+        assert "second" in str(exc_info.value)
+        # Direct cause is the spawn-layer wrap; its cause is the backend's
+        # original exception. Both links must survive so callers can branch
+        # on either "preset fan-out failed" (outer) or the raw failure mode
+        # (root) without losing the wrapper context.
+        outer_cause = exc_info.value.__cause__
+        assert isinstance(outer_cause, BackendSpawnFailedError)
+        assert isinstance(outer_cause.__cause__, RuntimeError)
+        assert "boom" in str(outer_cause.__cause__)
+
+        # Team persists with the successful member; the failed one was
+        # rolled back at the spawn-core layer before the preset wrap.
+        cfg = await teams.read_config("core-fail-team")
+        names = {m.name for m in cfg.members}
+        assert "team-lead" in names
+        assert "first" in names
+        assert "second" not in names
+
+    async def test_team_already_exists_surfaces_raw_domain_error(self, client: Client):
+        """Core raises ``TeamAlreadyExistsError`` unwrapped on name collision.
+
+        The docstring contract: the collision surfaces directly (no preset
+        wrap) because expansion never started — no partial team state to
+        report. This test also locks the no-rollback property: the
+        pre-seeded team survives the failed expansion because the core
+        never owned it.
+        """
+        # ``client`` fixture is depended on for its side effects only
+        # (monkeypatched ``TEAMS_DIR``/``TASKS_DIR`` and the mocked backend
+        # registry). The test drives ``expand_preset_core`` directly so a
+        # future refactor that swaps in a wrapped surface fails here
+        # explicitly rather than drifting the MCP contract silently.
+        _ = client
+
+        await teams.create_team(
+            name="collision-team",
+            session_id="other-session",
+            description="pre-existing team",
+        )
+
+        preset = presets.get_preset("review-and-fix")
+
+        with pytest.raises(TeamAlreadyExistsError) as exc_info:
+            await expand_preset_core(
+                registry=registry,
+                preset=preset,
+                team_name="collision-team",
+                session_id="test-session",
+                description="from preset",
+                deps=_build_spawn_dependencies(),
+            )
+        assert "collision-team" in str(exc_info.value)
+
+        # Pre-existing team persists — no rollback of a team we never
+        # owned. Re-reading its description proves the original config is
+        # still on disk untouched.
+        cfg = await teams.read_config("collision-team")
+        assert cfg.description == "pre-existing team"
+
+
+class TestRetainPaneFailureWiring:
+    """``retain_pane_after_exit`` errors log a warning without failing the spawn.
+
+    The orchestration core catches exceptions from
+    ``Backend.retain_pane_after_exit`` and hands them to
+    ``log_retain_pane_failure`` via ``SpawnDependencies``. The spawn has
+    already succeeded by that point — pane retention is an operational
+    breadcrumb, not a reason to fail the user-facing call. This test
+    pins the wiring end-to-end: a non-interactive backend whose
+    ``retain_pane_after_exit`` raises still produces a successful
+    ``spawn_teammate`` return, and the warning lands in the shared
+    ``claude_teams.server_runtime`` logger.
+    """
+
+    async def test_retain_pane_failure_is_logged_without_failing_spawn(
+        self, client: Client, caplog: pytest.LogCaptureFixture
+    ):
+        # A non-interactive backend is required: orchestration only calls
+        # ``retain_pane_after_exit`` on the one-shot (non-interactive) path.
+        # ``_make_mock_backend`` sets ``is_interactive`` from the name, so
+        # any non-``claude-code`` name flips the flag off.
+        mock_codex = _make_mock_backend("codex")
+        mock_codex.retain_pane_after_exit.side_effect = RuntimeError("pane retain boom")
+        # Background relay task needs a "pane ended" signal to exit
+        # quickly; without this it would sit in its poll loop until
+        # pytest-asyncio cancels it at teardown.
+        mock_codex.health_check.return_value = HealthStatus(
+            alive=False, detail="one-shot complete"
+        )
+        registry._backends["codex"] = mock_codex
+
+        await client.call_tool("team_create", {"team_name": "retain-wire"})
+
+        with caplog.at_level(logging.WARNING, logger="claude_teams.server_runtime"):
+            result = await client.call_tool(
+                "spawn_teammate",
+                {
+                    "team_name": "retain-wire",
+                    "name": "codex-worker",
+                    "prompt": "do something",
+                    "options": {"backend": "codex", "model": "gpt-5.3-codex"},
+                },
+                raise_on_error=False,
+            )
+
+        # Spawn succeeds — a failure here would mean the exception bubbled
+        # past the ``except Exception`` guard in orchestration, which is
+        # the exact regression this test exists to prevent.
+        assert result.is_error is False
+        # The mock's retain hook was actually invoked by orchestration;
+        # rules out the "callback logged for some other reason" failure
+        # mode before asserting on the log contents.
+        assert mock_codex.retain_pane_after_exit.call_count == 1
+        # Injected ``log_retain_pane_failure`` ran with the raised
+        # exception. Substring match is narrow enough to distinguish the
+        # retain breadcrumb from any background relay-task error.
+        assert "retain_pane_after_exit failed" in caplog.text
+        assert "pane retain boom" in caplog.text

@@ -21,9 +21,36 @@ can layer on without schema churn.
 """
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypedDict
 
 PermissionModeOpt = Literal["default", "require_approval", "bypass"]
+
+
+class McpServerConfig(TypedDict, total=False):
+    """Structural shape of an MCP server config fragment.
+
+    Forward-compat type for Feature G's per-team / per-agent MCP
+    injection. Defined with ``total=False`` because the MCP server
+    config grammar evolves (stdio vs. sse vs. http transports each use
+    different keys) and this type only has to be permissive enough for
+    the Feature G consumer to narrow further at use time. Using a
+    TypedDict instead of ``dict[str, object]`` keeps the "this is a
+    config fragment, not arbitrary bag" intent visible in signatures.
+
+    Attributes:
+        command: Executable path for stdio-transport servers.
+        args: Argv passed to ``command``.
+        env: Environment variables overlaid on the server process.
+        type: Transport discriminator (``"stdio"``/``"sse"``/``"http"``).
+        url: Endpoint URL for sse/http transports.
+
+    """
+
+    command: str
+    args: list[str]
+    env: dict[str, str]
+    type: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -69,7 +96,7 @@ class AgentTemplate:
     default_permission_mode: PermissionModeOpt | None = None
     default_plan_mode_required: bool | None = None
     skill_roots: tuple[str, ...] = ()
-    mcp_servers: tuple[dict[str, object], ...] = ()
+    mcp_servers: tuple[McpServerConfig, ...] = ()
 
 
 # Module-level registry. Tests reset via ``_reset_registry`` in their
@@ -242,6 +269,7 @@ _seed_builtin_templates()
 # validator wants to treat the registry as read-only.
 __all__ = [
     "AgentTemplate",
+    "McpServerConfig",
     "PermissionModeOpt",
     "get_template",
     "list_names",

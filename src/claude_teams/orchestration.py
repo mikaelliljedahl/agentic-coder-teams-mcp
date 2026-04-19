@@ -21,14 +21,14 @@ Design notes
   protocol concerns, not domain concerns.
 - **Non-transactional preset expansion.** If a mid-fan-out spawn
   fails, the created team and any already-spawned members persist.
-  Callers see a ``ToolError`` naming the failed member and can retry
-  the remaining members or tear down the team. A transactional
+  Callers see a ``PresetMemberSpawnFailedError`` naming the failed
+  member; the originating error (a ``ToolError`` subclass or a
+  domain ``Exception``) is preserved on ``__cause__`` so callers can
+  branch on subclass identity when they need to. A transactional
   rollback would itself have to handle ``team_delete`` failures, so
   the shipped contract keeps the failure surface simple and
   observable.
 """
-
-from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -36,7 +36,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from fastmcp.exceptions import ToolError
 
@@ -78,6 +78,34 @@ PermissionMode = Literal["default", "require_approval", "bypass"]
 ProgressCallback = Callable[[int, str], Awaitable[None]]
 
 
+class RelayOneShotResultCallback(Protocol):
+    """Structural type for the one-shot relay callback.
+
+    Mirrors the keyword-only signature of
+    ``server_team_relay.relay_one_shot_result`` so the core can invoke
+    the relay without reaching for an unconstrained
+    ``Callable[..., ...]``. A Protocol lets ty verify both call sites
+    (MCP wrapper + CLI factory) wire a compatible function.
+
+    The ``Any`` slots on ``Coroutine`` are forced by the stdlib:
+    ``asyncio.create_task`` accepts ``Coroutine[Any, Any, _T]`` because
+    the event loop's yield/send types are open-ended. Narrowing those
+    parameters here would make the shape unassignable to
+    ``create_task`` at the call site.
+    """
+
+    def __call__(
+        self,
+        *,
+        team_name: str,
+        agent_name: str,
+        backend_type: str,
+        process_handle: str,
+        result_file: Path | None,
+        color: str,
+    ) -> Coroutine[Any, Any, None]: ...
+
+
 # Heartbeat cadence. Matches the prior MCP-tool value so perceived
 # latency of spawn calls does not change after the refactor.
 _HEARTBEAT_INTERVAL_S = 15
@@ -108,15 +136,22 @@ class SpawnDependencies:
             path used when a backend writes its result to disk.
         log_relay_task_exception: Done-callback attached to the relay
             task so non-fatal failures are logged rather than lost.
+        log_retain_pane_failure: Callback invoked when
+            ``Backend.retain_pane_after_exit`` raises. The spawn itself
+            has already succeeded by the time this runs, so the failure
+            is observability breadcrumb, not a reason to fail the call.
+            Injected rather than hardcoded so the orchestration core
+            stays free of logging-sink imports.
 
     """
 
     resolve_permission_mode: Callable[[PermissionMode | None], PermissionMode]
     resolve_spawn_cwd: Callable[[str], str]
     build_agent_auth_notice: Callable[[str, str], str]
-    relay_one_shot_result: Callable[..., Coroutine[Any, Any, None]]
+    relay_one_shot_result: RelayOneShotResultCallback
     create_one_shot_result_path: Callable[[str, str], Path]
     log_relay_task_exception: Callable[[asyncio.Task[None]], None]
+    log_retain_pane_failure: Callable[[BaseException], None]
 
 
 @dataclass(frozen=True)
@@ -186,7 +221,7 @@ def apply_template(opts: SpawnOptions, prompt: str) -> tuple[SpawnOptions, str]:
         raise UnknownTemplateToolError(opts.template, templates.list_names()) from exc
 
     explicit = opts.model_fields_set
-    updates: dict[str, object] = {}
+    updates: dict[str, str | bool] = {}
     if "backend" not in explicit and template.default_backend is not None:
         updates["backend"] = template.default_backend
     if "model" not in explicit and template.default_model is not None:
@@ -321,7 +356,17 @@ async def spawn_teammate_core(
             and team name.
 
     Raises:
-        ToolError: Backend not registered or unsupported model.
+        ToolError: Backend not registered, unsupported model, or the
+            chosen member name already exists on the team (the domain
+            ``MemberAlreadyExistsError`` is surfaced as ``ToolError``).
+            Every named subclass below is also a ``ToolError``, so
+            callers that only care about the MCP-safe shape can catch
+            ``ToolError`` alone. ``BackendSpawnFailedError`` is also a
+            ``ToolError`` but listed separately because its trigger
+            (backend-side failure) differs from the validation errors.
+        UnknownTemplateToolError: ``options.template`` names a
+            template that is not in the template registry. Raised by
+            ``apply_template`` before any backend work begins.
         PermissionBypassUnsupportedToolError: Resolved mode is
             ``bypass`` but the backend cannot honor it.
         ReasoningEffortUnsupportedToolError /
@@ -456,14 +501,12 @@ async def spawn_teammate_core(
     await teams.write_config(team_name, config)
 
     if not backend_obj.is_interactive:
-        # retain-on-exit is best-effort; the MCP wrapper logs via
-        # ctx.debug around the same call, but the CLI path has no
-        # equivalent observability surface today, so the core stays
-        # silent to avoid coupling to either sink.
-        with contextlib.suppress(Exception):
+        try:
             await run_blocking(
                 backend_obj.retain_pane_after_exit, spawn_result.process_handle
             )
+        except Exception as exc:
+            deps.log_retain_pane_failure(exc)
         relay_task = asyncio.create_task(
             deps.relay_one_shot_result(
                 team_name=team_name,
@@ -495,11 +538,16 @@ async def expand_preset_core(
 ) -> PresetExpansionResult:
     """Expand a preset into a new team plus one teammate per member.
 
-    Expansion is not transactional. On a mid-fan-out failure the
-    team and any already-spawned members persist so the caller can
-    retry the remaining members or tear the team down. The caller
-    receives the original ``ToolError`` with the failing member
-    named in the message.
+    Expansion is not transactional once fan-out begins. On a
+    mid-fan-out failure the team and any already-spawned members
+    persist so the caller can retry the remaining members or tear the
+    team down. The caller receives a ``PresetMemberSpawnFailedError``
+    naming the failing member; the originating error (a ``ToolError``
+    subclass or a domain ``Exception``) is preserved on ``__cause__``.
+
+    Setup failures (lead-capability initialization) are different: the
+    team has nothing useful on it yet, so we roll the team deletion
+    inline to avoid leaving a dangling on-disk config.
 
     Args:
         registry: Backend registry (same shape as for
@@ -517,13 +565,30 @@ async def expand_preset_core(
         ``PresetExpansionResult`` with the team result, the lead
         capability, and per-member spawn results in preset order.
 
+    Raises:
+        TeamAlreadyExistsError: A team with ``team_name`` already
+            exists. Surfaced directly (not wrapped) because no partial
+            team state needs reporting — expansion never started.
+        PresetMemberSpawnFailedError: A member spawn inside the fan-out
+            raised. The wrapper carries the failing member name; the
+            original error is preserved on ``__cause__``.
+
     """
     team_result = await teams.create_team(
         name=team_name,
         session_id=session_id,
         description=description,
     )
-    lead_capability = await capabilities.initialize_team_capabilities(team_name)
+    try:
+        lead_capability = await capabilities.initialize_team_capabilities(team_name)
+    except Exception:
+        # Team was created but capabilities failed to initialize: the
+        # team is unusable (no lead capability to mint member caps
+        # against) yet persists on disk. Roll back the team so
+        # ``preset launch`` is idempotent over retries.
+        with contextlib.suppress(Exception):
+            await teams.delete_team(team_name)
+        raise
 
     member_results: list[SpawnResult] = []
     for member in preset.members:
@@ -540,6 +605,8 @@ async def expand_preset_core(
                 progress=progress,
             )
         except Exception as exc:
+            # Observability: wrap so the failing member's name lands in
+            # the outer message instead of only on ``__cause__``.
             raise PresetMemberSpawnFailedError(member.name, exc) from exc
         member_results.append(spawn_result)
 
@@ -560,7 +627,7 @@ def _preset_member_spawn_options(
     "explicit vs defaulted" shape a direct MCP caller would produce.
 
     """
-    updates: dict[str, object] = {}
+    updates: dict[str, str | bool] = {}
     if member.template is not None:
         updates["template"] = member.template
     if member.backend is not None:

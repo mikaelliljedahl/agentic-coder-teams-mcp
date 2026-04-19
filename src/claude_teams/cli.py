@@ -45,6 +45,7 @@ from claude_teams.server_team_relay import (
     build_agent_auth_notice,
     create_one_shot_result_path,
     log_relay_task_exception,
+    log_retain_pane_failure,
     relay_one_shot_result,
 )
 
@@ -595,18 +596,33 @@ def kill(
     process_handle = member.process_handle or member.tmux_pane_id
     backend_type = member.backend_type
 
+    backend_kill_skipped = False
     if process_handle:
         try:
             backend_obj = registry.get(backend_type)
             _run(run_blocking(backend_obj.kill, process_handle))
         except BackendNotRegisteredError:
-            pass  # backend unavailable; process may already be dead
+            # Backend binary went missing between spawn and kill (e.g.
+            # operator uninstalled the CLI). We cannot invoke
+            # backend.kill, but we can still scrub the team config and
+            # capability store. Surface the skipped kill so the operator
+            # can manually clean up any lingering process.
+            backend_kill_skipped = True
+            err_console.print(
+                f"[yellow]Warning: backend {backend_type!r} no longer "
+                f"registered; skipped backend-level kill. Team-side "
+                f"cleanup will continue.[/yellow]"
+            )
 
     _run(teams.remove_member(team_name, agent_name))
     _run(capabilities.remove_agent_capability(team_name, agent_name))
     _run(tasks.reset_owner_tasks(team_name, agent_name))
 
-    result = {"success": True, "message": f"{agent_name} has been stopped."}
+    result: dict[str, str | bool] = {
+        "success": True,
+        "message": f"{agent_name} has been stopped.",
+        "backend_kill_skipped": backend_kill_skipped,
+    }
 
     if output_json:
         console.print_json(json.dumps(result))
@@ -631,6 +647,7 @@ def _build_cli_spawn_dependencies() -> SpawnDependencies:
         relay_one_shot_result=relay_one_shot_result,
         create_one_shot_result_path=create_one_shot_result_path,
         log_relay_task_exception=log_relay_task_exception,
+        log_retain_pane_failure=log_retain_pane_failure,
     )
 
 
@@ -693,6 +710,15 @@ def preset_launch(
             )
         )
     except ToolError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from None
+    except Exception as exc:
+        # Domain errors (e.g. TeamAlreadyExistsError, validation failures
+        # raised below the MCP boundary) do not subclass ToolError. The
+        # MCP wrapper converts them to typed ToolErrors; the CLI has no
+        # such boundary, so catch broadly here and surface the message
+        # verbatim. Exit code 1 mirrors the ToolError branch so shell
+        # callers can keep their existing error handling.
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from None
 

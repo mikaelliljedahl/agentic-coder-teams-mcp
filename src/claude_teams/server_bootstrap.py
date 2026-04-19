@@ -8,6 +8,8 @@ from claude_teams.errors import (
     BackendNotRegisteredError,
     InvalidCapabilityError,
     SessionActiveTeamError,
+    TeamAlreadyExistsError,
+    TeamAlreadyExistsToolError,
     TeamNotFoundToolError,
     UnknownPresetToolError,
 )
@@ -57,9 +59,12 @@ async def team_create(
     active_team = await ctx.get_state("active_team")
     if active_team:
         raise SessionActiveTeamError(active_team)
-    result = await teams.create_team(
-        name=team_name, session_id=ctx.session_id, description=description
-    )
+    try:
+        result = await teams.create_team(
+            name=team_name, session_id=ctx.session_id, description=description
+        )
+    except TeamAlreadyExistsError as exc:
+        raise TeamAlreadyExistsToolError(team_name) from exc
     lead_capability = await capabilities.initialize_team_capabilities(team_name)
     await _set_session_principal(
         ctx,
@@ -237,15 +242,18 @@ async def create_team_from_preset(
     async def _progress(elapsed: int, message: str) -> None:
         await ctx.report_progress(progress=elapsed, total=None, message=message)
 
-    expansion = await expand_preset_core(
-        registry=reg,
-        preset=preset,
-        team_name=team_name,
-        session_id=ctx.session_id,
-        description=effective_description,
-        deps=_build_spawn_dependencies(),
-        progress=_progress,
-    )
+    try:
+        expansion = await expand_preset_core(
+            registry=reg,
+            preset=preset,
+            team_name=team_name,
+            session_id=ctx.session_id,
+            description=effective_description,
+            deps=_build_spawn_dependencies(),
+            progress=_progress,
+        )
+    except TeamAlreadyExistsError as exc:
+        raise TeamAlreadyExistsToolError(team_name) from exc
 
     await _set_session_principal(
         ctx,
