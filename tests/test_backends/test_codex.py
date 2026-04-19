@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -85,8 +84,7 @@ class TestCodexResolveModel:
 
 
 class TestCodexBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_produces_exec_command(self, mock_which, _make_request):
+    def test_produces_exec_command(self, _make_request):
         backend = CodexBackend()
         request = _make_request()
 
@@ -98,8 +96,7 @@ class TestCodexBuildCommand:
         assert "--full-auto" in cmd
         assert "-C" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_omits_full_auto_when_require_approval(self, mock_which, _make_request):
+    def test_omits_full_auto_when_require_approval(self, _make_request):
         backend = CodexBackend()
         request = _make_request(permission_mode="require_approval")
 
@@ -107,8 +104,7 @@ class TestCodexBuildCommand:
 
         assert "--full-auto" not in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_includes_prompt_as_last_arg(self, mock_which, _make_request):
+    def test_includes_prompt_as_last_arg(self, _make_request):
         backend = CodexBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -116,8 +112,7 @@ class TestCodexBuildCommand:
 
         assert cmd[-1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_includes_cwd_flag(self, mock_which, _make_request, tmp_path: Path):
+    def test_includes_cwd_flag(self, _make_request, tmp_path: Path):
         backend = CodexBackend()
         project_dir = str(tmp_path / "my" / "project")
         request = _make_request(cwd=project_dir)
@@ -127,9 +122,8 @@ class TestCodexBuildCommand:
         idx = cmd.index("-C")
         assert cmd[idx + 1] == project_dir
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
     def test_includes_output_file_flag_when_extra_path_provided(
-        self, mock_which, _make_request, tmp_path: Path
+        self, _make_request, tmp_path: Path
     ):
         backend = CodexBackend()
         output_path = str(tmp_path / "codex-last-message.txt")
@@ -141,8 +135,7 @@ class TestCodexBuildCommand:
         idx = cmd.index("--output-last-message")
         assert cmd[idx + 1] == output_path
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
-    def test_excludes_output_file_flag_when_no_extra(self, mock_which, _make_request):
+    def test_excludes_output_file_flag_when_no_extra(self, _make_request):
         backend = CodexBackend()
         request = _make_request()
 
@@ -165,3 +158,112 @@ class TestCodexPermissionSupport:
     def test_supports_permission_bypass(self):
         backend = CodexBackend()
         assert backend.supports_permission_bypass() is True
+
+
+class TestCodexReasoningEffort:
+    def test_spec_advertises_c_flag_and_options(self):
+        backend = CodexBackend()
+        spec = backend.reasoning_effort_spec()
+        assert spec is not None
+        assert spec.flag == "-c"
+        assert spec.value_template == "model_reasoning_effort={value}"
+        assert spec.options == frozenset({"low", "medium", "high", "xhigh"})
+
+    def test_build_command_appends_c_override_when_set(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(reasoning_effort="xhigh")
+
+        cmd = backend.build_command(request)
+
+        assert "-c" in cmd
+        idx = cmd.index("-c")
+        assert cmd[idx + 1] == "model_reasoning_effort=xhigh"
+
+    def test_build_command_keeps_prompt_last_with_effort(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(reasoning_effort="low", prompt="fix the bug")
+
+        cmd = backend.build_command(request)
+
+        assert cmd[-1] == "fix the bug"
+
+    def test_build_command_omits_c_override_when_none(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert "-c" not in cmd
+
+
+class TestCodexAgentSelect:
+    def test_spec_advertises_c_agents_template(self):
+        backend = CodexBackend()
+        spec = backend.agent_select_spec()
+        assert spec is not None
+        assert spec.flag == "-c"
+        assert spec.value_template == 'agents.{name}.config_file="{path}"'
+
+    def test_discover_reads_codex_config_toml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        codex_dir = tmp_path / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "config.toml").write_text(
+            '[agents.reviewer]\nconfig_file = "/abs/reviewer.md"\n'
+        )
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = CodexBackend()
+        profiles = backend.discover_agents(str(tmp_path))
+
+        names = [p.name for p in profiles]
+        assert "reviewer" in names
+        reviewer = next(p for p in profiles if p.name == "reviewer")
+        assert reviewer.path == "/abs/reviewer.md"
+
+    def test_build_command_appends_c_override_when_discovered(
+        self,
+        _make_request,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        codex_dir = tmp_path / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "config.toml").write_text(
+            '[agents.reviewer]\nconfig_file = "/abs/reviewer.md"\n'
+        )
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = CodexBackend()
+        request = _make_request(
+            cwd=str(tmp_path), agent_profile="reviewer", prompt="go"
+        )
+
+        cmd = backend.build_command(request)
+
+        assert 'agents.reviewer.config_file="/abs/reviewer.md"' in cmd
+        assert cmd[-1] == "go"
+
+    def test_build_command_omits_agents_override_when_profile_none(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert not any("agents." in arg for arg in cmd)
+
+    def test_build_command_omits_agents_override_when_profile_undiscovered(
+        self,
+        _make_request,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = CodexBackend()
+        request = _make_request(cwd=str(tmp_path), agent_profile="ghost")
+
+        cmd = backend.build_command(request)
+
+        assert not any("agents." in arg for arg in cmd)

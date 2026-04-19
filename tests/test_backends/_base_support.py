@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from claude_code_tools.tmux_cli_controller import TmuxCLIController
 
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
@@ -67,8 +68,13 @@ def _make_spawn_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
 
 
 def _make_backend_with_mock_controller() -> tuple[_StubBackend, MagicMock]:
-    """Create a stub backend with a mocked tmux controller."""
+    """Create a stub backend with a mocked tmux controller.
+
+    Uses ``spec=TmuxCLIController`` so tests that misspell controller methods
+    (e.g. ``launch_CLI`` vs ``launch_cli``) fail loudly instead of silently
+    accessing auto-created child mocks.
+    """
     backend = _StubBackend()
-    mock_ctrl = MagicMock()
+    mock_ctrl = MagicMock(spec=TmuxCLIController)
     backend._controller = mock_ctrl
     return backend, mock_ctrl

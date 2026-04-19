@@ -9,6 +9,7 @@ import pytest_asyncio
 from typer.testing import CliRunner
 
 from claude_teams import capabilities, messaging, tasks, teams
+from claude_teams.backends.base import Backend
 from claude_teams.backends.registry import registry as reg
 from claude_teams.cli import app
 from claude_teams.models import TeammateMember
@@ -344,8 +345,10 @@ async def test_kill_removes_member(team, monkeypatch):
     monkeypatch.setattr(messaging, "TEAMS_DIR", base_dir / "teams")
     await _add_teammate(name, base_dir, "alice")
 
-    # Mock the registry.get to avoid needing a real backend
-    mock_backend = MagicMock()
+    # Spec against Backend so typos surface as AttributeError instead of
+    # silent auto-created child mocks (hence the kill assertion below is
+    # guaranteed to observe the real method name).
+    mock_backend = MagicMock(spec=Backend)
     original_get = reg.get
 
     def patched_get(backend_name):
@@ -361,7 +364,11 @@ async def test_kill_removes_member(team, monkeypatch):
     assert result.exit_code == 0
     assert "stopped" in result.output
 
-    # Verify member removed
+    # Pin that kill actually fired with alice's pane id — prior assertion only
+    # proved CLI exit 0 + member removed, which silently passed even if kill
+    # were never invoked.
+    mock_backend.kill.assert_called_once_with("%42")
+
     cfg = await teams.read_config(name, base_dir)
     member_names = {member.name for member in cfg.members}
     assert "alice" not in member_names
@@ -374,7 +381,7 @@ async def test_kill_json(team, monkeypatch):
     monkeypatch.setattr(messaging, "TEAMS_DIR", base_dir / "teams")
     await _add_teammate(name, base_dir, "alice")
 
-    mock_backend = MagicMock()
+    mock_backend = MagicMock(spec=Backend)
     original_get = reg.get
 
     def patched_get(backend_name):
@@ -391,3 +398,4 @@ async def test_kill_json(team, monkeypatch):
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["success"] is True
+    mock_backend.kill.assert_called_once_with("%42")

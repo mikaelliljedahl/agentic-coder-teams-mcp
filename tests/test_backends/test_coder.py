@@ -83,8 +83,7 @@ class TestCoderResolveModel:
 
 
 class TestCoderBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/coder")
-    def test_produces_exec_command(self, _mock_which, _make_request):
+    def test_produces_exec_command(self, _make_request):
         backend = CoderBackend()
         request = _make_request()
 
@@ -95,8 +94,7 @@ class TestCoderBuildCommand:
         assert "-m" in cmd
         assert "--full-auto" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/coder")
-    def test_includes_prompt_as_last_arg(self, _mock_which, _make_request):
+    def test_includes_prompt_as_last_arg(self, _make_request):
         backend = CoderBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -104,8 +102,7 @@ class TestCoderBuildCommand:
 
         assert cmd[-1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/coder")
-    def test_resolves_generic_model(self, _mock_which, _make_request):
+    def test_resolves_generic_model(self, _make_request):
         backend = CoderBackend()
         request = _make_request(model="powerful")
 
@@ -123,8 +120,7 @@ class TestCoderBuildEnv:
 
 
 class TestCoderAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/coder")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = CoderBackend()
         assert backend.is_available() is True
 
@@ -132,3 +128,110 @@ class TestCoderAvailability:
     def test_unavailable_when_binary_not_found(self, _mock_which):
         backend = CoderBackend()
         assert backend.is_available() is False
+
+
+class TestCoderReasoningEffort:
+    def test_spec_advertises_c_flag_and_options(self):
+        backend = CoderBackend()
+        spec = backend.reasoning_effort_spec()
+        assert spec is not None
+        assert spec.flag == "-c"
+        assert spec.value_template == "model_reasoning_effort={value}"
+        assert spec.options == frozenset({"low", "medium", "high", "xhigh"})
+
+    def test_build_command_appends_c_override_when_set(self, _make_request):
+        backend = CoderBackend()
+        request = _make_request(reasoning_effort="high")
+
+        cmd = backend.build_command(request)
+
+        assert "-c" in cmd
+        idx = cmd.index("-c")
+        assert cmd[idx + 1] == "model_reasoning_effort=high"
+
+    def test_build_command_keeps_prompt_last_with_effort(self, _make_request):
+        backend = CoderBackend()
+        request = _make_request(reasoning_effort="medium", prompt="fix the bug")
+
+        cmd = backend.build_command(request)
+
+        assert cmd[-1] == "fix the bug"
+
+    def test_build_command_omits_c_override_when_none(self, _make_request):
+        backend = CoderBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert "-c" not in cmd
+
+
+class TestCoderAgentSelect:
+    def test_spec_advertises_c_agents_template(self):
+        backend = CoderBackend()
+        spec = backend.agent_select_spec()
+        assert spec is not None
+        assert spec.flag == "-c"
+        assert spec.value_template == 'agents.{name}.config_file="{path}"'
+
+    def test_discover_reads_coder_config_toml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        coder_dir = tmp_path / ".coder"
+        coder_dir.mkdir(parents=True)
+        (coder_dir / "config.toml").write_text(
+            '[agents.planner]\nconfig_file = "/abs/planner.md"\n'
+        )
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = CoderBackend()
+        profiles = backend.discover_agents(str(tmp_path))
+
+        names = [p.name for p in profiles]
+        assert "planner" in names
+        planner = next(p for p in profiles if p.name == "planner")
+        assert planner.path == "/abs/planner.md"
+
+    def test_build_command_appends_c_override_when_discovered(
+        self,
+        _make_request,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        coder_dir = tmp_path / ".coder"
+        coder_dir.mkdir(parents=True)
+        (coder_dir / "config.toml").write_text(
+            '[agents.planner]\nconfig_file = "/abs/planner.md"\n'
+        )
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = CoderBackend()
+        request = _make_request(cwd=str(tmp_path), agent_profile="planner", prompt="go")
+
+        cmd = backend.build_command(request)
+
+        assert 'agents.planner.config_file="/abs/planner.md"' in cmd
+        assert cmd[-1] == "go"
+
+    def test_build_command_omits_agents_override_when_profile_none(self, _make_request):
+        backend = CoderBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert not any("agents." in arg for arg in cmd)
+
+    def test_build_command_omits_agents_override_when_profile_undiscovered(
+        self,
+        _make_request,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+        backend = CoderBackend()
+        request = _make_request(cwd=str(tmp_path), agent_profile="ghost")
+
+        cmd = backend.build_command(request)
+
+        assert not any("agents." in arg for arg in cmd)

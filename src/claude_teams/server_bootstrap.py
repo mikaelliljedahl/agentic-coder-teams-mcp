@@ -5,11 +5,18 @@ from fastmcp.exceptions import ToolError
 
 from claude_teams import capabilities, teams
 from claude_teams.errors import (
+    BackendNotRegisteredError,
     InvalidCapabilityError,
     SessionActiveTeamError,
     TeamNotFoundToolError,
 )
-from claude_teams.models import BackendInfo, TeamAttachResult, TeamCreateResult
+from claude_teams.models import (
+    AgentListResult,
+    AgentProfileInfo,
+    BackendInfo,
+    TeamAttachResult,
+    TeamCreateResult,
+)
 from claude_teams.server_runtime import (
     _ANN_ATTACH,
     _ANN_CREATE,
@@ -21,10 +28,13 @@ from claude_teams.server_runtime import (
     _clear_session_principal,
     _get_lifespan,
     _require_lead,
+    _resolve_spawn_cwd,
     _set_session_principal,
 )
 from claude_teams.server_schema import (
+    BackendName,
     Capability,
+    Cwd,
     Description,
     TeamName,
 )
@@ -136,6 +146,44 @@ def list_backends(ctx: Context) -> list[dict[str, object]]:
     return result
 
 
+def list_agents(
+    backend_name: BackendName,
+    ctx: Context,
+    cwd: Cwd = "",
+) -> dict[str, object]:
+    """List discoverable agent/persona profiles for a backend.
+
+    Returns ``supported=False`` when the backend has no agent-selection
+    mechanism; otherwise enumerates profiles visible from ``cwd`` (empty
+    string resolves to the server's working directory).
+    """
+    ls = _get_lifespan(ctx)
+    reg = ls["registry"]
+    try:
+        backend_obj = reg.get(backend_name)
+    except BackendNotRegisteredError as exc:
+        raise ToolError(str(exc)) from exc
+
+    resolved_cwd = str(_resolve_spawn_cwd(cwd))
+
+    spec = backend_obj.agent_select_spec()
+    if spec is None:
+        return AgentListResult(
+            backend=backend_name,
+            supported=False,
+            cwd=resolved_cwd,
+            profiles=[],
+        ).model_dump(by_alias=True)
+
+    profiles = backend_obj.discover_agents(resolved_cwd)
+    return AgentListResult(
+        backend=backend_name,
+        supported=True,
+        cwd=resolved_cwd,
+        profiles=[AgentProfileInfo(name=p.name, path=p.path) for p in profiles],
+    ).model_dump(by_alias=True)
+
+
 def register_bootstrap_tools(mcp: FastMCP) -> None:
     """Register bootstrap-tier tools on the FastMCP app."""
     mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_CREATE)(team_create)
@@ -143,3 +191,4 @@ def register_bootstrap_tools(mcp: FastMCP) -> None:
     mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_DELETE)(team_delete)
     mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_READ)(read_config)
     mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_READ)(list_backends)
+    mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_READ)(list_agents)

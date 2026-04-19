@@ -77,8 +77,7 @@ class TestLlxprtResolveModel:
 
 
 class TestLlxprtBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/llxprt")
-    def test_produces_prompt_command(self, _mock_which, _make_request):
+    def test_produces_prompt_command(self, _make_request):
         backend = LlxprtBackend()
         request = _make_request()
 
@@ -89,8 +88,7 @@ class TestLlxprtBuildCommand:
         assert "-m" in cmd
         assert "-y" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/llxprt")
-    def test_includes_prompt_after_p_flag(self, _mock_which, _make_request):
+    def test_includes_prompt_after_p_flag(self, _make_request):
         backend = LlxprtBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -99,8 +97,7 @@ class TestLlxprtBuildCommand:
         idx = cmd.index("-p")
         assert cmd[idx + 1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/llxprt")
-    def test_resolves_generic_model(self, _mock_which, _make_request):
+    def test_resolves_generic_model(self, _make_request):
         backend = LlxprtBackend()
         request = _make_request(model="powerful")
 
@@ -118,8 +115,7 @@ class TestLlxprtBuildEnv:
 
 
 class TestLlxprtAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/llxprt")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = LlxprtBackend()
         assert backend.is_available() is True
 

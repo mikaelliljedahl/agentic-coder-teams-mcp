@@ -78,8 +78,7 @@ class TestGooseResolveModel:
 
 
 class TestGooseBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/goose")
-    def test_produces_run_command(self, _mock_which, _make_request):
+    def test_produces_run_command(self, _make_request):
         backend = GooseBackend()
         request = _make_request()
 
@@ -91,8 +90,7 @@ class TestGooseBuildCommand:
         assert "--model" in cmd
         assert "--no-session" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/goose")
-    def test_includes_prompt_after_t_flag(self, _mock_which, _make_request):
+    def test_includes_prompt_after_t_flag(self, _make_request):
         backend = GooseBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -101,8 +99,7 @@ class TestGooseBuildCommand:
         idx = cmd.index("-t")
         assert cmd[idx + 1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/goose")
-    def test_includes_provider_for_generic_tier(self, _mock_which, _make_request):
+    def test_includes_provider_for_generic_tier(self, _make_request):
         backend = GooseBackend()
         request = _make_request(model="powerful")
 
@@ -112,8 +109,7 @@ class TestGooseBuildCommand:
         idx = cmd.index("--provider")
         assert cmd[idx + 1] == "anthropic"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/goose")
-    def test_no_provider_for_direct_model(self, _mock_which, _make_request):
+    def test_no_provider_for_direct_model(self, _make_request):
         backend = GooseBackend()
         request = _make_request(model="gpt-5.2-codex")
 
@@ -121,8 +117,7 @@ class TestGooseBuildCommand:
 
         assert "--provider" not in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/goose")
-    def test_resolves_generic_model(self, _mock_which, _make_request):
+    def test_resolves_generic_model(self, _make_request):
         backend = GooseBackend()
         request = _make_request(model="fast")
 
@@ -140,8 +135,7 @@ class TestGooseBuildEnv:
 
 
 class TestGooseAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/goose")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = GooseBackend()
         assert backend.is_available() is True
 
@@ -149,3 +143,67 @@ class TestGooseAvailability:
     def test_unavailable_when_binary_not_found(self, _mock_which):
         backend = GooseBackend()
         assert backend.is_available() is False
+
+
+class TestGooseAgentSelect:
+    def test_spec_advertises_recipe_flag(self):
+        backend = GooseBackend()
+        spec = backend.agent_select_spec()
+        assert spec is not None
+        assert spec.flag == "--recipe"
+        assert spec.value_template == "{path}"
+
+    def test_discover_walks_goose_recipe_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        recipe_dir = tmp_path / "recipes"
+        recipe_dir.mkdir()
+        (recipe_dir / "reviewer.yaml").write_text("steps: []")
+        monkeypatch.setenv("GOOSE_RECIPE_PATH", str(recipe_dir))
+
+        backend = GooseBackend()
+        profiles = backend.discover_agents(str(tmp_path))
+
+        names = [p.name for p in profiles]
+        assert "reviewer" in names
+
+    def test_discover_returns_empty_when_env_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("GOOSE_RECIPE_PATH", raising=False)
+
+        backend = GooseBackend()
+        assert backend.discover_agents(str(tmp_path)) == []
+
+    def test_build_command_appends_recipe_flag_when_discovered(
+        self,
+        _make_request,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        recipe_dir = tmp_path / "recipes"
+        recipe_dir.mkdir()
+        recipe_path = recipe_dir / "reviewer.yaml"
+        recipe_path.write_text("steps: []")
+        monkeypatch.setenv("GOOSE_RECIPE_PATH", str(recipe_dir))
+
+        backend = GooseBackend()
+        request = _make_request(cwd=str(tmp_path), agent_profile="reviewer")
+
+        cmd = backend.build_command(request)
+
+        assert "--recipe" in cmd
+        idx = cmd.index("--recipe")
+        assert cmd[idx + 1] == str(recipe_path)
+
+    def test_build_command_omits_recipe_flag_when_profile_none(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("GOOSE_RECIPE_PATH", raising=False)
+
+        backend = GooseBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert "--recipe" not in cmd

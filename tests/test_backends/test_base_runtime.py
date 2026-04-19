@@ -2,9 +2,10 @@
 
 import shlex
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
+from claude_code_tools.tmux_cli_controller import TmuxCLIController
 
 from claude_teams.backends.base import SpawnRequest, SpawnResult
 from tests.test_backends._base_support import (
@@ -26,10 +27,7 @@ class _DangerousEnvBackend(_StubBackend):
 
 
 class TestBaseBackendSpawn:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_returns_spawn_result_on_success(
-        self, _mock_which: MagicMock, _make_spawn_request
-    ):
+    def test_returns_spawn_result_on_success(self, _make_spawn_request):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = "remote:1.2"
         request = _make_spawn_request()
@@ -40,10 +38,7 @@ class TestBaseBackendSpawn:
         assert result.process_handle == "remote:1.2"
         assert result.backend_type == "stub"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_calls_launch_cli_with_full_command(
-        self, _mock_which: MagicMock, _make_spawn_request
-    ):
+    def test_calls_launch_cli_with_full_command(self, _make_spawn_request):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = "remote:1.0"
         request = _make_spawn_request()
@@ -56,10 +51,7 @@ class TestBaseBackendSpawn:
         assert "STUB_MODE=" in full_cmd
         assert "stub-cli" in full_cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_raises_runtime_error_when_launch_fails(
-        self, _mock_which: MagicMock, _make_spawn_request
-    ):
+    def test_raises_runtime_error_when_launch_fails(self, _make_spawn_request):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = None
         request = _make_spawn_request()
@@ -67,10 +59,7 @@ class TestBaseBackendSpawn:
         with pytest.raises(RuntimeError, match="Failed to create tmux pane"):
             backend.spawn(request)
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_includes_env_prefix_in_command(
-        self, _mock_which: MagicMock, _make_spawn_request
-    ):
+    def test_includes_env_prefix_in_command(self, _make_spawn_request):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = "remote:1.0"
         request = _make_spawn_request()
@@ -80,10 +69,7 @@ class TestBaseBackendSpawn:
         full_cmd = mock_ctrl.launch_cli.call_args[0][0]
         assert "STUB_MODE=" in full_cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_rejects_invalid_env_var_name(
-        self, _mock_which: MagicMock, _make_spawn_request
-    ):
+    def test_rejects_invalid_env_var_name(self, _make_spawn_request):
         backend = _InvalidEnvBackend()
         request = _make_spawn_request()
 
@@ -342,10 +328,7 @@ class TestBaseBackendSpawnQuotingContract:
     tokens reappear as a single argv element, proving the quoting held.
     """
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_prompt_metacharacters_are_shell_quoted(
-        self, _mock_which: MagicMock, _make_spawn_request
-    ):
+    def test_prompt_metacharacters_are_shell_quoted(self, _make_spawn_request):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = "remote:1.0"
         dangerous = "$(rm -rf /); echo `id`; && :"
@@ -359,10 +342,7 @@ class TestBaseBackendSpawnQuotingContract:
             f"prompt was not preserved as a single argv token: {parsed!r}"
         )
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_cwd_with_spaces_is_shell_quoted(
-        self, _mock_which: MagicMock, tmp_path: Path, _make_spawn_request
-    ):
+    def test_cwd_with_spaces_is_shell_quoted(self, tmp_path: Path, _make_spawn_request):
         backend, mock_ctrl = _make_backend_with_mock_controller()
         mock_ctrl.launch_cli.return_value = "remote:1.0"
         spaced = str(tmp_path / "has space" / "dir")
@@ -375,12 +355,9 @@ class TestBaseBackendSpawnQuotingContract:
         assert parsed[0] == "cd"
         assert parsed[1] == spaced
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/stub-cli")
-    def test_env_var_values_are_shell_quoted(
-        self, _mock_which: MagicMock, _make_spawn_request
-    ):
+    def test_env_var_values_are_shell_quoted(self, _make_spawn_request):
         backend = _DangerousEnvBackend()
-        mock_ctrl = MagicMock()
+        mock_ctrl = MagicMock(spec=TmuxCLIController)
         backend._controller = mock_ctrl
         mock_ctrl.launch_cli.return_value = "remote:1.0"
         request = _make_spawn_request()

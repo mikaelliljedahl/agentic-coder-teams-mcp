@@ -5,6 +5,7 @@ import re
 import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,10 +14,34 @@ from mcp.types import TextContent, TextResourceContents
 
 from claude_teams import messaging, tasks, teams
 from claude_teams.backends import registry
-from claude_teams.backends.base import HealthStatus
+from claude_teams.backends.base import Backend, HealthStatus
 from claude_teams.backends.base import SpawnResult as BackendSpawnResult
 from claude_teams.models import TeammateMember
 from claude_teams.server import mcp
+
+# Authoritative backend-name -> binary-name map so mocks reflect what a real
+# ``<BackendClass>().binary_name`` would return. Derived from ``_binary_name``
+# class attributes in src/claude_teams/backends/*.py. Without this, the old
+# ``binary_name = "claude"`` default made every non-claude-code mock lie.
+_BACKEND_BINARY_NAMES = {
+    "aider": "aider",
+    "amp": "amp-cli",
+    "auggie": "auggie",
+    "claude-code": "claude",
+    "claudish": "claudish",
+    "coder": "coder",
+    "codex": "codex",
+    "copilot": "copilot",
+    "gemini": "gemini",
+    "goose": "goose",
+    "happy": "happy",
+    "kimi": "kimi",
+    "llxprt": "llxprt",
+    "opencode": "opencode",
+    "qwen": "qwen",
+    "rovodev": "acli",
+    "vibe": "vibe",
+}
 
 
 def _make_teammate(
@@ -47,10 +72,16 @@ def _make_teammate(
 
 
 def _make_mock_backend(name: str = "claude-code") -> MagicMock:
-    """Create a mock backend that satisfies the Backend protocol."""
-    mock = MagicMock()
+    """Create a mock backend that satisfies the Backend protocol.
+
+    Uses ``spec=Backend`` so attribute typos raise ``AttributeError`` instead
+    of silently auto-creating child mocks. ``binary_name`` is derived from
+    ``name`` via ``_BACKEND_BINARY_NAMES`` to match what a real backend would
+    return — the prior hardcoded ``"claude"`` made non-claude-code mocks lie.
+    """
+    mock = MagicMock(spec=Backend)
     mock.name = name
-    mock.binary_name = "claude"
+    mock.binary_name = _BACKEND_BINARY_NAMES.get(name, name)
     mock.is_interactive = name == "claude-code"
     mock.is_available.return_value = True
     mock.discover_binary.return_value = "/usr/bin/echo"
@@ -73,6 +104,8 @@ def _make_mock_backend(name: str = "claude-code") -> MagicMock:
     mock.retain_pane_after_exit.return_value = None
     mock.kill.return_value = None
     mock.supports_permission_bypass.return_value = True
+    mock.agent_select_spec.return_value = None
+    mock.discover_agents.return_value = []
     return mock
 
 
@@ -116,6 +149,7 @@ async def team_client(client: Client) -> Client:
             "prompt": "help out",
         },
     )
+    cast(MagicMock, registry._backends["claude-code"]).reset_mock()
     return client
 
 

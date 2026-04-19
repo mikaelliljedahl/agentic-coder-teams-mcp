@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from claude_teams.backends.base import BaseBackend, SpawnRequest
+from claude_teams.backends.base import BaseBackend, ReasoningEffortSpec, SpawnRequest
 
 
 class AmpBackend(BaseBackend):
@@ -21,6 +21,20 @@ class AmpBackend(BaseBackend):
         "balanced": "smart",
         "powerful": "smart",
     }
+
+    _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
+        flag="-m",
+        value_template="{value}",
+        options=frozenset({"free", "rush", "smart"}),
+    )
+
+    def reasoning_effort_spec(self) -> ReasoningEffortSpec | None:
+        """Amp expresses effort through its ``-m`` mode selector (free/rush/smart).
+
+        Setting ``reasoning_effort`` overrides whatever ``model`` would otherwise
+        resolve to, because on Amp the mode and the model are the same dial.
+        """
+        return self._REASONING_EFFORT_SPEC
 
     def supported_models(self) -> list[str]:
         """Return Amp agent modes presented as model choices.
@@ -78,7 +92,7 @@ class AmpBackend(BaseBackend):
 
         """
         binary = self.discover_binary()
-        mode = self.resolve_model(request.model)
+        mode = request.reasoning_effort or self.resolve_model(request.model)
 
         cmd = [
             binary,

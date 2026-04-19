@@ -2,7 +2,14 @@
 
 from typing import ClassVar
 
-from claude_teams.backends.base import BaseBackend, SpawnRequest
+from claude_teams.backends._agent_discovery import discover_codex_style_agents
+from claude_teams.backends.base import (
+    AgentProfile,
+    AgentSelectSpec,
+    BaseBackend,
+    ReasoningEffortSpec,
+    SpawnRequest,
+)
 
 
 class CodexBackend(BaseBackend):
@@ -19,6 +26,29 @@ class CodexBackend(BaseBackend):
         "gpt-5.1-codex-max": "gpt-5.1-codex-max",
         "gpt-5.1-codex-mini": "gpt-5.1-codex-mini",
     }
+
+    _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
+        flag="-c",
+        value_template="model_reasoning_effort={value}",
+        options=frozenset({"low", "medium", "high", "xhigh"}),
+    )
+
+    _AGENT_SELECT_SPEC: ClassVar[AgentSelectSpec] = AgentSelectSpec(
+        flag="-c",
+        value_template='agents.{name}.config_file="{path}"',
+    )
+
+    def reasoning_effort_spec(self) -> ReasoningEffortSpec | None:
+        """Codex sets reasoning effort via a ``-c`` config override."""
+        return self._REASONING_EFFORT_SPEC
+
+    def agent_select_spec(self) -> AgentSelectSpec | None:
+        """Codex selects an agent via a ``-c 'agents.<name>.config_file'`` override."""
+        return self._AGENT_SELECT_SPEC
+
+    def discover_agents(self, cwd: str) -> list[AgentProfile]:
+        """Parse ``[agents.*]`` tables from ``~/.codex/config.toml`` and project."""
+        return discover_codex_style_agents(cwd, "codex")
 
     def supported_models(self) -> list[str]:
         """Return supported Codex model names.
@@ -83,6 +113,11 @@ class CodexBackend(BaseBackend):
         output_path = (request.extra or {}).get("output_last_message_path")
         if output_path:
             cmd.extend(["--output-last-message", output_path])
+
+        if request.reasoning_effort:
+            cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
+
+        cmd.extend(self._agent_args(request))
 
         cmd.append(request.prompt)
         return cmd

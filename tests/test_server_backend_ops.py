@@ -9,7 +9,7 @@ from fastmcp import Client
 from claude_teams import teams
 from claude_teams.backends import registry
 from claude_teams.backends.base import HealthStatus
-from claude_teams.errors import UnsupportedBackendModelError
+from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.models import TeammateMember
 from tests._server_support import (
     _data,
@@ -37,7 +37,6 @@ class TestProcessShutdownCleanup:
         await teams.add_member("test-team", mate)
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
-        mock_backend.kill.reset_mock()
 
         result = _data(
             await team_client.call_tool(
@@ -58,7 +57,6 @@ class TestProcessShutdownCleanup:
         await teams.add_member("test-team", mate)
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
-        mock_backend.kill.reset_mock()
 
         result = _data(
             await team_client.call_tool(
@@ -102,7 +100,6 @@ class TestHealthCheck:
         assert "detail" in result
 
     async def test_returns_dead_when_backend_says_dead(self, team_client: Client):
-        # Override mock to return dead
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
         mock_backend.health_check.return_value = HealthStatus(
             alive=False, detail="pane gone"
@@ -115,10 +112,10 @@ class TestHealthCheck:
         )
 
         assert result["alive"] is False
-        # Restore original behavior
-        mock_backend.health_check.return_value = HealthStatus(
-            alive=True, detail="mock check"
-        )
+        # Pin the call: if routing ever short-circuits to a cached alive=True
+        # branch, the backend would never be queried and the prior assertion
+        # would silently drift out of sync.
+        mock_backend.health_check.assert_called_once_with("%mock")
 
     async def test_rejects_nonexistent_teammate(self, team_client: Client):
         result = await team_client.call_tool(
@@ -220,7 +217,6 @@ class TestSpawnWithBackend:
         await client.call_tool("team_create", {"team_name": "sb-cwd"})
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
-        mock_backend.spawn.reset_mock()
 
         await client.call_tool(
             "spawn_teammate",
@@ -281,7 +277,6 @@ class TestSpawnWithBackend:
         await client.call_tool("team_create", {"team_name": "sb4"})
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
-        mock_backend.resolve_model.reset_mock()
 
         await client.call_tool(
             "spawn_teammate",
@@ -297,26 +292,28 @@ class TestSpawnWithBackend:
     async def test_rejects_invalid_model_for_backend(self, client: Client):
         await client.call_tool("team_create", {"team_name": "sb5"})
 
-        mock_backend = cast(MagicMock, registry._backends["claude-code"])
-        original_side_effect = mock_backend.resolve_model.side_effect
-        mock_backend.resolve_model.side_effect = UnsupportedBackendModelError(
-            "bogus", "claude-code", ["fast", "sonnet"]
-        )
-
-        result = await client.call_tool(
-            "spawn_teammate",
-            {
-                "team_name": "sb5",
-                "name": "coder",
-                "prompt": "write code",
-                "options": {"model": "bogus"},
-            },
-            raise_on_error=False,
-        )
-        assert result.is_error is True
-        assert "bogus" in _text(result)
-
-        mock_backend.resolve_model.side_effect = original_side_effect
+        # Swap in the REAL ClaudeCodeBackend so the rejection branch runs
+        # against live model logic — mocking resolve_model's side_effect only
+        # tested that errors propagate, not that "bogus" would actually be
+        # rejected by production code. resolve_model is pure and runs long
+        # before any spawn I/O, so no process ever starts.
+        original = registry._backends["claude-code"]
+        registry._backends["claude-code"] = ClaudeCodeBackend()
+        try:
+            result = await client.call_tool(
+                "spawn_teammate",
+                {
+                    "team_name": "sb5",
+                    "name": "coder",
+                    "prompt": "write code",
+                    "options": {"model": "bogus"},
+                },
+                raise_on_error=False,
+            )
+            assert result.is_error is True
+            assert "bogus" in _text(result)
+        finally:
+            registry._backends["claude-code"] = original
 
     async def test_passes_permission_mode_through_to_backend_request(
         self, client: Client
@@ -325,7 +322,6 @@ class TestSpawnWithBackend:
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
         mock_backend.supports_permission_bypass.return_value = True
-        mock_backend.spawn.reset_mock()
 
         await client.call_tool(
             "spawn_teammate",
@@ -370,7 +366,6 @@ class TestForceKillWithBackend:
         await teams.add_member("test-team", mate)
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
-        mock_backend.kill.reset_mock()
 
         result = _data(
             await team_client.call_tool(
@@ -391,7 +386,6 @@ class TestForceKillWithBackend:
         await teams.add_member("test-team", mate)
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
-        mock_backend.kill.reset_mock()
 
         result = _data(
             await team_client.call_tool(

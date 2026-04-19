@@ -82,8 +82,7 @@ class TestKimiResolveModel:
 
 
 class TestKimiBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/kimi")
-    def test_produces_print_command(self, _mock_which, _make_request):
+    def test_produces_print_command(self, _make_request):
         backend = KimiBackend()
         request = _make_request()
 
@@ -94,8 +93,7 @@ class TestKimiBuildCommand:
         assert "-p" in cmd
         assert "-m" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/kimi")
-    def test_includes_prompt_after_p_flag(self, _mock_which, _make_request):
+    def test_includes_prompt_after_p_flag(self, _make_request):
         backend = KimiBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -104,8 +102,7 @@ class TestKimiBuildCommand:
         idx = cmd.index("-p")
         assert cmd[idx + 1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/kimi")
-    def test_resolves_generic_model(self, _mock_which, _make_request):
+    def test_resolves_generic_model(self, _make_request):
         backend = KimiBackend()
         request = _make_request(model="fast")
 
@@ -123,8 +120,7 @@ class TestKimiBuildEnv:
 
 
 class TestKimiAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/kimi")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = KimiBackend()
         assert backend.is_available() is True
 
@@ -132,3 +128,32 @@ class TestKimiAvailability:
     def test_unavailable_when_binary_not_found(self, _mock_which):
         backend = KimiBackend()
         assert backend.is_available() is False
+
+
+class TestKimiReasoningEffort:
+    def test_spec_advertises_m_flag_and_variant_options(self):
+        backend = KimiBackend()
+        spec = backend.reasoning_effort_spec()
+        assert spec is not None
+        assert spec.flag == "-m"
+        assert spec.options == frozenset(
+            {"kimi-k2", "kimi-k2-thinking", "kimi-k2-thinking-turbo"}
+        )
+
+    def test_effort_overrides_resolved_model_on_m_flag(self, _make_request):
+        backend = KimiBackend()
+        request = _make_request(model="fast", reasoning_effort="kimi-k2-thinking-turbo")
+
+        cmd = backend.build_command(request)
+
+        idx = cmd.index("-m")
+        assert cmd[idx + 1] == "kimi-k2-thinking-turbo"
+
+    def test_without_effort_falls_back_to_resolved_model(self, _make_request):
+        backend = KimiBackend()
+        request = _make_request(model="fast")
+
+        cmd = backend.build_command(request)
+
+        idx = cmd.index("-m")
+        assert cmd[idx + 1] == "kimi-k2"

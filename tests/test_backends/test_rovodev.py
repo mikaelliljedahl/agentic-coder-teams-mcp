@@ -73,8 +73,7 @@ class TestRovoDevResolveModel:
 
 
 class TestRovoDevBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/acli")
-    def test_produces_rovodev_run_command(self, _mock_which, _make_request):
+    def test_produces_rovodev_run_command(self, _make_request):
         backend = RovoDevBackend()
         request = _make_request()
 
@@ -85,8 +84,7 @@ class TestRovoDevBuildCommand:
         assert cmd[2] == "run"
         assert "--yolo" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/acli")
-    def test_includes_prompt_as_positional(self, _mock_which, _make_request):
+    def test_includes_prompt_as_positional(self, _make_request):
         backend = RovoDevBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -94,8 +92,7 @@ class TestRovoDevBuildCommand:
 
         assert cmd[-1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/acli")
-    def test_does_not_include_model_flag(self, _mock_which, _make_request):
+    def test_does_not_include_model_flag(self, _make_request):
         backend = RovoDevBackend()
         request = _make_request()
 
@@ -113,8 +110,7 @@ class TestRovoDevBuildEnv:
 
 
 class TestRovoDevAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/acli")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = RovoDevBackend()
         assert backend.is_available() is True
 

@@ -6,11 +6,13 @@ from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_val
 from pydantic.alias_generators import to_camel
 
 from claude_teams.server_schema import (
+    AgentProfileName,
     BackendName,
     Capability,
     Cwd,
     ModelName,
     PermissionModeOpt,
+    ReasoningEffort,
     SubagentType,
 )
 
@@ -204,6 +206,13 @@ class SpawnOptions(BaseModel):
             ``None`` to inherit the backend default.
         capability: Out-of-session capability token; leave empty when the MCP
             session is already attached.
+        reasoning_effort: Backend-specific effort selector; ``None`` leaves the
+            backend default untouched. Rejected when the resolved backend does
+            not expose a reasoning-effort dial.
+        agent_profile: Backend-specific agent/persona profile name; ``None``
+            skips profile injection. Rejected when the resolved backend does
+            not support profile selection or when the name is not among
+            discovered profiles for the request's cwd.
 
     """
 
@@ -216,6 +225,8 @@ class SpawnOptions(BaseModel):
     plan_mode_required: bool = False
     permission_mode: PermissionModeOpt | None = None
     capability: Capability = ""
+    reasoning_effort: ReasoningEffort | None = None
+    agent_profile: AgentProfileName | None = None
 
 
 class InboxMessage(BaseModel):
@@ -351,6 +362,29 @@ class BackendInfo(BaseModel):
     available: bool
     default_model: str
     supported_models: list[str]
+
+
+class AgentProfileInfo(BaseModel):
+    """A single discovered agent/persona profile."""
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    name: str
+    path: str
+
+
+class AgentListResult(BaseModel):
+    """Result of ``list_agents``.
+
+    Reports whether selection is supported and which profiles are discoverable.
+    """
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    backend: str
+    supported: bool
+    cwd: str
+    profiles: list[AgentProfileInfo]
 
 
 class SendMessageResult(BaseModel):

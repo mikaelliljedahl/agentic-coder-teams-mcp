@@ -82,8 +82,7 @@ class TestHappyResolveModel:
 
 
 class TestHappyBuildCommand:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/happy")
-    def test_produces_print_command(self, _mock_which, _make_request):
+    def test_produces_print_command(self, _make_request):
         backend = HappyBackend()
         request = _make_request()
 
@@ -94,8 +93,7 @@ class TestHappyBuildCommand:
         assert "--model" in cmd
         assert "--yolo" in cmd
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/happy")
-    def test_includes_prompt_as_last_arg(self, _mock_which, _make_request):
+    def test_includes_prompt_as_last_arg(self, _make_request):
         backend = HappyBackend()
         request = _make_request(prompt="fix the bug")
 
@@ -103,8 +101,7 @@ class TestHappyBuildCommand:
 
         assert cmd[-1] == "fix the bug"
 
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/happy")
-    def test_resolves_generic_model(self, _mock_which, _make_request):
+    def test_resolves_generic_model(self, _make_request):
         backend = HappyBackend()
         request = _make_request(model="fast")
 
@@ -122,8 +119,7 @@ class TestHappyBuildEnv:
 
 
 class TestHappyAvailability:
-    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/happy")
-    def test_available_when_binary_found(self, _mock_which):
+    def test_available_when_binary_found(self):
         backend = HappyBackend()
         assert backend.is_available() is True
 

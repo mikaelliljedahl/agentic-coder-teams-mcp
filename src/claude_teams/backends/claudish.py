@@ -2,7 +2,13 @@
 
 from typing import ClassVar
 
-from claude_teams.backends.base import BaseBackend, SpawnRequest
+from claude_teams.backends._agent_discovery import discover_claude_agents
+from claude_teams.backends.base import (
+    AgentProfile,
+    AgentSelectSpec,
+    BaseBackend,
+    SpawnRequest,
+)
 
 
 class ClaudishBackend(BaseBackend):
@@ -22,6 +28,19 @@ class ClaudishBackend(BaseBackend):
         "balanced": "oai@gpt-5.2",
         "powerful": "google@gemini-3-pro",
     }
+
+    _AGENT_SELECT_SPEC: ClassVar[AgentSelectSpec] = AgentSelectSpec(
+        flag="--agent",
+        value_template="{name}",
+    )
+
+    def agent_select_spec(self) -> AgentSelectSpec | None:
+        """Claudish accepts a profile by name via ``--agent <name>``."""
+        return self._AGENT_SELECT_SPEC
+
+    def discover_agents(self, cwd: str) -> list[AgentProfile]:
+        """Reuse the Claude-style ``.claude/agents/*.md`` discovery."""
+        return discover_claude_agents(cwd)
 
     def supported_models(self) -> list[str]:
         """Return a curated set of Claudish provider@model identifiers.
@@ -88,5 +107,6 @@ class ClaudishBackend(BaseBackend):
             "--model",
             model,
             *self.permission_args(request),
+            *self._agent_args(request),
             request.prompt,
         ]
