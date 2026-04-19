@@ -22,6 +22,7 @@ from claude_teams.server_team_spawn import register_team_spawn_tools
 from claude_teams.server_team_tasks import register_team_task_tools
 from claude_teams.server_teammate import register_teammate_tools
 from claude_teams.skill_providers import build_custom_skills_providers
+from claude_teams.telemetry import configure_tracing
 
 register_bootstrap_tools(mcp)
 register_team_spawn_tools(mcp)
@@ -75,12 +76,6 @@ mcp.add_middleware(LoggingMiddleware())
 def main():
     """Entry point for the claude-teams MCP server."""
     signal.signal(signal.SIGINT, lambda *_: os._exit(0))
-    # Opportunistically enable OTel tracing. No-op when the ``otel``
-    # extra is not installed or ``OTEL_SDK_DISABLED=true``. Kept inside
-    # ``main()`` so importing this module for tooling or tests never
-    # triggers telemetry bootstrap.
-    from claude_teams.telemetry import configure_tracing  # noqa: PLC0415
-
     configure_tracing()
     mcp.run()
 
