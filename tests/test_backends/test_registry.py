@@ -63,14 +63,20 @@ class TestRegistryDiscovery:
 class TestRegistryManualRegister:
     def test_register_and_get(self):
         reg = BackendRegistry()
-        # Real backend instance: if register/get ever grows a Protocol check,
-        # a MagicMock would pretend to conform and hide the regression.
-        backend = ClaudeCodeBackend()
+
+        # Real backend instance with ``_name`` overridden so the registry
+        # key and ``backend.name`` match — several tool errors use
+        # ``backend_obj.name`` after a registry lookup, so the test should
+        # not bake in a key/name mismatch.
+        class _CustomClaudeBackend(ClaudeCodeBackend):
+            _name = "custom"
+
+        backend = _CustomClaudeBackend()
         reg.register("custom", backend)
 
         result = reg.get("custom")
         assert result is backend
-        assert result.name == "claude-code"
+        assert result.name == "custom"
 
     def test_get_raises_key_error_for_unknown_name(self):
         reg = BackendRegistry()

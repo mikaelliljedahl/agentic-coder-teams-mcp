@@ -12,6 +12,7 @@ from fastmcp.exceptions import ToolError
 from claude_teams import capabilities, messaging, teams
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends import SpawnRequest
+from claude_teams.backends.contracts import AgentProfile
 from claude_teams.errors import (
     AgentSelectUnsupportedToolError,
     BackendNotRegisteredError,
@@ -111,8 +112,19 @@ async def _validate_reasoning_effort(backend_obj, effort: str | None) -> None:
         raise InvalidReasoningEffortToolError(backend_obj.name, effort, spec.options)
 
 
-async def _validate_agent_profile(backend_obj, profile: str | None, cwd: str) -> None:
+async def _validate_agent_profile(
+    backend_obj, profile: str | None, cwd: str
+) -> AgentProfile | None:
     """Validate agent_profile against the backend's spec and current discovery.
+
+    Returns the matched ``AgentProfile`` so the caller can thread its
+    resolved path through ``SpawnRequest.extra`` — backends would
+    otherwise re-run ``discover_agents`` at command-build time just to
+    recover the path for the spec's ``value_template``.
+
+    Returns:
+        The discovered ``AgentProfile`` when ``profile`` was set and
+        matched, otherwise ``None``.
 
     Raises:
         AgentSelectUnsupportedToolError: Backend lacks an agent_select_spec.
@@ -120,14 +132,16 @@ async def _validate_agent_profile(backend_obj, profile: str | None, cwd: str) ->
 
     """
     if profile is None:
-        return
+        return None
     spec = await run_blocking(backend_obj.agent_select_spec)
     if spec is None:
         raise AgentSelectUnsupportedToolError(backend_obj.name)
     profiles = await run_blocking(backend_obj.discover_agents, cwd)
+    for discovered in profiles:
+        if discovered.name == profile:
+            return discovered
     names = [p.name for p in profiles]
-    if profile not in names:
-        raise UnknownAgentProfileToolError(backend_obj.name, profile, names)
+    raise UnknownAgentProfileToolError(backend_obj.name, profile, names)
 
 
 async def _assign_color(team_name: str) -> str:
@@ -208,7 +222,9 @@ async def spawn_teammate_tool(
         raise ReservedAgentNameError()
 
     resolved_cwd = await run_blocking(_resolve_spawn_cwd, opts.cwd)
-    await _validate_agent_profile(backend_obj, opts.agent_profile, resolved_cwd)
+    resolved_profile = await _validate_agent_profile(
+        backend_obj, opts.agent_profile, resolved_cwd
+    )
     color = await _assign_color(team_name)
 
     member = TeammateMember(
@@ -250,6 +266,10 @@ async def spawn_teammate_tool(
     if backend_obj.name == "codex":
         one_shot_result_path = create_one_shot_result_path(team_name, name)
         extra["output_last_message_path"] = str(one_shot_result_path)
+    if resolved_profile is not None:
+        # Thread the resolved path through so ``_agent_args`` doesn't
+        # re-scan the filesystem / re-parse TOML at command-build time.
+        extra["agent_profile_path"] = resolved_profile.path
 
     request = SpawnRequest(
         agent_id=member.agent_id,

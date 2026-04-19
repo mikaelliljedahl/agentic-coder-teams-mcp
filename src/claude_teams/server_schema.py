@@ -208,8 +208,9 @@ ReasoningEffort = Annotated[
             "backend: Claude (low/medium/high/max), Codex and Coder "
             "(low/medium/high/xhigh), Amp (free/rush/smart), Kimi "
             "(kimi-k2/kimi-k2-thinking/kimi-k2-thinking-turbo). Backends that "
-            "do not expose a reasoning-effort dial will reject any value. Call "
-            "``list_backends`` for each backend's current set."
+            "do not expose a reasoning-effort dial will reject any value. "
+            "Refer to the per-backend values enumerated above when choosing a "
+            "setting."
         ),
         min_length=1,
         max_length=64,

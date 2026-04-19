@@ -341,11 +341,14 @@ class BaseBackend:
     def _agent_args(self, request: SpawnRequest) -> list[str]:
         """Build ``agent_profile``-related CLI args, if selection is active.
 
-        Re-discovers profiles from ``request.cwd`` so the resolved path is
-        available for the spec's ``value_template``. The server layer is
-        responsible for validating that ``request.agent_profile`` names a
-        discovered profile before reaching this point; a missing match here
-        produces an empty list rather than raising so the build stays pure.
+        Prefers a pre-resolved path from ``request.extra['agent_profile_path']``
+        when the server-layer validator already discovered and matched the
+        profile — the common path, and skips the filesystem/TOML scan that
+        validation just performed. Falls back to re-running
+        ``discover_agents(request.cwd)`` so direct callers (notably backend
+        unit tests constructing ``SpawnRequest`` without routing through
+        ``spawn_teammate``) keep working. A missing match produces an empty
+        list rather than raising so the build stays pure.
 
         Args:
             request: Backend-agnostic spawn parameters.
@@ -361,6 +364,11 @@ class BaseBackend:
         spec = self.agent_select_spec()
         if spec is None:
             return []
+        cached_path = (request.extra or {}).get("agent_profile_path")
+        if cached_path:
+            return spec.build_args(
+                AgentProfile(name=request.agent_profile, path=cached_path)
+            )
         for profile in self.discover_agents(request.cwd):
             if profile.name == request.agent_profile:
                 return spec.build_args(profile)
