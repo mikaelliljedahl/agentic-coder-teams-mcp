@@ -14,6 +14,7 @@ from claude_teams.server_schema import (
     PermissionModeOpt,
     ReasoningEffort,
     SubagentType,
+    TemplateName,
 )
 
 
@@ -213,6 +214,11 @@ class SpawnOptions(BaseModel):
             skips profile injection. Rejected when the resolved backend does
             not support profile selection or when the name is not among
             discovered profiles for the request's cwd.
+        template: Registered agent template name; ``None`` skips template
+            application. When set, the template's role-prompt is prepended
+            to the spawn prompt and its default fields populate any
+            ``SpawnOptions`` field the caller left unset. Explicit caller
+            values always take precedence over template defaults.
 
     """
 
@@ -227,6 +233,7 @@ class SpawnOptions(BaseModel):
     capability: Capability = ""
     reasoning_effort: ReasoningEffort | None = None
     agent_profile: AgentProfileName | None = None
+    template: TemplateName | None = None
 
 
 class InboxMessage(BaseModel):
@@ -395,3 +402,66 @@ class SendMessageResult(BaseModel):
     routing: MessageRouting | None = None
     request_id: str | None = None
     target: str | None = None
+
+
+class TemplateInfo(BaseModel):
+    """Summary view of an ``AgentTemplate`` returned by ``list_templates``.
+
+    Mirrors the dataclass fields that are meaningful to MCP clients:
+    the identity, the role-prompt preview, and the defaults the template
+    applies when a spawn option is left unset. Forward-compat metadata
+    (``skill_roots``, ``mcp_servers``) is omitted here until Feature G
+    consumes it; adding it later is additive and therefore safe.
+    """
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    name: str
+    description: str
+    role_prompt: str = ""
+    default_backend: str | None = None
+    default_model: str | None = None
+    default_subagent_type: str | None = None
+    default_reasoning_effort: str | None = None
+    default_agent_profile: str | None = None
+    default_permission_mode: PermissionModeOpt | None = None
+    default_plan_mode_required: bool | None = None
+
+
+class PresetMemberInfo(BaseModel):
+    """Summary view of a preset member returned by ``list_presets``."""
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    name: str
+    prompt: str
+    template: str | None = None
+    backend: str | None = None
+    model: str | None = None
+    subagent_type: str | None = None
+    reasoning_effort: str | None = None
+    agent_profile: str | None = None
+    cwd: str | None = None
+    plan_mode_required: bool | None = None
+    permission_mode: PermissionModeOpt | None = None
+
+
+class PresetInfo(BaseModel):
+    """Summary view of a ``TeamPreset`` returned by ``list_presets``."""
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    name: str
+    description: str
+    team_description: str = ""
+    members: list[PresetMemberInfo]
+
+
+class PresetSpawnResult(BaseModel):
+    """Result payload returned after ``create_team_from_preset``."""
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    team: TeamCreateResult
+    members: list[SpawnResult]
+    preset: str

@@ -184,6 +184,9 @@ Tools are organized into three tiers using **progressive disclosure**. At startu
 | `team_delete` | Delete a team and all its data. Fails if teammates are still active. |
 | `list_backends` | List all available backends and their supported models. |
 | `list_agents` | List discoverable agent/persona profiles for a backend. Returns `supported=false` when the backend has no profile-selection mechanism; otherwise enumerates profiles visible from the given `cwd`. |
+| `list_templates` | List registered agent templates. Templates are reusable role-context layers applied at `spawn_teammate` time (see [Templates and Presets](#templates-and-presets)). |
+| `list_presets` | List registered team presets. Presets are declarative team compositions that expand into one `team_create` plus one `spawn_teammate` per member. |
+| `create_team_from_preset` | Expand a named preset into a team + teammates in a single call. Returns the same `TeamCreateResult` plus the list of `SpawnResult`s for each member. |
 | `read_config` | Read team configuration and member list (lead capability required). |
 
 ### Tier 1: Team (visible after `team_create`)
@@ -207,6 +210,60 @@ Tools are organized into three tiers using **progressive disclosure**. At startu
 | `poll_inbox` | Long-poll an inbox for new messages (blocks up to 30 seconds). |
 | `process_shutdown_approved` | Cleanly remove a teammate after graceful shutdown approval. |
 | `health_check` | Check if a teammate's process is still running. |
+
+### Templates and Presets
+
+Two discoverable, declarative shortcuts reduce the prompt/option plumbing a lead has to write by hand.
+
+**Agent templates** are named role-context bundles applied at `spawn_teammate` time. A template carries a role-prompt header and optional default spawn options (backend, model, subagent type, reasoning effort, permission mode, etc.). Pass `options.template = "<name>"` to apply one. Task prompts layer on top of the role prompt; explicit `SpawnOptions` fields always override template defaults.
+
+Seeded built-ins:
+
+| Template | Role | Default subagent |
+|----------|------|------------------|
+| `code-reviewer` | Reviews code; rates findings by severity; does not rewrite. | `code-reviewer` |
+| `debugger` | Reproduces failures; hypothesis-driven root-cause analysis. | `debugger` |
+| `executor` | Implements focused tasks; runs lint and tests before declaring done. | `executor` |
+| `test-engineer` | Writes and hardens tests; covers happy path, boundaries, and errors. | `test-engineer` |
+| `writer` | Produces and refines technical documentation. | `writer` |
+
+**Team presets** are declarative team compositions: one preset name expands into a `team_create` followed by one `spawn_teammate` per member. Expansion is not transactional — if a mid-fan-out spawn fails, the team and prior members persist and the caller can either retry the remaining members via `spawn_teammate` or tear down via `team_delete`.
+
+Seeded built-ins:
+
+| Preset | Purpose | Members |
+|--------|---------|---------|
+| `review-and-fix` | Review a change and produce the fix. | `reviewer` (code-reviewer) + `executor` (executor) |
+| `docs-pair` | Docs pair: writer drafts, reviewer hardens. | `writer` (writer) + `reviewer` (code-reviewer) |
+
+Example — spawn a teammate with a template applied:
+
+```json
+{
+  "tool": "spawn_teammate",
+  "arguments": {
+    "team_name": "my-team",
+    "name": "reviewer",
+    "prompt": "Review PR #42.",
+    "options": {"template": "code-reviewer"}
+  }
+}
+```
+
+Example — expand a preset into a full team:
+
+```json
+{
+  "tool": "create_team_from_preset",
+  "arguments": {
+    "preset_name": "review-and-fix",
+    "team_name": "fix-pr-42",
+    "description": "Review + fix PR #42."
+  }
+}
+```
+
+Plugin-provided templates and presets register through the same module-level registries and can supersede built-ins by registering with the same name. The schemas also carry forward-compat metadata (`skill_roots`, `mcp_servers`) reserved for per-team skill and MCP-server injection; the spawn path ignores those fields today but the shape is stable.
 
 ### Capability model
 
@@ -359,6 +416,8 @@ The `claude-teams` CLI provides terminal commands for inspecting and managing te
 ```
 claude-teams serve              # Start the MCP server
 claude-teams backends           # List available backends
+claude-teams templates          # List registered agent templates
+claude-teams presets            # List registered team presets
 claude-teams config TEAM        # Show team config
 claude-teams status TEAM        # Show member status and task summary
 claude-teams inbox TEAM AGENT   # Read an agent's inbox messages
@@ -373,6 +432,10 @@ All commands support `--json` / `-j` for machine-readable output.
 ```bash
 # List what backends are available on your system
 claude-teams backends
+
+# Discover reusable role-context templates and declarative team presets
+claude-teams templates
+claude-teams presets
 
 # Show team config with member list
 claude-teams config my-team

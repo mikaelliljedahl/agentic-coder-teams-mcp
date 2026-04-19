@@ -9,13 +9,26 @@ import asyncio
 import json
 import os
 import signal
+import uuid
 from typing import Annotated, Literal
 
 import typer
+from fastmcp.exceptions import ToolError
 from rich.console import Console
 from rich.table import Table
 
-from claude_teams import capabilities, messaging, tasks, teams
+from claude_teams import (
+    capabilities,
+    messaging,
+    tasks,
+    teams,
+)
+from claude_teams import (
+    presets as presets_mod,
+)
+from claude_teams import (
+    templates as templates_mod,
+)
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends.registry import registry
 from claude_teams.errors import (
@@ -25,7 +38,15 @@ from claude_teams.errors import (
     TeamNotFoundValueError,
 )
 from claude_teams.models import TeammateMember
+from claude_teams.orchestration import SpawnDependencies, expand_preset_core
 from claude_teams.server import mcp
+from claude_teams.server_runtime import _resolve_permission_mode, _resolve_spawn_cwd
+from claude_teams.server_team_relay import (
+    build_agent_auth_notice,
+    create_one_shot_result_path,
+    log_relay_task_exception,
+    relay_one_shot_result,
+)
 
 _INBOX_SUMMARY_TRUNC_LEN = 80
 
@@ -35,6 +56,14 @@ app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
+
+preset_app = typer.Typer(
+    name="preset",
+    help="Launch and inspect team presets.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(preset_app, name="preset")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -169,6 +198,119 @@ def backends(output_json: JsonFlag = False) -> None:
         "\n[dim]Note: Supported models shown are a curated set. Actual"
         " availability depends on authentication state, account tier,"
         " and configured providers.[/dim]"
+    )
+
+
+@app.command()
+def templates(output_json: JsonFlag = False) -> None:
+    """List registered agent templates.
+
+    Templates are reusable role-context layers applied at
+    ``spawn_teammate`` time. Pass a template name via
+    ``options.template`` to prepend the role prompt and fill in any
+    spawn-option defaults the caller left unset.
+
+    Args:
+        output_json (bool): Whether to output as JSON instead of a table.
+
+    Raises:
+        typer.Exit: If no templates are registered (exit code 1).
+
+    """
+    rows = [
+        {
+            "name": t.name,
+            "description": t.description,
+            "default_backend": t.default_backend or "",
+            "default_model": t.default_model or "",
+            "default_subagent_type": t.default_subagent_type or "",
+        }
+        for t in templates_mod.list_templates()
+    ]
+
+    if output_json:
+        console.print_json(json.dumps(rows))
+        return
+
+    if not rows:
+        err_console.print("[yellow]No templates registered.[/yellow]")
+        raise typer.Exit(code=1)
+
+    table = Table(title="Agent Templates")
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Description")
+    table.add_column("Backend", style="green")
+    table.add_column("Model")
+    table.add_column("Subagent")
+    for row in rows:
+        table.add_row(
+            row["name"],
+            row["description"],
+            row["default_backend"] or "[dim]-[/dim]",
+            row["default_model"] or "[dim]-[/dim]",
+            row["default_subagent_type"] or "[dim]-[/dim]",
+        )
+    console.print(table)
+
+
+@app.command()
+def presets(output_json: JsonFlag = False) -> None:
+    """List registered team presets.
+
+    Presets are declarative team compositions that expand into one
+    ``team_create`` call followed by one ``spawn_teammate`` call per
+    member. Use ``claude-teams preset launch`` to launch one.
+
+    Args:
+        output_json (bool): Whether to output as JSON instead of a table.
+
+    Raises:
+        typer.Exit: If no presets are registered (exit code 1).
+
+    """
+    preset_list = presets_mod.list_presets()
+
+    if output_json:
+        rows = [
+            {
+                "name": p.name,
+                "description": p.description,
+                "team_description": p.team_description,
+                "members": [
+                    {
+                        "name": m.name,
+                        "template": m.template or "",
+                        "backend": m.backend or "",
+                    }
+                    for m in p.members
+                ],
+            }
+            for p in preset_list
+        ]
+        console.print_json(json.dumps(rows))
+        return
+
+    if not preset_list:
+        err_console.print("[yellow]No presets registered.[/yellow]")
+        raise typer.Exit(code=1)
+
+    table = Table(title="Team Presets")
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Description")
+    table.add_column("Members")
+    for preset in preset_list:
+        members_text = ", ".join(
+            f"{m.name}" + (f" ({m.template})" if m.template else "")
+            for m in preset.members
+        )
+        table.add_row(
+            preset.name,
+            preset.description,
+            members_text or "[dim]-[/dim]",
+        )
+    console.print(table)
+    console.print(
+        "\n[dim]Note: Launch a preset with `claude-teams preset launch`.[/dim]"
     )
 
 
@@ -473,6 +615,116 @@ def kill(
     console.print(
         f"[green]{agent_name} has been stopped and removed from {team_name}.[/green]"
     )
+
+
+def _build_cli_spawn_dependencies() -> SpawnDependencies:
+    """Assemble ``SpawnDependencies`` for the CLI orchestration surface.
+
+    Intentionally mirrors the MCP wrapper's factory so both entrypoints
+    drive ``orchestration`` with identical helpers — keeping CLI and MCP
+    results behaviorally equivalent for the same inputs.
+    """
+    return SpawnDependencies(
+        resolve_permission_mode=_resolve_permission_mode,
+        resolve_spawn_cwd=_resolve_spawn_cwd,
+        build_agent_auth_notice=build_agent_auth_notice,
+        relay_one_shot_result=relay_one_shot_result,
+        create_one_shot_result_path=create_one_shot_result_path,
+        log_relay_task_exception=log_relay_task_exception,
+    )
+
+
+@preset_app.command("launch")
+def preset_launch(
+    preset_name: Annotated[str, typer.Argument(help="Registered preset name.")],
+    team_name: Annotated[str, typer.Argument(help="Name for the new team.")],
+    description: Annotated[
+        str,
+        typer.Option(
+            "--description",
+            "-d",
+            help="Override the preset's default team description.",
+        ),
+    ] = "",
+    output_json: JsonFlag = False,
+) -> None:
+    """Expand a preset into a new team and spawn its teammates.
+
+    Prints the minted lead capability so the operator can export
+    ``CLAUDE_TEAMS_CAPABILITY`` and then run lead-only CLI commands or
+    attach an MCP session as the team lead.
+
+    Args:
+        preset_name (str): Registered preset name.
+        team_name (str): Team name to create.
+        description (str): Optional override for the preset's team
+            description. Empty string falls back to the preset default.
+        output_json (bool): Emit a JSON envelope instead of a rich report.
+
+    Raises:
+        typer.Exit: Preset unknown, team creation fails, or any teammate
+            spawn fails (exit code 1). On mid-fan-out spawn failure the
+            team and previously-spawned teammates persist — mirroring the
+            MCP contract — so the operator can retry or tear down.
+
+    """
+    try:
+        preset = presets_mod.get_preset(preset_name)
+    except KeyError:
+        available = ", ".join(sorted(presets_mod.list_names())) or "(none registered)"
+        err_console.print(
+            f"[red]Unknown preset {preset_name!r}. Available: {available}[/red]"
+        )
+        raise typer.Exit(code=1) from None
+
+    effective_description = description or preset.team_description
+    session_id = f"cli-{uuid.uuid4().hex}"
+
+    try:
+        expansion = _run(
+            expand_preset_core(
+                registry=registry,
+                preset=preset,
+                team_name=team_name,
+                session_id=session_id,
+                description=effective_description,
+                deps=_build_cli_spawn_dependencies(),
+                progress=None,
+            )
+        )
+    except ToolError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from None
+
+    if output_json:
+        payload = {
+            "preset": preset_name,
+            "team": expansion.team.model_dump(),
+            "lead_capability": expansion.lead_capability,
+            "members": [m.model_dump() for m in expansion.members],
+        }
+        console.print_json(json.dumps(payload))
+        return
+
+    console.print(
+        f"[green]Launched preset {preset_name!r} -> team {team_name!r}[/green] "
+        f"({len(expansion.members)} teammate(s))"
+    )
+    console.print(
+        f"[bold]Lead capability:[/bold] [cyan]{expansion.lead_capability}[/cyan]"
+    )
+    console.print(
+        "\n[dim]Export the token to drive the team as lead:\n"
+        f"  export CLAUDE_TEAMS_CAPABILITY={expansion.lead_capability}[/dim]"
+    )
+
+    if expansion.members:
+        table = Table(title="Spawned Members")
+        table.add_column("Name", style="bold")
+        table.add_column("Agent ID", style="dim")
+        for member in expansion.members:
+            table.add_row(member.name, member.agent_id)
+        console.print(table)
 
 
 def _find_teammate(cfg: teams.TeamConfig, agent_name: str) -> TeammateMember | None:

@@ -1,14 +1,19 @@
 """Bootstrap and capability server tests."""
 
 from pathlib import Path
-from unittest.mock import patch
+from typing import cast
+from unittest.mock import MagicMock, patch
 
+import pytest
 from fastmcp import Client
 
-from claude_teams import teams
+from claude_teams import presets, teams, templates
 from claude_teams.backends import registry
 from claude_teams.backends.base import AgentProfile, AgentSelectSpec
+from claude_teams.models import TeammateMember
+from claude_teams.presets import PresetMemberSpec, TeamPreset
 from claude_teams.server import mcp
+from claude_teams.templates import AgentTemplate
 from tests._server_support import (
     _data,
     _extract_capability,
@@ -355,3 +360,218 @@ class TestListAgents:
             {"name": "scoped-a", "path": str(tmp_path / "scoped-a.md")},
             {"name": "scoped-b", "path": str(tmp_path / "scoped-b.md")},
         ]
+
+
+class TestListTemplates:
+    """Tier-0 ``list_templates`` visibility and payload shape.
+
+    Tier-0 placement matters: callers need to see available templates
+    before they have a team to attach to, so the tool must appear in the
+    pre-create tool list. Payload shape matters for SDK clients that type
+    their parsing against the documented fields.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_registry(self):
+        yield
+        templates._seed_builtin_templates()
+
+    async def test_list_templates_is_visible_at_tier_zero(self, client: Client):
+        tool_list = await client.list_tools()
+        names = {t.name for t in tool_list}
+        assert "list_templates" in names
+
+    async def test_returns_seeded_builtins(self, client: Client):
+        result = _data(await client.call_tool("list_templates", {}))
+        assert isinstance(result, list)
+        names = {entry["name"] for entry in result}
+        # The five shipped built-ins must always be present.
+        assert {
+            "code-reviewer",
+            "debugger",
+            "executor",
+            "test-engineer",
+            "writer",
+        } <= names
+
+    async def test_entries_carry_expected_fields(self, client: Client):
+        result = _data(await client.call_tool("list_templates", {}))
+        reviewer = next(e for e in result if e["name"] == "code-reviewer")
+        # camelCase alias — matches every other Tier-0 payload.
+        assert "description" in reviewer
+        assert reviewer["rolePrompt"].startswith("You are acting as a code reviewer.")
+        assert reviewer["defaultSubagentType"] == "code-reviewer"
+        # Optional defaults are null when unset, not missing — keeps the
+        # field shape stable for typed clients.
+        assert reviewer["defaultBackend"] is None
+
+    async def test_returns_sorted_by_name(self, client: Client):
+        result = _data(await client.call_tool("list_templates", {}))
+        names = [entry["name"] for entry in result]
+        assert names == sorted(names)
+
+    async def test_custom_registered_template_is_visible(self, client: Client):
+        templates.register_template(
+            AgentTemplate(
+                name="custom-role",
+                description="Ad-hoc registration for tests.",
+                role_prompt="Custom header.",
+                default_backend="claude-code",
+            )
+        )
+        result = _data(await client.call_tool("list_templates", {}))
+        custom = next(e for e in result if e["name"] == "custom-role")
+        assert custom["rolePrompt"] == "Custom header."
+        assert custom["defaultBackend"] == "claude-code"
+
+
+class TestListPresets:
+    """Tier-0 ``list_presets`` visibility and payload shape."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_registry(self):
+        yield
+        presets._seed_builtin_presets()
+
+    async def test_list_presets_is_visible_at_tier_zero(self, client: Client):
+        tool_list = await client.list_tools()
+        names = {t.name for t in tool_list}
+        assert "list_presets" in names
+
+    async def test_returns_seeded_builtins(self, client: Client):
+        result = _data(await client.call_tool("list_presets", {}))
+        names = {entry["name"] for entry in result}
+        assert {"review-and-fix", "docs-pair"} <= names
+
+    async def test_entries_carry_member_details(self, client: Client):
+        result = _data(await client.call_tool("list_presets", {}))
+        review = next(e for e in result if e["name"] == "review-and-fix")
+        assert review["description"]
+        assert review["teamDescription"]
+        assert len(review["members"]) == 2
+        reviewer = next(m for m in review["members"] if m["name"] == "reviewer")
+        assert reviewer["template"] == "code-reviewer"
+        assert reviewer["prompt"]
+
+
+class TestCreateTeamFromPreset:
+    """Preset expansion through the ``team_create`` + ``spawn_teammate`` path."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_registry(self):
+        yield
+        presets._seed_builtin_presets()
+        templates._seed_builtin_templates()
+
+    async def test_expands_preset_into_team_and_members(self, client: Client):
+        result = _data(
+            await client.call_tool(
+                "create_team_from_preset",
+                {
+                    "preset_name": "review-and-fix",
+                    "team_name": "preset-team-1",
+                },
+            )
+        )
+        assert result["preset"] == "review-and-fix"
+        # TeamCreateResult and SpawnResult don't use camelCase aliases,
+        # so nested payloads stay snake_case.
+        assert result["team"]["team_name"] == "preset-team-1"
+        member_names = [m["name"] for m in result["members"]]
+        assert member_names == ["reviewer", "executor"]
+
+        cfg = await teams.read_config("preset-team-1")
+        teammates = {m.name: m for m in cfg.members if isinstance(m, TeammateMember)}
+        # Template default subagent_types came through the expansion.
+        assert teammates["reviewer"].agent_type == "code-reviewer"
+        assert teammates["executor"].agent_type == "executor"
+
+    async def test_applies_template_role_prompt_through_expansion(self, client: Client):
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+
+        await client.call_tool(
+            "create_team_from_preset",
+            {
+                "preset_name": "review-and-fix",
+                "team_name": "preset-team-2",
+            },
+        )
+
+        # Inspect the last spawn (executor) — should carry executor role
+        # prompt via its template, composed with the preset's per-member
+        # task prompt.
+        spawn_calls = mock_backend.spawn.call_args_list
+        assert len(spawn_calls) == 2
+        executor_request = spawn_calls[1].args[0]
+        assert executor_request.prompt.startswith("You are acting as an executor.")
+        assert "Wait for review findings" in executor_request.prompt
+
+    async def test_explicit_description_overrides_preset_default(self, client: Client):
+        await client.call_tool(
+            "create_team_from_preset",
+            {
+                "preset_name": "review-and-fix",
+                "team_name": "preset-team-3",
+                "description": "Custom override description.",
+            },
+        )
+        cfg = await teams.read_config("preset-team-3")
+        assert cfg.description == "Custom override description."
+
+    async def test_falls_back_to_preset_team_description(self, client: Client):
+        await client.call_tool(
+            "create_team_from_preset",
+            {
+                "preset_name": "review-and-fix",
+                "team_name": "preset-team-4",
+            },
+        )
+        cfg = await teams.read_config("preset-team-4")
+        assert "Review-and-fix" in cfg.description
+
+    async def test_unknown_preset_raises_structured_error(self, client: Client):
+        result = await client.call_tool(
+            "create_team_from_preset",
+            {
+                "preset_name": "does-not-exist",
+                "team_name": "preset-bad",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        text = _text(result)
+        assert "does-not-exist" in text
+        # Error surface enumerates available presets.
+        assert "review-and-fix" in text
+
+    async def test_custom_preset_with_explicit_member_overrides(self, client: Client):
+        presets.register_preset(
+            TeamPreset(
+                name="custom-duo",
+                description="Custom duo for tests.",
+                members=(
+                    PresetMemberSpec(
+                        name="alpha",
+                        prompt="do alpha work",
+                        template="code-reviewer",
+                        # Explicit subagent_type wins over template default.
+                        subagent_type="executor",
+                    ),
+                ),
+            )
+        )
+        await client.call_tool(
+            "create_team_from_preset",
+            {
+                "preset_name": "custom-duo",
+                "team_name": "preset-custom",
+            },
+        )
+        cfg = await teams.read_config("preset-custom")
+        alpha = next(
+            m
+            for m in cfg.members
+            if isinstance(m, TeammateMember) and m.name == "alpha"
+        )
+        # Explicit beats template default.
+        assert alpha.agent_type == "executor"

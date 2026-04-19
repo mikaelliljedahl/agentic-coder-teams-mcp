@@ -9,7 +9,10 @@ from typing import TextIO
 
 import pytest
 
+from claude_teams.errors import InboxMasterKeyTooShortError
 from claude_teams.messaging import (
+    _INBOX_MAX_MESSAGES,
+    _compact_messages,
     append_message,
     ensure_inbox,
     inbox_path,
@@ -497,8 +500,6 @@ async def test_append_raises_when_master_key_below_min_length(
     brute-forceable input space. The gate surfaces the misconfiguration
     loudly on the first encrypted write.
     """
-    from claude_teams.errors import InboxMasterKeyTooShortError
-
     monkeypatch.setenv("CLAUDE_TEAMS_ENCRYPTION_MASTER_KEY", "too-short-key")
     message = InboxMessage(
         from_="lead", text="payload", timestamp=now_iso(), read=False, summary="s"
@@ -513,8 +514,6 @@ def test_compact_messages_preserves_all_unread() -> None:
     When the inbox overflows but unread already equals or exceeds the cap,
     the compactor returns unread-only; read messages are evicted wholesale.
     """
-    from claude_teams.messaging import _INBOX_MAX_MESSAGES, _compact_messages
-
     unread_count = _INBOX_MAX_MESSAGES + 5
     unread = [
         InboxMessage(
@@ -540,8 +539,6 @@ def test_compact_messages_drops_oldest_read_first() -> None:
     sparse, the oldest read messages are evicted first and the newest
     ``keep_read`` read messages are retained alongside all unread.
     """
-    from claude_teams.messaging import _INBOX_MAX_MESSAGES, _compact_messages
-
     unread = [
         InboxMessage(
             from_="lead", text=f"u{i}", timestamp=now_iso(), read=False, summary="s"
@@ -566,8 +563,6 @@ def test_compact_messages_drops_oldest_read_first() -> None:
 
 def test_compact_messages_below_cap_is_noop() -> None:
     """Under the cap, compaction returns the input list unchanged."""
-    from claude_teams.messaging import _compact_messages
-
     msgs = [
         InboxMessage(
             from_="lead",

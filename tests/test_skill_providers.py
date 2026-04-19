@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 from fastmcp import Client
 
+from claude_teams import skill_providers as sp
 from claude_teams.skill_providers import (
     _CUSTOM_PROVIDER_ROOTS,
     build_custom_skills_providers,
@@ -140,8 +141,6 @@ def test_factory_wires_skill_md_as_main_file(
     (what it passes to ``SkillsDirectoryProvider``) and not to whatever
     private field FastMCP happens to store the main file name in.
     """
-    import claude_teams.skill_providers as sp
-
     seen: list[dict[str, object]] = []
 
     class _Recorder:
@@ -165,8 +164,6 @@ def test_factory_preserves_root_ordering(
     declared iteration order. Relies on Python's guaranteed dict insertion
     order and avoids touching provider internals.
     """
-    import claude_teams.skill_providers as sp
-
     seen: list[dict[str, object]] = []
 
     class _Recorder:

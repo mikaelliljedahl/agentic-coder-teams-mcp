@@ -653,3 +653,34 @@ class NoProcessHandleError(ToolError):
     def __init__(self, agent_name: str) -> None:
         """Build the message from the teammate lacking a process handle."""
         super().__init__(f"No process handle for teammate {agent_name!r}")
+
+
+class UnknownTemplateToolError(ToolError):
+    """Raised when ``options.template`` names an unregistered template."""
+
+    def __init__(self, value: str, available: Iterable[str]) -> None:
+        """Build the message from the rejected name and registered templates."""
+        available_str = ", ".join(sorted(available)) or "(none registered)"
+        super().__init__(f"Unknown template {value!r}. Available: {available_str}")
+
+
+class UnknownPresetToolError(ToolError):
+    """Raised when ``create_team_from_preset`` names an unregistered preset."""
+
+    def __init__(self, value: str, available: Iterable[str]) -> None:
+        """Build the message from the rejected name and registered presets."""
+        available_str = ", ".join(sorted(available)) or "(none registered)"
+        super().__init__(f"Unknown preset {value!r}. Available: {available_str}")
+
+
+class PresetMemberSpawnFailedError(ToolError):
+    """Raised when a preset expansion fails partway through fan-out.
+
+    The team and any already-spawned members persist — expansion is
+    intentionally non-transactional so callers can retry the remaining
+    members or tear the team down with ``team_delete``.
+    """
+
+    def __init__(self, member_name: str, cause: BaseException) -> None:
+        """Build the message from the failing member and root cause."""
+        super().__init__(f"Preset expansion failed on member {member_name!r}: {cause}")

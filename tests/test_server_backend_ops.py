@@ -4,13 +4,15 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
+import pytest
 from fastmcp import Client
 
-from claude_teams import teams
+from claude_teams import teams, templates
 from claude_teams.backends import registry
 from claude_teams.backends.base import HealthStatus
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.models import TeammateMember
+from claude_teams.templates import AgentTemplate
 from tests._server_support import (
     _data,
     _make_teammate,
@@ -422,3 +424,120 @@ class TestForceKillWithBackend:
             )
         )
         assert result["success"] is True
+
+
+class TestSpawnTemplate:
+    """Template application through the spawn pipeline.
+
+    Covers the three observable guarantees of ``_apply_template``:
+    role-prompt composition, default-field merging, and error taxonomy.
+    Reaches into the mock backend's captured ``SpawnRequest`` to confirm
+    values traverse the full tool → backend path, not just the top of
+    ``spawn_teammate_tool``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_registry(self):
+        yield
+        templates._seed_builtin_templates()
+
+    async def test_applies_role_prompt_and_default_subagent(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tpl-role"})
+
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-role",
+                "name": "reviewer",
+                "prompt": "review PR #42",
+                "options": {"template": "code-reviewer"},
+            },
+        )
+
+        request = mock_backend.spawn.call_args.args[0]
+        # Role prompt prepended with blank-line separator.
+        assert request.prompt.startswith("You are acting as a code reviewer.")
+        assert "\n\nreview PR #42" in request.prompt
+        # Default subagent_type from the template reached the backend.
+        assert request.agent_type == "code-reviewer"
+
+        cfg = await teams.read_config("tpl-role")
+        teammate = next(
+            m
+            for m in cfg.members
+            if isinstance(m, TeammateMember) and m.name == "reviewer"
+        )
+        assert teammate.agent_type == "code-reviewer"
+
+    async def test_explicit_option_overrides_template_default(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tpl-override"})
+
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-override",
+                "name": "reviewer",
+                "prompt": "review",
+                "options": {
+                    "template": "code-reviewer",
+                    "subagent_type": "executor",
+                },
+            },
+        )
+
+        request = mock_backend.spawn.call_args.args[0]
+        # Explicit subagent_type wins over the template's default.
+        assert request.agent_type == "executor"
+        # But the role_prompt still composes — it has no "explicit" equivalent.
+        assert request.prompt.startswith("You are acting as a code reviewer.")
+
+    async def test_empty_role_prompt_does_not_compose(self, client: Client):
+        templates.register_template(
+            AgentTemplate(
+                name="no-prefix",
+                description="Defaults only, no role header.",
+                default_subagent_type="executor",
+            )
+        )
+        await client.call_tool("team_create", {"team_name": "tpl-bare"})
+
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-bare",
+                "name": "worker",
+                "prompt": "do the task",
+                "options": {"template": "no-prefix"},
+            },
+        )
+
+        request = mock_backend.spawn.call_args.args[0]
+        # No leading blank line when role_prompt is empty.
+        assert request.prompt == "do the task"
+        assert request.agent_type == "executor"
+
+    async def test_unknown_template_raises_structured_error(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tpl-missing"})
+
+        result = await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-missing",
+                "name": "ghost",
+                "prompt": "task",
+                "options": {"template": "does-not-exist"},
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        text = _text(result)
+        assert "does-not-exist" in text
+        # Error surface should enumerate available templates so the caller
+        # can correct the typo without guessing.
+        assert "code-reviewer" in text
