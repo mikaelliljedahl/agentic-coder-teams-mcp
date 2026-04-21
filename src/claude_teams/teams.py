@@ -128,6 +128,10 @@ def _create_team(
     config_path = team_dir / "config.json"
     team_dir.mkdir(parents=True, exist_ok=True)
 
+    task_dir = tasks_dir / name
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / ".lock").touch()
+
     now_ms = int(time.time() * 1000)
 
     lead = LeadMember(
@@ -149,16 +153,14 @@ def _create_team(
         members=[lead],
     )
 
+    # config.json exclusive-create is the commit point; task_dir setup above
+    # is idempotent so a pre-commit failure leaves no "team exists" state.
     payload = json.dumps(config.model_dump(by_alias=True), indent=2)
     try:
         with config_path.open("x") as f:
             f.write(payload)
     except FileExistsError:
         raise TeamAlreadyExistsError(name) from None
-
-    task_dir = tasks_dir / name
-    task_dir.mkdir(parents=True, exist_ok=True)
-    (task_dir / ".lock").touch()
 
     return TeamCreateResult(
         team_name=name,

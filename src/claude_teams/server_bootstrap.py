@@ -242,6 +242,18 @@ async def create_team_from_preset(
     async def _progress(elapsed: int, message: str) -> None:
         await ctx.report_progress(progress=elapsed, total=None, message=message)
 
+    async def _attach_session(lead_capability: str) -> None:
+        # Attach before member fan-out so a mid-expansion failure still
+        # leaves ``team_delete`` and ``spawn_teammate`` reachable — the
+        # non-transactional contract's retry/teardown promises assume
+        # the session already holds the lead capability.
+        await _set_session_principal(
+            ctx, team_name, "team-lead", "lead", lead_capability=lead_capability
+        )
+        await ctx.enable_components(tags={_TAG_TEAM}, components={"tool", "prompt"})
+        await ctx.set_state("has_teammates", True)
+        await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
+
     try:
         expansion = await expand_preset_core(
             registry=reg,
@@ -251,21 +263,10 @@ async def create_team_from_preset(
             description=effective_description,
             deps=_build_spawn_dependencies(),
             progress=_progress,
+            on_capability_minted=_attach_session,
         )
     except TeamAlreadyExistsError as exc:
         raise TeamAlreadyExistsToolError(team_name) from exc
-
-    await _set_session_principal(
-        ctx,
-        team_name,
-        "team-lead",
-        "lead",
-        lead_capability=expansion.lead_capability,
-    )
-    await ctx.enable_components(tags={_TAG_TEAM}, components={"tool", "prompt"})
-    if expansion.members:
-        await ctx.set_state("has_teammates", True)
-        await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
 
     return PresetSpawnResult(
         team=expansion.team,

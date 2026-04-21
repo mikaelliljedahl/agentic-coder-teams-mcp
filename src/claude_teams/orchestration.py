@@ -77,6 +77,12 @@ PermissionMode = Literal["default", "require_approval", "bypass"]
 # or ``ctx.report_progress`` without leaking MCP types into the core.
 ProgressCallback = Callable[[int, str], Awaitable[None]]
 
+# Capability-mint hook contract: ``(lead_capability)``. Fires before
+# member fan-out so the MCP wrapper can attach the session + unlock
+# tools early, keeping ``team_delete`` / ``spawn_teammate`` reachable
+# when a later member spawn raises mid-expansion.
+CapabilityCallback = Callable[[str], Awaitable[None]]
+
 
 class RelayOneShotResultCallback(Protocol):
     """Structural type for the one-shot relay callback.
@@ -535,6 +541,7 @@ async def expand_preset_core(
     description: str,
     deps: SpawnDependencies,
     progress: ProgressCallback | None = None,
+    on_capability_minted: CapabilityCallback | None = None,
 ) -> PresetExpansionResult:
     """Expand a preset into a new team plus one teammate per member.
 
@@ -545,9 +552,10 @@ async def expand_preset_core(
     naming the failing member; the originating error (a ``ToolError``
     subclass or a domain ``Exception``) is preserved on ``__cause__``.
 
-    Setup failures (lead-capability initialization) are different: the
-    team has nothing useful on it yet, so we roll the team deletion
-    inline to avoid leaving a dangling on-disk config.
+    Setup failures (lead-capability initialization or the
+    ``on_capability_minted`` callback) are different: the team has
+    nothing useful on it yet, so we roll the team deletion inline to
+    avoid leaving a dangling on-disk config.
 
     Args:
         registry: Backend registry (same shape as for
@@ -560,6 +568,14 @@ async def expand_preset_core(
         deps: Bundle of injected helpers; see ``SpawnDependencies``.
         progress: Optional heartbeat callback forwarded to each
             per-member spawn.
+        on_capability_minted: Optional async hook invoked with the
+            lead capability token immediately after it is minted,
+            before member fan-out begins. The MCP wrapper uses this to
+            attach the session as lead and unlock team/teammate tools
+            early so callers can still reach ``team_delete`` /
+            ``spawn_teammate`` when a later member spawn fails
+            mid-expansion. Raising from the callback triggers the
+            same team-rollback as a capability-init failure.
 
     Returns:
         ``PresetExpansionResult`` with the team result, the lead
@@ -581,11 +597,13 @@ async def expand_preset_core(
     )
     try:
         lead_capability = await capabilities.initialize_team_capabilities(team_name)
+        if on_capability_minted is not None:
+            await on_capability_minted(lead_capability)
     except Exception:
-        # Team was created but capabilities failed to initialize: the
-        # team is unusable (no lead capability to mint member caps
-        # against) yet persists on disk. Roll back the team so
-        # ``preset launch`` is idempotent over retries.
+        # Team was created but setup (capability init or the early-attach
+        # callback) failed: the team is unusable yet persists on disk.
+        # Roll the team deletion so ``preset launch`` stays idempotent
+        # over retries.
         with contextlib.suppress(Exception):
             await teams.delete_team(team_name)
         raise
@@ -651,6 +669,7 @@ def _preset_member_spawn_options(
 
 
 __all__ = [
+    "CapabilityCallback",
     "PermissionMode",
     "PresetExpansionResult",
     "ProgressCallback",

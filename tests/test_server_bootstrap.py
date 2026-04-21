@@ -677,6 +677,60 @@ class TestCreateTeamFromPreset:
         # to the caller, but the partially-added member record is gone.
         assert "boom" not in names
 
+    async def test_member_spawn_failure_keeps_session_lead_attached(
+        self, client: Client
+    ):
+        """Partial failure still attaches the session as lead.
+
+        Locks the ``on_capability_minted`` early-attach contract: the MCP
+        wrapper attaches the session principal before member fan-out so the
+        caller can still reach lead-gated tools on the partially-created
+        team when a later member spawn fails mid-expansion. Without the
+        early attach, any follow-up on the failed team (``read_config``,
+        ``team_delete``, ``spawn_teammate``) would hit
+        ``AuthenticationRequiredError`` and strand the caller with a team
+        they can neither use nor clean up.
+
+        ``read_config`` is the cleanest probe because it requires a lead
+        principal but makes no state changes — a successful call proves
+        session auth survived the failure.
+        """
+        mock = cast(MagicMock, registry._backends["claude-code"])
+        mock.spawn.side_effect = [
+            BackendSpawnResult(process_handle="%ok", backend_type="claude-code"),
+            RuntimeError("synthetic spawn failure"),
+        ]
+
+        presets.register_preset(
+            TeamPreset(
+                name="attach-duo",
+                description="Second member fails; exercises early-attach.",
+                team_description="Covers on_capability_minted attach timing.",
+                members=(
+                    PresetMemberSpec(
+                        name="ok-one", prompt="succeeds", template="executor"
+                    ),
+                    PresetMemberSpec(name="boom", prompt="fails", template="executor"),
+                ),
+            )
+        )
+
+        failure = await client.call_tool(
+            "create_team_from_preset",
+            {"preset_name": "attach-duo", "team_name": "attach-team"},
+            raise_on_error=False,
+        )
+        assert failure.is_error is True
+
+        # No explicit capability — ``_require_lead`` must resolve the
+        # principal from session state or this call raises auth error.
+        cfg = await client.call_tool(
+            "read_config",
+            {"team_name": "attach-team"},
+            raise_on_error=False,
+        )
+        assert cfg.is_error is False
+
 
 class TestExpandPresetCoreFailure:
     """Core-level expansion contract: failure path without the MCP wrapper.
@@ -795,6 +849,97 @@ class TestExpandPresetCoreFailure:
         # still on disk untouched.
         cfg = await teams.read_config("collision-team")
         assert cfg.description == "pre-existing team"
+
+    async def test_on_capability_minted_receives_lead_capability(self, client: Client):
+        """Callback fires once, before fan-out, with the token in the result.
+
+        Locks the hook's data contract: the MCP wrapper needs the lead
+        capability minted during expansion to attach the session as lead
+        before member fan-out starts. If the callback ever stops being
+        called, or is called with a different token than what's returned
+        on ``PresetExpansionResult``, the session-attach path silently
+        desynchronises from the returned capability.
+        """
+        _ = client
+
+        presets.register_preset(
+            TeamPreset(
+                name="hook-solo",
+                description="Single-member preset to exercise the hook.",
+                team_description="One member that spawns cleanly.",
+                members=(
+                    PresetMemberSpec(name="only", prompt="runs", template="executor"),
+                ),
+            )
+        )
+        preset = presets.get_preset("hook-solo")
+
+        minted: list[str] = []
+
+        async def spy(capability: str) -> None:
+            minted.append(capability)
+
+        result = await expand_preset_core(
+            registry=registry,
+            preset=preset,
+            team_name="hook-team",
+            session_id="test-session",
+            description="desc",
+            deps=_build_spawn_dependencies(),
+            on_capability_minted=spy,
+        )
+
+        # Exactly one mint per expansion, and it matches the token the
+        # caller receives — no drift between what's attached to the
+        # session and what ``PresetExpansionResult`` advertises.
+        assert minted == [result.lead_capability]
+
+    async def test_on_capability_minted_failure_rolls_back_team(self, client: Client):
+        """A raising hook rolls the team back so retries stay idempotent.
+
+        Exercises the ``except Exception`` branch in the setup block of
+        ``expand_preset_core``: the team is already on disk when the
+        callback fires, so a hook failure without rollback would leave a
+        dangling config that blocks ``preset launch`` retries with
+        ``TeamAlreadyExistsError`` and no way to recover from the session
+        that could not attach.
+        """
+        _ = client
+
+        presets.register_preset(
+            TeamPreset(
+                name="hook-raise",
+                description="Preset used only to verify rollback.",
+                team_description="Rollback test; members never spawn.",
+                members=(
+                    PresetMemberSpec(
+                        name="never-spawns", prompt="x", template="executor"
+                    ),
+                ),
+            )
+        )
+        preset = presets.get_preset("hook-raise")
+
+        class _HookFailureError(RuntimeError):
+            pass
+
+        async def boom(_capability: str) -> None:
+            raise _HookFailureError
+
+        with pytest.raises(_HookFailureError):
+            await expand_preset_core(
+                registry=registry,
+                preset=preset,
+                team_name="hook-raise-team",
+                session_id="test-session",
+                description="desc",
+                deps=_build_spawn_dependencies(),
+                on_capability_minted=boom,
+            )
+
+        # Team rolled back — retrying the same name must not hit
+        # ``TeamAlreadyExistsError`` from leftover on-disk state.
+        assert not await teams.team_exists("hook-raise-team")
 
 
 class TestRetainPaneFailureWiring:
