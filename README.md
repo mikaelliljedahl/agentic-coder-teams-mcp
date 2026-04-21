@@ -8,7 +8,7 @@
 
 Multi-backend MCP server for orchestrating teams of agentic coding agents.
 
-**779 tests | 94% coverage | 17 backends | Python 3.12+**
+**782 tests | 94% coverage | 17 backends | Python 3.12+**
 
 </div>
 
