@@ -39,6 +39,8 @@ dev = [
     "opentelemetry-api>=1.41,<2",
     "opentelemetry-sdk>=1.41,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.41,<2",
+    "ruff>=0.15.11,<1",
+    "ty>=0.0.32,<1",
 ]
 
 [project.scripts]
