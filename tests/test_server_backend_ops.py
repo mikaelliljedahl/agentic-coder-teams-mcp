@@ -4,15 +4,23 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
+import pytest
 from fastmcp import Client
 
-from claude_teams import teams
+from claude_teams import teams, templates
 from claude_teams.backends import registry
-from claude_teams.backends.base import HealthStatus
+from claude_teams.backends.base import (
+    AgentProfile,
+    AgentSelectSpec,
+    HealthStatus,
+    ReasoningEffortSpec,
+)
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.models import TeammateMember
+from claude_teams.templates import AgentTemplate
 from tests._server_support import (
     _data,
+    _make_mock_backend,
     _make_teammate,
     _text,
 )
@@ -422,3 +430,312 @@ class TestForceKillWithBackend:
             )
         )
         assert result["success"] is True
+
+
+class TestSpawnTemplate:
+    """Template application through the spawn pipeline.
+
+    Covers the three observable guarantees of ``apply_template``:
+    role-prompt composition, default-field merging, and error taxonomy.
+    Reaches into the mock backend's captured ``SpawnRequest`` to confirm
+    values traverse the full tool → backend path, not just the top of
+    ``spawn_teammate_tool``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_registry(self):
+        yield
+        templates._seed_builtin_templates()
+
+    async def test_applies_role_prompt_and_default_subagent(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tpl-role"})
+
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-role",
+                "name": "reviewer",
+                "prompt": "review PR #42",
+                "options": {"template": "code-reviewer"},
+            },
+        )
+
+        request = mock_backend.spawn.call_args.args[0]
+        # Role prompt prepended with blank-line separator.
+        assert request.prompt.startswith("You are acting as a code reviewer.")
+        assert "\n\nreview PR #42" in request.prompt
+        # Default subagent_type from the template reached the backend.
+        assert request.agent_type == "code-reviewer"
+
+        cfg = await teams.read_config("tpl-role")
+        teammate = next(
+            m
+            for m in cfg.members
+            if isinstance(m, TeammateMember) and m.name == "reviewer"
+        )
+        assert teammate.agent_type == "code-reviewer"
+
+    async def test_explicit_option_overrides_template_default(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tpl-override"})
+
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-override",
+                "name": "reviewer",
+                "prompt": "review",
+                "options": {
+                    "template": "code-reviewer",
+                    "subagent_type": "executor",
+                },
+            },
+        )
+
+        request = mock_backend.spawn.call_args.args[0]
+        # Explicit subagent_type wins over the template's default.
+        assert request.agent_type == "executor"
+        # But the role_prompt still composes — it has no "explicit" equivalent.
+        assert request.prompt.startswith("You are acting as a code reviewer.")
+
+    async def test_empty_role_prompt_does_not_compose(self, client: Client):
+        templates.register_template(
+            AgentTemplate(
+                name="no-prefix",
+                description="Defaults only, no role header.",
+                default_subagent_type="executor",
+            )
+        )
+        await client.call_tool("team_create", {"team_name": "tpl-bare"})
+
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-bare",
+                "name": "worker",
+                "prompt": "do the task",
+                "options": {"template": "no-prefix"},
+            },
+        )
+
+        request = mock_backend.spawn.call_args.args[0]
+        # No leading blank line when role_prompt is empty.
+        assert request.prompt == "do the task"
+        assert request.agent_type == "executor"
+
+    async def test_unknown_template_raises_structured_error(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tpl-missing"})
+
+        result = await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-missing",
+                "name": "ghost",
+                "prompt": "task",
+                "options": {"template": "does-not-exist"},
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        text = _text(result)
+        assert "does-not-exist" in text
+        # Error surface should enumerate available templates so the caller
+        # can correct the typo without guessing.
+        assert "code-reviewer" in text
+
+    @staticmethod
+    def _configure_full_mock_backend() -> MagicMock:
+        """Mount effort/profile specs on the mock so template defaults pass validation.
+
+        ``apply_template`` defers validation of ``reasoning_effort`` and
+        ``agent_profile`` to ``_validate_reasoning_effort`` /
+        ``_validate_agent_profile``, which call the backend's spec methods.
+        ``_make_mock_backend`` leaves those returning ``None`` (matching the
+        no-op default most backends ship), so tests that exercise those two
+        defaults must opt in to real specs here.
+        """
+        mock = cast(MagicMock, registry._backends["claude-code"])
+        mock.reasoning_effort_spec.return_value = ReasoningEffortSpec(
+            flag="--effort",
+            value_template="{value}",
+            options=frozenset({"low", "medium", "high"}),
+        )
+        mock.agent_select_spec.return_value = AgentSelectSpec(
+            flag="--agent", value_template="{name}"
+        )
+        mock.discover_agents.return_value = [
+            AgentProfile(name="senior", path="/abs/senior.md"),
+            AgentProfile(name="junior", path="/abs/junior.md"),
+        ]
+        return mock
+
+    @staticmethod
+    def _register_full_defaults_template() -> None:
+        """Register a template setting all 7 ``apply_template`` precedence fields."""
+        templates.register_template(
+            AgentTemplate(
+                name="full-defaults",
+                description="All 7 defaults set for precedence tests.",
+                # Empty role_prompt isolates precedence assertions from
+                # prompt-composition behaviour already covered above.
+                role_prompt="",
+                default_backend="claude-code",
+                default_model="sonnet",
+                default_subagent_type="tpl-sub",
+                default_reasoning_effort="medium",
+                default_agent_profile="senior",
+                default_permission_mode="require_approval",
+                default_plan_mode_required=True,
+            )
+        )
+
+    async def test_template_defaults_fill_every_unset_field(self, client: Client):
+        """All 7 template defaults reach the SpawnRequest when caller sets none.
+
+        Covers the "template fills every gap" half of the precedence contract:
+        ``backend``, ``model``, ``subagent_type``, ``reasoning_effort``,
+        ``agent_profile``, ``permission_mode``, ``plan_mode_required``. The
+        companion parametrized test locks the "explicit wins" half.
+        """
+        mock = self._configure_full_mock_backend()
+        self._register_full_defaults_template()
+
+        await client.call_tool("team_create", {"team_name": "tpl-fill-all"})
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-fill-all",
+                "name": "target",
+                "prompt": "do work",
+                "options": {"template": "full-defaults"},
+            },
+        )
+
+        request = mock.spawn.call_args.args[0]
+        assert request.model == "sonnet"
+        assert request.agent_type == "tpl-sub"
+        assert request.reasoning_effort == "medium"
+        assert request.agent_profile == "senior"
+        assert request.permission_mode == "require_approval"
+        assert request.plan_mode_required is True
+        # ``default_backend="claude-code"`` routed the spawn to this mock.
+        # Only the claude-code mock is registered, so a single spawn call
+        # proves the default reached ``_resolve_backend``.
+        assert mock.spawn.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("field", "override_value", "request_attr", "expected"),
+        [
+            pytest.param("model", "haiku", "model", "haiku", id="model"),
+            pytest.param(
+                "subagent_type",
+                "override-sub",
+                "agent_type",
+                "override-sub",
+                id="subagent_type",
+            ),
+            pytest.param(
+                "reasoning_effort",
+                "high",
+                "reasoning_effort",
+                "high",
+                id="reasoning_effort",
+            ),
+            pytest.param(
+                "agent_profile",
+                "junior",
+                "agent_profile",
+                "junior",
+                id="agent_profile",
+            ),
+            pytest.param(
+                "permission_mode",
+                "bypass",
+                "permission_mode",
+                "bypass",
+                id="permission_mode",
+            ),
+            pytest.param(
+                "plan_mode_required",
+                False,
+                "plan_mode_required",
+                False,
+                id="plan_mode_required",
+            ),
+        ],
+    )
+    async def test_explicit_option_beats_template_default_per_field(
+        self,
+        client: Client,
+        field: str,
+        override_value: object,
+        request_attr: str,
+        expected: object,
+    ):
+        """Explicit option wins over the template default for each field.
+
+        Backend precedence is exercised in its own test because it needs a
+        second registered backend — the other 6 fields are deliberately kept
+        in one parametrize block so the shared template + mock setup does not
+        drift between near-identical assertions.
+        """
+        mock = self._configure_full_mock_backend()
+        self._register_full_defaults_template()
+
+        team_name = f"tpl-ov-{field.replace('_', '-')}"
+        await client.call_tool("team_create", {"team_name": team_name})
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": team_name,
+                "name": "target",
+                "prompt": "do work",
+                "options": {"template": "full-defaults", field: override_value},
+            },
+        )
+
+        request = mock.spawn.call_args.args[0]
+        assert getattr(request, request_attr) == expected
+
+    async def test_explicit_backend_beats_template_default(self, client: Client):
+        """Explicit ``options.backend`` wins over the template's ``default_backend``.
+
+        A second mock backend is registered so the template has somewhere
+        other than ``claude-code`` to point at; the explicit override then
+        must force selection back, proving the precedence without coupling
+        to a specific non-default backend identifier.
+        """
+        alt_mock = _make_mock_backend("aider")
+        # Default is_interactive=False for non-claude-code names, which would
+        # schedule a one-shot relay task we do not need here.
+        alt_mock.is_interactive = True
+        registry._backends["aider"] = alt_mock
+
+        templates.register_template(
+            AgentTemplate(
+                name="aider-default",
+                description="Template routes to aider; override must win.",
+                default_backend="aider",
+                default_subagent_type="tpl-sub",
+            )
+        )
+
+        await client.call_tool("team_create", {"team_name": "tpl-backend-override"})
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "tpl-backend-override",
+                "name": "target",
+                "prompt": "do work",
+                "options": {"template": "aider-default", "backend": "claude-code"},
+            },
+        )
+
+        claude_mock = cast(MagicMock, registry._backends["claude-code"])
+        assert claude_mock.spawn.call_count == 1
+        assert alt_mock.spawn.call_count == 0

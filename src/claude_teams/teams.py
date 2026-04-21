@@ -14,6 +14,7 @@ from claude_teams.errors import (
     InvalidNameError,
     MemberAlreadyExistsError,
     NameTooLongError,
+    TeamAlreadyExistsError,
     TeamHasMembersError,
 )
 from claude_teams.models import (
@@ -112,6 +113,10 @@ def _create_team(
 
     Raises:
         ValueError: If team name is invalid or exceeds 64 characters.
+        TeamAlreadyExistsError: If a team config already exists at the
+            target name. Caught and converted to
+            ``TeamAlreadyExistsToolError`` at the MCP boundary;
+            propagated as ValueError to CLI callers.
 
     """
     validate_safe_name(name, "team name")
@@ -120,6 +125,7 @@ def _create_team(
     tasks_dir = _tasks_dir(base_dir)
 
     team_dir = teams_dir / name
+    config_path = team_dir / "config.json"
     team_dir.mkdir(parents=True, exist_ok=True)
 
     task_dir = tasks_dir / name
@@ -147,8 +153,14 @@ def _create_team(
         members=[lead],
     )
 
-    config_path = team_dir / "config.json"
-    config_path.write_text(json.dumps(config.model_dump(by_alias=True), indent=2))
+    # config.json exclusive-create is the commit point; task_dir setup above
+    # is idempotent so a pre-commit failure leaves no "team exists" state.
+    payload = json.dumps(config.model_dump(by_alias=True), indent=2)
+    try:
+        with config_path.open("x") as f:
+            f.write(payload)
+    except FileExistsError:
+        raise TeamAlreadyExistsError(name) from None
 
     return TeamCreateResult(
         team_name=name,

@@ -3,20 +3,28 @@
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
-from claude_teams import capabilities, teams
+from claude_teams import capabilities, presets, teams, templates
 from claude_teams.errors import (
     BackendNotRegisteredError,
     InvalidCapabilityError,
     SessionActiveTeamError,
+    TeamAlreadyExistsError,
+    TeamAlreadyExistsToolError,
     TeamNotFoundToolError,
+    UnknownPresetToolError,
 )
 from claude_teams.models import (
     AgentListResult,
     AgentProfileInfo,
     BackendInfo,
+    PresetInfo,
+    PresetMemberInfo,
+    PresetSpawnResult,
     TeamAttachResult,
     TeamCreateResult,
+    TemplateInfo,
 )
+from claude_teams.orchestration import expand_preset_core
 from claude_teams.server_runtime import (
     _ANN_ATTACH,
     _ANN_CREATE,
@@ -36,8 +44,10 @@ from claude_teams.server_schema import (
     Capability,
     Cwd,
     Description,
+    PresetName,
     TeamName,
 )
+from claude_teams.server_team_spawn import _build_spawn_dependencies
 
 
 async def team_create(
@@ -49,9 +59,12 @@ async def team_create(
     active_team = await ctx.get_state("active_team")
     if active_team:
         raise SessionActiveTeamError(active_team)
-    result = await teams.create_team(
-        name=team_name, session_id=ctx.session_id, description=description
-    )
+    try:
+        result = await teams.create_team(
+            name=team_name, session_id=ctx.session_id, description=description
+        )
+    except TeamAlreadyExistsError as exc:
+        raise TeamAlreadyExistsToolError(team_name) from exc
     lead_capability = await capabilities.initialize_team_capabilities(team_name)
     await _set_session_principal(
         ctx,
@@ -184,6 +197,156 @@ def list_agents(
     ).model_dump(by_alias=True)
 
 
+async def create_team_from_preset(
+    preset_name: PresetName,
+    ctx: Context,
+    team_name: TeamName,
+    description: Description = "",
+) -> dict[str, object]:
+    """Expand a registered preset into a team + teammates.
+
+    Thin MCP wrapper over
+    :func:`claude_teams.orchestration.expand_preset_core`. The wrapper
+    owns session-state bookkeeping (``active_team``,
+    ``has_teammates``), tier-unlock of the team / teammate tool
+    components, and attaching the minted lead capability to the
+    FastMCP session — the core owns preset expansion itself.
+
+    The preset's ``description`` is a summary of the preset itself;
+    ``team_description`` (or an explicit ``description`` argument) is
+    what gets persisted on the created team. Explicit ``description``
+    argument overrides the preset's ``team_description``.
+
+    Expansion is not transactional. If a teammate spawn fails mid-fan-out
+    the team and any already-spawned teammates persist; the caller sees
+    a ``PresetMemberSpawnFailedError`` naming the failed member and can
+    either retry the remaining members via ``spawn_teammate`` or tear
+    the team down via ``team_delete``. A transactional rollback would
+    itself have to handle ``team_delete`` failures, so the shipped
+    contract keeps the failure surface simple and observable.
+    """
+    active_team = await ctx.get_state("active_team")
+    if active_team:
+        raise SessionActiveTeamError(active_team)
+
+    try:
+        preset = presets.get_preset(preset_name)
+    except KeyError as exc:
+        raise UnknownPresetToolError(preset_name, presets.list_names()) from exc
+
+    effective_description = description or preset.team_description
+
+    ls = _get_lifespan(ctx)
+    reg = ls["registry"]
+
+    async def _progress(elapsed: int, message: str) -> None:
+        await ctx.report_progress(progress=elapsed, total=None, message=message)
+
+    async def _attach_session(lead_capability: str) -> None:
+        # Attach before member fan-out so a mid-expansion failure still
+        # leaves ``team_delete`` and ``spawn_teammate`` reachable — the
+        # non-transactional contract's retry/teardown promises assume
+        # the session already holds the lead capability.
+        await _set_session_principal(
+            ctx, team_name, "team-lead", "lead", lead_capability=lead_capability
+        )
+        await ctx.enable_components(tags={_TAG_TEAM}, components={"tool", "prompt"})
+        await ctx.set_state("has_teammates", True)
+        await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
+
+    try:
+        expansion = await expand_preset_core(
+            registry=reg,
+            preset=preset,
+            team_name=team_name,
+            session_id=ctx.session_id,
+            description=effective_description,
+            deps=_build_spawn_dependencies(),
+            progress=_progress,
+            on_capability_minted=_attach_session,
+        )
+    except TeamAlreadyExistsError as exc:
+        raise TeamAlreadyExistsToolError(team_name) from exc
+
+    return PresetSpawnResult(
+        team=expansion.team,
+        members=list(expansion.members),
+        preset=preset_name,
+    ).model_dump(by_alias=True)
+
+
+def _preset_to_info(preset: presets.TeamPreset) -> PresetInfo:
+    """Project a ``TeamPreset`` into its MCP-visible ``PresetInfo``.
+
+    Omits forward-compat metadata (``skill_roots``, ``mcp_servers``)
+    until Feature G consumes it — adding fields later is additive and
+    therefore safe for clients that pinned the current shape.
+    """
+    members = [
+        PresetMemberInfo(
+            name=m.name,
+            prompt=m.prompt,
+            template=m.template,
+            backend=m.backend,
+            model=m.model,
+            subagent_type=m.subagent_type,
+            reasoning_effort=m.reasoning_effort,
+            agent_profile=m.agent_profile,
+            cwd=m.cwd,
+            plan_mode_required=m.plan_mode_required,
+            permission_mode=m.permission_mode,
+        )
+        for m in preset.members
+    ]
+    return PresetInfo(
+        name=preset.name,
+        description=preset.description,
+        team_description=preset.team_description,
+        members=members,
+    )
+
+
+def list_presets(ctx: Context) -> list[dict[str, object]]:
+    """List registered team presets.
+
+    Presets are declarative team compositions: each expands, through
+    ``create_team_from_preset``, into a ``team_create`` call followed by
+    one ``spawn_teammate`` per listed member. Call this tool to discover
+    available preset names before expanding one.
+    """
+    _ = ctx  # Context is required by FastMCP signature but unused here.
+    return [
+        _preset_to_info(p).model_dump(by_alias=True) for p in presets.list_presets()
+    ]
+
+
+def list_templates(ctx: Context) -> list[dict[str, object]]:
+    """List registered agent templates.
+
+    Templates are reusable role-context layers applied at
+    ``spawn_teammate`` time: they prepend a role-prompt header and fill
+    in default spawn options for fields the caller did not explicitly
+    set. Call this tool first to discover which templates are available,
+    then pass a name via ``options.template`` when spawning.
+    """
+    _ = ctx  # Context is required by FastMCP signature but unused here.
+    return [
+        TemplateInfo(
+            name=t.name,
+            description=t.description,
+            role_prompt=t.role_prompt,
+            default_backend=t.default_backend,
+            default_model=t.default_model,
+            default_subagent_type=t.default_subagent_type,
+            default_reasoning_effort=t.default_reasoning_effort,
+            default_agent_profile=t.default_agent_profile,
+            default_permission_mode=t.default_permission_mode,
+            default_plan_mode_required=t.default_plan_mode_required,
+        ).model_dump(by_alias=True)
+        for t in templates.list_templates()
+    ]
+
+
 def register_bootstrap_tools(mcp: FastMCP) -> None:
     """Register bootstrap-tier tools on the FastMCP app."""
     mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_CREATE)(team_create)
@@ -192,3 +355,10 @@ def register_bootstrap_tools(mcp: FastMCP) -> None:
     mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_READ)(read_config)
     mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_READ)(list_backends)
     mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_READ)(list_agents)
+    mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_READ)(list_templates)
+    mcp.tool(tags={_TAG_BOOTSTRAP}, annotations=_ANN_READ)(list_presets)
+    mcp.tool(
+        tags={_TAG_BOOTSTRAP},
+        annotations=_ANN_CREATE,
+        timeout=900.0,
+    )(create_team_from_preset)

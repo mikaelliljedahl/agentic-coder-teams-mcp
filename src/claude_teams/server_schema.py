@@ -297,3 +297,33 @@ SenderName = Annotated[
     ),
 ]
 """Sender identity for send_message."""
+
+TemplateName = Annotated[
+    str,
+    Field(
+        description=(
+            "Name of a registered agent template. Applies role-prompt text "
+            "and default spawn options where the caller left them unset. "
+            "Call ``list_templates`` to enumerate available templates."
+        ),
+        min_length=1,
+        max_length=_SAFE_NAME_MAX,
+        pattern=_SAFE_NAME_PATTERN,
+    ),
+]
+"""Template selector for ``spawn_teammate`` and preset member specs."""
+
+PresetName = Annotated[
+    str,
+    Field(
+        description=(
+            "Name of a registered team preset. Expands into a validated "
+            "team_create + spawn_teammate sequence. Call ``list_presets`` "
+            "to enumerate available presets."
+        ),
+        min_length=1,
+        max_length=_SAFE_NAME_MAX,
+        pattern=_SAFE_NAME_PATTERN,
+    ),
+]
+"""Preset selector for ``create_team_from_preset``."""

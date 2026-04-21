@@ -34,6 +34,23 @@ def log_relay_task_exception(task: asyncio.Task) -> None:
         logger.error("One-shot relay task failed: %s", exc, exc_info=exc)
 
 
+def log_retain_pane_failure(exc: BaseException) -> None:
+    """Log non-fatal failures from ``Backend.retain_pane_after_exit``.
+
+    ``retain_pane_after_exit`` runs after a one-shot backend spawn
+    returns; when it fails the spawn itself has already succeeded, so
+    the pane-retention error is recorded at ``warning`` level (not
+    ``error``) — it is operational breadcrumb, not a reason to fail
+    the user-facing call. Injected via ``SpawnDependencies`` so the
+    orchestration core never imports this logger directly.
+
+    Args:
+        exc: The caught exception raised by ``retain_pane_after_exit``.
+
+    """
+    logger.warning("retain_pane_after_exit failed: %s", exc, exc_info=exc)
+
+
 def build_agent_auth_notice(team_name: str, capability: str) -> str:
     """Build agent attach instructions for the bootstrap inbox message.
 
