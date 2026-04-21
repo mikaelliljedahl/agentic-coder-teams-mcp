@@ -21,9 +21,9 @@ can layer on without schema churn.
 """
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import TypedDict
 
-PermissionModeOpt = Literal["default", "require_approval", "bypass"]
+from claude_teams.server_schema import PermissionModeOpt
 
 
 class McpServerConfig(TypedDict, total=False):

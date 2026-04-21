@@ -25,12 +25,10 @@ fields override template defaults.
 """
 
 from dataclasses import dataclass
-from typing import Literal
 
 from claude_teams.errors import PresetEmptyMembersError
+from claude_teams.server_schema import PermissionModeOpt
 from claude_teams.templates import McpServerConfig
-
-PermissionModeOpt = Literal["default", "require_approval", "bypass"]
 
 
 @dataclass(frozen=True)

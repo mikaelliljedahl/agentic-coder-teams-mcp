@@ -435,7 +435,7 @@ class TestForceKillWithBackend:
 class TestSpawnTemplate:
     """Template application through the spawn pipeline.
 
-    Covers the three observable guarantees of ``_apply_template``:
+    Covers the three observable guarantees of ``apply_template``:
     role-prompt composition, default-field merging, and error taxonomy.
     Reaches into the mock backend's captured ``SpawnRequest`` to confirm
     values traverse the full tool → backend path, not just the top of

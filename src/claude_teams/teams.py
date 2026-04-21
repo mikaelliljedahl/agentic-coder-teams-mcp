@@ -126,13 +126,7 @@ def _create_team(
 
     team_dir = teams_dir / name
     config_path = team_dir / "config.json"
-    if config_path.exists():
-        raise TeamAlreadyExistsError(name)
     team_dir.mkdir(parents=True, exist_ok=True)
-
-    task_dir = tasks_dir / name
-    task_dir.mkdir(parents=True, exist_ok=True)
-    (task_dir / ".lock").touch()
 
     now_ms = int(time.time() * 1000)
 
@@ -155,7 +149,16 @@ def _create_team(
         members=[lead],
     )
 
-    config_path.write_text(json.dumps(config.model_dump(by_alias=True), indent=2))
+    payload = json.dumps(config.model_dump(by_alias=True), indent=2)
+    try:
+        with config_path.open("x") as f:
+            f.write(payload)
+    except FileExistsError:
+        raise TeamAlreadyExistsError(name) from None
+
+    task_dir = tasks_dir / name
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / ".lock").touch()
 
     return TeamCreateResult(
         team_name=name,
