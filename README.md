@@ -1,3 +1,7 @@
+<!-- prettier-ignore -->
+> [!IMPORTANT]
+> **Repository relocation pending:** This project will soon move to [`beardedeagle/agentic-coder-teams-mcp`](https://github.com/beardedeagle/agentic-coder-teams-mcp). Update your remotes, `uvx --from git+...` install commands, and any CI references when the move is announced.
+
 <div align="center">
 
 # agentic-coder-teams-mcp
