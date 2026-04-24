@@ -10,6 +10,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.lifespan import lifespan
 from mcp.types import ToolAnnotations
+from pydantic import TypeAdapter, ValidationError
 
 from claude_teams import capabilities, teams
 from claude_teams.backends import BackendRegistry, registry
@@ -30,6 +31,7 @@ from claude_teams.errors import (
     TeamNotFoundToolError,
 )
 from claude_teams.models import SpawnOptions, TeammateMember
+from claude_teams.server_schema import BackendName, Capability, Cwd, Description
 
 _TAG_BOOTSTRAP = "bootstrap"
 _TAG_TEAM = "team"
@@ -67,6 +69,31 @@ _ENV_DEFAULT_DESCRIPTION = "CLAUDE_TEAMS_DEFAULT_DESCRIPTION"
 
 _TRUTHY_BOOL_ENV = frozenset({"true", "1", "yes", "on"})
 _FALSY_BOOL_ENV = frozenset({"false", "0", "no", "off"})
+
+# Per-field TypeAdapters for scalar env-resolvers. Each adapter enforces the
+# same pydantic constraints (``min_length`` / ``max_length`` / ``pattern``)
+# that the direct-arg path carries via ``server_schema`` annotations — so an
+# env-sourced value cannot smuggle past schema limits the MCP tool rejects.
+_DESCRIPTION_ADAPTER: TypeAdapter[str] = TypeAdapter(Description)
+_CAPABILITY_ADAPTER: TypeAdapter[str] = TypeAdapter(Capability)
+_BACKEND_NAME_ADAPTER: TypeAdapter[str] = TypeAdapter(BackendName)
+_CWD_ADAPTER: TypeAdapter[str] = TypeAdapter(Cwd)
+
+# Reverse map from ``SpawnOptions`` field names to their env-var names.
+# Used by :func:`apply_spawn_env_defaults` to name the offending env var
+# when ``SpawnOptions.model_validate`` rejects a merged payload.
+_SPAWN_FIELD_TO_ENV: dict[str, str] = {
+    "cwd": _ENV_DEFAULT_CWD,
+    "model": _ENV_DEFAULT_MODEL,
+    "backend": _ENV_DEFAULT_BACKEND,
+    "subagent_type": _ENV_DEFAULT_SUBAGENT_TYPE,
+    "capability": _ENV_CAPABILITY,
+    "reasoning_effort": _ENV_DEFAULT_REASONING_EFFORT,
+    "agent_profile": _ENV_DEFAULT_AGENT_PROFILE,
+    "template": _ENV_DEFAULT_TEMPLATE,
+    "permission_mode": _ENV_PERMISSION_MODE,
+    "plan_mode_required": _ENV_DEFAULT_PLAN_MODE_REQUIRED,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -112,15 +139,42 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
+def _validate_env_value(env_var: str, value: str, adapter: TypeAdapter[str]) -> None:
+    """Validate an env-var-sourced string against its schema TypeAdapter.
+
+    Used by the scalar resolvers so env values carry the same pydantic
+    constraints (``min_length`` / ``max_length`` / ``pattern``) that the
+    direct-arg path enforces at the MCP tool boundary. A schema failure
+    surfaces as :class:`claude_teams.errors.InvalidEnvVarValueError` with
+    the env-var name and pydantic's first-error message so operators can
+    pinpoint the offending export.
+    """
+    try:
+        adapter.validate_python(value)
+    except ValidationError as exc:
+        errors = exc.errors()
+        reason = errors[0]["msg"] if errors else str(exc)
+        raise InvalidEnvVarValueError(env_var, value, reason) from exc
+
+
 def _resolve_spawn_cwd(cwd: str) -> str:
     """Return a validated working directory for a new teammate.
 
     Precedence chain: ``direct → CLAUDE_TEAMS_DEFAULT_CWD → Path.cwd()``.
     The env fallback lets operators pin a project root without threading
     ``cwd`` through every MCP call; callers that pass a non-empty value
-    always win over the env.
+    always win over the env. Env-sourced values are validated against the
+    ``Cwd`` schema before the filesystem checks run, so an oversize or
+    malformed env export fails with a typed error at env-read time rather
+    than smuggling past the direct-arg constraints.
     """
-    raw = cwd or os.environ.get(_ENV_DEFAULT_CWD, "")
+    if cwd:
+        raw = cwd
+    else:
+        env_value = os.environ.get(_ENV_DEFAULT_CWD, "")
+        if env_value:
+            _validate_env_value(_ENV_DEFAULT_CWD, env_value, _CWD_ADAPTER)
+        raw = env_value
     if not raw:
         return str(Path.cwd())
 
@@ -147,30 +201,53 @@ def _resolve_capability(capability: str) -> str:
     """Return a capability token, falling back to ``CLAUDE_TEAMS_CAPABILITY``.
 
     Shared by MCP tool handlers and the Typer CLI so both surfaces agree on
-    the precedence chain. An empty string after resolution means "no
-    capability was supplied" — downstream helpers already treat that as
-    absence and attempt session-state auth instead.
+    the precedence chain. Env-sourced tokens are validated against the
+    ``Capability`` schema (max 512 chars) so an oversize export fails with
+    a typed error rather than reaching ``resolve_principal``. An empty
+    string after resolution means "no capability was supplied" — downstream
+    helpers treat that as absence and attempt session-state auth instead.
     """
-    return capability or os.environ.get(_ENV_CAPABILITY, "")
+    if capability:
+        return capability
+    env_value = os.environ.get(_ENV_CAPABILITY, "")
+    if env_value:
+        _validate_env_value(_ENV_CAPABILITY, env_value, _CAPABILITY_ADAPTER)
+    return env_value
 
 
 def _resolve_description(description: str) -> str:
     """Return a team description, falling back to ``CLAUDE_TEAMS_DEFAULT_DESCRIPTION``.
 
-    Descriptions are advisory free-form text, so the resolver never raises —
-    an absent direct arg and absent env both yield the empty string.
+    Env-sourced descriptions are validated against the ``Description``
+    schema (max 4096 chars) so the env fallback cannot bypass the bound
+    enforced on the direct-arg path. Raises
+    :class:`claude_teams.errors.InvalidEnvVarValueError` when the env
+    value exceeds the schema limit; absent direct arg and absent env both
+    yield the empty string without raising.
     """
-    return description or os.environ.get(_ENV_DEFAULT_DESCRIPTION, "")
+    if description:
+        return description
+    env_value = os.environ.get(_ENV_DEFAULT_DESCRIPTION, "")
+    if env_value:
+        _validate_env_value(_ENV_DEFAULT_DESCRIPTION, env_value, _DESCRIPTION_ADAPTER)
+    return env_value
 
 
 def _resolve_backend_name(backend_name: str) -> str:
     """Return a backend name, falling back to ``CLAUDE_TEAMS_DEFAULT_BACKEND``.
 
-    Used by ``list_agents`` where ``backend_name`` is positional but schema-
-    wise accepts empty strings. The SpawnOptions ``backend`` field has a
-    parallel fallback via :func:`apply_spawn_env_defaults`.
+    Used by ``list_agents`` where ``backend_name`` is positional but
+    schema-wise accepts empty strings. Env-sourced names are validated
+    against the ``BackendName`` schema (max 64 chars) so an operator
+    cannot pin an oversize value via env. The ``SpawnOptions.backend``
+    field has a parallel fallback via :func:`apply_spawn_env_defaults`.
     """
-    return backend_name or os.environ.get(_ENV_DEFAULT_BACKEND, "")
+    if backend_name:
+        return backend_name
+    env_value = os.environ.get(_ENV_DEFAULT_BACKEND, "")
+    if env_value:
+        _validate_env_value(_ENV_DEFAULT_BACKEND, env_value, _BACKEND_NAME_ADAPTER)
+    return env_value
 
 
 def _parse_bool_env(env_var: str, raw: str) -> bool:
@@ -208,7 +285,13 @@ def apply_spawn_env_defaults(opts: SpawnOptions) -> SpawnOptions:
     The literal field ``permission_mode`` is validated against the known
     mode set; an unknown value raises
     :class:`claude_teams.errors.InvalidPermissionModeError` (same surface
-    as a bad direct arg).
+    as a bad direct arg). All other env-sourced values flow through
+    :meth:`SpawnOptions.model_validate` on a merged dict so the schema
+    constraints (``min_length`` / ``max_length`` / ``pattern``) that
+    guard the direct-arg path apply identically to the env-arg path.
+    A constraint violation on an env-sourced field becomes
+    :class:`claude_teams.errors.InvalidEnvVarValueError` naming the
+    offending variable.
 
     Args:
         opts: Spawn options payload received from a caller.
@@ -216,13 +299,14 @@ def apply_spawn_env_defaults(opts: SpawnOptions) -> SpawnOptions:
     Returns:
         A new ``SpawnOptions`` with env-driven defaults applied where the
         caller did not explicitly set a field, or the original object when
-        no env overrides were active (avoids a needless ``model_copy``).
+        no env overrides were active (avoids a needless re-validation).
 
     Raises:
         InvalidPermissionModeError: ``CLAUDE_TEAMS_PERMISSION_MODE`` is
             set to a value outside the known permission-mode set.
-        InvalidEnvVarValueError: ``CLAUDE_TEAMS_DEFAULT_PLAN_MODE_REQUIRED``
-            is set to a value the bool parser does not recognize.
+        InvalidEnvVarValueError: An env-sourced value failed type
+            coercion (bool parser) or schema validation
+            (``min_length`` / ``max_length`` / ``pattern``).
 
     """
     explicit = opts.model_fields_set
@@ -246,8 +330,10 @@ def apply_spawn_env_defaults(opts: SpawnOptions) -> SpawnOptions:
         if value:
             updates[field] = value
 
-    # Permission mode — validate against the known literal set before stuffing
-    # because ``model_copy(update=...)`` bypasses pydantic re-validation.
+    # Permission mode — validate against the known literal set up-front so
+    # the operator sees the dedicated ``InvalidPermissionModeError`` surface
+    # (same as a bad direct arg), not the generic ``InvalidEnvVarValueError``
+    # we would wrap pydantic's error into.
     if "permission_mode" not in explicit:
         raw_mode = os.environ.get(_ENV_PERMISSION_MODE, "")
         if raw_mode:
@@ -264,7 +350,34 @@ def apply_spawn_env_defaults(opts: SpawnOptions) -> SpawnOptions:
                 _ENV_DEFAULT_PLAN_MODE_REQUIRED, raw_bool
             )
 
-    return opts.model_copy(update=updates) if updates else opts
+    if not updates:
+        return opts
+
+    # Merge caller-explicit and env-sourced values, then validate the whole
+    # payload as a fresh ``SpawnOptions``. ``model_dump(exclude_unset=True)``
+    # preserves ``model_fields_set`` semantics downstream — the returned
+    # model treats both caller and env fields as explicitly set, so
+    # ``apply_template`` (which checks ``model_fields_set``) will not
+    # override them. Running through pydantic validation closes the
+    # ``model_copy`` bypass that earlier revisions carried.
+    merged_dict = {**opts.model_dump(exclude_unset=True), **updates}
+    try:
+        return SpawnOptions.model_validate(merged_dict)
+    except ValidationError as exc:
+        for err in exc.errors():
+            if not err["loc"]:
+                continue
+            field = err["loc"][0]
+            if field in updates:
+                env_var = _SPAWN_FIELD_TO_ENV.get(str(field))
+                if env_var is not None:
+                    raise InvalidEnvVarValueError(
+                        env_var, str(updates[field]), err["msg"]
+                    ) from exc
+        # Any failure outside the env-sourced subset means a caller-explicit
+        # value somehow passed initial validation but fails on re-validation;
+        # surface pydantic's original error rather than silently masking it.
+        raise
 
 
 def _normalize_pagination(limit: int, offset: int) -> tuple[int, int]:

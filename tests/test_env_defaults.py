@@ -8,7 +8,13 @@ so failures point directly at the layer that regressed:
   / ``TestResolveBackendName`` cover the scalar resolvers.
 - ``TestParseBoolEnv`` covers the shared bool-env parser.
 - ``TestApplySpawnEnvDefaults`` covers the unified ``SpawnOptions`` resolver,
-  including the "direct wins over env" and "env wins over template" ordering.
+  including the "direct wins over env" ordering.
+- ``TestEnvBeatsTemplate`` pins the "env wins over template" composition
+  that emerges from ``model_fields_set`` bookkeeping — explicit proof the
+  two layers stack correctly rather than relying on it transitively.
+- ``TestEnvValidationBypassClosed`` proves env-sourced values hit the same
+  pydantic schema constraints as direct args (max_length / pattern /
+  min_length). Locks the contract: env is not a validation bypass route.
 - ``TestMcpIntegration`` exercises the env layer through the MCP tool surface
   so a missed wire-up in a tool body fails here (not just in a unit test).
 """
@@ -20,7 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastmcp import Client
 
-from claude_teams import teams
+from claude_teams import teams, templates
 from claude_teams.backends import registry
 from claude_teams.errors import (
     CwdNotAbsoluteError,
@@ -28,6 +34,7 @@ from claude_teams.errors import (
     InvalidPermissionModeError,
 )
 from claude_teams.models import SpawnOptions
+from claude_teams.orchestration import apply_template
 from claude_teams.server_runtime import (
     _parse_bool_env,
     _resolve_backend_name,
@@ -36,6 +43,7 @@ from claude_teams.server_runtime import (
     _resolve_spawn_cwd,
     apply_spawn_env_defaults,
 )
+from claude_teams.templates import AgentTemplate
 from tests._server_support import _data
 
 # ---------------------------------------------------------------------------
@@ -276,6 +284,176 @@ class TestApplySpawnEnvDefaults:
         assert resolved.model == "powerful"
         assert resolved.backend == "codex"
         assert resolved.plan_mode_required is True
+
+
+# ---------------------------------------------------------------------------
+# Env beats template composition
+# ---------------------------------------------------------------------------
+
+
+class TestEnvBeatsTemplate:
+    """``apply_spawn_env_defaults`` + ``apply_template`` — env wins over template.
+
+    The env layer fills unset fields and the resulting ``SpawnOptions``
+    marks them as set in ``model_fields_set``. ``apply_template`` then
+    inspects that set and skips any field it would otherwise fill from
+    the template's ``default_*``. Without this composition, an operator
+    pinning a default via env could still see a template's default win
+    silently — the precedence chain the feature advertises would be a
+    lie for template-selected spawns.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_registry(self):
+        yield
+        templates._seed_builtin_templates()
+
+    def test_env_filled_model_blocks_template_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        templates.register_template(
+            AgentTemplate(
+                name="env-vs-template-model",
+                description="Fixture template for env-beats-template test.",
+                default_model="template-model-default",
+            )
+        )
+        monkeypatch.setenv("CLAUDE_TEAMS_DEFAULT_MODEL", "env-model")
+
+        env_applied = apply_spawn_env_defaults(
+            SpawnOptions(template="env-vs-template-model")
+        )
+        final_opts, _ = apply_template(env_applied, "do work")
+
+        # Env value survives; template default does not override it.
+        assert final_opts.model == "env-model"
+
+    def test_env_filled_backend_blocks_template_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Separate test so a future regression in any one field shows
+        # up independently — both assertions share the same failure mode
+        # but different env vars and different template fields.
+        templates.register_template(
+            AgentTemplate(
+                name="env-vs-template-backend",
+                description="Fixture template for env-beats-template test.",
+                default_backend="template-backend-default",
+            )
+        )
+        monkeypatch.setenv("CLAUDE_TEAMS_DEFAULT_BACKEND", "env-backend")
+
+        env_applied = apply_spawn_env_defaults(
+            SpawnOptions(template="env-vs-template-backend")
+        )
+        final_opts, _ = apply_template(env_applied, "do work")
+
+        assert final_opts.backend == "env-backend"
+
+    def test_template_still_fills_fields_env_did_not_touch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Negative control: env setting ``model`` must NOT block the
+        # template from filling a different field (``subagent_type``).
+        # Otherwise "env beats template" would collapse into "any env var
+        # disables the entire template", which is not the contract.
+        templates.register_template(
+            AgentTemplate(
+                name="env-partial-template",
+                description="Fixture template for env-partial test.",
+                default_model="template-model-default",
+                default_subagent_type="template-subagent",
+            )
+        )
+        monkeypatch.setenv("CLAUDE_TEAMS_DEFAULT_MODEL", "env-model")
+
+        env_applied = apply_spawn_env_defaults(
+            SpawnOptions(template="env-partial-template")
+        )
+        final_opts, _ = apply_template(env_applied, "do work")
+
+        assert final_opts.model == "env-model"  # env won
+        assert final_opts.subagent_type == "template-subagent"  # template won
+
+
+# ---------------------------------------------------------------------------
+# Schema validation on env-sourced values
+# ---------------------------------------------------------------------------
+
+
+class TestEnvValidationBypassClosed:
+    """Env-sourced values flow through the same pydantic constraints as direct.
+
+    Copilot review on PR #7 flagged that ``model_copy(update=...)`` inside
+    ``apply_spawn_env_defaults`` and the scalar resolvers bypassed schema
+    validation — so an oversize env value could land in a ``SpawnOptions``
+    or a ``TeamConfig`` without tripping the ``min_length`` / ``max_length``
+    / ``pattern`` gates the direct-arg path enforces. These tests lock the
+    fix: env bypass is closed at each resolver's boundary.
+    """
+
+    def test_oversize_description_env_raises(self, monkeypatch: pytest.MonkeyPatch):
+        # ``Description`` schema: max_length=4096.
+        monkeypatch.setenv("CLAUDE_TEAMS_DEFAULT_DESCRIPTION", "x" * 5000)
+        with pytest.raises(InvalidEnvVarValueError) as exc_info:
+            _resolve_description("")
+        assert "CLAUDE_TEAMS_DEFAULT_DESCRIPTION" in str(exc_info.value)
+
+    def test_oversize_capability_env_raises(self, monkeypatch: pytest.MonkeyPatch):
+        # ``Capability`` schema: max_length=512.
+        monkeypatch.setenv("CLAUDE_TEAMS_CAPABILITY", "y" * 1000)
+        with pytest.raises(InvalidEnvVarValueError) as exc_info:
+            _resolve_capability("")
+        assert "CLAUDE_TEAMS_CAPABILITY" in str(exc_info.value)
+
+    def test_oversize_backend_name_env_raises(self, monkeypatch: pytest.MonkeyPatch):
+        # ``BackendName`` schema: max_length=64.
+        monkeypatch.setenv("CLAUDE_TEAMS_DEFAULT_BACKEND", "b" * 200)
+        with pytest.raises(InvalidEnvVarValueError) as exc_info:
+            _resolve_backend_name("")
+        assert "CLAUDE_TEAMS_DEFAULT_BACKEND" in str(exc_info.value)
+
+    def test_oversize_cwd_env_raises(self, monkeypatch: pytest.MonkeyPatch):
+        # ``Cwd`` schema: max_length=4096. Validation now fires before the
+        # filesystem checks, so an oversize value fails with a typed error
+        # naming the env var instead of a path-not-found downstream.
+        monkeypatch.setenv("CLAUDE_TEAMS_DEFAULT_CWD", "/" + "p" * 5000)
+        with pytest.raises(InvalidEnvVarValueError) as exc_info:
+            _resolve_spawn_cwd("")
+        assert "CLAUDE_TEAMS_DEFAULT_CWD" in str(exc_info.value)
+
+    def test_oversize_spawn_options_model_env_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # ``ModelName`` schema: max_length=128. Exercised through the
+        # unified resolver so the ``model_validate``-on-merged-dict path
+        # catches and re-raises with the env-var name attached.
+        monkeypatch.setenv("CLAUDE_TEAMS_DEFAULT_MODEL", "m" * 500)
+        with pytest.raises(InvalidEnvVarValueError) as exc_info:
+            apply_spawn_env_defaults(SpawnOptions())
+        assert "CLAUDE_TEAMS_DEFAULT_MODEL" in str(exc_info.value)
+
+    def test_spawn_options_template_env_pattern_violation_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # ``TemplateName`` schema: pattern ``^[A-Za-z0-9_-]+$``. A value
+        # with path-traversal characters must be rejected at env-read
+        # time, not at the downstream ``templates.get_template`` lookup.
+        monkeypatch.setenv("CLAUDE_TEAMS_DEFAULT_TEMPLATE", "../bad")
+        with pytest.raises(InvalidEnvVarValueError) as exc_info:
+            apply_spawn_env_defaults(SpawnOptions())
+        assert "CLAUDE_TEAMS_DEFAULT_TEMPLATE" in str(exc_info.value)
+
+    def test_direct_args_still_accepted_when_env_invalid_is_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Positive control: the new validation must only fire on
+        # env-sourced values. A caller-explicit value stays unaffected
+        # even when the same env var isn't set — otherwise the fix
+        # would have widened the failure surface beyond env.
+        monkeypatch.delenv("CLAUDE_TEAMS_DEFAULT_MODEL", raising=False)
+        resolved = apply_spawn_env_defaults(SpawnOptions(model="fast"))
+        assert resolved.model == "fast"
 
 
 # ---------------------------------------------------------------------------
