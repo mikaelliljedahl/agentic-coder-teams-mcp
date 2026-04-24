@@ -365,15 +365,21 @@ def apply_spawn_env_defaults(opts: SpawnOptions) -> SpawnOptions:
         return SpawnOptions.model_validate(merged_dict)
     except ValidationError as exc:
         for err in exc.errors():
-            if not err["loc"]:
+            loc = err["loc"]
+            if not loc:
                 continue
-            field = err["loc"][0]
-            if field in updates:
-                env_var = _SPAWN_FIELD_TO_ENV.get(str(field))
-                if env_var is not None:
-                    raise InvalidEnvVarValueError(
-                        env_var, str(updates[field]), err["msg"]
-                    ) from exc
+            head = loc[0]
+            # ``loc`` entries can be ints (list/tuple indexes from nested
+            # validation) or strs (field names). For a flat-model payload
+            # like ``SpawnOptions`` the first element is always the field
+            # name, but narrow explicitly so ty does not have to guess.
+            if not isinstance(head, str) or head not in updates:
+                continue
+            env_var = _SPAWN_FIELD_TO_ENV.get(head)
+            if env_var is not None:
+                raise InvalidEnvVarValueError(
+                    env_var, str(updates[head]), err["msg"]
+                ) from exc
         # Any failure outside the env-sourced subset means a caller-explicit
         # value somehow passed initial validation but fails on re-validation;
         # surface pydantic's original error rather than silently masking it.
