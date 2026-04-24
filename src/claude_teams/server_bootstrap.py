@@ -7,6 +7,7 @@ from claude_teams import capabilities, presets, teams, templates
 from claude_teams.errors import (
     BackendNotRegisteredError,
     InvalidCapabilityError,
+    NoBackendsAvailableError,
     SessionActiveTeamError,
     TeamAlreadyExistsError,
     TeamAlreadyExistsToolError,
@@ -177,13 +178,22 @@ def list_agents(
     string resolves to the server's working directory). Both
     ``backend_name`` and ``cwd`` fall back to their ``CLAUDE_TEAMS_DEFAULT_*``
     env vars when the caller leaves them empty.
+
+    An empty ``backend_name`` after env fallback selects the registry's
+    default backend — mirroring the documented ``BackendName`` contract
+    and the behaviour of :func:`claude_teams.orchestration._resolve_backend`
+    on the spawn path. The concrete backend actually queried is reported
+    back on ``AgentListResult.backend`` so clients can tell which one was
+    resolved.
     """
     ls = _get_lifespan(ctx)
     reg = ls["registry"]
     resolved_backend = _resolve_backend_name(backend_name)
     try:
+        if not resolved_backend:
+            resolved_backend = reg.default_backend()
         backend_obj = reg.get(resolved_backend)
-    except BackendNotRegisteredError as exc:
+    except (NoBackendsAvailableError, BackendNotRegisteredError) as exc:
         raise ToolError(str(exc)) from exc
 
     resolved_cwd = str(_resolve_spawn_cwd(cwd))

@@ -559,3 +559,51 @@ class TestMcpIntegration:
         )
 
         assert result["cwd"] == str(tmp_path)
+
+    async def test_list_agents_empty_backend_no_env_resolves_to_registry_default(
+        self, client: Client, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Copilot follow-up on PR #7: ``BackendName`` documents ``""`` as
+        # "selects the default backend." ``list_agents`` must honor that
+        # contract even after env fallback — otherwise ``backend_name=""``
+        # with ``CLAUDE_TEAMS_DEFAULT_BACKEND`` unset would raise
+        # ``BackendNotRegisteredError`` instead of querying the default.
+        # The response must also report the concrete backend name, not
+        # the caller's empty input, so clients can see which one ran.
+        monkeypatch.delenv("CLAUDE_TEAMS_DEFAULT_BACKEND", raising=False)
+
+        result = _data(await client.call_tool("list_agents", {"backend_name": ""}))
+
+        # Mock registry seeds ``claude-code`` as the only backend, which
+        # makes it the default. Concrete name, not the caller's "".
+        assert result["backend"] == "claude-code"
+
+    async def test_list_agents_env_override_beats_default_resolution(
+        self, client: Client, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Negative control for the default-resolution fix: env-sourced
+        # backend must still win over the registry default. Prevents a
+        # regression where the new "empty → default" path swallows the
+        # env layer entirely.
+        monkeypatch.setenv("CLAUDE_TEAMS_DEFAULT_BACKEND", "claude-code")
+
+        result = _data(await client.call_tool("list_agents", {"backend_name": ""}))
+
+        assert result["backend"] == "claude-code"
+
+    async def test_list_agents_empty_backend_no_backends_available_errors(
+        self, client: Client, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Edge case: caller asks for the default backend but the registry
+        # has none. Must surface ``ToolError`` (wrapping
+        # ``NoBackendsAvailableError``) rather than a silent success with
+        # a phantom payload. Locks the full handling of the spawn-path
+        # contract ``orchestration._resolve_backend`` already enforces.
+        monkeypatch.delenv("CLAUDE_TEAMS_DEFAULT_BACKEND", raising=False)
+        registry._backends = {}
+
+        result = await client.call_tool(
+            "list_agents", {"backend_name": ""}, raise_on_error=False
+        )
+
+        assert result.is_error is True
