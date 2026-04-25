@@ -83,6 +83,68 @@ Example `spawn_teammate` arguments:
 }
 ```
 
+## Windows Smoke Test
+
+Use this smoke test to verify the Windows-native Codex lead -> Claude Code
+teammate path. It exercises MCP spawning, inbox messaging, PID handles, log
+capture, health checks, and cleanup without tmux, WSL, Cygwin, or psmux.
+
+Refresh the GitHub install first so Codex uses the latest fork revision:
+
+```powershell
+uvx --refresh --from git+https://github.com/mikaelliljedahl/agentic-coder-teams-mcp win-agent-teams --help
+uvx --refresh --from git+https://github.com/mikaelliljedahl/agentic-coder-teams-mcp win-agent-teams backends --json
+```
+
+Start a fresh Codex CLI session with the `win-agent-teams` MCP server
+configured, then run this prompt:
+
+```text
+Run a Windows-native smoke test for win-agent-teams MCP using the team name `codex-lead-smoke-visual`.
+
+Use the `win-agent-teams` MCP tools only, not direct filesystem reads unless an MCP tool fails.
+
+Steps:
+
+1. Create team `codex-lead-smoke-visual`.
+2. Spawn teammate:
+   - name: `claude-worker`
+   - backend: `claude-code`
+   - model: `sonnet`
+   - prompt: `Read your inbox, reply to the team lead with a one-sentence confirmation using send_message(sender="claude-worker", recipient="team-lead"), then wait for further instructions.`
+3. Read config and verify:
+   - `claude-worker` exists
+   - `backendType` is `claude-code`
+   - `processHandle` is a decimal PID string
+   - `pid` is populated
+4. Send a follow-up message from `team-lead` to `claude-worker`:
+   `Please confirm you received the follow-up message.`
+5. Poll or read `team-lead` inbox using MCP tools until a message from `claude-worker` appears.
+6. Report the exact received message text.
+7. Call `health_check` for `claude-worker`.
+8. Call `get_agent_logs` for `claude-worker` with `tail=80`.
+9. Stop `claude-worker` using `force_kill_teammate`.
+10. Delete the team.
+```
+
+Expected result:
+
+- A real Claude Code terminal window opens for `claude-worker`.
+- The backend list includes `claude-code` and `codex`.
+- `processHandle` and `pid` are decimal PID values.
+- Claude replies to `team-lead` through MCP `send_message`.
+- Codex can read the reply through MCP inbox tools.
+- `health_check` returns process-based detail.
+- `get_agent_logs` returns a path under
+  `%USERPROFILE%\.claude\teams\codex-lead-smoke-visual\logs\claude-worker.log`.
+- `force_kill_teammate` and `team_delete` complete successfully.
+- No tmux, pane, WSL, Cygwin, or psmux errors appear.
+
+If Codex cannot see Claude's inbox replies but direct file inspection shows
+messages in `team-lead.json`, refresh the `uvx` install and restart Codex. Older
+builds read inbox files using the Windows process codepage; current builds use
+UTF-8 explicitly for inbox state.
+
 ## CLI Reference
 
 ```powershell
