@@ -95,6 +95,38 @@ async def test_read_inbox_returns_all_by_default(tmp_claude_dir: Path) -> None:
     assert len(messages) == 2
 
 
+async def test_read_inbox_reads_utf8_non_ascii_entries(
+    tmp_claude_dir: Path,
+) -> None:
+    path = await ensure_inbox("test-team", "unicode", base_dir=tmp_claude_dir)
+    expected = "Confirmed — received ✅"
+    await asyncio.to_thread(
+        path.write_text,
+        json.dumps(
+            [
+                {
+                    "from": "claude-worker",
+                    "text": expected,
+                    "timestamp": now_iso(),
+                    "read": False,
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        "utf-8",
+    )
+
+    messages = await read_inbox(
+        "test-team",
+        "unicode",
+        mark_as_read=False,
+        base_dir=tmp_claude_dir,
+    )
+
+    assert len(messages) == 1
+    assert messages[0].text == expected
+
+
 async def test_read_inbox_unread_only(tmp_claude_dir: Path) -> None:
     msg1 = InboxMessage(
         from_="lead", text="a", timestamp=now_iso(), read=True, summary="s1"

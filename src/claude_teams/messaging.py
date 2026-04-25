@@ -89,7 +89,7 @@ def _ensure_inbox(
     path = inbox_path(team_name, agent_name, base_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        path.write_text("[]")
+        path.write_text("[]", encoding="utf-8")
     return path
 
 
@@ -111,7 +111,7 @@ async def ensure_inbox(
 
 
 def _load_inbox_messages(path: Path, team_name: str) -> list[InboxMessage]:
-    raw_list = json.loads(path.read_text())
+    raw_list = json.loads(path.read_text(encoding="utf-8"))
     return [
         InboxMessage.model_validate(decrypt_entry(team_name, entry))
         for entry in raw_list
@@ -180,7 +180,10 @@ def _read_inbox_page(
         if mark_as_read and result:
             for index in paged_indices:
                 all_msgs[index].read = True
-            path.write_text(json.dumps(_serialize_inbox_messages(team_name, all_msgs)))
+            path.write_text(
+                json.dumps(_serialize_inbox_messages(team_name, all_msgs)),
+                encoding="utf-8",
+            )
 
         return result, total_count
 
@@ -319,7 +322,10 @@ def _read_inbox_filtered(
         if mark_as_read and result:
             for index in selected_indices:
                 all_msgs[index].read = True
-            path.write_text(json.dumps(_serialize_inbox_messages(team_name, all_msgs)))
+            path.write_text(
+                json.dumps(_serialize_inbox_messages(team_name, all_msgs)),
+                encoding="utf-8",
+            )
 
         return result
 
@@ -373,7 +379,10 @@ def _append_message(
         all_msgs = _load_inbox_messages(path, team_name)
         all_msgs.append(message)
         all_msgs = _compact_messages(all_msgs)
-        path.write_text(json.dumps(_serialize_inbox_messages(team_name, all_msgs)))
+        path.write_text(
+            json.dumps(_serialize_inbox_messages(team_name, all_msgs)),
+            encoding="utf-8",
+        )
 
 
 async def append_message(
