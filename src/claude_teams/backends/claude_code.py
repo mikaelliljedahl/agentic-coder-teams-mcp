@@ -142,6 +142,7 @@ class ClaudeCodeBackend(BaseBackend):
         if request.reasoning_effort:
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
         cmd.extend(self._agent_args(request))
+        cmd.append("--")
         cmd.append(request.prompt)
         return cmd
 

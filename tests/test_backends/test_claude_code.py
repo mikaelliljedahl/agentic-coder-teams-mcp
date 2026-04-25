@@ -159,7 +159,16 @@ class TestClaudeCodeBuildCommand:
 
         idx = cmd.index("--mcp-config")
         assert cmd[idx + 1] == "C:\\tmp\\worker.mcp.json"
+        assert cmd[-2] == "--"
         assert cmd[-1] == "do stuff"
+
+    def test_terminates_options_before_prompt(self, _make_request):
+        backend = ClaudeCodeBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert cmd[-2:] == ["--", "do stuff"]
 
 
 class TestClaudeCodeBuildEnv:

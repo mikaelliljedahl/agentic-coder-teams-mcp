@@ -27,7 +27,7 @@ class ProcessInfo:
     backend: str
     process: subprocess.Popen[str]
     log_path: Path
-    log_handle: IO[str]
+    log_handle: IO[str] | None
     started_at: float
     exit_logged: bool = False
 
@@ -106,17 +106,41 @@ class WindowsProcessManager:
         merged_env = os.environ.copy()
         merged_env.update(env)
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        try:
-            process = subprocess.Popen(  # noqa: S603 - backend argv is built by adapters.
-                cmd,
-                cwd=request.cwd,
-                env=merged_env,
-                stdin=subprocess.PIPE,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=creationflags,
+        interactive_console = self._should_use_interactive_console(backend_type)
+        popen_log_handle: IO[str] | None = log_handle
+        if interactive_console:
+            cmd = self._with_debug_file(cmd, log_path)
+            log_handle.write(
+                "[interactive console] stdout/stderr are attached to the agent window\n"
             )
+            log_handle.flush()
+            log_handle.close()
+            popen_log_handle = None
+            creationflags |= getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+
+        try:
+            if interactive_console:
+                process = subprocess.Popen(  # noqa: S603 - backend argv is built by adapters.
+                    cmd,
+                    cwd=request.cwd,
+                    env=merged_env,
+                    stdin=None,
+                    stdout=None,
+                    stderr=None,
+                    text=True,
+                    creationflags=creationflags,
+                )
+            else:
+                process = subprocess.Popen(  # noqa: S603 - backend argv is built by adapters.
+                    cmd,
+                    cwd=request.cwd,
+                    env=merged_env,
+                    stdin=subprocess.PIPE,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    creationflags=creationflags,
+                )
         except BaseException:
             log_handle.close()
             raise
@@ -131,7 +155,7 @@ class WindowsProcessManager:
             backend=backend_type,
             process=process,
             log_path=log_path,
-            log_handle=log_handle,
+            log_handle=popen_log_handle,
             started_at=time.time(),
         )
         eventlog.log_event(
@@ -142,7 +166,8 @@ class WindowsProcessManager:
             pid=process.pid,
             log_path=str(log_path),
         )
-        self._open_windows_terminal_tail(request.team_name, request.name, log_path)
+        if not interactive_console:
+            self._open_windows_terminal_tail(request.team_name, request.name, log_path)
         return SpawnResult(process_handle=handle, backend_type=backend_type)
 
     def health_check(self, handle: str) -> tuple[bool, str]:
@@ -275,9 +300,29 @@ class WindowsProcessManager:
         return True
 
     def _close_log(self, info: ProcessInfo) -> None:
-        if not info.log_handle.closed:
+        if info.log_handle is not None and not info.log_handle.closed:
             info.log_handle.flush()
             info.log_handle.close()
+
+    def _should_use_interactive_console(self, backend_type: str) -> bool:
+        if backend_type != "claude-code":
+            return False
+        if os.environ.get("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", "").lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return False
+        return os.name == "nt"
+
+    def _with_debug_file(self, cmd: list[str], log_path: Path) -> list[str]:
+        if "--debug-file" in cmd:
+            return cmd
+        updated = list(cmd)
+        insert_at = updated.index("--") if "--" in updated else len(updated)
+        updated[insert_at:insert_at] = ["--debug-file", str(log_path)]
+        return updated
 
     def _open_windows_terminal_tail(
         self, team_name: str, agent_name: str, log_path: Path

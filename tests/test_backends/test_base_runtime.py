@@ -231,6 +231,70 @@ class TestBaseBackendExecuteInPane:
         assert run_mock.call_args.kwargs["timeout"] == 120
 
 
+class TestInteractiveConsoleSpawn:
+    def test_claude_code_uses_new_console_and_debug_file(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        manager = process_manager_mod.WindowsProcessManager()
+        process = MagicMock(pid=4242)
+        popen_mock = MagicMock(return_value=process)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
+        monkeypatch.delenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", raising=False)
+        monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
+        monkeypatch.setattr(manager._job, "assign", lambda process: None)
+        request = _make_spawn_request()
+
+        result = manager.spawn_process(
+            request,
+            ["claude", "--mcp-config", "worker.mcp.json", "--", "do stuff"],
+            {},
+            "claude-code",
+        )
+
+        assert result.process_handle == "4242"
+        command = popen_mock.call_args.args[0]
+        debug_idx = command.index("--debug-file")
+        prompt_sep_idx = command.index("--")
+        assert debug_idx < prompt_sep_idx
+        assert command[debug_idx + 1] == str(tmp_path / "team" / "worker.log")
+        kwargs = popen_mock.call_args.kwargs
+        assert kwargs["stdin"] is None
+        assert kwargs["stdout"] is None
+        assert kwargs["stderr"] is None
+        assert kwargs["creationflags"] & getattr(
+            process_manager_mod.subprocess, "CREATE_NEW_CONSOLE", 0
+        )
+        assert "[interactive console]" in (tmp_path / "team" / "worker.log").read_text(
+            encoding="utf-8"
+        )
+
+    def test_env_can_disable_interactive_console(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        manager = process_manager_mod.WindowsProcessManager()
+        process = MagicMock(pid=4242)
+        popen_mock = MagicMock(return_value=process)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
+        monkeypatch.setenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", "0")
+        monkeypatch.setenv("USE_WINDOWS_TERMINAL", "0")
+        monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
+        monkeypatch.setattr(manager._job, "assign", lambda process: None)
+
+        manager.spawn_process(
+            _make_spawn_request(),
+            ["claude", "--", "do stuff"],
+            {},
+            "claude-code",
+        )
+
+        command = popen_mock.call_args.args[0]
+        assert "--debug-file" not in command
+        kwargs = popen_mock.call_args.kwargs
+        assert kwargs["stdin"] == process_manager_mod.subprocess.PIPE
+        assert kwargs["stdout"] is not None
+        assert kwargs["stderr"] == process_manager_mod.subprocess.STDOUT
+
+
 class TestWindowsTerminalTail:
     def test_opens_windows_terminal_by_default_when_available(
         self, monkeypatch, tmp_path
