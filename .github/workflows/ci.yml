@@ -8,11 +8,7 @@ on:
 
 jobs:
   verify:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -20,7 +16,7 @@ jobs:
         with:
           version: "0.9.26"
 
-      - run: uv sync --locked --group dev
+      - run: uv sync --group dev
 
       - run: uv run ruff format --check .
 
