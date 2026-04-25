@@ -140,6 +140,9 @@ class SpawnDependencies:
             one-shot backend's transcript back to the lead inbox.
         create_one_shot_result_path: Builds the per-agent transcript
             path used when a backend writes its result to disk.
+        create_agent_mcp_config_path: Builds a per-agent MCP config
+            path for interactive backends that need to call back into
+            the team server.
         log_relay_task_exception: Done-callback attached to the relay
             task so non-fatal failures are logged rather than lost.
         log_retain_pane_failure: Callback invoked when
@@ -156,6 +159,7 @@ class SpawnDependencies:
     build_agent_auth_notice: Callable[[str, str], str]
     relay_one_shot_result: RelayOneShotResultCallback
     create_one_shot_result_path: Callable[[str, str], Path]
+    create_agent_mcp_config_path: Callable[[str, str], Path]
     log_relay_task_exception: Callable[[asyncio.Task[None]], None]
     log_retain_pane_failure: Callable[[BaseException], None]
 
@@ -450,6 +454,10 @@ async def spawn_teammate_core(
     if backend_obj.name == "codex":
         one_shot_result_path = deps.create_one_shot_result_path(team_name, name)
         extra["output_last_message_path"] = str(one_shot_result_path)
+    if backend_obj.name == "claude-code":
+        extra["mcp_config_path"] = str(
+            deps.create_agent_mcp_config_path(team_name, name)
+        )
     if resolved_profile is not None:
         extra["agent_profile_path"] = resolved_profile.path
 

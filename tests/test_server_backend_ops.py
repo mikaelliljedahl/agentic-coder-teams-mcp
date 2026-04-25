@@ -1,10 +1,12 @@
 """Backend-oriented server operation tests."""
 
+import json
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
+from anyio import Path as AsyncPath
 from fastmcp import Client
 
 from claude_teams import teams, templates
@@ -386,6 +388,32 @@ class TestSpawnWithBackend:
 
         request = mock_backend.spawn.call_args.args[0]
         assert request.permission_mode == "bypass"
+
+    async def test_writes_mcp_config_for_claude_code_teammate(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "sb-mcp-config"})
+
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "sb-mcp-config",
+                "name": "coder",
+                "prompt": "write code",
+            },
+        )
+
+        request = mock_backend.spawn.call_args.args[0]
+        assert request.extra is not None
+        config_path = Path(request.extra["mcp_config_path"])
+        payload = json.loads(await AsyncPath(config_path).read_text(encoding="utf-8"))
+        server = payload["mcpServers"]["win-agent-teams"]
+        assert server["args"] == ["-m", "claude_teams.server"]
+        assert server["env"]["CLAUDE_TEAMS_PERMISSION_MODE"] in {
+            "default",
+            "bypass",
+            "require_approval",
+        }
 
     async def test_rejects_permission_bypass_for_unsupported_backend(
         self, client: Client

@@ -151,6 +151,16 @@ class TestClaudeCodeBuildCommand:
 
         assert "--permission-mode" not in cmd
 
+    def test_includes_mcp_config_when_provided(self, _make_request):
+        backend = ClaudeCodeBackend()
+        request = _make_request(extra={"mcp_config_path": "C:\\tmp\\worker.mcp.json"})
+
+        cmd = backend.build_command(request)
+
+        idx = cmd.index("--mcp-config")
+        assert cmd[idx + 1] == "C:\\tmp\\worker.mcp.json"
+        assert cmd[-1] == "do stuff"
+
 
 class TestClaudeCodeBuildEnv:
     def test_returns_claude_env_vars(self, _make_request):

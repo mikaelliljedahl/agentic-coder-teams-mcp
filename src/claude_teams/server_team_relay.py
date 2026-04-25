@@ -2,7 +2,10 @@
 
 import asyncio
 import contextlib
+import json
+import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -87,6 +90,31 @@ def create_one_shot_result_path(team_name: str, agent_name: str) -> Path:
     runs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = int(time.time() * 1000)
     return runs_dir / f"{safe_agent_name}-{timestamp}.last-message.txt"
+
+
+def create_agent_mcp_config_path(team_name: str, agent_name: str) -> Path:
+    """Create a per-agent MCP config that points back at this server package."""
+    safe_team_name = validate_safe_name(team_name, "team name")
+    safe_agent_name = validate_safe_name(agent_name, "agent name")
+    config_dir = messaging.TEAMS_DIR / safe_team_name / "mcp"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / f"{safe_agent_name}.mcp.json"
+    env = {
+        "CLAUDE_TEAMS_PERMISSION_MODE": os.environ.get(
+            "CLAUDE_TEAMS_PERMISSION_MODE", "default"
+        )
+    }
+    payload = {
+        "mcpServers": {
+            "win-agent-teams": {
+                "command": sys.executable,
+                "args": ["-m", "claude_teams.server"],
+                "env": env,
+            }
+        }
+    }
+    config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return config_path
 
 
 async def _read_result_file(result_file: Path) -> str:

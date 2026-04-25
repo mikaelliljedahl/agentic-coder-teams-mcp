@@ -53,6 +53,7 @@ from claude_teams.server_schema import (
 )
 from claude_teams.server_team_relay import (
     build_agent_auth_notice,
+    create_agent_mcp_config_path,
     create_one_shot_result_path,
     log_relay_task_exception,
     log_retain_pane_failure,
@@ -90,6 +91,7 @@ def _build_spawn_dependencies() -> SpawnDependencies:
         build_agent_auth_notice=build_agent_auth_notice,
         relay_one_shot_result=relay_one_shot_result,
         create_one_shot_result_path=create_one_shot_result_path,
+        create_agent_mcp_config_path=create_agent_mcp_config_path,
         log_relay_task_exception=log_relay_task_exception,
         log_retain_pane_failure=log_retain_pane_failure,
     )

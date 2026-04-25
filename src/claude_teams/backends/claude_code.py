@@ -134,6 +134,9 @@ class ClaudeCodeBackend(BaseBackend):
             model,
             *self.permission_args(request),
         ]
+        mcp_config_path = (request.extra or {}).get("mcp_config_path")
+        if mcp_config_path:
+            cmd.extend(["--mcp-config", mcp_config_path])
         if request.plan_mode_required:
             cmd.append("--plan-mode-required")
         if request.reasoning_effort:
