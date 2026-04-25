@@ -282,7 +282,12 @@ class WindowsProcessManager:
     def _open_windows_terminal_tail(
         self, team_name: str, agent_name: str, log_path: Path
     ) -> None:
-        if os.environ.get("USE_WINDOWS_TERMINAL") != "1":
+        if os.environ.get("USE_WINDOWS_TERMINAL", "").lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
             return
         wt = shutil.which("wt.exe")
         if wt is None:

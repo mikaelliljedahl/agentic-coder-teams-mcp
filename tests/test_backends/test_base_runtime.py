@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from claude_teams.backends import process_base
+from claude_teams.backends import process_manager as process_manager_mod
 from claude_teams.backends.base import HealthStatus, SpawnRequest, SpawnResult
 from tests.test_backends._base_support import (
     _InvalidProcessEnvBackend,
@@ -228,3 +229,60 @@ class TestBaseBackendExecuteInPane:
         assert result["exit_code"] == -1
         assert result["output"] == "timed out"
         assert run_mock.call_args.kwargs["timeout"] == 120
+
+
+class TestWindowsTerminalTail:
+    def test_opens_windows_terminal_by_default_when_available(
+        self, monkeypatch, tmp_path
+    ):
+        manager = process_manager_mod.WindowsProcessManager()
+        popen_mock = MagicMock()
+        monkeypatch.delenv("USE_WINDOWS_TERMINAL", raising=False)
+        monkeypatch.setattr(
+            process_manager_mod.shutil,
+            "which",
+            lambda name: "C:\\WindowsApps\\wt.exe" if name == "wt.exe" else None,
+        )
+        monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
+        log_path = tmp_path / "worker.log"
+
+        manager._open_windows_terminal_tail("team", "worker", log_path)
+
+        popen_mock.assert_called_once()
+        command = popen_mock.call_args.args[0]
+        assert command[:6] == [
+            "C:\\WindowsApps\\wt.exe",
+            "-w",
+            "0",
+            "nt",
+            "--title",
+            "worker@team",
+        ]
+        assert f"Get-Content -LiteralPath '{log_path}' -Wait -Tail 80" in command
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off"])
+    def test_env_can_disable_windows_terminal_tail(self, monkeypatch, tmp_path, value):
+        manager = process_manager_mod.WindowsProcessManager()
+        popen_mock = MagicMock()
+        monkeypatch.setenv("USE_WINDOWS_TERMINAL", value)
+        monkeypatch.setattr(
+            process_manager_mod.shutil,
+            "which",
+            lambda name: "C:\\WindowsApps\\wt.exe" if name == "wt.exe" else None,
+        )
+        monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
+
+        manager._open_windows_terminal_tail("team", "worker", tmp_path / "worker.log")
+
+        popen_mock.assert_not_called()
+
+    def test_skips_windows_terminal_when_wt_is_missing(self, monkeypatch, tmp_path):
+        manager = process_manager_mod.WindowsProcessManager()
+        popen_mock = MagicMock()
+        monkeypatch.delenv("USE_WINDOWS_TERMINAL", raising=False)
+        monkeypatch.setattr(process_manager_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
+
+        manager._open_windows_terminal_tail("team", "worker", tmp_path / "worker.log")
+
+        popen_mock.assert_not_called()
