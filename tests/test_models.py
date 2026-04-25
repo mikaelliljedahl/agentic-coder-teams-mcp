@@ -97,16 +97,19 @@ class TestTeammateMember:
             color="blue",
             plan_mode_required=False,
             joined_at=1770398210601,
-            tmux_pane_id="%34",
+            tmux_pane_id="1234",
             cwd=str(tmp_path),
-            backend_type="tmux",
+            backend_type="claude-code",
             is_active=False,
+            process_handle="1234",
         )
         data = mate.model_dump(by_alias=True)
         assert data["agentId"] == "worker@my-team"
         assert data["planModeRequired"] is False
-        assert data["tmuxPaneId"] == "%34"
-        assert data["backendType"] == "tmux"
+        assert data["processHandle"] == "1234"
+        assert data["processHandle"].isdecimal()
+        assert data["tmuxPaneId"] == "1234"
+        assert data["backendType"] == "claude-code"
         assert data["isActive"] is False
 
     def test_defaults(self, tmp_path: Path):
@@ -125,6 +128,39 @@ class TestTeammateMember:
         assert mate.backend_type == "claude-code"
         assert mate.is_active is False
         assert mate.subscriptions == []
+
+    def test_process_handle_populates_legacy_tmux_pane_id(self, tmp_path: Path):
+        mate = TeammateMember(
+            agent_id="w@t",
+            name="w",
+            agent_type="general-purpose",
+            model="sonnet",
+            prompt="p",
+            color="blue",
+            joined_at=0,
+            process_handle="4321",
+            tmux_pane_id="",
+            cwd=str(tmp_path),
+        )
+        assert mate.process_handle == "4321"
+        assert mate.tmux_pane_id == "4321"
+
+    def test_legacy_tmux_pane_id_populates_process_handle(self, tmp_path: Path):
+        mate = TeammateMember.model_validate(
+            {
+                "agentId": "w@t",
+                "name": "w",
+                "agentType": "general-purpose",
+                "model": "sonnet",
+                "prompt": "p",
+                "color": "blue",
+                "joinedAt": 0,
+                "tmuxPaneId": "%1",
+                "cwd": str(tmp_path),
+            }
+        )
+        assert mate.tmux_pane_id == "%1"
+        assert mate.process_handle == "%1"
 
 
 class TestTeamConfig:
@@ -179,10 +215,11 @@ class TestTeamConfig:
                     "color": "blue",
                     "planModeRequired": False,
                     "joinedAt": 200,
-                    "tmuxPaneId": "%5",
+                    "processHandle": "5005",
+                    "tmuxPaneId": "5005",
                     "cwd": cwd,
                     "subscriptions": [],
-                    "backendType": "tmux",
+                    "backendType": "claude-code",
                     "isActive": False,
                 },
             ],
@@ -290,13 +327,15 @@ class TestStructuredMessages:
             request_id="shutdown-123@worker",
             from_="worker",
             timestamp="ts",
-            pane_id="%34",
-            backend_type="tmux",
+            pane_id="1234",
+            backend_type="claude-code",
+            process_handle="1234",
         )
         data = json.loads(approval.model_dump_json(by_alias=True))
         assert data["type"] == "shutdown_approved"
-        assert data["paneId"] == "%34"
-        assert data["backendType"] == "tmux"
+        assert data["paneId"] == "1234"
+        assert data["processHandle"] == "1234"
+        assert data["backendType"] == "claude-code"
 
 
 class TestToolReturnModels:

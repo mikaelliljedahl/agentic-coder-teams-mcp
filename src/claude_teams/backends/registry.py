@@ -13,21 +13,6 @@ logger = logging.getLogger(__name__)
 _BUILTIN_BACKENDS: dict[str, str] = {
     "claude-code": "claude_teams.backends.claude_code.ClaudeCodeBackend",
     "codex": "claude_teams.backends.codex.CodexBackend",
-    "gemini": "claude_teams.backends.gemini.GeminiBackend",
-    "opencode": "claude_teams.backends.opencode.OpenCodeBackend",
-    "aider": "claude_teams.backends.aider.AiderBackend",
-    "copilot": "claude_teams.backends.copilot.CopilotBackend",
-    "auggie": "claude_teams.backends.auggie.AuggieBackend",
-    "goose": "claude_teams.backends.goose.GooseBackend",
-    "qwen": "claude_teams.backends.qwen.QwenBackend",
-    "vibe": "claude_teams.backends.vibe.VibeBackend",
-    "kimi": "claude_teams.backends.kimi.KimiBackend",
-    "amp": "claude_teams.backends.amp.AmpBackend",
-    "rovodev": "claude_teams.backends.rovodev.RovoDevBackend",
-    "llxprt": "claude_teams.backends.llxprt.LlxprtBackend",
-    "coder": "claude_teams.backends.coder.CoderBackend",
-    "claudish": "claude_teams.backends.claudish.ClaudishBackend",
-    "happy": "claude_teams.backends.happy.HappyBackend",
 }
 
 ENTRY_POINT_GROUP = "claude_teams.backends"

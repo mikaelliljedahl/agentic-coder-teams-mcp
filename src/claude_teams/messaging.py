@@ -9,6 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from claude_teams import eventlog
 from claude_teams.async_utils import run_blocking
 from claude_teams.errors import (
     InvalidInboxOffsetError,
@@ -411,6 +412,14 @@ def _send_plain_message(
         color=color,
     )
     _append_message(team_name, to_name, msg, base_dir)
+    eventlog.log_event(
+        team_name,
+        "message_sent",
+        from_=from_name,
+        to=to_name,
+        summary=summary,
+        preview=text[:120],
+    )
 
 
 async def send_plain_message(
@@ -463,6 +472,14 @@ def _send_structured_message(
         color=color,
     )
     _append_message(team_name, to_name, msg, base_dir)
+    eventlog.log_event(
+        team_name,
+        "message_sent",
+        from_=from_name,
+        to=to_name,
+        summary=payload.__class__.__name__,
+        preview=serialized[:120],
+    )
 
 
 async def send_structured_message(
@@ -512,6 +529,13 @@ def _send_task_assignment(
     )
     _send_structured_message(
         team_name, assigned_by, task.owner, payload, base_dir=base_dir
+    )
+    eventlog.log_event(
+        team_name,
+        "task_assigned",
+        task_id=task.id,
+        assignee=task.owner,
+        assigned_by=assigned_by,
     )
 
 

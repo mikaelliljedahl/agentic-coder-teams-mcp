@@ -1,15 +1,15 @@
 """Inbox storage and retrieval tests."""
 
 import asyncio
-import fcntl
 import json
 import re
+from contextlib import ExitStack
 from pathlib import Path
-from typing import TextIO
 
 import pytest
 
 from claude_teams.errors import InboxMasterKeyTooShortError
+from claude_teams.filelock import file_lock
 from claude_teams.messaging import (
     _INBOX_MAX_MESSAGES,
     _compact_messages,
@@ -469,16 +469,15 @@ async def test_read_inbox_waits_for_lock_before_mark_as_read(
         )
         completed.set()
 
-    def _open_and_lock() -> TextIO:
-        lock_file = lock_path.open()
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        return lock_file
+    def _open_and_lock() -> ExitStack:
+        stack = ExitStack()
+        stack.enter_context(file_lock(lock_path))
+        return stack
 
-    def _unlock_and_close(lock_file: TextIO) -> None:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        lock_file.close()
+    def _unlock_and_close(stack: ExitStack) -> None:
+        stack.close()
 
-    lock_file = await asyncio.to_thread(_open_and_lock)
+    lock_stack = await asyncio.to_thread(_open_and_lock)
     try:
         read_task = asyncio.create_task(do_read())
         await asyncio.sleep(0.1)
@@ -486,7 +485,7 @@ async def test_read_inbox_waits_for_lock_before_mark_as_read(
             "read_inbox(mark_as_read=True) completed without acquiring the inbox lock"
         )
     finally:
-        await asyncio.to_thread(_unlock_and_close, lock_file)
+        await asyncio.to_thread(_unlock_and_close, lock_stack)
 
     await asyncio.wait_for(read_task, timeout=5)
 

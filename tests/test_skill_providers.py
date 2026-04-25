@@ -91,17 +91,7 @@ def test_skill_frontmatter_valid(skill_md: Path) -> None:
 # Backend name -> path fragments that MUST appear in at least one root.
 # Keep this in sync with ``_CUSTOM_PROVIDER_ROOTS``; the coverage assertion
 # below tightly couples the two so drift fails loudly.
-_EXPECTED_ROOT_FRAGMENTS: dict[str, list[str]] = {
-    "amp": [".config/amp/skills"],
-    "auggie": [".augment/skills"],
-    "coder": [".code/skills", ".codex/skills"],
-    "goose": [".agents/skills", ".goose/skills"],
-    "kimi": [".kimi/skills"],
-    "llxprt": [".llxprt/skills"],
-    "qwen": [".qwen/skills"],
-    "rovodev": [".rovodev/skills"],
-    "vibe": [".vibe/skills"],
-}
+_EXPECTED_ROOT_FRAGMENTS: dict[str, list[str]] = {}
 
 
 def test_custom_provider_table_covers_expected_backends() -> None:
@@ -151,6 +141,8 @@ def test_factory_wires_skill_md_as_main_file(
     sp.build_custom_skills_providers()
 
     assert len(seen) == len(sp._CUSTOM_PROVIDER_ROOTS)
+    if not seen:
+        return
     assert {call["main_file_name"] for call in seen} == {"SKILL.md"}
 
 

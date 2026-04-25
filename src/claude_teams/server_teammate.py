@@ -7,9 +7,10 @@ import time
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
-from claude_teams import capabilities, messaging, tasks, teams
+from claude_teams import capabilities, eventlog, messaging, tasks, teams
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends import registry
+from claude_teams.backends.process_manager import process_manager, read_log_tail
 from claude_teams.errors import (
     BackendNotRegisteredError,
     InboxAccessDeniedError,
@@ -96,6 +97,13 @@ async def force_kill_teammate(
         try:
             backend_obj = registry.get(backend_type)
             await run_blocking(backend_obj.kill, process_handle)
+            eventlog.log_event(
+                team_name,
+                "teammate_force_killed",
+                name=agent_name,
+                backend=backend_type,
+                process_handle=process_handle,
+            )
         except BackendNotRegisteredError:
             pass
 
@@ -186,6 +194,15 @@ async def check_teammate(
         status = await run_blocking(backend_obj.health_check, process_handle)
         alive = status.alive
         detail = status.detail
+        if not alive:
+            eventlog.log_event(
+                team_name,
+                "health_failure",
+                name=agent_name,
+                backend=backend_type,
+                process_handle=process_handle,
+                detail=detail,
+            )
 
         if include_output:
             try:
@@ -227,6 +244,13 @@ async def process_shutdown_approved(
         try:
             backend_obj = registry.get(backend_type)
             await run_blocking(backend_obj.kill, process_handle)
+            eventlog.log_event(
+                team_name,
+                "teammate_shutdown_cleaned",
+                name=agent_name,
+                backend=backend_type,
+                process_handle=process_handle,
+            )
         except BackendNotRegisteredError:
             pass
         except Exception as exc:  # pragma: no cover
@@ -268,11 +292,41 @@ async def health_check(
         raise ToolError(str(exc)) from exc
 
     status = await run_blocking(backend_obj.health_check, process_handle)
+    if not status.alive:
+        eventlog.log_event(
+            team_name,
+            "health_failure",
+            name=agent_name,
+            backend=backend_type,
+            process_handle=process_handle,
+            detail=status.detail,
+        )
     return {
         "agent_name": agent_name,
         "alive": status.alive,
         "backend": backend_type,
         "detail": status.detail,
+    }
+
+
+async def get_agent_logs(
+    team_name: TeamName,
+    agent_name: AgentName,
+    ctx: Context,
+    tail: OutputLines = 50,
+    capability: Capability = "",
+) -> dict[str, object]:
+    """Return the last lines of a teammate's stdout/stderr log."""
+    await _require_lead(ctx, team_name, capability)
+    member, _process_handle, _backend_type = await _resolve_teammate(
+        team_name, agent_name
+    )
+    log_path = process_manager.log_path(team_name, member.name)
+    return {
+        "agent_name": agent_name,
+        "log_path": str(log_path),
+        "tail": tail,
+        "content": read_log_tail(log_path, tail),
     }
 
 
@@ -296,3 +350,4 @@ def register_teammate_tools(mcp: FastMCP) -> None:
         process_shutdown_approved
     )
     mcp.tool(tags={_TAG_TEAMMATE}, annotations=_ANN_READ)(health_check)
+    mcp.tool(tags={_TAG_TEAMMATE}, annotations=_ANN_READ)(get_agent_logs)

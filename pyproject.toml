@@ -3,21 +3,20 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "claude-teams"
+name = "win-agent-teams-mcp"
 version = "0.1.0"
-description = "Multi-backend MCP server for orchestrating teams of agentic coding agents"
+description = "Windows-native MCP server for orchestrating teams of agentic coding agents"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
     "fastmcp>=3.2.4,<4",
     "typer>=0.24.1,<1",
     "rich>=15.0.0,<16",
-    "claude-code-tools>=1.11.1,<2",
     "cryptography>=46.0.7,<47",
 ]
 
 [project.optional-dependencies]
-# Install with ``pip install claude-teams[otel]`` to enable OpenTelemetry
+# Install with ``pip install win-agent-teams-mcp[otel]`` to enable OpenTelemetry
 # trace export. FastMCP auto-emits tool/resource/prompt spans whenever a
 # global tracer provider is registered; this extra supplies the SDK bits
 # needed to register one that ships spans over OTLP/HTTP.
@@ -44,7 +43,7 @@ dev = [
 ]
 
 [project.scripts]
-claude-teams = "claude_teams.cli:app"
+win-agent-teams = "claude_teams.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_teams"]

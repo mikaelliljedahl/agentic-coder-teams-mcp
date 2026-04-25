@@ -503,6 +503,9 @@ async def spawn_teammate_core(
         if isinstance(config_member, TeammateMember) and config_member.name == name:
             config_member.process_handle = spawn_result.process_handle
             config_member.tmux_pane_id = spawn_result.process_handle
+            if spawn_result.process_handle.isdecimal():
+                config_member.pid = int(spawn_result.process_handle)
+            config_member.is_active = True
             break
     await teams.write_config(team_name, config)
 
