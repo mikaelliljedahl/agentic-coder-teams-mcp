@@ -35,7 +35,6 @@ from claude_teams.server_runtime import (
     _ANN_CREATE,
     _ANN_MUTATE,
     _TAG_TEAM,
-    _TAG_TEAMMATE,
     _get_lifespan,
     _require_lead,
     _require_sender_or_lead,
@@ -151,7 +150,6 @@ async def spawn_teammate_tool(
 
     if not await ctx.get_state("has_teammates"):
         await ctx.set_state("has_teammates", True)
-        await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
 
     return spawn_result.model_dump()
 

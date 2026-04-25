@@ -31,8 +31,6 @@ from claude_teams.server_runtime import (
     _ANN_DELETE,
     _ANN_READ,
     _TAG_BOOTSTRAP,
-    _TAG_TEAM,
-    _TAG_TEAMMATE,
     _clear_session_principal,
     _get_lifespan,
     _require_lead,
@@ -73,7 +71,6 @@ async def team_create(
         "lead",
         lead_capability=lead_capability,
     )
-    await ctx.enable_components(tags={_TAG_TEAM}, components={"tool", "prompt"})
     return TeamCreateResult(
         team_name=result.team_name,
         team_file_path=result.team_file_path,
@@ -103,9 +100,6 @@ async def team_attach(
         principal["role"],
         lead_capability=capability if principal["role"] == "lead" else None,
     )
-    await ctx.enable_components(tags={_TAG_TEAM}, components={"tool", "prompt"})
-    if await ctx.get_state("has_teammates"):
-        await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
 
     return TeamAttachResult(
         team_name=team_name,
@@ -124,9 +118,6 @@ async def team_delete(
     except (RuntimeError, FileNotFoundError) as e:
         raise ToolError(str(e)) from e
     await _clear_session_principal(ctx)
-    await ctx.disable_components(
-        tags={_TAG_TEAM, _TAG_TEAMMATE}, components={"tool", "prompt"}
-    )
     return result.model_dump()
 
 
@@ -208,8 +199,7 @@ async def create_team_from_preset(
     Thin MCP wrapper over
     :func:`claude_teams.orchestration.expand_preset_core`. The wrapper
     owns session-state bookkeeping (``active_team``,
-    ``has_teammates``), tier-unlock of the team / teammate tool
-    components, and attaching the minted lead capability to the
+    ``has_teammates``) and attaching the minted lead capability to the
     FastMCP session — the core owns preset expansion itself.
 
     The preset's ``description`` is a summary of the preset itself;
@@ -250,9 +240,7 @@ async def create_team_from_preset(
         await _set_session_principal(
             ctx, team_name, "team-lead", "lead", lead_capability=lead_capability
         )
-        await ctx.enable_components(tags={_TAG_TEAM}, components={"tool", "prompt"})
         await ctx.set_state("has_teammates", True)
-        await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
 
     try:
         expansion = await expand_preset_core(

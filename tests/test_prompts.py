@@ -1,4 +1,4 @@
-"""Tests for team-lead MCP prompts and progressive disclosure."""
+"""Tests for team-lead MCP prompts and rendering."""
 
 import pytest
 from fastmcp import Client
@@ -17,14 +17,16 @@ _EXPECTED_PROMPTS = [
 
 
 # ---------------------------------------------------------------------------
-# Progressive disclosure — prompts gated behind team creation
+# Static discovery — prompts are visible to clients at startup
 # ---------------------------------------------------------------------------
 
 
-async def test_prompts_hidden_before_team(client: Client) -> None:
-    """No prompts are visible before a team is created."""
+async def test_prompts_visible_before_team(client: Client) -> None:
+    """Prompts are visible before a team is created."""
     prompts = await client.list_prompts()
-    assert len(prompts) == 0
+    names = [p.name for p in prompts]
+    for expected in _EXPECTED_PROMPTS:
+        assert expected in names, f"Missing prompt: {expected}"
 
 
 async def test_prompts_visible_after_team(team_client: Client) -> None:

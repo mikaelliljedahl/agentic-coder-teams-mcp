@@ -172,7 +172,6 @@ mcp = FastMCP(
     # letting them propagate as subtly-wrong values into team state.
     strict_input_validation=True,
 )
-mcp.enable(tags={_TAG_BOOTSTRAP}, only=True, components={"tool", "prompt"})
 
 
 def _get_lifespan(ctx: Context) -> _LifespanState:

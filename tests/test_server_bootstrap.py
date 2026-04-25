@@ -32,32 +32,16 @@ from tests._server_support import (
 )
 
 
-class TestProgressiveDisclosure:
-    async def test_only_bootstrap_tools_at_startup(self, client: Client):
+class TestStaticToolDiscovery:
+    async def test_all_tools_visible_at_startup(self, client: Client):
         tool_list = await client.list_tools()
         names = {t.name for t in tool_list}
-        # Bootstrap tools should be visible
         assert "team_create" in names
         assert "team_attach" in names
         assert "team_delete" in names
         assert "list_backends" in names
         assert "list_agents" in names
         assert "read_config" in names
-        # Team-tier tools should NOT be visible
-        assert "spawn_teammate" not in names
-        assert "send_message" not in names
-        assert "task_create" not in names
-        # Teammate-tier tools should NOT be visible
-        assert "force_kill_teammate" not in names
-        assert "poll_inbox" not in names
-        assert "check_teammate" not in names
-        assert "health_check" not in names
-
-    async def test_team_tools_visible_after_create(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "vis-test"})
-        tool_list = await client.list_tools()
-        names = {t.name for t in tool_list}
-        # Team-tier tools should now be visible
         assert "spawn_teammate" in names
         assert "send_message" in names
         assert "task_create" in names
@@ -65,31 +49,29 @@ class TestProgressiveDisclosure:
         assert "task_list" in names
         assert "task_get" in names
         assert "read_inbox" in names
-        # Teammate-tier tools should still NOT be visible
-        assert "force_kill_teammate" not in names
-        assert "poll_inbox" not in names
-        assert "check_teammate" not in names
-
-    async def test_teammate_tools_visible_after_spawn(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "vis-test2"})
-        await client.call_tool(
-            "spawn_teammate",
-            {
-                "team_name": "vis-test2",
-                "name": "coder",
-                "prompt": "write code",
-            },
-        )
-        tool_list = await client.list_tools()
-        names = {t.name for t in tool_list}
-        # All tiers should be visible
         assert "force_kill_teammate" in names
         assert "poll_inbox" in names
         assert "check_teammate" in names
         assert "process_shutdown_approved" in names
         assert "health_check" in names
+        assert "get_agent_logs" in names
 
-    async def test_tools_hidden_after_delete(self, client: Client):
+    async def test_team_tools_reject_without_authenticated_session(
+        self, client: Client
+    ):
+        result = await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "missing-auth",
+                "name": "coder",
+                "prompt": "write code",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "not found" in _text(result).lower()
+
+    async def test_tools_remain_visible_after_delete(self, client: Client):
         await client.call_tool("team_create", {"team_name": "vis-del"})
         await client.call_tool(
             "spawn_teammate",
@@ -104,21 +86,18 @@ class TestProgressiveDisclosure:
         await client.call_tool("team_delete", {"team_name": "vis-del"})
         tool_list = await client.list_tools()
         names = {t.name for t in tool_list}
-        # Only bootstrap should remain
         assert "team_create" in names
         assert "list_backends" in names
-        assert "spawn_teammate" not in names
-        assert "force_kill_teammate" not in names
+        assert "spawn_teammate" in names
+        assert "force_kill_teammate" in names
 
-    async def test_re_enable_cycle(self, client: Client):
+    async def test_recreate_cycle_keeps_tools_visible(self, client: Client):
         # Create -> delete -> re-create cycle
         await client.call_tool("team_create", {"team_name": "cycle1"})
         await client.call_tool("team_delete", {"team_name": "cycle1"})
-        # After delete, team tools should be gone
         tool_list = await client.list_tools()
         names = {t.name for t in tool_list}
-        assert "spawn_teammate" not in names
-        # Re-create should bring them back
+        assert "spawn_teammate" in names
         await client.call_tool("team_create", {"team_name": "cycle2"})
         tool_list = await client.list_tools()
         names = {t.name for t in tool_list}
