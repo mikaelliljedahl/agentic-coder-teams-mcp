@@ -6,8 +6,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from claude_code_tools.tmux_cli_controller import TmuxCLIController
 
+from claude_teams.backends import process_base
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 
@@ -41,6 +41,36 @@ class _InvalidEnvBackend(_StubBackend):
         return {"INVALID-KEY": "val"}
 
 
+class _ProcessStubBackend(process_base.BaseBackend):
+    """Minimal concrete process-backed backend for runtime contract tests."""
+
+    _name = "stub"
+    _binary_name = "stub-cli"
+
+    def build_command(self, request: SpawnRequest) -> list[str]:
+        binary = self.discover_binary()
+        return [binary, "--prompt", request.prompt]
+
+    def build_env(self, request: SpawnRequest) -> dict[str, str]:
+        return {"STUB_MODE": "1"}
+
+    def supported_models(self) -> list[str]:
+        return ["default"]
+
+    def default_model(self) -> str:
+        return "default"
+
+    def resolve_model(self, generic_name: str) -> str:
+        return generic_name
+
+
+class _InvalidProcessEnvBackend(_ProcessStubBackend):
+    """Process backend that returns an invalid environment key."""
+
+    def build_env(self, request: SpawnRequest) -> dict[str, str]:
+        return {"INVALID-KEY": "val"}
+
+
 @pytest.fixture
 def _make_spawn_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
     """Factory yielding ``SpawnRequest`` instances rooted at ``tmp_path``.
@@ -67,14 +97,21 @@ def _make_spawn_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
     return factory
 
 
-def _make_backend_with_mock_controller() -> tuple[_StubBackend, MagicMock]:
-    """Create a stub backend with a mocked tmux controller.
+def _make_backend_with_mock_process_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_ProcessStubBackend, MagicMock]:
+    """Create a process-backed stub with a mocked process manager singleton."""
+    backend = _ProcessStubBackend()
+    mock_manager = MagicMock(spec=process_base.process_manager)
+    monkeypatch.setattr(process_base, "process_manager", mock_manager)
+    return backend, mock_manager
 
-    Uses ``spec=TmuxCLIController`` so tests that misspell controller methods
-    (e.g. ``launch_CLI`` vs ``launch_cli``) fail loudly instead of silently
-    accessing auto-created child mocks.
-    """
-    backend = _StubBackend()
-    mock_ctrl = MagicMock(spec=TmuxCLIController)
-    backend._controller = mock_ctrl
-    return backend, mock_ctrl
+
+@pytest.fixture(autouse=True)
+def _process_base_which_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make process-backed test backends find their fake binary on PATH."""
+    monkeypatch.setattr(
+        process_base.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}",
+    )

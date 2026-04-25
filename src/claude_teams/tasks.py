@@ -5,6 +5,7 @@ from collections import deque
 from pathlib import Path
 from typing import Literal
 
+from claude_teams import eventlog
 from claude_teams.async_utils import run_blocking
 from claude_teams.errors import (
     BlockedTaskStatusError,
@@ -108,6 +109,12 @@ def _create_task(
         )
         fpath = team_dir / f"{task_id}.json"
         fpath.write_text(json.dumps(task.model_dump(by_alias=True, exclude_none=True)))
+        eventlog.log_event(
+            safe_team_name,
+            "task_created",
+            task_id=task.id,
+            subject=subject,
+        )
 
     return task
 
@@ -415,6 +422,13 @@ def _update_task(
         _apply_metadata(task, fields.metadata)
         _apply_status_mutation(task, fields.status, task_id, team_dir, pending_writes)
         _persist_task_file(fpath, task, fields.status, pending_writes)
+        eventlog.log_event(
+            safe_team_name,
+            "task_updated",
+            task_id=task.id,
+            status=task.status,
+            owner=task.owner,
+        )
 
     return task
 

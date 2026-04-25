@@ -5,13 +5,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from claude_code_tools.tmux_cli_controller import TmuxCLIController
 
 from claude_teams.backends.base import Backend, HealthStatus, SpawnRequest, SpawnResult
-from tests.test_backends._base_support import (
-    _make_backend_with_mock_controller,
-    _StubBackend,
-)
+from tests.test_backends._base_support import _StubBackend
 
 
 class TestSpawnRequest:
@@ -96,8 +92,8 @@ class TestHealthStatus:
         assert health.detail == ""
 
     def test_detail_accepts_custom_string(self):
-        health = HealthStatus(alive=True, detail="tmux pane check")
-        assert health.detail == "tmux pane check"
+        health = HealthStatus(alive=True, detail="process running")
+        assert health.detail == "process running"
 
     def test_frozen_raises_on_mutation(self):
         health = HealthStatus(alive=True)
@@ -122,33 +118,15 @@ class TestBackendProtocol:
 
 
 # ---------------------------------------------------------------------------
-# BaseBackend.controller property
+# BaseBackend process compatibility hooks
 # ---------------------------------------------------------------------------
 
 
-class TestBaseBackendController:
-    @patch("claude_teams.backends.tmux_base.TmuxCLIController")
-    def test_creates_controller_lazily(self, mock_ctrl_cls: MagicMock):
+class TestBaseBackendProcessHooks:
+    def test_retain_pane_after_exit_is_noop_compatibility_hook(self):
         backend = _StubBackend()
-        ctrl = backend.controller
-        mock_ctrl_cls.assert_called_once()
-        assert ctrl is mock_ctrl_cls.return_value
 
-    @patch("claude_teams.backends.tmux_base.TmuxCLIController")
-    def test_returns_same_controller_on_subsequent_calls(
-        self, mock_ctrl_cls: MagicMock
-    ):
-        backend = _StubBackend()
-        ctrl1 = backend.controller
-        ctrl2 = backend.controller
-        assert ctrl1 is ctrl2
-        mock_ctrl_cls.assert_called_once()
-
-    def test_accepts_injected_controller(self):
-        backend = _StubBackend()
-        mock_ctrl = MagicMock(spec=TmuxCLIController)
-        backend._controller = mock_ctrl
-        assert backend.controller is mock_ctrl
+        backend.retain_pane_after_exit("4242")
 
 
 # ---------------------------------------------------------------------------
@@ -185,17 +163,6 @@ class TestBaseBackendPermissionArgs:
         request = _make_spawn_request(permission_mode="bypass")
         with pytest.raises(ValueError, match="permission_mode='bypass'"):
             backend.permission_args(request)
-
-
-class TestBaseBackendRetainPaneAfterExit:
-    def test_sets_remain_on_exit_option(self):
-        backend, mock_ctrl = _make_backend_with_mock_controller()
-
-        backend.retain_pane_after_exit("%42")
-
-        mock_ctrl._run_tmux_command.assert_called_once_with(
-            ["set-option", "-p", "-t", "%42", "remain-on-exit", "on"]
-        )
 
 
 class TestBaseBackendIsAvailable:

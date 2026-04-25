@@ -1,5 +1,6 @@
 """Shared Pydantic models for team orchestration state."""
 
+import contextlib
 from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
@@ -82,6 +83,7 @@ class TeammateMember(BaseModel):
     backend_type: str = "claude-code"
     is_active: bool = False
     process_handle: str = ""
+    pid: int | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -105,6 +107,13 @@ class TeammateMember(BaseModel):
                 raw_dict["processHandle"] = pane
             elif handle and not pane:
                 raw_dict["tmuxPaneId"] = handle
+            pid = raw_dict.get("pid")
+            effective_handle = raw_dict.get("processHandle") or raw_dict.get(
+                "process_handle"
+            )
+            if pid is None and isinstance(effective_handle, str):
+                with contextlib.suppress(ValueError):
+                    raw_dict["pid"] = int(effective_handle)
             return raw_dict
         return data
 

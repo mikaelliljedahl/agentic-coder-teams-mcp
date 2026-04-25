@@ -1,16 +1,8 @@
-"""Custom skills providers for backends not covered by FastMCP built-ins.
+"""Custom skills providers for supported Windows-native backends.
 
-FastMCP ships vendor providers for Claude, Codex, Copilot, Cursor, Gemini,
-Goose, OpenCode, and VSCode. The table below covers the remaining
-backends in the claude-teams registry that follow the ``agentskills.io``
-``SKILL.md`` convention but need a non-default root.
-
-``_CUSTOM_PROVIDER_ROOTS`` maps backend name -> ordered list of candidate
-skill root directories. ``SkillsDirectoryProvider`` consults roots in
-order; earlier entries win on name collision. The built-in
-``GooseSkillsProvider`` ships with ``~/.config/agents/skills/``, which is
-not the convention Block Goose actually uses, so this module overrides
-it with the ``goose`` entry below.
+This fork supports Claude Code and Codex as first-class backends. FastMCP
+already provides built-in skill providers for those ecosystems, so no
+additional vendor-specific roots are registered here.
 """
 
 from pathlib import Path
@@ -18,38 +10,7 @@ from typing import Literal
 
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
 
-_CUSTOM_PROVIDER_ROOTS: dict[str, list[Path]] = {
-    "amp": [
-        Path.home() / ".config" / "amp" / "skills",
-        Path.home() / ".config" / "agents" / "skills",
-        Path.home() / ".claude" / "skills",
-    ],
-    "auggie": [
-        Path.home() / ".augment" / "skills",
-        Path.home() / ".claude" / "skills",
-        Path.home() / ".agents" / "skills",
-    ],
-    "coder": [
-        Path.home() / ".code" / "skills",
-        Path.home() / ".codex" / "skills",
-    ],
-    "goose": [
-        Path.home() / ".agents" / "skills",
-        Path.home() / ".goose" / "skills",
-        Path.home() / ".claude" / "skills",
-    ],
-    "kimi": [
-        Path.home() / ".kimi" / "skills",
-        Path.home() / ".claude" / "skills",
-        Path.home() / ".codex" / "skills",
-        Path.home() / ".config" / "agents" / "skills",
-        Path.home() / ".agents" / "skills",
-    ],
-    "llxprt": [Path.home() / ".llxprt" / "skills"],
-    "qwen": [Path.home() / ".qwen" / "skills"],
-    "rovodev": [Path.home() / ".rovodev" / "skills"],
-    "vibe": [Path.home() / ".vibe" / "skills"],
-}
+_CUSTOM_PROVIDER_ROOTS: dict[str, list[Path]] = {}
 
 
 def build_custom_skills_providers(

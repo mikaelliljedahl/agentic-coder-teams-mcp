@@ -1,6 +1,7 @@
 """Compatibility exports for backend base types."""
 
-import claude_teams.backends.tmux_base as tmux_base_module
+import shutil
+
 from claude_teams.backends.contracts import (
     AgentProfile,
     AgentSelectSpec,
@@ -11,9 +12,7 @@ from claude_teams.backends.contracts import (
     SpawnRequest,
     SpawnResult,
 )
-from claude_teams.backends.tmux_base import BaseBackend
-
-shutil = tmux_base_module.shutil
+from claude_teams.backends.process_base import BaseBackend
 
 __all__ = [
     "AgentProfile",

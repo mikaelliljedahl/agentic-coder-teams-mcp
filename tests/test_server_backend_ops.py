@@ -15,6 +15,9 @@ from claude_teams.backends.base import (
     HealthStatus,
     ReasoningEffortSpec,
 )
+from claude_teams.backends.base import (
+    SpawnResult as BackendSpawnResult,
+)
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.models import TeammateMember
 from claude_teams.templates import AgentTemplate
@@ -39,9 +42,9 @@ class TestProcessShutdownGuard:
 
 class TestProcessShutdownCleanup:
     async def test_kills_via_correct_backend(self, team_client: Client, tmp_path: Path):
-        mate = _make_teammate("graceful", "test-team", tmp_path, pane_id="%55")
+        mate = _make_teammate("graceful", "test-team", tmp_path, pane_id="5555")
         mate.backend_type = "claude-code"
-        mate.process_handle = "%55"
+        mate.process_handle = "5555"
         await teams.add_member("test-team", mate)
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
@@ -54,7 +57,7 @@ class TestProcessShutdownCleanup:
         )
 
         assert result["success"] is True
-        mock_backend.kill.assert_called_once_with("%55")
+        mock_backend.kill.assert_called_once_with("5555")
 
     async def test_legacy_tmux_backend_type_maps_to_claude_code(
         self, team_client: Client, tmp_path: Path
@@ -79,9 +82,9 @@ class TestProcessShutdownCleanup:
     async def test_skips_cleanup_when_backend_unavailable(
         self, team_client: Client, tmp_path: Path
     ):
-        mate = _make_teammate("orphaned", "test-team", tmp_path, pane_id="%57")
+        mate = _make_teammate("orphaned", "test-team", tmp_path, pane_id="5757")
         mate.backend_type = "nonexistent"
-        mate.process_handle = "%57"
+        mate.process_handle = "5757"
         await teams.add_member("test-team", mate)
 
         result = _data(
@@ -144,6 +147,32 @@ class TestHealthCheck:
         assert "not found" in _text(result).lower()
 
 
+class TestAgentLogs:
+    async def test_returns_agent_log_tail(
+        self,
+        team_client: Client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path / "logs"))
+        log_dir = tmp_path / "logs" / "test-team"
+        log_dir.mkdir(parents=True)
+        log_path = log_dir / "worker.log"
+        log_path.write_text("one\ntwo\nthree\n")
+
+        result = _data(
+            await team_client.call_tool(
+                "get_agent_logs",
+                {"team_name": "test-team", "agent_name": "worker", "tail": 2},
+            )
+        )
+
+        assert result["agent_name"] == "worker"
+        assert result["tail"] == 2
+        assert result["content"] == "two\nthree"
+        assert result["log_path"] == str(log_path)
+
+
 class TestSpawnWithBackend:
     async def test_spawns_with_explicit_backend(self, client: Client):
         await client.call_tool("team_create", {"team_name": "sb1"})
@@ -163,6 +192,11 @@ class TestSpawnWithBackend:
 
     async def test_spawns_with_default_backend(self, client: Client):
         await client.call_tool("team_create", {"team_name": "sb2"})
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+        mock_backend.spawn.return_value = BackendSpawnResult(
+            process_handle="2002",
+            backend_type="claude-code",
+        )
         result = _data(
             await client.call_tool(
                 "spawn_teammate",
@@ -174,6 +208,15 @@ class TestSpawnWithBackend:
             )
         )
         assert result["name"] == "coder"
+        cfg = await teams.read_config("sb2")
+        teammate = next(
+            member
+            for member in cfg.members
+            if isinstance(member, TeammateMember) and member.name == "coder"
+        )
+        assert teammate.process_handle == "2002"
+        assert teammate.process_handle.isdecimal()
+        assert teammate.tmux_pane_id == "2002"
 
     async def test_assigns_distinct_colors_in_join_order(self, client: Client):
         await client.call_tool("team_create", {"team_name": "sb-colors"})
@@ -368,9 +411,9 @@ class TestSpawnWithBackend:
 
 class TestForceKillWithBackend:
     async def test_kills_via_correct_backend(self, team_client: Client, tmp_path: Path):
-        mate = _make_teammate("victim", "test-team", tmp_path, pane_id="%77")
+        mate = _make_teammate("victim", "test-team", tmp_path, pane_id="7777")
         mate.backend_type = "claude-code"
-        mate.process_handle = "%77"
+        mate.process_handle = "7777"
         await teams.add_member("test-team", mate)
 
         mock_backend = cast(MagicMock, registry._backends["claude-code"])
@@ -383,7 +426,7 @@ class TestForceKillWithBackend:
         )
 
         assert result["success"] is True
-        mock_backend.kill.assert_called_once_with("%77")
+        mock_backend.kill.assert_called_once_with("7777")
 
     async def test_legacy_tmux_backend_type_maps_to_claude_code(
         self, team_client: Client, tmp_path: Path
@@ -417,9 +460,9 @@ class TestForceKillWithBackend:
     async def test_skips_kill_when_backend_unavailable(
         self, team_client: Client, tmp_path: Path
     ):
-        mate = _make_teammate("orphan", "test-team", tmp_path, pane_id="%99")
+        mate = _make_teammate("orphan", "test-team", tmp_path, pane_id="9999")
         mate.backend_type = "nonexistent"
-        mate.process_handle = "%99"
+        mate.process_handle = "9999"
         await teams.add_member("test-team", mate)
 
         # Should not raise even if backend is unavailable

@@ -154,9 +154,10 @@ async def app_lifespan(_server):
 
 
 mcp = FastMCP(
-    name="claude-teams",
+    name="win-agent-teams",
     instructions=(
-        "MCP server for orchestrating Claude Code agent teams. "
+        "Windows-native MCP server for orchestrating Claude Code and Codex "
+        "agent teams. "
         "Manages team creation, teammate spawning, messaging, and task tracking."
     ),
     lifespan=app_lifespan,

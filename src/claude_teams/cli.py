@@ -1,4 +1,4 @@
-"""Typer CLI for claude-teams.
+"""Typer CLI for win-agent-teams.
 
 Provides human-friendly commands that operate on the same file-based state
 as the MCP server.  Both the CLI and MCP server can run concurrently thanks
@@ -52,8 +52,8 @@ from claude_teams.server_team_relay import (
 _INBOX_SUMMARY_TRUNC_LEN = 80
 
 app = typer.Typer(
-    name="claude-teams",
-    help="CLI for orchestrating Claude Code agent teams.",
+    name="win-agent-teams",
+    help="Windows-native CLI for orchestrating Claude Code and Codex agent teams.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -260,7 +260,7 @@ def presets(output_json: JsonFlag = False) -> None:
 
     Presets are declarative team compositions that expand into one
     ``team_create`` call followed by one ``spawn_teammate`` call per
-    member. Use ``claude-teams preset launch`` to launch one.
+    member. Use ``win-agent-teams preset launch`` to launch one.
 
     Args:
         output_json (bool): Whether to output as JSON instead of a table.
@@ -311,7 +311,7 @@ def presets(output_json: JsonFlag = False) -> None:
         )
     console.print(table)
     console.print(
-        "\n[dim]Note: Launch a preset with `claude-teams preset launch`.[/dim]"
+        "\n[dim]Note: Launch a preset with `win-agent-teams preset launch`.[/dim]"
     )
 
 
