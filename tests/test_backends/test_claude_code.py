@@ -116,6 +116,7 @@ class TestClaudeCodeBuildCommand:
         assert cmd[idx + 1] == "worker"
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "sonnet"
+        assert cmd[-1] == "do stuff"
 
     def test_includes_plan_mode_required_when_set(self, _make_request):
         backend = ClaudeCodeBackend()

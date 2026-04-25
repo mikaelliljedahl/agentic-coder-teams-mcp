@@ -3,7 +3,9 @@
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
-from claude_teams import capabilities, presets, teams, templates
+from claude_teams import capabilities, presets, tasks, teams, templates
+from claude_teams.async_utils import run_blocking
+from claude_teams.backends import registry
 from claude_teams.errors import (
     BackendNotRegisteredError,
     InvalidCapabilityError,
@@ -22,6 +24,7 @@ from claude_teams.models import (
     PresetSpawnResult,
     TeamAttachResult,
     TeamCreateResult,
+    TeammateMember,
     TemplateInfo,
 )
 from claude_teams.orchestration import expand_preset_core
@@ -46,6 +49,28 @@ from claude_teams.server_schema import (
     TeamName,
 )
 from claude_teams.server_team_spawn import _build_spawn_dependencies
+
+
+async def _cleanup_teammates_for_delete(team_name: str) -> None:
+    """Best-effort teammate cleanup before deleting team directories."""
+    config = await teams.read_config(team_name)
+    teammates = [
+        member for member in config.members if isinstance(member, TeammateMember)
+    ]
+    for member in teammates:
+        process_handle = member.process_handle or member.tmux_pane_id
+        backend_type = (
+            "claude-code" if member.backend_type == "tmux" else member.backend_type
+        )
+        if process_handle:
+            try:
+                backend_obj = registry.get(backend_type)
+                await run_blocking(backend_obj.kill, process_handle)
+            except BackendNotRegisteredError:
+                pass
+        await teams.remove_member(team_name, member.name)
+        await capabilities.remove_agent_capability(team_name, member.name)
+        await tasks.reset_owner_tasks(team_name, member.name)
 
 
 async def team_create(
@@ -111,8 +136,9 @@ async def team_attach(
 async def team_delete(
     team_name: TeamName, ctx: Context, capability: Capability = ""
 ) -> dict[str, object]:
-    """Delete a team and its files. Fails if teammates are still present."""
+    """Delete a team and its files, first removing any remaining teammates."""
     await _require_lead(ctx, team_name, capability)
+    await _cleanup_teammates_for_delete(team_name)
     try:
         result = await teams.delete_team(team_name)
     except (RuntimeError, FileNotFoundError) as e:

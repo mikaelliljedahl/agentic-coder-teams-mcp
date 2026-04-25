@@ -367,18 +367,14 @@ class TestSendMessageValidation:
 
 
 class TestTeamDeleteErrorWrapping:
-    async def test_should_reject_delete_with_active_members(
+    async def test_should_cleanup_delete_with_active_members(
         self, client: Client, tmp_path: Path
     ):
         await client.call_tool("team_create", {"team_name": "td1"})
         await teams.add_member("td1", _make_teammate("worker", "td1", tmp_path))
-        result = await client.call_tool(
-            "team_delete",
-            {"team_name": "td1"},
-            raise_on_error=False,
-        )
-        assert result.is_error is True
-        assert "member" in _text(result).lower()
+        result = _data(await client.call_tool("team_delete", {"team_name": "td1"}))
+        assert result["success"] is True
+        assert not await teams.team_exists("td1")
 
     async def test_should_reject_delete_nonexistent_team(self, client: Client):
         result = await client.call_tool(

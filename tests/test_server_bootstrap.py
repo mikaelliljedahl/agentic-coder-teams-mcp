@@ -91,6 +91,26 @@ class TestStaticToolDiscovery:
         assert "spawn_teammate" in names
         assert "force_kill_teammate" in names
 
+    async def test_team_delete_cleans_up_remaining_teammates(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "delete-cleans"})
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "delete-cleans",
+                "name": "temp",
+                "prompt": "temporary",
+            },
+        )
+        mock_backend = cast(MagicMock, registry._backends["claude-code"])
+
+        result = _data(
+            await client.call_tool("team_delete", {"team_name": "delete-cleans"})
+        )
+
+        assert result["success"] is True
+        mock_backend.kill.assert_called_with("%mock")
+        assert not await teams.team_exists("delete-cleans")
+
     async def test_recreate_cycle_keeps_tools_visible(self, client: Client):
         # Create -> delete -> re-create cycle
         await client.call_tool("team_create", {"team_name": "cycle1"})
