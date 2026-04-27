@@ -18,6 +18,16 @@ class CodexBackend(BaseBackend):
     _name = "codex"
     _binary_name = "codex"
 
+    @property
+    def is_interactive(self) -> bool:
+        """Codex runs interactively so its configured MCP servers are started.
+
+        Returns:
+            bool: Always True.
+
+        """
+        return True
+
     _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "gpt-5.1-codex-mini",
         "balanced": "gpt-5.3-codex",
@@ -102,17 +112,12 @@ class CodexBackend(BaseBackend):
         model = self.resolve_model(request.model)
         cmd = [
             binary,
-            "exec",
             "--model",
             model,
             *self.permission_args(request),
             "-C",
             request.cwd,
         ]
-
-        output_path = (request.extra or {}).get("output_last_message_path")
-        if output_path:
-            cmd.extend(["--output-last-message", output_path])
 
         if request.reasoning_effort:
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))

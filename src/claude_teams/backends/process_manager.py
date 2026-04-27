@@ -94,6 +94,8 @@ class WindowsProcessManager:
         cmd: list[str],
         env: dict[str, str],
         backend_type: str,
+        *,
+        is_interactive: bool = False,
     ) -> SpawnResult:
         """Start an agent process and return its PID handle."""
         log_path = self.log_path(request.team_name, request.name)
@@ -106,10 +108,13 @@ class WindowsProcessManager:
         merged_env = os.environ.copy()
         merged_env.update(env)
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        interactive_console = self._should_use_interactive_console(backend_type)
+        interactive_console = self._should_use_interactive_console(
+            backend_type, is_interactive=is_interactive
+        )
         popen_log_handle: IO[str] | None = log_handle
         if interactive_console:
-            cmd = self._with_debug_file(cmd, log_path)
+            if backend_type == "claude-code":
+                cmd = self._with_debug_file(cmd, log_path)
             log_handle.write(
                 "[interactive console] stdout/stderr are attached to the agent window\n"
             )
@@ -304,8 +309,11 @@ class WindowsProcessManager:
             info.log_handle.flush()
             info.log_handle.close()
 
-    def _should_use_interactive_console(self, backend_type: str) -> bool:
-        if backend_type != "claude-code":
+    def _should_use_interactive_console(
+        self, backend_type: str, *, is_interactive: bool = False
+    ) -> bool:
+        _ = backend_type
+        if not is_interactive:
             return False
         if os.environ.get("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", "").lower() in {
             "0",

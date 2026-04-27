@@ -54,6 +54,7 @@ class TestBaseBackendSpawn:
             ["/usr/bin/stub-cli", "--prompt", "do stuff"],
             {"STUB_MODE": "1"},
             "stub",
+            is_interactive=False,
         )
 
     def test_propagates_process_manager_spawn_failure(
@@ -249,6 +250,7 @@ class TestInteractiveConsoleSpawn:
             ["claude", "--mcp-config", "worker.mcp.json", "--", "do stuff"],
             {},
             "claude-code",
+            is_interactive=True,
         )
 
         assert result.process_handle == "4242"
@@ -285,6 +287,7 @@ class TestInteractiveConsoleSpawn:
             ["claude", "--", "do stuff"],
             {},
             "claude-code",
+            is_interactive=True,
         )
 
         command = popen_mock.call_args.args[0]

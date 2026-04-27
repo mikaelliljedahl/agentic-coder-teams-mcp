@@ -90,7 +90,9 @@ class BaseBackend:
             if not _SAFE_ENV_KEY.match(key):
                 raise InvalidEnvVarNameError(key)
 
-        return process_manager.spawn_process(request, cmd_parts, env_vars, self._name)
+        return process_manager.spawn_process(
+            request, cmd_parts, env_vars, self._name, is_interactive=self.is_interactive
+        )
 
     def health_check(self, handle: str) -> HealthStatus:
         """Check whether a spawned agent is still running."""

@@ -37,9 +37,9 @@ class TestCodexProperties:
         backend = CodexBackend()
         assert backend.binary_name == "codex"
 
-    def test_is_not_interactive(self):
+    def test_is_interactive(self):
         backend = CodexBackend()
-        assert backend.is_interactive is False
+        assert backend.is_interactive is True
 
 
 class TestCodexSupportedModels:
@@ -84,14 +84,14 @@ class TestCodexResolveModel:
 
 
 class TestCodexBuildCommand:
-    def test_produces_exec_command(self, _make_request):
+    def test_produces_interactive_command(self, _make_request):
         backend = CodexBackend()
         request = _make_request()
 
         cmd = backend.build_command(request)
 
         assert cmd[0] == "/usr/bin/codex"
-        assert "exec" in cmd
+        assert "exec" not in cmd
         assert "--model" in cmd
         assert "--full-auto" in cmd
         assert "-C" in cmd
@@ -122,20 +122,7 @@ class TestCodexBuildCommand:
         idx = cmd.index("-C")
         assert cmd[idx + 1] == project_dir
 
-    def test_includes_output_file_flag_when_extra_path_provided(
-        self, _make_request, tmp_path: Path
-    ):
-        backend = CodexBackend()
-        output_path = str(tmp_path / "codex-last-message.txt")
-        request = _make_request(extra={"output_last_message_path": output_path})
-
-        cmd = backend.build_command(request)
-
-        assert "--output-last-message" in cmd
-        idx = cmd.index("--output-last-message")
-        assert cmd[idx + 1] == output_path
-
-    def test_excludes_output_file_flag_when_no_extra(self, _make_request):
+    def test_excludes_output_file_flag_in_interactive_mode(self, _make_request):
         backend = CodexBackend()
         request = _make_request()
 
