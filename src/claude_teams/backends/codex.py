@@ -109,11 +109,8 @@ class CodexBackend(BaseBackend):
 
         """
         binary = self.discover_binary()
-        model = self.resolve_model(request.model)
         cmd = [
             binary,
-            "--model",
-            model,
             *self.permission_args(request),
             "-C",
             request.cwd,

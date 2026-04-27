@@ -92,7 +92,7 @@ class TestCodexBuildCommand:
 
         assert cmd[0] == "/usr/bin/codex"
         assert "exec" not in cmd
-        assert "--model" in cmd
+        assert "--model" not in cmd
         assert "--full-auto" in cmd
         assert "-C" in cmd
 
