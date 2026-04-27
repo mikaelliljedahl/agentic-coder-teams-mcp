@@ -96,7 +96,7 @@ class CodexBackend(BaseBackend):
 
     def default_permission_args(self) -> list[str]:
         """Return default permission-bypass arguments for Codex."""
-        return ["--full-auto"]
+        return ["--dangerously-bypass-approvals-and-sandbox"]
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Codex CLI command.

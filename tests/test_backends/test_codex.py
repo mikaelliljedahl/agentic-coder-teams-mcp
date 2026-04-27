@@ -93,16 +93,16 @@ class TestCodexBuildCommand:
         assert cmd[0] == "/usr/bin/codex"
         assert "exec" not in cmd
         assert "--model" not in cmd
-        assert "--full-auto" in cmd
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
         assert "-C" in cmd
 
-    def test_omits_full_auto_when_require_approval(self, _make_request):
+    def test_omits_bypass_when_require_approval(self, _make_request):
         backend = CodexBackend()
         request = _make_request(permission_mode="require_approval")
 
         cmd = backend.build_command(request)
 
-        assert "--full-auto" not in cmd
+        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
 
     def test_includes_prompt_as_last_arg(self, _make_request):
         backend = CodexBackend()
