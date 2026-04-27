@@ -210,7 +210,7 @@ class WindowsProcessManager:
             try:
                 info.process.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                info.process.kill()
+                self._kill_pid(str(info.pid))
                 info.process.wait(timeout=timeout_s)
         eventlog.log_event(
             info.team_name,
