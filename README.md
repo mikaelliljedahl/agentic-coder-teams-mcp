@@ -87,13 +87,22 @@ The server detects its role from environment variables:
 ### Example Flow
 
 ```
-1. Lead calls spawn_agent(prompt="Review auth.py", backend="codex", name="reviewer")
+1. Lead calls spawn_agent(prompt="Review auth.py and send_message results to lead", backend="codex", name="reviewer")
 2. Codex opens in a new console window, starts working
 3. Codex calls send_message(to="lead", text="Found 3 issues in auth.py")
 4. Lead calls read_messages() → sees the message
-5. Lead calls send_message(to="reviewer", text="Fix issue #1")
-6. Lead calls kill_agent(name="reviewer") when done
+5. Lead calls kill_agent(name="reviewer") when done
 ```
+
+### Messaging Model — Fire-and-Forget
+
+Agents are **single-prompt workers**, not chatbots. The prompt at spawn is their task. They execute it, optionally send a status message back to lead, and then go idle.
+
+- **Agent → Lead**: Works well. Include "send results to lead via send_message" in the prompt. The agent sends a message when done.
+- **Lead → Agent (follow-up)**: The message is written to the agent's inbox, but the agent only sees it if it actively polls `read_messages`. Most agents don't poll after completing their initial task.
+- **Multi-turn conversation**: Not practical. Agents don't run inbox-polling loops.
+
+**Recommended pattern**: Spawn an agent per task. Put everything it needs in the prompt. Have it report back via `send_message` when done. For file output, tell the agent which file to write to in the prompt — that's more reliable than messaging for large results.
 
 ## Spawn Options
 
