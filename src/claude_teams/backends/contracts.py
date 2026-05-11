@@ -1,8 +1,67 @@
-"""Shared backend contracts and request/result types."""
+"""Shared backend contracts, request/result types, and backend exceptions."""
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypedDict, runtime_checkable
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific exceptions (previously in claude_teams.errors)
+# ---------------------------------------------------------------------------
+
+
+class BackendNotRegisteredError(KeyError):
+    """Raised when a requested backend name is not in the registry."""
+
+    def __init__(self, name: str, available: Iterable[str]) -> None:
+        available_str = ", ".join(sorted(available)) or "(none)"
+        super().__init__(f"Backend {name!r} not found. Available: {available_str}")
+
+
+class NoBackendsAvailableError(RuntimeError):
+    """Raised when no spawner backend binaries are on PATH."""
+
+    def __init__(self) -> None:
+        super().__init__("No backends available. Install at least one agentic CLI tool.")
+
+
+class BackendBinaryNotFoundError(FileNotFoundError):
+    """Raised when a backend's CLI binary cannot be located on PATH."""
+
+    def __init__(self, binary_name: str, backend_name: str) -> None:
+        super().__init__(
+            f"Could not find {binary_name!r} on PATH. "
+            f"Install {backend_name} or add it to PATH."
+        )
+
+
+class InvalidEnvVarNameError(ValueError):
+    """Raised when a spawn env-var key fails the safe-name pattern."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"Invalid environment variable name: {key!r}")
+
+
+class PermissionBypassUnsupportedValueError(ValueError):
+    """Raised when ``permission_mode='bypass'`` is requested without support."""
+
+    def __init__(self, backend_name: str) -> None:
+        super().__init__(
+            f"Backend {backend_name!r} does not support permission_mode='bypass'."
+        )
+
+
+class UnsupportedBackendModelError(ValueError):
+    """Raised when a model name is not recognized for a backend."""
+
+    def __init__(
+        self, generic_name: str, backend_name: str, supported: Iterable[str]
+    ) -> None:
+        super().__init__(
+            f"Unsupported model {generic_name!r} for {backend_name}. "
+            f"Supported: {', '.join(supported)}"
+        )
 
 
 class CaptureResult(TypedDict):

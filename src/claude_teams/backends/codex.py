@@ -123,3 +123,10 @@ class CodexBackend(BaseBackend):
 
         cmd.append(request.prompt)
         return cmd
+
+    def build_env(self, request: SpawnRequest) -> dict[str, str]:
+        """Pass agent identity so MCP servers inherit session context."""
+        return {
+            "AGENT_NAME": request.name,
+            "AGENT_SESSION_ID": request.team_name,
+        }

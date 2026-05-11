@@ -12,7 +12,6 @@ dependencies = [
     "fastmcp>=3.2.4,<4",
     "typer>=0.24.1,<1",
     "rich>=15.0.0,<16",
-    "cryptography>=46.0.7,<47",
 ]
 
 [project.optional-dependencies]

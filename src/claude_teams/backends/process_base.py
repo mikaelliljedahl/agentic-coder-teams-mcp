@@ -8,18 +8,16 @@ from claude_teams.backends.contracts import (
     _SAFE_ENV_KEY,
     AgentProfile,
     AgentSelectSpec,
+    BackendBinaryNotFoundError,
     CaptureResult,
     HealthStatus,
+    InvalidEnvVarNameError,
+    PermissionBypassUnsupportedValueError,
     ReasoningEffortSpec,
     SpawnRequest,
     SpawnResult,
 )
 from claude_teams.backends.process_manager import process_manager
-from claude_teams.errors import (
-    BackendBinaryNotFoundError,
-    InvalidEnvVarNameError,
-    PermissionBypassUnsupportedValueError,
-)
 
 
 class BaseBackend:

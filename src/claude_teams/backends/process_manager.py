@@ -11,9 +11,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, ClassVar
 
-from claude_teams import eventlog
+import re
+
 from claude_teams.backends.contracts import SpawnRequest, SpawnResult
-from claude_teams.teams import validate_safe_name
+
+_VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_MAX_NAME_LEN = 64
+
+
+def _validate_safe_name(name: str, label: str = "name") -> str:
+    """Validate a filesystem-safe team or agent identifier."""
+    if not _VALID_NAME_RE.match(name):
+        raise ValueError(f"Invalid {label}: {name!r}")
+    if len(name) > _MAX_NAME_LEN:
+        raise ValueError(f"{label} too long: {name!r}")
+    return name
 
 
 @dataclass
@@ -163,14 +175,6 @@ class WindowsProcessManager:
             log_handle=popen_log_handle,
             started_at=time.time(),
         )
-        eventlog.log_event(
-            request.team_name,
-            "teammate_spawned",
-            name=request.name,
-            backend=backend_type,
-            pid=process.pid,
-            log_path=str(log_path),
-        )
         if not interactive_console:
             self._open_windows_terminal_tail(request.team_name, request.name, log_path)
         return SpawnResult(process_handle=handle, backend_type=backend_type)
@@ -184,14 +188,6 @@ class WindowsProcessManager:
                 return True, "process running"
             if not info.exit_logged:
                 info.exit_logged = True
-                eventlog.log_event(
-                    info.team_name,
-                    "teammate_exited",
-                    name=info.name,
-                    backend=info.backend,
-                    pid=info.pid,
-                    exit_code=exit_code,
-                )
                 self._close_log(info)
             return False, f"process exited ({exit_code})"
         if self._pid_alive(handle):
@@ -212,13 +208,6 @@ class WindowsProcessManager:
             except subprocess.TimeoutExpired:
                 self._kill_pid(str(info.pid))
                 info.process.wait(timeout=timeout_s)
-        eventlog.log_event(
-            info.team_name,
-            "teammate_killed",
-            name=info.name,
-            backend=info.backend,
-            pid=info.pid,
-        )
         self._close_log(info)
         self._processes.pop(handle, None)
 
@@ -255,8 +244,8 @@ class WindowsProcessManager:
 
     def log_path(self, team_name: str, agent_name: str) -> Path:
         """Return the log file path for a team member."""
-        safe_team = validate_safe_name(team_name, "team name")
-        safe_agent = validate_safe_name(agent_name, "agent name")
+        safe_team = _validate_safe_name(team_name, "team name")
+        safe_agent = _validate_safe_name(agent_name, "agent name")
         override = os.environ.get("WIN_AGENT_TEAMS_LOG_DIR")
         if override:
             return Path(override).expanduser() / safe_team / f"{safe_agent}.log"

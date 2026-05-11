@@ -1,12 +1,11 @@
 """Backend discovery and registry management."""
 
 import importlib
-import importlib.metadata
 import logging
 from collections.abc import Iterator
 
 from claude_teams.backends.base import Backend
-from claude_teams.errors import BackendNotRegisteredError, NoBackendsAvailableError
+from claude_teams.backends.contracts import BackendNotRegisteredError, NoBackendsAvailableError
 
 logger = logging.getLogger(__name__)
 
@@ -14,9 +13,6 @@ _BUILTIN_BACKENDS: dict[str, str] = {
     "claude-code": "claude_teams.backends.claude_code.ClaudeCodeBackend",
     "codex": "claude_teams.backends.codex.CodexBackend",
 }
-
-ENTRY_POINT_GROUP = "claude_teams.backends"
-
 
 class BackendRegistry:
     """Discovers and manages available spawner backends.
@@ -50,27 +46,6 @@ class BackendRegistry:
                     logger.debug("Backend %s not available (binary not found)", name)
             except Exception:
                 logger.debug("Failed to load backend %s", name, exc_info=True)
-
-        try:
-            eps = importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
-            for ep in eps:
-                if ep.name in self._backends:
-                    logger.debug(
-                        "Skipping entry-point %s (already registered)", ep.name
-                    )
-                    continue
-                try:
-                    cls = ep.load()
-                    instance = cls()
-                    if instance.is_available():
-                        self._backends[ep.name] = instance
-                        logger.info("Registered entry-point backend: %s", ep.name)
-                except Exception:
-                    logger.debug(
-                        "Failed to load entry-point %s", ep.name, exc_info=True
-                    )
-        except Exception:
-            logger.debug("Entry point discovery failed", exc_info=True)
 
     def register(self, name: str, backend: Backend) -> None:
         """Manually register a backend instance.

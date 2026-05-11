@@ -10,7 +10,7 @@ from claude_teams.backends.base import (
     ReasoningEffortSpec,
     SpawnRequest,
 )
-from claude_teams.errors import UnsupportedBackendModelError
+from claude_teams.backends.contracts import UnsupportedBackendModelError
 
 
 class ClaudeCodeBackend(BaseBackend):

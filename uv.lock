@@ -1648,7 +1648,6 @@ name = "win-agent-teams-mcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "cryptography" },
     { name = "fastmcp" },
     { name = "rich" },
     { name = "typer" },
@@ -1675,7 +1674,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cryptography", specifier = ">=46.0.7,<47" },
     { name = "fastmcp", specifier = ">=3.2.4,<4" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.41,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.41,<2" },
