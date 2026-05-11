@@ -1,10 +1,18 @@
 # win-agent-teams-mcp
 
-Windows-native MCP server for orchestrating teams of agentic coding agents.
+Minimal MCP server for spawning and communicating with Claude Code and Codex agents on Windows. Fire-and-forget agent spawning with bidirectional 1:1 messaging.
 
-This fork is focused on running directly on Windows with Claude Code and
-OpenAI Codex CLI as the primary workflow. It exposes a FastMCP server plus a
-small operator CLI named `win-agent-teams`.
+## Tools (7 total)
+
+| Tool | Description |
+|------|-------------|
+| `spawn_agent` | Start an agent process (fire-and-forget) |
+| `send_message` | Send a message to an agent or lead |
+| `read_messages` | Read messages from own inbox |
+| `check_agent` | Check if an agent process is alive |
+| `kill_agent` | Force-kill an agent process |
+| `list_agents` | List all agents and their status |
+| `list_backends` | List available backends |
 
 ## Quick Start
 
@@ -13,153 +21,91 @@ small operator CLI named `win-agent-teams`.
 - Windows 10 or Windows 11
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
-- Claude Code CLI available as `claude` on `PATH`
-- OpenAI Codex CLI available as `codex` on `PATH`
+- Claude Code CLI (`claude`) and/or OpenAI Codex CLI (`codex`) on `PATH`
 
-### Run with uvx
+### Claude Code MCP Setup
 
-```powershell
-uvx --from git+https://github.com/mikaelliljedahl/agentic-coder-teams-mcp win-agent-teams serve
-```
-
-### Verify available backends
-
-```powershell
-uvx --from git+https://github.com/mikaelliljedahl/agentic-coder-teams-mcp win-agent-teams backends
-```
-
-The server auto-discovers supported agent CLIs from your Windows `PATH`.
-
-## Claude Code MCP Setup
-
-Add the server to your project's `.mcp.json`:
+Add to your project's `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "win-agent-teams": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/mikaelliljedahl/agentic-coder-teams-mcp",
-        "win-agent-teams",
-        "serve"
-      ]
+      "command": "C:\\path\\to\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "claude_teams.server_simple"]
     }
   }
 }
 ```
 
-Start Claude Code in the project directory after saving the MCP config. Claude
-Code can then use the MCP tools to create a team, spawn teammates, assign tasks,
-send messages, and check teammate health.
+### Codex MCP Setup
 
-## Codex Flow On Windows
+Add to `~/.codex/config.toml`:
 
-Use Claude Code as the team lead and spawn Codex teammates when you want an
-OpenAI Codex CLI worker to implement, review, or investigate a task.
-
-Typical flow:
-
-1. Start Claude Code in a Windows workspace with the MCP server configured.
-2. Use `team_create` to create a team.
-3. Use `list_backends` to confirm `claude-code` and `codex` are available.
-4. Use `spawn_teammate` with `backend_name` set to `codex` for Codex workers.
-5. Use `task_create`, `send_message`, `read_inbox`, and `check_teammate` to
-   coordinate the work.
-
-Example `spawn_teammate` arguments:
-
-```json
-{
-  "team_name": "windows-port",
-  "name": "codex-worker",
-  "prompt": "Implement the focused change and report back with tests run.",
-  "options": {
-    "backend_name": "codex",
-    "model": "balanced",
-    "cwd": "C:\\code\\github\\my-project"
-  }
-}
+```toml
+[mcp_servers.win-agent-teams]
+command = "C:\\path\\to\\.venv\\Scripts\\python.exe"
+args = ["-m", "claude_teams.server_simple"]
+env = { "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass" }
+enabled = true
 ```
 
-## Windows Smoke Test
+The server auto-injects `AGENT_NAME` and `AGENT_SESSION_ID` into the Codex config before each spawn so the MCP server knows agent identity.
 
-Use this smoke test to verify the Windows-native Codex lead -> Claude Code
-teammate path. It exercises MCP spawning, inbox messaging, PID handles, log
-capture, health checks, and cleanup without tmux, WSL, Cygwin, or psmux.
+## How It Works
 
-Refresh the GitHub install first so Codex uses the latest fork revision:
+### Spawning
+
+`spawn_agent` starts a CLI process in its own console window and returns immediately with `{name, pid, backend, session_id}`. The agent runs independently — output is visible in the console window.
+
+### Messaging
+
+Bidirectional 1:1 messaging between lead and agents via JSONL files:
+
+```
+~/.claude/agent-sessions/{session-id}/
+    agents.json              # agent registry
+    inbox-lead.jsonl         # messages TO lead
+    inbox-{agent}.jsonl      # messages TO agent
+```
+
+Each line: `{"from": "agent-1", "text": "done", "ts": "2026-05-11T..."}`
+
+### Identity
+
+The server detects its role from environment variables:
+- **Lead mode**: No `AGENT_NAME` set → identity = `"lead"`
+- **Agent mode**: `AGENT_NAME` + `AGENT_SESSION_ID` set → identity = agent name
+
+### Example Flow
+
+```
+1. Lead calls spawn_agent(prompt="Review auth.py", backend="codex", name="reviewer")
+2. Codex opens in a new console window, starts working
+3. Codex calls send_message(to="lead", text="Found 3 issues in auth.py")
+4. Lead calls read_messages() → sees the message
+5. Lead calls send_message(to="reviewer", text="Fix issue #1")
+6. Lead calls kill_agent(name="reviewer") when done
+```
+
+## Spawn Options
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `prompt` | required | Task prompt for the agent |
+| `name` | auto (`agent-1`) | Agent name |
+| `backend` | `claude-code` | `claude-code` or `codex` |
+| `model` | backend default | Model to use |
+| `reasoning_effort` | none | `low`/`medium`/`high` (codex), `low`/`medium`/`high`/`max` (claude-code) |
+| `permission_mode` | `bypass` | `bypass`, `default`, or `require_approval` |
+| `cwd` | server cwd | Working directory for the agent |
+
+## CLI
 
 ```powershell
-uvx --refresh --from git+https://github.com/mikaelliljedahl/agentic-coder-teams-mcp win-agent-teams --help
-uvx --refresh --from git+https://github.com/mikaelliljedahl/agentic-coder-teams-mcp win-agent-teams backends --json
+win-agent-teams serve      # Start the MCP server
+win-agent-teams backends   # List available backends
 ```
-
-Start a fresh Codex CLI session with the `win-agent-teams` MCP server
-configured, then run this prompt:
-
-```text
-Run a Windows-native smoke test for win-agent-teams MCP using the team name `codex-lead-smoke-visual`.
-
-Use the `win-agent-teams` MCP tools only, not direct filesystem reads unless an MCP tool fails.
-
-Steps:
-
-1. Create team `codex-lead-smoke-visual`.
-2. Spawn teammate:
-   - name: `claude-worker`
-   - backend: `claude-code`
-   - model: `sonnet`
-   - prompt: `Read your inbox, reply to the team lead with a one-sentence confirmation using send_message(sender="claude-worker", recipient="team-lead"), then wait for further instructions.`
-3. Read config and verify:
-   - `claude-worker` exists
-   - `backendType` is `claude-code`
-   - `processHandle` is a decimal PID string
-   - `pid` is populated
-4. Send a follow-up message from `team-lead` to `claude-worker`:
-   `Please confirm you received the follow-up message.`
-5. Poll or read `team-lead` inbox using MCP tools until a message from `claude-worker` appears.
-6. Report the exact received message text.
-7. Call `health_check` for `claude-worker`.
-8. Call `get_agent_logs` for `claude-worker` with `tail=80`.
-9. Stop `claude-worker` using `force_kill_teammate`.
-10. Delete the team.
-```
-
-Expected result:
-
-- A real Claude Code terminal window opens for `claude-worker`.
-- The backend list includes `claude-code` and `codex`.
-- `processHandle` and `pid` are decimal PID values.
-- Claude replies to `team-lead` through MCP `send_message`.
-- Codex can read the reply through MCP inbox tools.
-- `health_check` returns process-based detail.
-- `get_agent_logs` returns a path under
-  `%USERPROFILE%\.claude\teams\codex-lead-smoke-visual\logs\claude-worker.log`.
-- `force_kill_teammate` and `team_delete` complete successfully.
-- No tmux, pane, WSL, Cygwin, or psmux errors appear.
-
-If Codex cannot see Claude's inbox replies but direct file inspection shows
-messages in `team-lead.json`, refresh the `uvx` install and restart Codex. Older
-builds read inbox files using the Windows process codepage; current builds use
-UTF-8 explicitly for inbox state.
-
-## CLI Reference
-
-```powershell
-win-agent-teams serve              # Start the MCP server
-win-agent-teams backends           # List available backends
-win-agent-teams templates          # List registered agent templates
-win-agent-teams presets            # List registered team presets
-win-agent-teams config TEAM        # Show team config
-win-agent-teams status TEAM        # Show member status and task summary
-win-agent-teams inbox TEAM AGENT   # Read an agent inbox
-win-agent-teams health TEAM AGENT  # Health-check a teammate process
-win-agent-teams kill TEAM AGENT    # Force-kill a teammate
-```
-
-All commands support `--json` / `-j` for machine-readable output.
 
 ## Development
 
@@ -168,25 +114,6 @@ git clone https://github.com/mikaelliljedahl/agentic-coder-teams-mcp.git
 cd agentic-coder-teams-mcp
 uv sync --group dev
 ```
-
-Run the same checks as CI:
-
-```powershell
-uv run ruff format --check .
-uv run ruff check .
-uv run ty check
-uv run pytest
-```
-
-CI runs on `windows-latest` only.
-
-## Project Notes
-
-- Package name: `win-agent-teams-mcp`
-- Console script: `win-agent-teams`
-- FastMCP app name: `win-agent-teams`
-- Supported platform for this fork: Windows
-- Primary documented lead/worker flow: Claude Code plus Codex CLI
 
 ## License
 
