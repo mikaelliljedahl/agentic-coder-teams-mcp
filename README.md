@@ -23,9 +23,9 @@ Minimal MCP server for spawning and communicating with Claude Code and Codex age
 - [uv](https://docs.astral.sh/uv/)
 - Claude Code CLI (`claude`) and/or OpenAI Codex CLI (`codex`) on `PATH`
 
-### Claude Code MCP Setup
+### Setup — Claude Code as Lead
 
-Add to your project's `.mcp.json`:
+Add to your project's `.mcp.json` so Claude Code can spawn agents:
 
 ```json
 {
@@ -38,9 +38,12 @@ Add to your project's `.mcp.json`:
 }
 ```
 
-### Codex MCP Setup
+Spawned Claude Code agents get the MCP server automatically via `--mcp-config`.
+Spawned Codex agents need the Codex setup below to message back.
 
-Add to `~/.codex/config.toml`:
+### Setup — Codex as Lead (or as Spawned Agent)
+
+Add to `~/.codex/config.toml` so Codex can use the MCP tools (both as lead and as spawned agent):
 
 ```toml
 [mcp_servers.win-agent-teams]
@@ -50,7 +53,11 @@ env = { "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass" }
 enabled = true
 ```
 
-The server auto-injects `AGENT_NAME` and `AGENT_SESSION_ID` into the Codex config before each spawn so the MCP server knows agent identity.
+This is required in two scenarios:
+1. **Codex as lead** — Codex calls `spawn_agent` to start Claude Code or other Codex agents
+2. **Codex as spawned agent** — when Claude Code spawns a Codex agent, the agent needs this config to call `send_message` back to lead
+
+The server auto-injects `AGENT_NAME` and `AGENT_SESSION_ID` into the Codex config env before each spawn so the MCP server knows agent identity.
 
 ## How It Works
 
