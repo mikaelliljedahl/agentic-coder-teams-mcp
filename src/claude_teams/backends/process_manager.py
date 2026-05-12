@@ -3,6 +3,7 @@
 import contextlib
 import ctypes
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -11,20 +12,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, ClassVar
 
-import re
-
 from claude_teams.backends.contracts import SpawnRequest, SpawnResult
 
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_NAME_LEN = 64
+_STILL_ACTIVE = 259
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_ACCESS_DENIED = 5
 
 
 def _validate_safe_name(name: str, label: str = "name") -> str:
     """Validate a filesystem-safe team or agent identifier."""
     if not _VALID_NAME_RE.match(name):
-        raise ValueError(f"Invalid {label}: {name!r}")
+        raise ValueError(f"Invalid {label}: {name!r}")  # noqa: TRY003
     if len(name) > _MAX_NAME_LEN:
-        raise ValueError(f"{label} too long: {name!r}")
+        raise ValueError(f"{label} too long: {name!r}")  # noqa: TRY003
     return name
 
 
@@ -288,10 +290,41 @@ class WindowsProcessManager:
     def _pid_alive(self, handle: str) -> bool:
         try:
             pid = int(handle)
+        except ValueError:
+            return False
+        if os.name == "nt":
+            return self._windows_pid_alive(pid)
+        try:
             os.kill(pid, 0)
-        except (OSError, ValueError):
+        except OSError:
             return False
         return True
+
+    def _windows_pid_alive(self, pid: int) -> bool:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        process_handle = kernel32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            pid,
+        )
+        if not process_handle:
+            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == _STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(process_handle)
 
     def _close_log(self, info: ProcessInfo) -> None:
         if info.log_handle is not None and not info.log_handle.closed:

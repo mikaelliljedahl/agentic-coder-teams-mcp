@@ -1,5 +1,7 @@
 """Runtime BaseBackend process-manager operation tests."""
 
+import subprocess
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -296,6 +298,19 @@ class TestInteractiveConsoleSpawn:
         assert kwargs["stdin"] == process_manager_mod.subprocess.PIPE
         assert kwargs["stdout"] is not None
         assert kwargs["stderr"] == process_manager_mod.subprocess.STDOUT
+
+
+class TestProcessLivenessFallback:
+    def test_pid_alive_detects_external_running_process(self):
+        manager = process_manager_mod.WindowsProcessManager()
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+        try:
+            assert manager._pid_alive(str(process.pid)) is True
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
 
 
 class TestWindowsTerminalTail:

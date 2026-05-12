@@ -103,6 +103,10 @@ class ClaudeCodeBackend(BaseBackend):
         """Use Claude Code's explicit bypass permission mode."""
         return ["--permission-mode", "bypassPermissions"]
 
+    def supports_resume(self) -> bool:
+        """Claude Code supports native session resume."""
+        return True
+
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Claude Code CLI command.
 
@@ -119,6 +123,44 @@ class ClaudeCodeBackend(BaseBackend):
         model = self.resolve_model(request.model)
         cmd = [
             binary,
+            "--agent-id",
+            request.agent_id,
+            "--agent-name",
+            request.name,
+            "--team-name",
+            request.team_name,
+            "--agent-color",
+            request.color,
+            "--parent-session-id",
+            request.lead_session_id,
+            "--agent-type",
+            request.agent_type,
+            "--model",
+            model,
+            *self.permission_args(request),
+        ]
+        mcp_config_path = (request.extra or {}).get("mcp_config_path")
+        if mcp_config_path:
+            cmd.extend(["--mcp-config", mcp_config_path])
+        if request.plan_mode_required:
+            cmd.append("--plan-mode-required")
+        if request.reasoning_effort:
+            cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
+        cmd.extend(self._agent_args(request))
+        cmd.append("--")
+        cmd.append(self._prompt_arg(request))
+        return cmd
+
+    def build_resume_command(
+        self, request: SpawnRequest, backend_session_id: str
+    ) -> list[str]:
+        """Build the Claude Code CLI command for a native session resume."""
+        binary = self.discover_binary()
+        model = self.resolve_model(request.model)
+        cmd = [
+            binary,
+            "--resume",
+            backend_session_id,
             "--agent-id",
             request.agent_id,
             "--agent-name",

@@ -84,6 +84,18 @@ class BaseBackend:
         cmd_parts = self.build_command(request)
         env_vars = self.build_env(request)
 
+        return self._spawn_with_command(request, cmd_parts, env_vars)
+
+    def resume(self, request: SpawnRequest, backend_session_id: str) -> SpawnResult:
+        """Resume a backend-native conversation as a new process."""
+        cmd_parts = self.build_resume_command(request, backend_session_id)
+        env_vars = self.build_env(request)
+        return self._spawn_with_command(request, cmd_parts, env_vars)
+
+    def _spawn_with_command(
+        self, request: SpawnRequest, cmd_parts: list[str], env_vars: dict[str, str]
+    ) -> SpawnResult:
+        """Spawn an already-built backend command."""
         for key in env_vars:
             if not _SAFE_ENV_KEY.match(key):
                 raise InvalidEnvVarNameError(key)
@@ -91,6 +103,10 @@ class BaseBackend:
         return process_manager.spawn_process(
             request, cmd_parts, env_vars, self._name, is_interactive=self.is_interactive
         )
+
+    def supports_resume(self) -> bool:
+        """Return whether this backend can resume native sessions."""
+        return False
 
     def health_check(self, handle: str) -> HealthStatus:
         """Check whether a spawned agent is still running."""
@@ -164,6 +180,13 @@ class BaseBackend:
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the backend command."""
+        raise NotImplementedError
+
+    def build_resume_command(
+        self, request: SpawnRequest, backend_session_id: str
+    ) -> list[str]:
+        """Build a backend command that resumes an existing native session."""
+        _ = request, backend_session_id
         raise NotImplementedError
 
     def reasoning_effort_spec(self) -> ReasoningEffortSpec | None:

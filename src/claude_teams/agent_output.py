@@ -21,12 +21,18 @@ class AgentOutput:
     """Latest assistant output found in an agent rollout file."""
 
     last_activity_at: float
-    last_message: str
+    last_message: str | None
     rollout_path: str
+    backend_session_id: str | None = None
+    busy_hint: bool = False
 
 
 def read_codex_output(
-    spawned_at: float, cwd: str, max_bytes: int = 10_240
+    spawned_at: float,
+    cwd: str,
+    max_bytes: int = 10_240,
+    *,
+    backend_session_id: str | None = None,
 ) -> AgentOutput | None:
     """Read the latest Codex assistant output for a spawned agent."""
     if spawned_at <= 0 or not cwd:
@@ -36,23 +42,30 @@ def read_codex_output(
     if not normalized_cwd:
         return None
 
-    candidates = _matching_codex_rollouts(spawned_at, normalized_cwd)
+    candidates = _matching_codex_rollouts(
+        spawned_at, normalized_cwd, backend_session_id
+    )
     if not candidates:
         return None
 
-    mtime, path = max(candidates, key=lambda item: item[0])
+    mtime, path, backend_session_id = max(candidates, key=lambda item: item[0])
     message = _last_codex_message(path)
-    if message is None:
+    if message is None and backend_session_id is None:
         return None
     return AgentOutput(
         last_activity_at=mtime,
-        last_message=_truncate_utf8(message, max_bytes),
+        last_message=_truncate_utf8(message, max_bytes) if message else None,
         rollout_path=str(path),
+        backend_session_id=backend_session_id,
     )
 
 
 def read_claude_output(
-    spawned_at: float, cwd: str, max_bytes: int = 10_240
+    spawned_at: float,
+    cwd: str,
+    max_bytes: int = 10_240,
+    *,
+    backend_session_id: str | None = None,
 ) -> AgentOutput | None:
     """Read the latest Claude Code assistant output for a spawned agent."""
     if spawned_at <= 0 or not cwd:
@@ -64,26 +77,38 @@ def read_claude_output(
 
     encoded_cwd = _encode_claude_cwd(resolved_cwd)
     project_dir = Path.home() / ".claude" / "projects" / encoded_cwd
-    candidates = _matching_jsonl_files(project_dir, spawned_at)
+    candidates = []
+    for mtime, path in _matching_jsonl_files(project_dir, spawned_at):
+        session_id = _claude_session_id(path)
+        if backend_session_id:
+            if session_id == backend_session_id:
+                candidates.append((mtime, path))
+            continue
+        if _started_after(_claude_started_at(path), spawned_at):
+            candidates.append((mtime, path))
     if not candidates:
         return None
 
     mtime, path = max(candidates, key=lambda item: item[0])
+    backend_session_id = _claude_session_id(path)
     message = _last_claude_message(path)
-    if message is None:
+    if message is None and backend_session_id is None:
         return None
     return AgentOutput(
         last_activity_at=mtime,
-        last_message=_truncate_utf8(message, max_bytes),
+        last_message=_truncate_utf8(message, max_bytes) if message else None,
         rollout_path=str(path),
+        backend_session_id=backend_session_id,
     )
 
 
 def _matching_codex_rollouts(
-    spawned_at: float, normalized_cwd: str
-) -> list[tuple[float, Path]]:
-    candidates: list[tuple[float, Path]] = []
-    for directory in _codex_candidate_dirs(spawned_at):
+    spawned_at: float, normalized_cwd: str, backend_session_id: str | None
+) -> list[tuple[float, Path, str | None]]:
+    candidates: list[tuple[float, Path, str | None]] = []
+    for directory in _codex_candidate_dirs(
+        spawned_at, include_all=bool(backend_session_id)
+    ):
         for mtime, path in _matching_jsonl_files(
             directory, spawned_at, pattern="rollout-*.jsonl"
         ):
@@ -93,12 +118,22 @@ def _matching_codex_rollouts(
             payload = meta.get("payload")
             if not isinstance(payload, dict):
                 continue
+            session_id = payload.get("id")
+            if backend_session_id:
+                if session_id != backend_session_id:
+                    continue
+            elif not _started_after(
+                _parse_timestamp(payload.get("timestamp")), spawned_at
+            ):
+                continue
             meta_cwd = payload.get("cwd")
             if (
                 isinstance(meta_cwd, str)
                 and _normalize_path(meta_cwd) == normalized_cwd
             ):
-                candidates.append((mtime, path))
+                candidates.append(
+                    (mtime, path, session_id if isinstance(session_id, str) else None)
+                )
     return candidates
 
 
@@ -121,7 +156,9 @@ def _matching_jsonl_files(
     return matches
 
 
-def _codex_candidate_dirs(spawned_at: float) -> list[Path]:
+def _codex_candidate_dirs(
+    spawned_at: float, *, include_all: bool = False
+) -> list[Path]:
     try:
         utc_time = datetime.fromtimestamp(spawned_at, tz=UTC)
     except (OSError, OverflowError, ValueError):
@@ -132,10 +169,14 @@ def _codex_candidate_dirs(spawned_at: float) -> list[Path]:
         (dt + timedelta(days=offset)).date() for dt in roots for offset in (-1, 0, 1)
     }
     base = Path.home() / ".codex" / "sessions"
-    return [
+    directories = [
         base / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
         for day in sorted(days)
     ]
+    if include_all:
+        with contextlib.suppress(OSError):
+            directories.extend(path for path in base.glob("*/*/*") if path.is_dir())
+    return list(dict.fromkeys(directories))
 
 
 def _first_json_object(path: Path) -> Any:
@@ -186,6 +227,64 @@ def _last_claude_message(path: Path) -> str | None:
         if text is not None:
             return text
     return None
+
+
+def _claude_session_id(path: Path) -> str | None:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    item = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                session_id = item.get("sessionId")
+                if isinstance(session_id, str):
+                    return session_id
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def _claude_started_at(path: Path) -> float | None:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    item = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                started_at = _parse_timestamp(item.get("timestamp"))
+                if started_at is not None:
+                    return started_at
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def _started_after(started_at: float | None, spawned_at: float) -> bool:
+    if started_at is None:
+        return True
+    return started_at >= spawned_at - _MTIME_SLACK_SECONDS
+
+
+def _parse_timestamp(value: object) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return None
 
 
 def _content_text(

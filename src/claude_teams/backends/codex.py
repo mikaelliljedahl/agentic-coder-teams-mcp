@@ -99,6 +99,10 @@ class CodexBackend(BaseBackend):
         """Return default permission-bypass arguments for Codex."""
         return ["--dangerously-bypass-approvals-and-sandbox"]
 
+    def supports_resume(self) -> bool:
+        """Codex supports native session resume."""
+        return True
+
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Codex CLI command.
 
@@ -123,6 +127,25 @@ class CodexBackend(BaseBackend):
         cmd.extend(self._agent_args(request))
 
         cmd.append(self._prompt_arg(request))
+        return cmd
+
+    def build_resume_command(
+        self, request: SpawnRequest, backend_session_id: str
+    ) -> list[str]:
+        """Build the Codex CLI command for a native session resume."""
+        binary = self.discover_binary()
+        cmd = [
+            binary,
+            *self.permission_args(request),
+            "-C",
+            request.cwd,
+        ]
+
+        if request.reasoning_effort:
+            cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
+
+        cmd.extend(self._agent_args(request))
+        cmd.extend(["resume", backend_session_id, self._prompt_arg(request)])
         return cmd
 
     def _prompt_arg(self, request: SpawnRequest) -> str:
