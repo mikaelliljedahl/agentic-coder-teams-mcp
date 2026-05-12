@@ -1,5 +1,6 @@
 """Codex backend integration."""
 
+import json
 from typing import ClassVar
 
 from claude_teams.backends._agent_discovery import discover_codex_style_agents
@@ -121,8 +122,22 @@ class CodexBackend(BaseBackend):
 
         cmd.extend(self._agent_args(request))
 
-        cmd.append(request.prompt)
+        cmd.append(self._prompt_arg(request))
         return cmd
+
+    def _prompt_arg(self, request: SpawnRequest) -> str:
+        """Return the initial Codex prompt argument.
+
+        Codex's interactive prompt handling can truncate multi-line argv prompts
+        in Windows consoles, so multi-line tasks are carried as a single JSON
+        string argument and decoded by the agent from the initial instruction.
+        """
+        if "\n" not in request.prompt and "\r" not in request.prompt:
+            return request.prompt
+        return (
+            "Decode this JSON string as your complete task prompt, then follow "
+            f"the decoded text exactly: {json.dumps(request.prompt)}"
+        )
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
         """Pass agent identity so MCP servers inherit session context."""

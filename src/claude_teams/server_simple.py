@@ -1,10 +1,11 @@
 """Simplified MCP server for agent orchestration — 7 tools, fire-and-forget."""
 
 import json
+import logging
 import os
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -21,6 +22,7 @@ _AGENT_SESSION_ID: str = os.environ.get("AGENT_SESSION_ID", "").strip()
 IDENTITY: str = _AGENT_NAME if _AGENT_NAME else "lead"
 
 _SESSION_BASE = Path.home() / ".claude" / "agent-sessions"
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     name="win-agent-teams",
@@ -95,7 +97,6 @@ def _update_codex_mcp_env(session_id: str, agent_name: str) -> None:
     if not config_path.exists():
         return
     try:
-        import tomllib
         content = config_path.read_text(encoding="utf-8")
         # Simple string replacement for the env block
         # Find and replace the win-agent-teams env line
@@ -103,16 +104,21 @@ def _update_codex_mcp_env(session_id: str, agent_name: str) -> None:
         new_lines = []
         in_win_agent = False
         for line in lines:
+            updated_line = line
             if line.strip().startswith("[mcp_servers.win-agent-teams]"):
                 in_win_agent = True
             elif line.strip().startswith("[") and in_win_agent:
                 in_win_agent = False
             if in_win_agent and line.strip().startswith("env"):
-                line = f'env = {{ "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass", "AGENT_NAME" = "{agent_name}", "AGENT_SESSION_ID" = "{session_id}" }}'
-            new_lines.append(line)
+                updated_line = (
+                    'env = { "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass", '
+                    f'"AGENT_NAME" = "{agent_name}", '
+                    f'"AGENT_SESSION_ID" = "{session_id}" }}'
+                )
+            new_lines.append(updated_line)
         config_path.write_text("\n".join(new_lines), encoding="utf-8")
     except Exception:
-        pass
+        logger.debug("Failed updating Codex MCP env", exc_info=True)
 
 
 @mcp.tool()
@@ -125,11 +131,14 @@ async def spawn_agent(
     permission_mode: str = "bypass",
     reasoning_effort: str = "",
 ) -> dict:
-    """Spawn a new agent process. reasoning_effort: low/medium/high for codex, low/medium/high/max for claude-code."""
-    global _session_id
+    """Spawn a new agent process.
+
+    reasoning_effort: low/medium/high for codex,
+    low/medium/high/max for claude-code.
+    """
 
     def _do_spawn() -> dict:
-        global _session_id
+        global _session_id  # noqa: PLW0603 - module-level lead session state.
 
         if not _session_id:
             _session_id = _create_session()
@@ -149,9 +158,13 @@ async def spawn_agent(
         if backend_name == "codex":
             _update_codex_mcp_env(session_id, agent_name)
 
-        agent_cwd = cwd.strip() or os.getcwd()
+        agent_cwd = cwd.strip() or str(Path.cwd())
 
         effort = reasoning_effort.strip() or None
+        extra = {
+            "mcp_config_path": str(mcp_config_path),
+            "agent_capability": "",
+        }
 
         request = SpawnRequest(
             agent_id=f"{agent_name}@{session_id}",
@@ -165,10 +178,7 @@ async def spawn_agent(
             lead_session_id="lead",
             permission_mode=permission_mode,  # type: ignore[arg-type]
             reasoning_effort=effort,
-            extra={
-                "mcp_config_path": str(mcp_config_path),
-                "agent_capability": "",
-            },
+            extra=extra,
         )
 
         result = b.spawn(request)
@@ -206,7 +216,7 @@ async def send_message(to: str, text: str) -> dict:
             {
                 "from": IDENTITY,
                 "text": text,
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": datetime.now(UTC).isoformat(),
             }
         )
         with inbox.open("a", encoding="utf-8") as f:
@@ -227,11 +237,11 @@ async def read_messages(from_agent: str = "") -> list[dict]:
             return []
         messages = []
         for raw in inbox.read_text(encoding="utf-8").splitlines():
-            raw = raw.strip()
-            if not raw:
+            stripped = raw.strip()
+            if not stripped:
                 continue
             try:
-                msg = json.loads(raw)
+                msg = json.loads(stripped)
             except json.JSONDecodeError:
                 continue
             if from_agent and msg.get("from") != from_agent:

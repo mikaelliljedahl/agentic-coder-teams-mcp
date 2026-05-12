@@ -112,6 +112,18 @@ class TestCodexBuildCommand:
 
         assert cmd[-1] == "fix the bug"
 
+    def test_encodes_multiline_prompt_as_single_arg(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(prompt="first line\nsecond line")
+
+        cmd = backend.build_command(request)
+
+        assert cmd[-1] == (
+            "Decode this JSON string as your complete task prompt, then follow "
+            'the decoded text exactly: "first line\\nsecond line"'
+        )
+        assert "\n" not in cmd[-1]
+
     def test_includes_cwd_flag(self, _make_request, tmp_path: Path):
         backend = CodexBackend()
         project_dir = str(tmp_path / "my" / "project")
