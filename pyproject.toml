@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "win-agent-teams-mcp"
 version = "0.1.0"
-description = "Windows-native MCP server for orchestrating teams of agentic coding agents"
+description = "Minimal Windows MCP server for spawning Claude Code and Codex agents with fire-and-forget 1:1 messaging"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
