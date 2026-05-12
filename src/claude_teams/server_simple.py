@@ -4,12 +4,14 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 from fastmcp import FastMCP
 
+from claude_teams.agent_output import read_claude_output, read_codex_output
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.process_manager import process_manager
@@ -53,9 +55,7 @@ def _load_agents(session_id: str) -> list[dict]:
 
 
 def _save_agents(session_id: str, agents: list[dict]) -> None:
-    _agents_file(session_id).write_text(
-        json.dumps(agents, indent=2), encoding="utf-8"
-    )
+    _agents_file(session_id).write_text(json.dumps(agents, indent=2), encoding="utf-8")
 
 
 def _create_session() -> str:
@@ -191,6 +191,8 @@ async def spawn_agent(
                 "backend": backend_name,
                 "session_id": session_id,
                 "status": "running",
+                "spawned_at": time.time(),
+                "cwd": agent_cwd,
             }
         )
         _save_agents(session_id, agents)
@@ -261,14 +263,32 @@ async def check_agent(name: str) -> dict:
         agents = _load_agents(session_id)
         agent = next((a for a in agents if a["name"] == name), None)
         if agent is None:
-            return {"name": name, "alive": False, "pid": None, "backend": None}
+            return {
+                "name": name,
+                "alive": False,
+                "pid": None,
+                "backend": None,
+                "last_activity_at": None,
+                "last_message": None,
+            }
         pid = agent["pid"]
         alive, _ = process_manager.health_check(str(pid))
+        backend = agent.get("backend")
+        output = None
+        spawned_at = float(agent.get("spawned_at") or 0.0)
+        cwd = str(agent.get("cwd") or "")
+        if spawned_at > 0 and cwd:
+            if backend == "codex":
+                output = read_codex_output(spawned_at, cwd)
+            elif backend == "claude-code":
+                output = read_claude_output(spawned_at, cwd)
         return {
             "name": name,
             "alive": alive,
             "pid": pid,
-            "backend": agent.get("backend"),
+            "backend": backend,
+            "last_activity_at": output.last_activity_at if output else None,
+            "last_message": output.last_message if output else None,
         }
 
     return await run_blocking(_do_check)

@@ -9,7 +9,7 @@ Minimal MCP server for spawning and communicating with Claude Code and Codex age
 | `spawn_agent` | Start an agent process (fire-and-forget) |
 | `send_message` | Send a message to an agent or lead |
 | `read_messages` | Read messages from own inbox |
-| `check_agent` | Check if an agent process is alive |
+| `check_agent` | Check if an agent process is alive and read fallback output |
 | `kill_agent` | Force-kill an agent process |
 | `list_agents` | List all agents and their status |
 | `list_backends` | List available backends |
@@ -77,6 +77,10 @@ Bidirectional 1:1 messaging between lead and agents via JSONL files:
 ```
 
 Each line: `{"from": "agent-1", "text": "done", "ts": "2026-05-11T..."}`
+
+### Output Fallback
+
+`check_agent(name)` returns `{name, alive, pid, backend, last_activity_at, last_message}`. For Codex and Claude Code workers, `last_activity_at` and `last_message` are read from the CLIs' existing JSONL session logs. This is a fallback for workers that finish without calling `send_message`; it does not replace explicit agent-to-lead messaging.
 
 ### Identity
 
