@@ -15,7 +15,7 @@ def _make_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
         name="worker",
         team_name="team",
         prompt="do stuff",
-        model="gpt-5.3-codex",
+        model="gpt-5.5",
         agent_type="general-purpose",
         color="blue",
         cwd=str(tmp_path),
@@ -46,15 +46,15 @@ class TestCodexSupportedModels:
     def test_returns_expected_models(self):
         backend = CodexBackend()
         models = backend.supported_models()
-        assert "gpt-5.3-codex" in models
+        assert "gpt-5.5" in models
         assert "gpt-5.1-codex-max" in models
         assert "gpt-5.1-codex-mini" in models
 
 
 class TestCodexDefaultModel:
-    def test_returns_gpt_5_3_codex(self):
+    def test_returns_gpt_5_5(self):
         backend = CodexBackend()
-        assert backend.default_model() == "gpt-5.3-codex"
+        assert backend.default_model() == "gpt-5.5"
 
 
 class TestCodexResolveModel:
@@ -64,7 +64,7 @@ class TestCodexResolveModel:
 
     def test_resolves_balanced_to_codex(self):
         backend = CodexBackend()
-        assert backend.resolve_model("balanced") == "gpt-5.3-codex"
+        assert backend.resolve_model("balanced") == "gpt-5.5"
 
     def test_resolves_powerful_to_max(self):
         backend = CodexBackend()
@@ -72,7 +72,7 @@ class TestCodexResolveModel:
 
     def test_resolves_direct_model_name(self):
         backend = CodexBackend()
-        assert backend.resolve_model("gpt-5.3-codex") == "gpt-5.3-codex"
+        assert backend.resolve_model("gpt-5.5") == "gpt-5.5"
 
     def test_passes_through_unknown_model_name(self):
         backend = CodexBackend()

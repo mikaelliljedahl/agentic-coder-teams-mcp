@@ -207,7 +207,7 @@ class TestClaudeCodeReasoningEffort:
         spec = backend.reasoning_effort_spec()
         assert spec is not None
         assert spec.flag == "--effort"
-        assert spec.options == frozenset({"low", "medium", "high", "max"})
+        assert spec.options == frozenset({"low", "medium", "high", "xhigh", "max"})
 
     def test_build_command_appends_effort_when_set(self, _make_request):
         backend = ClaudeCodeBackend()

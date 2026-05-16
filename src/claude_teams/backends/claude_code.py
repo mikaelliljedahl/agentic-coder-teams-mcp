@@ -42,7 +42,7 @@ class ClaudeCodeBackend(BaseBackend):
     _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
         flag="--effort",
         value_template="{value}",
-        options=frozenset({"low", "medium", "high", "max"}),
+        options=frozenset({"low", "medium", "high", "xhigh", "max"}),
     )
 
     _AGENT_SELECT_SPEC: ClassVar[AgentSelectSpec] = AgentSelectSpec(

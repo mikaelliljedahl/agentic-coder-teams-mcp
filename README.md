@@ -145,7 +145,7 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 | `name` | auto (`agent-1`) | Agent name |
 | `backend` | `claude-code` | `claude-code` or `codex` |
 | `model` | backend default | Model to use |
-| `reasoning_effort` | none | `low`/`medium`/`high` (codex), `low`/`medium`/`high`/`max` (claude-code) |
+| `reasoning_effort` | none | `low`/`medium`/`high`/`xhigh` (codex), `low`/`medium`/`high`/`xhigh`/`max` (claude-code) |
 | `permission_mode` | `bypass` | `bypass`, `default`, or `require_approval` |
 | `cwd` | server cwd | Working directory for the agent |
 

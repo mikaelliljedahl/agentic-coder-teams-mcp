@@ -223,8 +223,8 @@ async def spawn_agent(
 ) -> dict:
     """Spawn a new agent process.
 
-    reasoning_effort: low/medium/high for codex,
-    low/medium/high/max for claude-code.
+    reasoning_effort: low/medium/high/xhigh for codex,
+    low/medium/high/xhigh/max for claude-code.
     """
 
     def _do_spawn() -> dict:

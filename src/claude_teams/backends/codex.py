@@ -31,9 +31,9 @@ class CodexBackend(BaseBackend):
 
     _MODEL_MAP: ClassVar[dict[str, str]] = {
         "fast": "gpt-5.1-codex-mini",
-        "balanced": "gpt-5.3-codex",
+        "balanced": "gpt-5.5",
         "powerful": "gpt-5.1-codex-max",
-        "gpt-5.3-codex": "gpt-5.3-codex",
+        "gpt-5.5": "gpt-5.5",
         "gpt-5.1-codex-max": "gpt-5.1-codex-max",
         "gpt-5.1-codex-mini": "gpt-5.1-codex-mini",
     }
@@ -68,7 +68,7 @@ class CodexBackend(BaseBackend):
             list[str]: Curated list of supported model identifiers.
 
         """
-        return ["gpt-5.3-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
+        return ["gpt-5.5", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
 
     def default_model(self) -> str:
         """Return the default Codex model.
@@ -77,7 +77,7 @@ class CodexBackend(BaseBackend):
             str: Default model identifier for this backend.
 
         """
-        return "gpt-5.3-codex"
+        return "gpt-5.5"
 
     def resolve_model(self, generic_name: str) -> str:
         """Map a generic or direct model name to a Codex model.
