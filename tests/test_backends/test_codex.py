@@ -144,13 +144,16 @@ class TestCodexBuildCommand:
 
 
 class TestCodexBuildEnv:
-    def test_returns_empty_dict(self, _make_request):
+    def test_passes_agent_identity(self, _make_request):
         backend = CodexBackend()
         request = _make_request()
 
         env = backend.build_env(request)
 
-        assert env == {}
+        assert env == {
+            "AGENT_NAME": request.name,
+            "AGENT_SESSION_ID": request.team_name,
+        }
 
 
 class TestCodexPermissionSupport:
