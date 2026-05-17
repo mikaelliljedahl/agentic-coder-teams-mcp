@@ -14,6 +14,20 @@ from typing import Any
 
 _MTIME_SLACK_SECONDS = 2.0
 _REVERSE_READ_CHUNK_SIZE = 64 * 1024
+_CODEX_CORRELATION_PREFIX = "wat-corr:"
+_CORRELATION_SCAN_MAX_LINES = 500
+
+
+def codex_correlation_token(agent_id: str) -> str:
+    """Return the stable per-agent marker embedded in the Codex prompt.
+
+    Two Codex agents spawned in the same ``cwd`` at nearly the same time are
+    otherwise indistinguishable before Codex's own session id is known
+    (matching falls back to cwd + start-time + mtime). The codex backend
+    appends this token to the initial prompt so the agent's rollout file can
+    be bound deterministically to the right logical agent.
+    """
+    return f"{_CODEX_CORRELATION_PREFIX}{agent_id}"
 
 
 @dataclass(frozen=True)
@@ -33,6 +47,7 @@ def read_codex_output(
     max_bytes: int = 10_240,
     *,
     backend_session_id: str | None = None,
+    correlation_token: str | None = None,
 ) -> AgentOutput | None:
     """Read the latest Codex assistant output for a spawned agent."""
     if spawned_at <= 0 or not cwd:
@@ -43,7 +58,7 @@ def read_codex_output(
         return None
 
     candidates = _matching_codex_rollouts(
-        spawned_at, normalized_cwd, backend_session_id
+        spawned_at, normalized_cwd, backend_session_id, correlation_token
     )
     if not candidates:
         return None
@@ -103,7 +118,10 @@ def read_claude_output(
 
 
 def _matching_codex_rollouts(
-    spawned_at: float, normalized_cwd: str, backend_session_id: str | None
+    spawned_at: float,
+    normalized_cwd: str,
+    backend_session_id: str | None,
+    correlation_token: str | None = None,
 ) -> list[tuple[float, Path, str | None]]:
     candidates: list[tuple[float, Path, str | None]] = []
     for directory in _codex_candidate_dirs(
@@ -134,7 +152,42 @@ def _matching_codex_rollouts(
                 candidates.append(
                     (mtime, path, session_id if isinstance(session_id, str) else None)
                 )
+    # Before Codex's own session id is known, cwd + start-time matching cannot
+    # tell two concurrently-spawned agents apart. If a correlation token was
+    # injected into the prompt, prefer the rollout that actually contains it so
+    # the binding is deterministic. Fall back to the unfiltered set when no
+    # rollout carries the token yet (e.g. Codex has not flushed the prompt, or
+    # the agent was spawned before this marker existed).
+    if backend_session_id is None and correlation_token:
+        token_matched = [
+            item
+            for item in candidates
+            if _rollout_contains_token(item[1], correlation_token)
+        ]
+        if token_matched:
+            return token_matched
     return candidates
+
+
+def _rollout_contains_token(
+    path: Path, token: str, max_lines: int = _CORRELATION_SCAN_MAX_LINES
+) -> bool:
+    """Return whether ``token`` appears in the first ``max_lines`` of a rollout.
+
+    The token is embedded in the initial user prompt, which Codex records near
+    the start of the rollout. A bounded forward scan keeps this cheap and
+    avoids reading large rollout files in full.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for index, raw in enumerate(handle):
+                if index >= max_lines:
+                    return False
+                if token in raw:
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def _matching_jsonl_files(

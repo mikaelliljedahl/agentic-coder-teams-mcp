@@ -11,14 +11,20 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from claude_teams.agent_output import read_claude_output, read_codex_output
+from claude_teams.agent_output import (
+    codex_correlation_token,
+    read_claude_output,
+    read_codex_output,
+)
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.process_manager import process_manager
 from claude_teams.backends.registry import registry
 
 # Identity: env vars (works for Claude Code via --mcp-config)
-# For Codex: spawn_agent updates ~/.codex/config.toml MCP env before spawning
+# For Codex: the codex backend passes identity per-spawn via a `-c
+# mcp_servers.<name>.env=...` override (see CodexBackend._mcp_identity_args),
+# avoiding races on the shared ~/.codex/config.toml.
 _AGENT_NAME: str = os.environ.get("AGENT_NAME", "").strip()
 _AGENT_SESSION_ID: str = os.environ.get("AGENT_SESSION_ID", "").strip()
 IDENTITY: str = _AGENT_NAME if _AGENT_NAME else "lead"
@@ -97,7 +103,13 @@ def _read_agent_output(agent: dict):
         return None
     backend_session_id = _stored_backend_session_id(agent)
     if backend == "codex":
-        return read_codex_output(spawned_at, cwd, backend_session_id=backend_session_id)
+        agent_id = f"{agent.get('name')}@{agent.get('session_id')}"
+        return read_codex_output(
+            spawned_at,
+            cwd,
+            backend_session_id=backend_session_id,
+            correlation_token=codex_correlation_token(agent_id),
+        )
     if backend == "claude-code":
         return read_claude_output(
             spawned_at, cwd, backend_session_id=backend_session_id
@@ -176,41 +188,6 @@ def _write_mcp_config(session_id: str, agent_name: str) -> Path:
     return path
 
 
-def _update_codex_mcp_env(session_id: str, agent_name: str) -> None:
-    """Update ~/.codex/config.toml MCP server env with agent identity.
-
-    Codex doesn't propagate process env to MCP servers — it uses
-    env from config.toml. We update it before each spawn so the
-    MCP server starts with correct AGENT_NAME and AGENT_SESSION_ID.
-    """
-    config_path = Path.home() / ".codex" / "config.toml"
-    if not config_path.exists():
-        return
-    try:
-        content = config_path.read_text(encoding="utf-8")
-        # Simple string replacement for the env block
-        # Find and replace the win-agent-teams env line
-        lines = content.splitlines()
-        new_lines = []
-        in_win_agent = False
-        for line in lines:
-            updated_line = line
-            if line.strip().startswith("[mcp_servers.win-agent-teams]"):
-                in_win_agent = True
-            elif line.strip().startswith("[") and in_win_agent:
-                in_win_agent = False
-            if in_win_agent and line.strip().startswith("env"):
-                updated_line = (
-                    'env = { "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass", '
-                    f'"AGENT_NAME" = "{agent_name}", '
-                    f'"AGENT_SESSION_ID" = "{session_id}" }}'
-                )
-            new_lines.append(updated_line)
-        config_path.write_text("\n".join(new_lines), encoding="utf-8")
-    except Exception:
-        logger.debug("Failed updating Codex MCP env", exc_info=True)
-
-
 @mcp.tool()
 async def spawn_agent(
     prompt: str,
@@ -244,9 +221,6 @@ async def spawn_agent(
         resolved_model = b.resolve_model(model) if model.strip() else b.default_model()
 
         mcp_config_path = _write_mcp_config(session_id, agent_name)
-
-        if backend_name == "codex":
-            _update_codex_mcp_env(session_id, agent_name)
 
         agent_cwd = cwd.strip() or str(Path.cwd())
 
@@ -433,8 +407,6 @@ async def follow_up_agent(
         agent_name = str(agent.get("name") or name)
         agent_cwd = str(agent.get("cwd") or Path.cwd())
         mcp_config_path = _write_mcp_config(session_id, agent_name)
-        if backend_name == "codex":
-            _update_codex_mcp_env(session_id, agent_name)
 
         model = str(agent.get("model") or backend.default_model())
         permission_mode = str(agent.get("permission_mode") or "bypass")

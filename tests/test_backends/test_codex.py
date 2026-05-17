@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_teams.agent_output import codex_correlation_token
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.codex import CodexBackend
 
@@ -46,9 +47,13 @@ class TestCodexSupportedModels:
     def test_returns_expected_models(self):
         backend = CodexBackend()
         models = backend.supported_models()
-        assert "gpt-5.5" in models
-        assert "gpt-5.1-codex-max" in models
-        assert "gpt-5.1-codex-mini" in models
+        assert models == [
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "gpt-5.2",
+        ]
 
 
 class TestCodexDefaultModel:
@@ -60,15 +65,19 @@ class TestCodexDefaultModel:
 class TestCodexResolveModel:
     def test_resolves_fast_to_mini(self):
         backend = CodexBackend()
-        assert backend.resolve_model("fast") == "gpt-5.1-codex-mini"
+        assert backend.resolve_model("fast") == "gpt-5.4-mini"
 
     def test_resolves_balanced_to_codex(self):
         backend = CodexBackend()
-        assert backend.resolve_model("balanced") == "gpt-5.5"
+        assert backend.resolve_model("balanced") == "gpt-5.4"
 
     def test_resolves_powerful_to_max(self):
         backend = CodexBackend()
-        assert backend.resolve_model("powerful") == "gpt-5.1-codex-max"
+        assert backend.resolve_model("powerful") == "gpt-5.5"
+
+    def test_resolves_gpt_5_4_mini_direct(self):
+        backend = CodexBackend()
+        assert backend.resolve_model("gpt-5.4-mini") == "gpt-5.4-mini"
 
     def test_resolves_direct_model_name(self):
         backend = CodexBackend()
@@ -110,7 +119,11 @@ class TestCodexBuildCommand:
 
         cmd = backend.build_command(request)
 
-        assert cmd[-1] == "fix the bug"
+        # The initial prompt gets a per-agent correlation marker appended,
+        # which makes it multi-line and therefore JSON-wrapped into one arg.
+        assert "fix the bug" in cmd[-1]
+        assert codex_correlation_token("worker@team") in cmd[-1]
+        assert "\n" not in cmd[-1]
 
     def test_encodes_multiline_prompt_as_single_arg(self, _make_request):
         backend = CodexBackend()
@@ -118,10 +131,12 @@ class TestCodexBuildCommand:
 
         cmd = backend.build_command(request)
 
-        assert cmd[-1] == (
-            "Decode this JSON string as your complete task prompt, then follow "
-            'the decoded text exactly: "first line\\nsecond line"'
+        assert cmd[-1].startswith(
+            "Decode this JSON string as your complete task prompt"
         )
+        assert "first line" in cmd[-1]
+        assert "second line" in cmd[-1]
+        assert codex_correlation_token("worker@team") in cmd[-1]
         assert "\n" not in cmd[-1]
 
     def test_includes_cwd_flag(self, _make_request, tmp_path: Path):
@@ -177,9 +192,7 @@ class TestCodexReasoningEffort:
 
         cmd = backend.build_command(request)
 
-        assert "-c" in cmd
-        idx = cmd.index("-c")
-        assert cmd[idx + 1] == "model_reasoning_effort=xhigh"
+        assert "model_reasoning_effort=xhigh" in cmd
 
     def test_build_command_keeps_prompt_last_with_effort(self, _make_request):
         backend = CodexBackend()
@@ -187,7 +200,8 @@ class TestCodexReasoningEffort:
 
         cmd = backend.build_command(request)
 
-        assert cmd[-1] == "fix the bug"
+        assert "fix the bug" in cmd[-1]
+        assert codex_correlation_token("worker@team") in cmd[-1]
 
     def test_build_command_omits_c_override_when_none(self, _make_request):
         backend = CodexBackend()
@@ -195,7 +209,50 @@ class TestCodexReasoningEffort:
 
         cmd = backend.build_command(request)
 
-        assert "-c" not in cmd
+        assert not any(arg.startswith("model_reasoning_effort=") for arg in cmd)
+
+
+class TestCodexMcpIdentity:
+    def _identity_token(self, cmd: list[str]) -> str:
+        return next(
+            arg for arg in cmd if arg.startswith("mcp_servers.win-agent-teams.env=")
+        )
+
+    def test_build_command_injects_identity_env_override(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(name="worker", team_name="sess-uuid")
+
+        cmd = backend.build_command(request)
+
+        assert "-c" in cmd
+        token = self._identity_token(cmd)
+        _, _, value = token.partition("=")
+        # value portion must parse as TOML and carry this agent's identity
+        import tomllib
+
+        parsed = tomllib.loads("x=" + value)["x"]
+        assert parsed == {
+            "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
+            "AGENT_NAME": "worker",
+            "AGENT_SESSION_ID": "sess-uuid",
+        }
+
+    def test_build_resume_command_injects_identity_env_override(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(name="worker", team_name="sess-uuid")
+
+        cmd = backend.build_resume_command(request, "codex-session-123")
+
+        token = self._identity_token(cmd)
+        assert "AGENT_SESSION_ID = 'sess-uuid'" in token
+        assert "codex-session-123" in cmd
+
+    def test_rejects_single_quote_in_identity(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(name="bad'name")
+
+        with pytest.raises(ValueError, match="TOML literal"):
+            backend.build_command(request)
 
 
 class TestCodexAgentSelect:
@@ -245,7 +302,8 @@ class TestCodexAgentSelect:
         cmd = backend.build_command(request)
 
         assert 'agents.reviewer.config_file="/abs/reviewer.md"' in cmd
-        assert cmd[-1] == "go"
+        assert "go" in cmd[-1]
+        assert codex_correlation_token("worker@team") in cmd[-1]
 
     def test_build_command_omits_agents_override_when_profile_none(self, _make_request):
         backend = CodexBackend()

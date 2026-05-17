@@ -3,6 +3,7 @@
 import json
 from typing import ClassVar
 
+from claude_teams.agent_output import codex_correlation_token
 from claude_teams.backends._agent_discovery import discover_codex_style_agents
 from claude_teams.backends.base import (
     AgentProfile,
@@ -18,6 +19,7 @@ class CodexBackend(BaseBackend):
 
     _name = "codex"
     _binary_name = "codex"
+    _MCP_SERVER_NAME = "win-agent-teams"
 
     @property
     def is_interactive(self) -> bool:
@@ -29,13 +31,18 @@ class CodexBackend(BaseBackend):
         """
         return True
 
+    # Verified against `codex debug models` (Codex CLI 0.130.0). Only
+    # API-usable, listed slugs are mapped; `gpt-5.3-codex-spark`
+    # (supported_in_api=false) and hidden `codex-auto-review` are excluded.
     _MODEL_MAP: ClassVar[dict[str, str]] = {
-        "fast": "gpt-5.1-codex-mini",
-        "balanced": "gpt-5.5",
-        "powerful": "gpt-5.1-codex-max",
+        "fast": "gpt-5.4-mini",
+        "balanced": "gpt-5.4",
+        "powerful": "gpt-5.5",
         "gpt-5.5": "gpt-5.5",
-        "gpt-5.1-codex-max": "gpt-5.1-codex-max",
-        "gpt-5.1-codex-mini": "gpt-5.1-codex-mini",
+        "gpt-5.4": "gpt-5.4",
+        "gpt-5.4-mini": "gpt-5.4-mini",
+        "gpt-5.3-codex": "gpt-5.3-codex",
+        "gpt-5.2": "gpt-5.2",
     }
 
     _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
@@ -68,7 +75,7 @@ class CodexBackend(BaseBackend):
             list[str]: Curated list of supported model identifiers.
 
         """
-        return ["gpt-5.5", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
+        return ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"]
 
     def default_model(self) -> str:
         """Return the default Codex model.
@@ -119,6 +126,7 @@ class CodexBackend(BaseBackend):
             *self.permission_args(request),
             "-C",
             request.cwd,
+            *self._mcp_identity_args(request),
         ]
 
         if request.reasoning_effort:
@@ -126,7 +134,7 @@ class CodexBackend(BaseBackend):
 
         cmd.extend(self._agent_args(request))
 
-        cmd.append(self._prompt_arg(request))
+        cmd.append(self._prompt_arg(request, self._correlated_prompt(request)))
         return cmd
 
     def build_resume_command(
@@ -139,6 +147,7 @@ class CodexBackend(BaseBackend):
             *self.permission_args(request),
             "-C",
             request.cwd,
+            *self._mcp_identity_args(request),
         ]
 
         if request.reasoning_effort:
@@ -148,18 +157,72 @@ class CodexBackend(BaseBackend):
         cmd.extend(["resume", backend_session_id, self._prompt_arg(request)])
         return cmd
 
-    def _prompt_arg(self, request: SpawnRequest) -> str:
-        """Return the initial Codex prompt argument.
+    def _mcp_identity_args(self, request: SpawnRequest) -> list[str]:
+        """Build a per-spawn ``-c`` override carrying this agent's identity.
+
+        Codex does not propagate process env to MCP servers; it reads their
+        ``env`` from config. Writing identity into the shared, machine-global
+        ``~/.codex/config.toml`` is racy: a concurrent spawn from another
+        session can overwrite it before Codex reads the file at startup,
+        permanently mis-binding this agent's MCP server to the wrong session.
+
+        Passing the env as a per-process ``-c`` override (highest config
+        precedence) keeps identity bound to this exact Codex process via its
+        own argv, with no shared mutable file and no race window.
+        """
+        env = {
+            "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
+            "AGENT_NAME": request.name,
+            "AGENT_SESSION_ID": request.team_name,
+        }
+        pairs = ", ".join(
+            f"{key} = {self._toml_literal(value)}" for key, value in env.items()
+        )
+        return ["-c", f"mcp_servers.{self._MCP_SERVER_NAME}.env={{ {pairs} }}"]
+
+    @staticmethod
+    def _toml_literal(value: str) -> str:
+        """Render ``value`` as a TOML single-quoted literal string.
+
+        Single-quoted literals avoid Windows ``CreateProcess`` double-quote
+        escaping issues for the single argv token. TOML literal strings cannot
+        contain a single quote (no escaping), so reject one rather than emit a
+        corrupt override. ``AGENT_NAME`` is validated against ``[A-Za-z0-9_-]+``
+        and ``AGENT_SESSION_ID`` is a uuid, so this is a defensive guard only.
+        """
+        if "'" in value or "\n" in value or "\r" in value:
+            msg = f"value not representable as a TOML literal: {value!r}"
+            raise ValueError(msg)
+        return f"'{value}'"
+
+    def _prompt_arg(self, request: SpawnRequest, prompt: str | None = None) -> str:
+        """Return the Codex prompt argument for ``prompt`` (default: request).
 
         Codex's interactive prompt handling can truncate multi-line argv prompts
         in Windows consoles, so multi-line tasks are carried as a single JSON
         string argument and decoded by the agent from the initial instruction.
         """
-        if "\n" not in request.prompt and "\r" not in request.prompt:
-            return request.prompt
+        text = request.prompt if prompt is None else prompt
+        if "\n" not in text and "\r" not in text:
+            return text
         return (
             "Decode this JSON string as your complete task prompt, then follow "
-            f"the decoded text exactly: {json.dumps(request.prompt)}"
+            f"the decoded text exactly: {json.dumps(text)}"
+        )
+
+    def _correlated_prompt(self, request: SpawnRequest) -> str:
+        """Append a per-agent correlation marker to the initial prompt.
+
+        The marker lets ``read_codex_output`` bind this agent's rollout file
+        deterministically when two agents are spawned in the same ``cwd`` at
+        nearly the same time (before Codex's own session id is known). Only
+        used for the initial spawn; resume already has the backend session id.
+        """
+        token = codex_correlation_token(request.agent_id)
+        return (
+            f"{request.prompt}\n\n"
+            f"[win-agent-teams correlation id: {token} "
+            "— internal marker, ignore this line]"
         )
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:

@@ -12,7 +12,11 @@ from typing import Any
 import pytest
 
 from claude_teams import server_simple
-from claude_teams.agent_output import read_claude_output, read_codex_output
+from claude_teams.agent_output import (
+    codex_correlation_token,
+    read_claude_output,
+    read_codex_output,
+)
 from claude_teams.backends import process_base
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.backends.codex import CodexBackend
@@ -242,6 +246,89 @@ def test_read_codex_output_truncates_at_utf8_boundary(
     assert output.last_message == "aaa"
 
 
+def _codex_user_prompt(text: str) -> dict:
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        },
+    }
+
+
+def test_read_codex_output_disambiguates_concurrent_agents_by_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    token_a = codex_correlation_token("smoke-a@sess")
+    token_b = codex_correlation_token("smoke-b@sess")
+
+    # Both spawned in the same cwd at ~the same time. rollout-b has the newer
+    # mtime, so plain max(mtime) would wrongly bind agent-a to session-b.
+    _write_jsonl(
+        _codex_path(tmp_path, spawned_at, "rollout-a.jsonl"),
+        [
+            _codex_meta(cwd, session_id="session-a"),
+            _codex_user_prompt(f"do work\n\n{token_a}"),
+            _codex_message("from a"),
+        ],
+        spawned_at + 10,
+    )
+    _write_jsonl(
+        _codex_path(tmp_path, spawned_at, "rollout-b.jsonl"),
+        [
+            _codex_meta(cwd, session_id="session-b"),
+            _codex_user_prompt(f"do work\n\n{token_b}"),
+            _codex_message("from b"),
+        ],
+        spawned_at + 30,
+    )
+
+    output = read_codex_output(spawned_at, str(cwd), correlation_token=token_a)
+
+    assert output is not None
+    assert output.backend_session_id == "session-a"
+    assert output.last_message == "from a"
+    assert output.rollout_path.endswith("rollout-a.jsonl")
+
+
+def test_read_codex_output_falls_back_when_token_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    # No rollout carries the token (e.g. agent spawned before the marker
+    # existed, or Codex has not flushed the prompt yet) -> latest mtime.
+    _write_jsonl(
+        _codex_path(tmp_path, spawned_at, "rollout-latest.jsonl"),
+        [_codex_meta(cwd, session_id="session-x"), _codex_message("latest")],
+        spawned_at + 20,
+    )
+
+    output = read_codex_output(
+        spawned_at, str(cwd), correlation_token=codex_correlation_token("ghost@sess")
+    )
+
+    assert output is not None
+    assert output.backend_session_id == "session-x"
+    assert output.last_message == "latest"
+
+
+def test_codex_build_command_embeds_correlation_token(tmp_path: Path) -> None:
+    backend = CodexBackend()
+    request = _make_request(
+        tmp_path, agent_id="worker@sess-uuid", prompt="single line task"
+    )
+
+    cmd = backend.build_command(request)
+
+    assert codex_correlation_token("worker@sess-uuid") in cmd[-1]
+
+
 def test_read_claude_output_returns_latest_project_assistant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -376,7 +463,10 @@ def test_codex_resume_command_preserves_permissions_and_prompt(
     assert cmd[0] == "/usr/bin/codex"
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert cmd[cmd.index("-C") + 1] == str(tmp_path)
-    assert cmd[cmd.index("-c") + 1] == "model_reasoning_effort=high"
+    assert "model_reasoning_effort=high" in cmd
+    assert any(
+        arg.startswith("mcp_servers.win-agent-teams.env=") for arg in cmd
+    )
     assert cmd[-3] == "resume"
     assert cmd[-2] == "codex-session-id"
     assert cmd[-1] == (
@@ -440,7 +530,6 @@ async def test_spawn_agent_persists_output_lookup_metadata(
     monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
     monkeypatch.setattr(server_simple, "_session_id", "")
     monkeypatch.setattr(server_simple, "registry", FakeRegistry())
-    monkeypatch.setattr(server_simple, "_update_codex_mcp_env", lambda *args: None)
     before = 1_762_969_000.0
     monkeypatch.setattr(server_simple.time, "time", lambda: before)
 
@@ -625,7 +714,6 @@ def _setup_follow_up_session(
     monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path / "sessions")
     monkeypatch.setattr(server_simple, "_session_id", "session-id")
     monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
-    monkeypatch.setattr(server_simple, "_update_codex_mcp_env", lambda *args: None)
 
 
 @pytest.mark.asyncio
