@@ -1,6 +1,9 @@
 """Codex backend integration."""
 
-import json
+import os
+import platform
+import shutil
+from pathlib import Path
 from typing import ClassVar
 
 from claude_teams.agent_output import codex_correlation_token
@@ -12,6 +15,15 @@ from claude_teams.backends.base import (
     ReasoningEffortSpec,
     SpawnRequest,
 )
+from claude_teams.backends.contracts import BackendBinaryNotFoundError
+
+# Windows arch (``platform.machine()``) -> Codex npm platform-package suffix
+# and Rust target triple, mirroring the dispatch table in the npm wrapper's
+# ``bin/codex.js``.
+_WINDOWS_NATIVE_TARGET: dict[str, tuple[str, str]] = {
+    "AMD64": ("x64", "x86_64-pc-windows-msvc"),
+    "ARM64": ("arm64", "aarch64-pc-windows-msvc"),
+}
 
 
 class CodexBackend(BaseBackend):
@@ -110,6 +122,59 @@ class CodexBackend(BaseBackend):
         """Codex supports native session resume."""
         return True
 
+    def discover_binary(self) -> str:
+        """Resolve ``codex`` to the native binary, bypassing the npm shim.
+
+        On Windows ``shutil.which("codex")`` resolves to ``codex.cmd`` (an npm
+        batch shim). Launching a ``.cmd`` runs it through ``cmd.exe``, which
+        applies metacharacter parsing (``< > | & ^ ! ( )``) to the prompt argv
+        token and kills the process before Codex starts. Resolving straight to
+        the bundled native ``codex.exe`` removes both the ``cmd.exe`` and the
+        ``node`` layers, so the argv passes verbatim through ``CreateProcess``
+        to the Rust binary's standard ``CommandLineToArgvW`` parsing.
+
+        Falls back to the shim path when the native binary cannot be located
+        (non-npm install, unknown arch, or non-Windows), preserving prior
+        behavior.
+        """
+        shim = shutil.which(self._binary_name)
+        if shim is None:
+            raise BackendBinaryNotFoundError(self._binary_name, self._name)
+        native = self._resolve_native_codex(shim)
+        return native[0] if native else shim
+
+    @staticmethod
+    def _resolve_native_codex(shim_path: str) -> tuple[str, str] | None:
+        """Locate the native ``codex.exe`` and its arch vendor root.
+
+        Mirrors the resolution in the npm wrapper's ``bin/codex.js``: the
+        platform package ``@openai/codex-win32-<arch>`` (hoisted or nested) or
+        the package's local ``vendor`` fallback, under
+        ``vendor/<triple>/codex/codex.exe``.
+
+        Returns ``(exe_path, arch_root)`` or ``None`` when not resolvable.
+        """
+        if os.name != "nt":
+            return None
+        target = _WINDOWS_NATIVE_TARGET.get(platform.machine().upper())
+        if target is None:
+            return None
+        arch_suffix, triple = target
+        shim_dir = Path(shim_path).parent
+        codex_pkg = shim_dir / "node_modules" / "@openai" / "codex"
+        platform_pkg = f"codex-win32-{arch_suffix}"
+        rel = Path("vendor") / triple / "codex" / "codex.exe"
+        bases = [
+            codex_pkg / "node_modules" / "@openai" / platform_pkg,
+            shim_dir / "node_modules" / "@openai" / platform_pkg,
+            codex_pkg,
+        ]
+        for base in bases:
+            exe = base / rel
+            if exe.is_file():
+                return str(exe), str(base / "vendor" / triple)
+        return None
+
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Codex CLI command.
 
@@ -198,17 +263,13 @@ class CodexBackend(BaseBackend):
     def _prompt_arg(self, request: SpawnRequest, prompt: str | None = None) -> str:
         """Return the Codex prompt argument for ``prompt`` (default: request).
 
-        Codex's interactive prompt handling can truncate multi-line argv prompts
-        in Windows consoles, so multi-line tasks are carried as a single JSON
-        string argument and decoded by the agent from the initial instruction.
+        Passed verbatim as a single argv token. Because the native binary is
+        launched directly (see :meth:`discover_binary`), ``CreateProcess`` and
+        the binary's ``CommandLineToArgvW`` parsing round-trip arbitrary text
+        — metacharacters and newlines included — so no escaping or wrapping is
+        needed.
         """
-        text = request.prompt if prompt is None else prompt
-        if "\n" not in text and "\r" not in text:
-            return text
-        return (
-            "Decode this JSON string as your complete task prompt, then follow "
-            f"the decoded text exactly: {json.dumps(text)}"
-        )
+        return request.prompt if prompt is None else prompt
 
     def _correlated_prompt(self, request: SpawnRequest) -> str:
         """Append a per-agent correlation marker to the initial prompt.
@@ -226,8 +287,24 @@ class CodexBackend(BaseBackend):
         )
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
-        """Pass agent identity so MCP servers inherit session context."""
-        return {
+        """Pass agent identity and replicate the npm shim's runtime env.
+
+        When the native binary is launched directly the npm ``bin/codex.js``
+        wrapper is bypassed, so its two runtime effects are reproduced here:
+        prepending the vendored ``path`` dir (bundled ``rg.exe``) to ``PATH``
+        and marking the install as npm-managed.
+        """
+        env = {
             "AGENT_NAME": request.name,
             "AGENT_SESSION_ID": request.team_name,
         }
+        shim = shutil.which(self._binary_name)
+        native = self._resolve_native_codex(shim) if shim else None
+        if native:
+            _, arch_root = native
+            env["CODEX_MANAGED_BY_NPM"] = "1"
+            path_dir = Path(arch_root) / "path"
+            if path_dir.is_dir():
+                current = os.environ.get("PATH", "")
+                env["PATH"] = f"{path_dir}{os.pathsep}{current}"
+        return env

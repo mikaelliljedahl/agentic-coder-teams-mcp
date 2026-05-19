@@ -119,25 +119,28 @@ class TestCodexBuildCommand:
 
         cmd = backend.build_command(request)
 
-        # The initial prompt gets a per-agent correlation marker appended,
-        # which makes it multi-line and therefore JSON-wrapped into one arg.
+        # The prompt (plus correlation marker) is a single verbatim argv token;
+        # the native binary is launched directly so no escaping/wrapping.
         assert "fix the bug" in cmd[-1]
         assert codex_correlation_token("worker@team") in cmd[-1]
-        assert "\n" not in cmd[-1]
 
-    def test_encodes_multiline_prompt_as_single_arg(self, _make_request):
+    def test_passes_multiline_prompt_verbatim_as_single_arg(self, _make_request):
         backend = CodexBackend()
         request = _make_request(prompt="first line\nsecond line")
 
         cmd = backend.build_command(request)
 
-        assert cmd[-1].startswith(
-            "Decode this JSON string as your complete task prompt"
-        )
-        assert "first line" in cmd[-1]
-        assert "second line" in cmd[-1]
+        assert cmd[-1].startswith("first line\nsecond line")
+        assert "\n" in cmd[-1]
         assert codex_correlation_token("worker@team") in cmd[-1]
-        assert "\n" not in cmd[-1]
+
+    def test_passes_cmd_metachars_verbatim(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(prompt="write <!-- DONE --> & exit | done (x)")
+
+        cmd = backend.build_command(request)
+
+        assert "write <!-- DONE --> & exit | done (x)" in cmd[-1]
 
     def test_includes_cwd_flag(self, _make_request, tmp_path: Path):
         backend = CodexBackend()
