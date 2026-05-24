@@ -330,3 +330,165 @@ class TestCodexAgentSelect:
         cmd = backend.build_command(request)
 
         assert not any("agents." in arg for arg in cmd)
+
+
+_TRIPLE = "x86_64-pc-windows-msvc"
+
+
+def _make_codex_npm_tree(
+    tmp_path: Path, exe_subdir: str | None, tools_subdir: str | None = None
+) -> tuple[Path, Path, Path]:
+    """Build a fake npm-global Codex install under ``tmp_path``.
+
+    Returns ``(shim_path, exe_path, vendor_dir)``. ``exe_subdir=None`` omits the
+    native exe entirely (forces the shim fallback).
+    """
+    npm = tmp_path / "npm"
+    npm.mkdir(exist_ok=True)
+    shim = npm / "codex.CMD"
+    shim.write_text("@echo shim")
+    vendor = (
+        npm
+        / "node_modules"
+        / "@openai"
+        / "codex"
+        / "node_modules"
+        / "@openai"
+        / "codex-win32-x64"
+        / "vendor"
+        / _TRIPLE
+    )
+    vendor.mkdir(parents=True)
+    exe_path = vendor / (exe_subdir or "bin") / "codex.exe"
+    if exe_subdir is not None:
+        exe_path.parent.mkdir(parents=True, exist_ok=True)
+        exe_path.write_text("MZ")
+    if tools_subdir is not None:
+        (vendor / tools_subdir).mkdir(parents=True, exist_ok=True)
+    return shim, exe_path, vendor
+
+
+def _patch_windows(monkeypatch: pytest.MonkeyPatch, shim: Path) -> None:
+    monkeypatch.setattr("os.name", "nt")
+    monkeypatch.setattr("platform.machine", lambda: "AMD64")
+    monkeypatch.setattr("shutil.which", lambda name: str(shim))
+
+
+class TestCodexDiscoverBinary:
+    def test_resolves_new_bin_layout(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, exe, _ = _make_codex_npm_tree(tmp_path, "bin")
+        _patch_windows(monkeypatch, shim)
+
+        assert CodexBackend().discover_binary() == str(exe)
+
+    def test_resolves_old_codex_layout(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, exe, _ = _make_codex_npm_tree(tmp_path, "codex")
+        _patch_windows(monkeypatch, shim)
+
+        assert CodexBackend().discover_binary() == str(exe)
+
+    def test_prefers_bin_over_codex_when_both_present(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, bin_exe, vendor = _make_codex_npm_tree(tmp_path, "bin")
+        old_exe = vendor / "codex" / "codex.exe"
+        old_exe.parent.mkdir(parents=True, exist_ok=True)
+        old_exe.write_text("MZ")
+        _patch_windows(monkeypatch, shim)
+
+        assert CodexBackend().discover_binary() == str(bin_exe)
+
+    def test_falls_back_to_shim_when_native_missing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, _, _ = _make_codex_npm_tree(tmp_path, exe_subdir=None)
+        _patch_windows(monkeypatch, shim)
+
+        assert CodexBackend().discover_binary() == str(shim)
+
+
+class TestCodexBuildEnvNativePath:
+    def test_prepends_codex_path_tools_dir(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, _, vendor = _make_codex_npm_tree(
+            tmp_path, "bin", tools_subdir="codex-path"
+        )
+        _patch_windows(monkeypatch, shim)
+
+        env = CodexBackend().build_env(_make_request())
+
+        assert env["CODEX_MANAGED_BY_NPM"] == "1"
+        assert env["PATH"].startswith(str(vendor / "codex-path"))
+
+    def test_prepends_legacy_path_tools_dir(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, _, vendor = _make_codex_npm_tree(tmp_path, "codex", tools_subdir="path")
+        _patch_windows(monkeypatch, shim)
+
+        env = CodexBackend().build_env(_make_request())
+
+        assert env["PATH"].startswith(str(vendor / "path"))
+
+
+class TestCodexPromptCmdShimFallback:
+    """When native exe is missing we fall back to the cmd.exe shim; a
+    multi-line prompt must then be JSON-wrapped so cmd.exe can't truncate it."""
+
+    def test_initial_prompt_json_wrapped_via_cmd_shim(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, _, _ = _make_codex_npm_tree(tmp_path, exe_subdir=None)
+        _patch_windows(monkeypatch, shim)
+        request = _make_request(prompt="first line\nsecond line")
+
+        cmd = CodexBackend().build_command(request)
+
+        assert cmd[0] == str(shim)
+        assert cmd[-1].startswith(
+            "Decode this JSON string as your complete task prompt,"
+        )
+        # carried as a single-line JSON token -> no real newline reaches cmd.exe
+        assert "\n" not in cmd[-1]
+        assert "first line" in cmd[-1]
+
+    def test_resume_prompt_json_wrapped_via_cmd_shim(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, _, _ = _make_codex_npm_tree(tmp_path, exe_subdir=None)
+        _patch_windows(monkeypatch, shim)
+        request = _make_request(prompt="first line\nsecond line")
+
+        cmd = CodexBackend().build_resume_command(request, "sess-id")
+
+        assert cmd[-1] == (
+            "Decode this JSON string as your complete task prompt, then follow "
+            'the decoded text exactly: "first line\\nsecond line"'
+        )
+
+    def test_single_line_prompt_not_wrapped_via_cmd_shim(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, _, _ = _make_codex_npm_tree(tmp_path, exe_subdir=None)
+        _patch_windows(monkeypatch, shim)
+        request = _make_request(prompt="single line")
+
+        cmd = CodexBackend().build_resume_command(request, "sess-id")
+
+        assert cmd[-1] == "single line"
+
+    def test_native_exe_keeps_multiline_verbatim(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        shim, _, _ = _make_codex_npm_tree(tmp_path, "bin")
+        _patch_windows(monkeypatch, shim)
+        request = _make_request(prompt="first line\nsecond line")
+
+        cmd = CodexBackend().build_resume_command(request, "sess-id")
+
+        assert cmd[-1] == "first line\nsecond line"

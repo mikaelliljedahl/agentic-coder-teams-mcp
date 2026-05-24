@@ -469,10 +469,10 @@ def test_codex_resume_command_preserves_permissions_and_prompt(
     )
     assert cmd[-3] == "resume"
     assert cmd[-2] == "codex-session-id"
-    assert cmd[-1] == (
-        "Decode this JSON string as your complete task prompt, then follow "
-        'the decoded text exactly: "first line\\nsecond line"'
-    )
+    # /usr/bin/codex is the native binary (not the cmd.exe shim), so the
+    # multi-line prompt passes verbatim; the JSON-wrap fallback only applies
+    # when launching through the npm codex.cmd shim.
+    assert cmd[-1] == "first line\nsecond line"
 
 
 def test_claude_resume_command_preserves_permissions_and_mcp_config(

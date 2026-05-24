@@ -1,5 +1,6 @@
 """Codex backend integration."""
 
+import json
 import os
 import platform
 import shutil
@@ -150,7 +151,7 @@ class CodexBackend(BaseBackend):
         Mirrors the resolution in the npm wrapper's ``bin/codex.js``: the
         platform package ``@openai/codex-win32-<arch>`` (hoisted or nested) or
         the package's local ``vendor`` fallback, under
-        ``vendor/<triple>/codex/codex.exe``.
+        ``vendor/<triple>/{bin,codex}/codex.exe``.
 
         Returns ``(exe_path, arch_root)`` or ``None`` when not resolvable.
         """
@@ -163,16 +164,23 @@ class CodexBackend(BaseBackend):
         shim_dir = Path(shim_path).parent
         codex_pkg = shim_dir / "node_modules" / "@openai" / "codex"
         platform_pkg = f"codex-win32-{arch_suffix}"
-        rel = Path("vendor") / triple / "codex" / "codex.exe"
+        vendor_rel = Path("vendor") / triple
         bases = [
             codex_pkg / "node_modules" / "@openai" / platform_pkg,
             shim_dir / "node_modules" / "@openai" / platform_pkg,
             codex_pkg,
         ]
+        # The native exe sat under ``vendor/<triple>/codex/`` in older Codex
+        # releases and moved to ``vendor/<triple>/bin/`` in newer ones. Probe
+        # both, newest layout first, so a layout bump doesn't silently fall
+        # back to the ``.cmd`` shim (which routes argv through ``cmd.exe`` and
+        # truncates the prompt at the first newline).
         for base in bases:
-            exe = base / rel
-            if exe.is_file():
-                return str(exe), str(base / "vendor" / triple)
+            arch_root = base / vendor_rel
+            for exe_subdir in ("bin", "codex"):
+                exe = arch_root / exe_subdir / "codex.exe"
+                if exe.is_file():
+                    return str(exe), str(arch_root)
         return None
 
     def build_command(self, request: SpawnRequest) -> list[str]:
@@ -186,6 +194,7 @@ class CodexBackend(BaseBackend):
 
         """
         binary = self.discover_binary()
+        via_cmd_shim = self._launches_via_cmd_shim(binary)
         cmd = [
             binary,
             *self.permission_args(request),
@@ -199,7 +208,11 @@ class CodexBackend(BaseBackend):
 
         cmd.extend(self._agent_args(request))
 
-        cmd.append(self._prompt_arg(request, self._correlated_prompt(request)))
+        cmd.append(
+            self._prompt_arg(
+                request, self._correlated_prompt(request), via_cmd_shim=via_cmd_shim
+            )
+        )
         return cmd
 
     def build_resume_command(
@@ -207,6 +220,7 @@ class CodexBackend(BaseBackend):
     ) -> list[str]:
         """Build the Codex CLI command for a native session resume."""
         binary = self.discover_binary()
+        via_cmd_shim = self._launches_via_cmd_shim(binary)
         cmd = [
             binary,
             *self.permission_args(request),
@@ -219,7 +233,13 @@ class CodexBackend(BaseBackend):
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
 
         cmd.extend(self._agent_args(request))
-        cmd.extend(["resume", backend_session_id, self._prompt_arg(request)])
+        cmd.extend(
+            [
+                "resume",
+                backend_session_id,
+                self._prompt_arg(request, via_cmd_shim=via_cmd_shim),
+            ]
+        )
         return cmd
 
     def _mcp_identity_args(self, request: SpawnRequest) -> list[str]:
@@ -260,16 +280,44 @@ class CodexBackend(BaseBackend):
             raise ValueError(msg)
         return f"'{value}'"
 
-    def _prompt_arg(self, request: SpawnRequest, prompt: str | None = None) -> str:
+    @staticmethod
+    def _launches_via_cmd_shim(binary: str) -> bool:
+        """True when ``binary`` is a Windows batch shim run through ``cmd.exe``.
+
+        ``cmd.exe`` truncates an argv token at the first newline (and mangles
+        ``< > | & ^ ! ( )``), so a multi-line prompt cannot survive the npm
+        ``codex.cmd`` shim verbatim. The native ``.exe`` and direct POSIX
+        launches don't go through ``cmd.exe`` and take the prompt as-is.
+        """
+        return binary.lower().endswith((".cmd", ".bat"))
+
+    def _prompt_arg(
+        self,
+        request: SpawnRequest,
+        prompt: str | None = None,
+        *,
+        via_cmd_shim: bool = False,
+    ) -> str:
         """Return the Codex prompt argument for ``prompt`` (default: request).
 
-        Passed verbatim as a single argv token. Because the native binary is
-        launched directly (see :meth:`discover_binary`), ``CreateProcess`` and
-        the binary's ``CommandLineToArgvW`` parsing round-trip arbitrary text
-        — metacharacters and newlines included — so no escaping or wrapping is
-        needed.
+        Normally passed verbatim as a single argv token: the native binary is
+        launched directly (see :meth:`discover_binary`), so ``CreateProcess``
+        and ``CommandLineToArgvW`` round-trip arbitrary text — metacharacters
+        and newlines included.
+
+        When the native exe can't be resolved and we fall back to the npm
+        ``codex.cmd`` shim (``via_cmd_shim``), ``cmd.exe`` would truncate a
+        multi-line prompt at the first newline. As a fallback the prompt is
+        then carried as a single-line JSON string and decoded by the agent
+        from the leading instruction — no real newlines reach ``cmd.exe``.
         """
-        return request.prompt if prompt is None else prompt
+        text = request.prompt if prompt is None else prompt
+        if via_cmd_shim and ("\n" in text or "\r" in text):
+            return (
+                "Decode this JSON string as your complete task prompt, then "
+                f"follow the decoded text exactly: {json.dumps(text)}"
+            )
+        return text
 
     def _correlated_prompt(self, request: SpawnRequest) -> str:
         """Append a per-agent correlation marker to the initial prompt.
@@ -291,7 +339,7 @@ class CodexBackend(BaseBackend):
 
         When the native binary is launched directly the npm ``bin/codex.js``
         wrapper is bypassed, so its two runtime effects are reproduced here:
-        prepending the vendored ``path`` dir (bundled ``rg.exe``) to ``PATH``
+        prepending the vendored bundled-tools dir (``rg.exe``) to ``PATH``
         and marking the install as npm-managed.
         """
         env = {
@@ -303,8 +351,12 @@ class CodexBackend(BaseBackend):
         if native:
             _, arch_root = native
             env["CODEX_MANAGED_BY_NPM"] = "1"
-            path_dir = Path(arch_root) / "path"
-            if path_dir.is_dir():
-                current = os.environ.get("PATH", "")
-                env["PATH"] = f"{path_dir}{os.pathsep}{current}"
+            # Bundled-tools dir was ``path`` in older Codex releases and
+            # ``codex-path`` in newer ones; prepend whichever exists.
+            for tools_subdir in ("codex-path", "path"):
+                path_dir = Path(arch_root) / tools_subdir
+                if path_dir.is_dir():
+                    current = os.environ.get("PATH", "")
+                    env["PATH"] = f"{path_dir}{os.pathsep}{current}"
+                    break
         return env
