@@ -171,6 +171,7 @@ class TestCodexBuildEnv:
         assert env == {
             "AGENT_NAME": request.name,
             "AGENT_SESSION_ID": request.team_name,
+            "AGENT_PARENT_NAME": request.lead_session_id,
         }
 
 
@@ -238,6 +239,7 @@ class TestCodexMcpIdentity:
             "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
             "AGENT_NAME": "worker",
             "AGENT_SESSION_ID": "sess-uuid",
+            "AGENT_PARENT_NAME": request.lead_session_id,
         }
 
     def test_build_resume_command_injects_identity_env_override(self, _make_request):

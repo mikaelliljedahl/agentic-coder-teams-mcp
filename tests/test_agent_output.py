@@ -598,6 +598,31 @@ async def test_spawn_agent_deduplicates_name_within_session(
 
 
 @pytest.mark.asyncio
+async def test_agent_send_message_to_lead_routes_to_parent_in_nested_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_base = tmp_path / "sessions"
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
+    monkeypatch.setattr(server_simple, "_session_id", "session-id")
+    monkeypatch.setattr(server_simple, "IDENTITY", "child")
+    monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "parent")
+    (session_base / "session-id").mkdir(parents=True)
+
+    result = await server_simple.send_message("lead", "hello parent")
+
+    assert result == {"success": True, "to": "parent"}
+    inbox = session_base / "session-id" / "inbox-parent.jsonl"
+    rows = [json.loads(line) for line in inbox.read_text(encoding="utf-8").splitlines()]
+    assert rows == [
+        {
+            "from": "child",
+            "text": "hello parent",
+            "ts": rows[0]["ts"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_list_agents_recovers_lead_session_after_mcp_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

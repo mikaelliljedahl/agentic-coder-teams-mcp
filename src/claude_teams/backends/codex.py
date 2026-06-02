@@ -259,6 +259,7 @@ class CodexBackend(BaseBackend):
             "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
             "AGENT_NAME": request.name,
             "AGENT_SESSION_ID": request.team_name,
+            "AGENT_PARENT_NAME": request.lead_session_id,
         }
         pairs = ", ".join(
             f"{key} = {self._toml_literal(value)}" for key, value in env.items()
@@ -282,7 +283,7 @@ class CodexBackend(BaseBackend):
 
     @staticmethod
     def _launches_via_cmd_shim(binary: str) -> bool:
-        """True when ``binary`` is a Windows batch shim run through ``cmd.exe``.
+        """Return whether ``binary`` is a Windows batch shim run through ``cmd.exe``.
 
         ``cmd.exe`` truncates an argv token at the first newline (and mangles
         ``< > | & ^ ! ( )``), so a multi-line prompt cannot survive the npm
@@ -345,6 +346,7 @@ class CodexBackend(BaseBackend):
         env = {
             "AGENT_NAME": request.name,
             "AGENT_SESSION_ID": request.team_name,
+            "AGENT_PARENT_NAME": request.lead_session_id,
         }
         shim = shutil.which(self._binary_name)
         native = self._resolve_native_codex(shim) if shim else None

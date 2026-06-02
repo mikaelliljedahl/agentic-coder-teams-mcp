@@ -35,6 +35,7 @@ from claude_teams.backends.registry import registry
 # avoiding races on the shared ~/.codex/config.toml.
 _AGENT_NAME: str = os.environ.get("AGENT_NAME", "").strip()
 _AGENT_SESSION_ID: str = os.environ.get("AGENT_SESSION_ID", "").strip()
+_AGENT_PARENT_NAME: str = os.environ.get("AGENT_PARENT_NAME", "").strip()
 IDENTITY: str = _AGENT_NAME if _AGENT_NAME else "lead"
 
 _SESSION_BASE = Path.home() / ".claude" / "agent-sessions"
@@ -248,6 +249,14 @@ def _active_session_id(*, create: bool = False) -> str:
     return ""
 
 
+def _message_recipient(to: str) -> str:
+    """Resolve recipient aliases in nested agent trees."""
+    recipient = to.strip()
+    if recipient == "lead" and IDENTITY != "lead":
+        return _AGENT_PARENT_NAME or "lead"
+    return recipient
+
+
 def _empty_agent_check(name: str) -> dict:
     """Return a stable empty ``check_agent`` payload."""
     return {
@@ -353,7 +362,7 @@ def _create_session() -> str:
     return sid
 
 
-def _write_mcp_config(session_id: str, agent_name: str) -> Path:
+def _write_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Path:
     """Write per-agent MCP config (used by Claude Code via --mcp-config)."""
     config = {
         "mcpServers": {
@@ -363,6 +372,7 @@ def _write_mcp_config(session_id: str, agent_name: str) -> Path:
                 "env": {
                     "AGENT_SESSION_ID": session_id,
                     "AGENT_NAME": agent_name,
+                    "AGENT_PARENT_NAME": parent_name,
                 },
             }
         }
@@ -400,7 +410,7 @@ async def spawn_agent(
                 b.resolve_model(model) if model.strip() else b.default_model()
             )
 
-            mcp_config_path = _write_mcp_config(session_id, agent_name)
+            mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
 
             agent_cwd = cwd.strip() or str(Path.cwd())
 
@@ -419,7 +429,7 @@ async def spawn_agent(
                 agent_type="worker",
                 color="blue",
                 cwd=agent_cwd,
-                lead_session_id="lead",
+                lead_session_id=IDENTITY,
                 permission_mode=permission_mode,  # type: ignore[arg-type]
                 reasoning_effort=effort,
                 extra=extra,
@@ -462,7 +472,8 @@ async def send_message(to: str, text: str) -> dict:
     def _do_send() -> dict:
         if not session_id:
             return {"success": False, "to": to, "reason": "session_not_found"}
-        inbox = _inbox_file(session_id, to)
+        recipient = _message_recipient(to)
+        inbox = _inbox_file(session_id, recipient)
         line = json.dumps(
             {
                 "from": IDENTITY,
@@ -472,7 +483,7 @@ async def send_message(to: str, text: str) -> dict:
         )
         with inbox.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
-        return {"success": True, "to": to}
+        return {"success": True, "to": recipient}
 
     return await run_blocking(_do_send)
 
@@ -594,7 +605,7 @@ async def follow_up_agent(
 
             agent_name = str(agent.get("name") or name)
             agent_cwd = str(agent.get("cwd") or Path.cwd())
-            mcp_config_path = _write_mcp_config(session_id, agent_name)
+            mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
 
             model = str(agent.get("model") or backend.default_model())
             permission_mode = str(agent.get("permission_mode") or "bypass")
@@ -613,7 +624,7 @@ async def follow_up_agent(
                 agent_type="worker",
                 color="blue",
                 cwd=agent_cwd,
-                lead_session_id="lead",
+                lead_session_id=IDENTITY,
                 permission_mode=permission_mode,  # type: ignore[arg-type]
                 reasoning_effort=effort,
                 extra=extra,
