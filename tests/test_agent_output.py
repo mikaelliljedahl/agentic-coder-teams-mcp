@@ -555,6 +555,93 @@ async def test_spawn_agent_persists_output_lookup_metadata(
 
 
 @pytest.mark.asyncio
+async def test_spawn_agent_deduplicates_name_within_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.next_pid = 456
+
+        def default_model(self) -> str:
+            return "model"
+
+        def resolve_model(self, model: str) -> str:
+            return model
+
+        def spawn(self, request: object) -> SimpleNamespace:
+            self.next_pid += 1
+            return SimpleNamespace(process_handle=str(self.next_pid))
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.backend = FakeBackend()
+
+        def default_backend(self) -> str:
+            return "codex"
+
+        def get(self, backend: str) -> FakeBackend:
+            assert backend == "codex"
+            return self.backend
+
+    session_base = tmp_path / "sessions"
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
+    monkeypatch.setattr(server_simple, "_session_id", "")
+    monkeypatch.setattr(server_simple, "registry", FakeRegistry())
+
+    first = await server_simple.spawn_agent("prompt", name="worker", backend="codex")
+    second = await server_simple.spawn_agent("prompt", name="worker", backend="codex")
+
+    assert first["name"] == "worker"
+    assert second["name"] == "worker-2"
+    agents = server_simple._load_agents(first["session_id"])
+    assert [agent["name"] for agent in agents] == ["worker", "worker-2"]
+
+
+@pytest.mark.asyncio
+async def test_list_agents_recovers_lead_session_after_mcp_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_base = tmp_path / "sessions"
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("WIN_AGENT_TEAMS_PARENT_ID", "parent-process")
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
+    monkeypatch.setattr(server_simple, "_session_id", "")
+
+    session_id = server_simple._create_session()
+    server_simple._save_agents(
+        session_id,
+        [
+            {
+                "name": "worker",
+                "pid": 123,
+                "backend": "codex",
+                "session_id": session_id,
+                "status": "running",
+                "spawned_at": 100.0,
+                "cwd": str(work),
+                "model": "model",
+                "permission_mode": "bypass",
+                "reasoning_effort": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(server_simple, "_session_id", "")
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "health_check",
+        lambda handle: (True, "running"),
+    )
+
+    result = await server_simple.list_agents()
+
+    assert server_simple._session_id == session_id
+    assert result[0]["name"] == "worker"
+    assert result[0]["alive"] is True
+
+
+@pytest.mark.asyncio
 async def test_check_agent_returns_stable_empty_fallback_for_unknown_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -840,3 +927,49 @@ async def test_follow_up_agent_rejects_backend_without_resume(
 
     assert result["success"] is False
     assert result["reason"] == "backend_not_supported"
+
+
+@pytest.mark.asyncio
+async def test_follow_up_agent_recovers_session_after_mcp_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _FakeResumeBackend()
+    session_base = tmp_path / "sessions"
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("WIN_AGENT_TEAMS_PARENT_ID", "parent-process")
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
+    monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
+    monkeypatch.setattr(server_simple, "_session_id", "")
+
+    session_id = server_simple._create_session()
+    server_simple._save_agents(
+        session_id,
+        [
+            {
+                "name": "worker",
+                "pid": 123,
+                "backend": "codex",
+                "session_id": session_id,
+                "status": "running",
+                "spawned_at": 100.0,
+                "cwd": str(work),
+                "backend_session_id": "backend-session-id",
+                "model": "model",
+                "permission_mode": "bypass",
+                "reasoning_effort": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(server_simple, "_session_id", "")
+    monkeypatch.setattr(
+        server_simple.process_manager, "health_check", lambda handle: (False, "dead")
+    )
+    monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
+
+    result = await server_simple.follow_up_agent("worker", "next prompt")
+
+    assert result["success"] is True
+    assert result["session_id"] == session_id
+    assert backend.resume_calls[0][1] == "backend-session-id"

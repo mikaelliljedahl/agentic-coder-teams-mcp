@@ -19,6 +19,7 @@ _MAX_NAME_LEN = 64
 _STILL_ACTIVE = 259
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _ERROR_ACCESS_DENIED = 5
+_KILL_ON_EXIT_ENV = "WIN_AGENT_TEAMS_KILL_ON_EXIT"
 
 
 def _validate_safe_name(name: str, label: str = "name") -> str:
@@ -28,6 +29,14 @@ def _validate_safe_name(name: str, label: str = "name") -> str:
     if len(name) > _MAX_NAME_LEN:
         raise ValueError(f"{label} too long: {name!r}")  # noqa: TRY003
     return name
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    """Return a boolean feature flag from common environment values."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -100,6 +109,7 @@ class WindowsProcessManager:
     def __init__(self) -> None:
         """Initialize the process registry and shared job object."""
         self._processes: dict[str, ProcessInfo] = {}
+        self._kill_on_exit = _env_flag(_KILL_ON_EXIT_ENV)
         self._job = WindowsJobObject()
 
     def spawn_process(
@@ -150,11 +160,16 @@ class WindowsProcessManager:
                     creationflags=creationflags,
                 )
             else:
+                stdin = (
+                    subprocess.DEVNULL
+                    if backend_type == "claude-code" and is_interactive
+                    else subprocess.PIPE
+                )
                 process = subprocess.Popen(  # noqa: S603 - backend argv is built by adapters.
                     cmd,
                     cwd=request.cwd,
                     env=merged_env,
-                    stdin=subprocess.PIPE,
+                    stdin=stdin,
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -164,7 +179,8 @@ class WindowsProcessManager:
             log_handle.close()
             raise
 
-        self._job.assign(process)
+        if self._kill_on_exit:
+            self._job.assign(process)
         handle = str(process.pid)
         self._processes[handle] = ProcessInfo(
             pid=process.pid,
@@ -337,14 +353,12 @@ class WindowsProcessManager:
         _ = backend_type
         if not is_interactive:
             return False
-        if os.environ.get("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", "").lower() in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }:
+        if os.name != "nt":
             return False
-        return os.name == "nt"
+        flag = os.environ.get("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE")
+        if flag is not None:
+            return _env_flag("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE")
+        return True
 
     def _with_debug_file(self, cmd: list[str], log_path: Path) -> list[str]:
         if "--debug-file" in cmd:

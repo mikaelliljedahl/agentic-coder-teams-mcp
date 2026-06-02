@@ -1,13 +1,21 @@
 """Simplified MCP server for agent orchestration."""
 
+import hashlib
 import json
 import logging
 import os
 import sys
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from fastmcp import FastMCP
 
@@ -30,8 +38,19 @@ _AGENT_SESSION_ID: str = os.environ.get("AGENT_SESSION_ID", "").strip()
 IDENTITY: str = _AGENT_NAME if _AGENT_NAME else "lead"
 
 _SESSION_BASE = Path.home() / ".claude" / "agent-sessions"
+_SESSION_META_NAME = "session.json"
+_BINDINGS_DIR_NAME = "bindings"
+_AGENTS_LOCK_NAME = "agents.lock"
+_LOCK_TIMEOUT_SECONDS = 30.0
+_LOCK_RETRY_SECONDS = 0.05
+_LOCK_SIZE = 1
 _FOLLOW_UP_IDLE_SECONDS = 60.0
 logger = logging.getLogger(__name__)
+
+
+class AgentsFileLockTimeoutError(TimeoutError):
+    """Raised when another MCP process holds the agents registry lock too long."""
+
 
 mcp = FastMCP(
     name="win-agent-teams",
@@ -50,19 +69,183 @@ def _agents_file(session_id: str) -> Path:
     return _session_dir(session_id) / "agents.json"
 
 
+def _agents_lock_file(session_id: str) -> Path:
+    return _session_dir(session_id) / _AGENTS_LOCK_NAME
+
+
+def _session_meta_file(session_id: str) -> Path:
+    return _session_dir(session_id) / _SESSION_META_NAME
+
+
 def _inbox_file(session_id: str, name: str) -> Path:
     return _session_dir(session_id) / f"inbox-{name}.jsonl"
 
 
-def _load_agents(session_id: str) -> list[dict]:
+def _bindings_dir() -> Path:
+    return _SESSION_BASE / _BINDINGS_DIR_NAME
+
+
+def _binding_key() -> str:
+    """Return a stable key for this MCP parent/workspace identity."""
+    parent_id = os.environ.get("WIN_AGENT_TEAMS_PARENT_ID", "").strip()
+    if not parent_id:
+        parent_id = str(os.getppid())
+    cwd = str(Path.cwd().resolve())
+    return f"identity={IDENTITY}\nparent={parent_id}\ncwd={cwd}"
+
+
+def _binding_file() -> Path:
+    digest = hashlib.sha256(_binding_key().encode("utf-8")).hexdigest()
+    return _bindings_dir() / f"{digest}.json"
+
+
+def _read_json_object(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _lock_file(handle) -> None:
+    if os.name == "nt":
+        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, _LOCK_SIZE)
+            except OSError as err:
+                if time.monotonic() >= deadline:
+                    raise AgentsFileLockTimeoutError from err
+                time.sleep(_LOCK_RETRY_SECONDS)
+            else:
+                return
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(handle) -> None:
+    if os.name == "nt":
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, _LOCK_SIZE)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _agents_file_lock(session_id: str) -> Iterator[None]:
+    path = _agents_lock_file(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        _lock_file(handle)
+        try:
+            yield
+        finally:
+            _unlock_file(handle)
+
+
+def _load_agents_unlocked(session_id: str) -> list[dict]:
     path = _agents_file(session_id)
     if not path.exists():
         return []
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _save_agents(session_id: str, agents: list[dict]) -> None:
+def _save_agents_unlocked(session_id: str, agents: list[dict]) -> None:
     _agents_file(session_id).write_text(json.dumps(agents, indent=2), encoding="utf-8")
+
+
+def _load_agents(session_id: str) -> list[dict]:
+    with _agents_file_lock(session_id):
+        return _load_agents_unlocked(session_id)
+
+
+def _save_agents(session_id: str, agents: list[dict]) -> None:
+    with _agents_file_lock(session_id):
+        _save_agents_unlocked(session_id, agents)
+
+
+@contextmanager
+def _agents_transaction(session_id: str) -> Iterator[list[dict]]:
+    with _agents_file_lock(session_id):
+        agents = _load_agents_unlocked(session_id)
+        yield agents
+
+
+def _save_agents_transaction(session_id: str, agents: list[dict]) -> None:
+    _save_agents_unlocked(session_id, agents)
+
+
+def _unique_agent_name(requested_name: str, agents: list[dict]) -> str:
+    """Return an agent name that does not collide within this session."""
+    requested = requested_name.strip()
+    candidate = requested or f"agent-{len(agents) + 1}"
+    existing = {str(agent.get("name") or "") for agent in agents}
+    if candidate not in existing:
+        return candidate
+
+    counter = 2
+    while True:
+        suffix = f"-{counter}"
+        name = f"{candidate[: 64 - len(suffix)]}{suffix}"
+        if name not in existing:
+            return name
+        counter += 1
+
+
+def _persist_session_binding(session_id: str) -> None:
+    """Bind this parent/workspace to a session id for MCP restart recovery."""
+    now = datetime.now(UTC).isoformat()
+    key = _binding_key()
+    meta = {
+        "session_id": session_id,
+        "binding_key": key,
+        "identity": IDENTITY,
+        "cwd": str(Path.cwd().resolve()),
+        "parent_id": os.environ.get("WIN_AGENT_TEAMS_PARENT_ID", "").strip()
+        or str(os.getppid()),
+        "updated_at": now,
+    }
+    _session_meta_file(session_id).write_text(
+        json.dumps(meta, indent=2),
+        encoding="utf-8",
+    )
+    _bindings_dir().mkdir(parents=True, exist_ok=True)
+    _binding_file().write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _recover_session_id() -> str:
+    """Recover the persisted lead session for this MCP parent/workspace."""
+    if _AGENT_SESSION_ID:
+        return _AGENT_SESSION_ID
+    key = _binding_key()
+    binding = _read_json_object(_binding_file())
+    session_id = binding.get("session_id")
+    if (
+        binding.get("binding_key") == key
+        and isinstance(session_id, str)
+        and _agents_file(session_id).exists()
+    ):
+        return session_id
+    return ""
+
+
+def _active_session_id(*, create: bool = False) -> str:
+    """Return the current session id, recovering persisted lead state if needed."""
+    global _session_id  # noqa: PLW0603 - module-level lead session state.
+
+    if _session_id:
+        return _session_id
+    recovered = _recover_session_id()
+    if recovered:
+        _session_id = recovered
+        return _session_id
+    if create:
+        _session_id = _create_session()
+        return _session_id
+    return ""
 
 
 def _empty_agent_check(name: str) -> dict:
@@ -165,7 +348,8 @@ def _create_session() -> str:
     base = _session_dir(sid)
     (base / "mcp").mkdir(parents=True, exist_ok=True)
     (base / "logs").mkdir(parents=True, exist_ok=True)
-    _save_agents(sid, [])
+    _save_agents_unlocked(sid, [])
+    _persist_session_binding(sid)
     return sid
 
 
@@ -205,64 +389,60 @@ async def spawn_agent(
     """
 
     def _do_spawn() -> dict:
-        global _session_id  # noqa: PLW0603 - module-level lead session state.
+        session_id = _active_session_id(create=True)
+        with _agents_transaction(session_id) as agents:
+            agent_name = _unique_agent_name(name, agents)
 
-        if not _session_id:
-            _session_id = _create_session()
+            backend_name = backend.strip() or registry.default_backend()
+            b = registry.get(backend_name)
 
-        session_id = _session_id
-        agents = _load_agents(session_id)
+            resolved_model = (
+                b.resolve_model(model) if model.strip() else b.default_model()
+            )
 
-        agent_name = name.strip() or f"agent-{len(agents) + 1}"
+            mcp_config_path = _write_mcp_config(session_id, agent_name)
 
-        backend_name = backend.strip() or registry.default_backend()
-        b = registry.get(backend_name)
+            agent_cwd = cwd.strip() or str(Path.cwd())
 
-        resolved_model = b.resolve_model(model) if model.strip() else b.default_model()
-
-        mcp_config_path = _write_mcp_config(session_id, agent_name)
-
-        agent_cwd = cwd.strip() or str(Path.cwd())
-
-        effort = reasoning_effort.strip() or None
-        extra = {
-            "mcp_config_path": str(mcp_config_path),
-            "agent_capability": "",
-        }
-
-        request = SpawnRequest(
-            agent_id=f"{agent_name}@{session_id}",
-            name=agent_name,
-            team_name=session_id,
-            prompt=prompt,
-            model=resolved_model,
-            agent_type="worker",
-            color="blue",
-            cwd=agent_cwd,
-            lead_session_id="lead",
-            permission_mode=permission_mode,  # type: ignore[arg-type]
-            reasoning_effort=effort,
-            extra=extra,
-        )
-
-        result = b.spawn(request)
-        pid = int(result.process_handle)
-
-        agents.append(
-            {
-                "name": agent_name,
-                "pid": pid,
-                "backend": backend_name,
-                "session_id": session_id,
-                "status": "running",
-                "spawned_at": time.time(),
-                "cwd": agent_cwd,
-                "model": resolved_model,
-                "permission_mode": permission_mode,
-                "reasoning_effort": effort,
+            effort = reasoning_effort.strip() or None
+            extra = {
+                "mcp_config_path": str(mcp_config_path),
+                "agent_capability": "",
             }
-        )
-        _save_agents(session_id, agents)
+
+            request = SpawnRequest(
+                agent_id=f"{agent_name}@{session_id}",
+                name=agent_name,
+                team_name=session_id,
+                prompt=prompt,
+                model=resolved_model,
+                agent_type="worker",
+                color="blue",
+                cwd=agent_cwd,
+                lead_session_id="lead",
+                permission_mode=permission_mode,  # type: ignore[arg-type]
+                reasoning_effort=effort,
+                extra=extra,
+            )
+
+            result = b.spawn(request)
+            pid = int(result.process_handle)
+
+            agents.append(
+                {
+                    "name": agent_name,
+                    "pid": pid,
+                    "backend": backend_name,
+                    "session_id": session_id,
+                    "status": "running",
+                    "spawned_at": time.time(),
+                    "cwd": agent_cwd,
+                    "model": resolved_model,
+                    "permission_mode": permission_mode,
+                    "reasoning_effort": effort,
+                }
+            )
+            _save_agents_transaction(session_id, agents)
 
         return {
             "name": agent_name,
@@ -277,9 +457,11 @@ async def spawn_agent(
 @mcp.tool()
 async def send_message(to: str, text: str) -> dict:
     """Send a message to an agent or lead."""
-    session_id = _session_id or _AGENT_SESSION_ID
+    session_id = _active_session_id()
 
     def _do_send() -> dict:
+        if not session_id:
+            return {"success": False, "to": to, "reason": "session_not_found"}
         inbox = _inbox_file(session_id, to)
         line = json.dumps(
             {
@@ -298,9 +480,11 @@ async def send_message(to: str, text: str) -> dict:
 @mcp.tool()
 async def read_messages(from_agent: str = "") -> list[dict]:
     """Read messages from own inbox, optionally filtered by sender."""
-    session_id = _session_id or _AGENT_SESSION_ID
+    session_id = _active_session_id()
 
     def _do_read() -> list[dict]:
+        if not session_id:
+            return []
         inbox = _inbox_file(session_id, IDENTITY)
         if not inbox.exists():
             return []
@@ -324,19 +508,21 @@ async def read_messages(from_agent: str = "") -> list[dict]:
 @mcp.tool()
 async def check_agent(name: str) -> dict:
     """Check whether an agent process is alive."""
-    session_id = _session_id or _AGENT_SESSION_ID
+    session_id = _active_session_id()
 
     def _do_check() -> dict:
-        agents = _load_agents(session_id)
-        agent = next((a for a in agents if a["name"] == name), None)
-        if agent is None:
+        if not session_id:
             return _empty_agent_check(name)
-        pid = agent["pid"]
-        alive, _ = process_manager.health_check(str(pid))
-        output = _read_agent_output(agent)
-        if _sync_backend_session_id(agent, output):
-            _save_agents(session_id, agents)
-        return _agent_check_payload(name, agent, alive, output)
+        with _agents_transaction(session_id) as agents:
+            agent = next((a for a in agents if a["name"] == name), None)
+            if agent is None:
+                return _empty_agent_check(name)
+            pid = agent["pid"]
+            alive, _ = process_manager.health_check(str(pid))
+            output = _read_agent_output(agent)
+            if _sync_backend_session_id(agent, output):
+                _save_agents_transaction(session_id, agents)
+            return _agent_check_payload(name, agent, alive, output)
 
     return await run_blocking(_do_check)
 
@@ -348,122 +534,124 @@ async def follow_up_agent(
     replace_if_idle: bool = False,
 ) -> dict:
     """Resume a logical agent with a follow-up prompt."""
-    session_id = _session_id or _AGENT_SESSION_ID
+    session_id = _active_session_id()
 
     def _do_follow_up() -> dict:  # noqa: PLR0911 - mirrors explicit refusal reasons.
-        agents = _load_agents(session_id)
-        agent = next((a for a in agents if a["name"] == name), None)
-        if agent is None:
-            return _follow_up_failure("agent_not_found", name)
+        if not session_id:
+            return _follow_up_failure("session_not_found", name)
+        with _agents_transaction(session_id) as agents:
+            agent = next((a for a in agents if a["name"] == name), None)
+            if agent is None:
+                return _follow_up_failure("agent_not_found", name)
 
-        backend_name = str(agent.get("backend") or "")
-        try:
-            backend = registry.get(backend_name)
-        except Exception:
-            logger.debug("Failed loading backend for follow-up", exc_info=True)
-            return _follow_up_failure("backend_not_supported", name)
+            backend_name = str(agent.get("backend") or "")
+            try:
+                backend = registry.get(backend_name)
+            except Exception:
+                logger.debug("Failed loading backend for follow-up", exc_info=True)
+                return _follow_up_failure("backend_not_supported", name)
 
-        if not getattr(backend, "supports_resume", lambda: False)():
-            return _follow_up_failure("backend_not_supported", name)
+            if not getattr(backend, "supports_resume", lambda: False)():
+                return _follow_up_failure("backend_not_supported", name)
 
-        pid = agent["pid"]
-        alive, _ = process_manager.health_check(str(pid))
-        output = _read_agent_output(agent)
-        changed = _sync_backend_session_id(agent, output)
-        status = _agent_check_payload(name, agent, alive, output)
-        backend_session_id = status.get("backend_session_id")
-        if not backend_session_id:
-            if changed:
-                _save_agents(session_id, agents)
-            return _follow_up_failure("backend_session_missing", name, status)
-
-        if alive:
-            last_message = status.get("last_message")
-            if last_message is None:
+            pid = agent["pid"]
+            alive, _ = process_manager.health_check(str(pid))
+            output = _read_agent_output(agent)
+            changed = _sync_backend_session_id(agent, output)
+            status = _agent_check_payload(name, agent, alive, output)
+            backend_session_id = status.get("backend_session_id")
+            if not backend_session_id:
                 if changed:
-                    _save_agents(session_id, agents)
-                return _follow_up_failure("agent_busy", name, status)
-            last_activity_at = status.get("last_activity_at")
-            if last_activity_at is None:
+                    _save_agents_transaction(session_id, agents)
+                return _follow_up_failure("backend_session_missing", name, status)
+
+            if alive:
+                last_message = status.get("last_message")
+                if last_message is None:
+                    if changed:
+                        _save_agents_transaction(session_id, agents)
+                    return _follow_up_failure("agent_busy", name, status)
+                last_activity_at = status.get("last_activity_at")
+                if last_activity_at is None:
+                    if changed:
+                        _save_agents_transaction(session_id, agents)
+                    return _follow_up_failure("agent_state_unknown", name, status)
+                if output is not None and output.busy_hint:
+                    if changed:
+                        _save_agents_transaction(session_id, agents)
+                    return _follow_up_failure("agent_busy", name, status)
+                if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
+                    if changed:
+                        _save_agents_transaction(session_id, agents)
+                    return _follow_up_failure("agent_busy", name, status)
+                if not replace_if_idle:
+                    if changed:
+                        _save_agents_transaction(session_id, agents)
+                    return _follow_up_failure("agent_idle_but_alive", name, status)
+
+                if not process_manager.graceful_shutdown(str(pid), timeout_s=5.0):
+                    process_manager.kill_process(str(pid))
+
+            agent_name = str(agent.get("name") or name)
+            agent_cwd = str(agent.get("cwd") or Path.cwd())
+            mcp_config_path = _write_mcp_config(session_id, agent_name)
+
+            model = str(agent.get("model") or backend.default_model())
+            permission_mode = str(agent.get("permission_mode") or "bypass")
+            effort_value = agent.get("reasoning_effort")
+            effort = effort_value if isinstance(effort_value, str) else None
+            extra = {
+                "mcp_config_path": str(mcp_config_path),
+                "agent_capability": "",
+            }
+            request = SpawnRequest(
+                agent_id=f"{agent_name}@{session_id}",
+                name=agent_name,
+                team_name=session_id,
+                prompt=prompt,
+                model=model,
+                agent_type="worker",
+                color="blue",
+                cwd=agent_cwd,
+                lead_session_id="lead",
+                permission_mode=permission_mode,  # type: ignore[arg-type]
+                reasoning_effort=effort,
+                extra=extra,
+            )
+
+            try:
+                result = backend.resume(request, str(backend_session_id))
+            except Exception:
+                logger.debug("Failed resuming backend session", exc_info=True)
                 if changed:
-                    _save_agents(session_id, agents)
-                return _follow_up_failure("agent_state_unknown", name, status)
-            if output is not None and output.busy_hint:
-                if changed:
-                    _save_agents(session_id, agents)
-                return _follow_up_failure("agent_busy", name, status)
-            if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
-                if changed:
-                    _save_agents(session_id, agents)
-                return _follow_up_failure("agent_busy", name, status)
-            if not replace_if_idle:
-                if changed:
-                    _save_agents(session_id, agents)
-                return _follow_up_failure("agent_idle_but_alive", name, status)
+                    _save_agents_transaction(session_id, agents)
+                return _follow_up_failure("resume_failed", name, status)
 
-            if not process_manager.graceful_shutdown(str(pid), timeout_s=5.0):
-                process_manager.kill_process(str(pid))
-
-        agent_name = str(agent.get("name") or name)
-        agent_cwd = str(agent.get("cwd") or Path.cwd())
-        mcp_config_path = _write_mcp_config(session_id, agent_name)
-
-        model = str(agent.get("model") or backend.default_model())
-        permission_mode = str(agent.get("permission_mode") or "bypass")
-        effort_value = agent.get("reasoning_effort")
-        effort = effort_value if isinstance(effort_value, str) else None
-        extra = {
-            "mcp_config_path": str(mcp_config_path),
-            "agent_capability": "",
-        }
-        request = SpawnRequest(
-            agent_id=f"{agent_name}@{session_id}",
-            name=agent_name,
-            team_name=session_id,
-            prompt=prompt,
-            model=model,
-            agent_type="worker",
-            color="blue",
-            cwd=agent_cwd,
-            lead_session_id="lead",
-            permission_mode=permission_mode,  # type: ignore[arg-type]
-            reasoning_effort=effort,
-            extra=extra,
-        )
-
-        try:
-            result = backend.resume(request, str(backend_session_id))
-        except Exception:
-            logger.debug("Failed resuming backend session", exc_info=True)
-            if changed:
-                _save_agents(session_id, agents)
-            return _follow_up_failure("resume_failed", name, status)
-
-        new_pid = int(result.process_handle)
-        agent.update(
-            {
+            new_pid = int(result.process_handle)
+            agent.update(
+                {
+                    "pid": new_pid,
+                    "backend": backend_name,
+                    "session_id": session_id,
+                    "status": "running",
+                    "spawned_at": time.time(),
+                    "cwd": agent_cwd,
+                    "backend_session_id": str(backend_session_id),
+                    "model": model,
+                    "permission_mode": permission_mode,
+                    "reasoning_effort": effort,
+                }
+            )
+            _save_agents_transaction(session_id, agents)
+            return {
+                "success": True,
+                "name": agent_name,
                 "pid": new_pid,
                 "backend": backend_name,
-                "session_id": session_id,
-                "status": "running",
-                "spawned_at": time.time(),
-                "cwd": agent_cwd,
                 "backend_session_id": str(backend_session_id),
-                "model": model,
-                "permission_mode": permission_mode,
-                "reasoning_effort": effort,
+                "replaced_existing": alive,
+                "session_id": session_id,
             }
-        )
-        _save_agents(session_id, agents)
-        return {
-            "success": True,
-            "name": agent_name,
-            "pid": new_pid,
-            "backend": backend_name,
-            "backend_session_id": str(backend_session_id),
-            "replaced_existing": alive,
-            "session_id": session_id,
-        }
 
     return await run_blocking(_do_follow_up)
 
@@ -471,19 +659,21 @@ async def follow_up_agent(
 @mcp.tool()
 async def kill_agent(name: str) -> dict:
     """Force-kill an agent process."""
-    session_id = _session_id or _AGENT_SESSION_ID
+    session_id = _active_session_id()
 
     def _do_kill() -> dict:
-        agents = _load_agents(session_id)
-        agent = next((a for a in agents if a["name"] == name), None)
-        if agent is None:
-            return {"success": False, "name": name}
-        process_manager.kill_process(str(agent["pid"]))
-        for a in agents:
-            if a["name"] == name:
-                a["status"] = "killed"
-        _save_agents(session_id, agents)
-        return {"success": True, "name": name}
+        if not session_id:
+            return {"success": False, "name": name, "reason": "session_not_found"}
+        with _agents_transaction(session_id) as agents:
+            agent = next((a for a in agents if a["name"] == name), None)
+            if agent is None:
+                return {"success": False, "name": name}
+            process_manager.kill_process(str(agent["pid"]))
+            for a in agents:
+                if a["name"] == name:
+                    a["status"] = "killed"
+            _save_agents_transaction(session_id, agents)
+            return {"success": True, "name": name}
 
     return await run_blocking(_do_kill)
 
@@ -491,7 +681,7 @@ async def kill_agent(name: str) -> dict:
 @mcp.tool()
 async def list_agents() -> list[dict]:
     """List all agents and their alive status."""
-    session_id = _session_id or _AGENT_SESSION_ID
+    session_id = _active_session_id()
 
     def _do_list() -> list[dict]:
         if not session_id:

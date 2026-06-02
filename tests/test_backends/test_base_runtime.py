@@ -235,14 +235,66 @@ class TestBaseBackendExecuteInPane:
 
 
 class TestInteractiveConsoleSpawn:
-    def test_claude_code_uses_new_console_and_debug_file(
+    def test_spawned_agents_are_detached_from_mcp_lifetime_by_default(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        manager = process_manager_mod.WindowsProcessManager()
+        process = MagicMock(pid=4242)
+        assign_mock = MagicMock()
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
+        monkeypatch.delenv("WIN_AGENT_TEAMS_KILL_ON_EXIT", raising=False)
+        monkeypatch.delenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", raising=False)
+        monkeypatch.setattr(
+            process_manager_mod.subprocess,
+            "Popen",
+            MagicMock(return_value=process),
+        )
+        monkeypatch.setattr(manager._job, "assign", assign_mock)
+
+        manager.spawn_process(
+            _make_spawn_request(),
+            ["claude", "--", "do stuff"],
+            {},
+            "claude-code",
+            is_interactive=True,
+        )
+
+        assign_mock.assert_not_called()
+
+    def test_env_can_attach_spawned_agents_to_mcp_lifetime(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_KILL_ON_EXIT", "1")
+        manager = process_manager_mod.WindowsProcessManager()
+        process = MagicMock(pid=4242)
+        assign_mock = MagicMock()
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
+        monkeypatch.delenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", raising=False)
+        monkeypatch.setattr(
+            process_manager_mod.subprocess,
+            "Popen",
+            MagicMock(return_value=process),
+        )
+        monkeypatch.setattr(manager._job, "assign", assign_mock)
+
+        manager.spawn_process(
+            _make_spawn_request(),
+            ["claude", "--", "do stuff"],
+            {},
+            "claude-code",
+            is_interactive=True,
+        )
+
+        assign_mock.assert_called_once_with(process)
+
+    def test_env_can_enable_claude_code_new_console_and_debug_file(
         self, _make_spawn_request, monkeypatch, tmp_path
     ):
         manager = process_manager_mod.WindowsProcessManager()
         process = MagicMock(pid=4242)
         popen_mock = MagicMock(return_value=process)
         monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
-        monkeypatch.delenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", raising=False)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", "1")
         monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
         monkeypatch.setattr(manager._job, "assign", lambda process: None)
         request = _make_spawn_request()
@@ -272,7 +324,7 @@ class TestInteractiveConsoleSpawn:
             encoding="utf-8"
         )
 
-    def test_env_can_disable_interactive_console(
+    def test_env_can_disable_claude_code_interactive_console(
         self, _make_spawn_request, monkeypatch, tmp_path
     ):
         manager = process_manager_mod.WindowsProcessManager()
@@ -295,9 +347,36 @@ class TestInteractiveConsoleSpawn:
         command = popen_mock.call_args.args[0]
         assert "--debug-file" not in command
         kwargs = popen_mock.call_args.kwargs
-        assert kwargs["stdin"] == process_manager_mod.subprocess.PIPE
+        assert kwargs["stdin"] == process_manager_mod.subprocess.DEVNULL
         assert kwargs["stdout"] is not None
         assert kwargs["stderr"] == process_manager_mod.subprocess.STDOUT
+
+    def test_non_claude_interactive_backend_uses_console_by_default(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        manager = process_manager_mod.WindowsProcessManager()
+        process = MagicMock(pid=4242)
+        popen_mock = MagicMock(return_value=process)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
+        monkeypatch.delenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", raising=False)
+        monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
+        monkeypatch.setattr(manager._job, "assign", lambda process: None)
+
+        manager.spawn_process(
+            _make_spawn_request(),
+            ["codex", "exec", "do stuff"],
+            {},
+            "codex",
+            is_interactive=True,
+        )
+
+        kwargs = popen_mock.call_args.kwargs
+        assert kwargs["stdin"] is None
+        assert kwargs["stdout"] is None
+        assert kwargs["stderr"] is None
+        assert kwargs["creationflags"] & getattr(
+            process_manager_mod.subprocess, "CREATE_NEW_CONSOLE", 0
+        )
 
 
 class TestProcessLivenessFallback:

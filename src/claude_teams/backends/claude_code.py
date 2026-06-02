@@ -1,6 +1,9 @@
 """Claude Code backend integration."""
 
 import json
+import os
+import shutil
+from pathlib import Path
 from typing import ClassVar
 
 from claude_teams.backends._agent_discovery import discover_claude_agents
@@ -11,7 +14,10 @@ from claude_teams.backends.base import (
     ReasoningEffortSpec,
     SpawnRequest,
 )
-from claude_teams.backends.contracts import UnsupportedBackendModelError
+from claude_teams.backends.contracts import (
+    BackendBinaryNotFoundError,
+    UnsupportedBackendModelError,
+)
 
 
 class ClaudeCodeBackend(BaseBackend):
@@ -106,6 +112,30 @@ class ClaudeCodeBackend(BaseBackend):
     def supports_resume(self) -> bool:
         """Claude Code supports native session resume."""
         return True
+
+    def discover_binary(self) -> str:
+        """Resolve ``claude`` to the native Windows binary when available."""
+        shim = shutil.which(self._binary_name)
+        if shim is None:
+            raise BackendBinaryNotFoundError(self._binary_name, self._name)
+        native = self._resolve_native_claude(shim)
+        return native or shim
+
+    @staticmethod
+    def _resolve_native_claude(shim_path: str) -> str | None:
+        """Locate npm's bundled ``claude.exe`` behind the shim."""
+        if os.name != "nt":
+            return None
+        shim_dir = Path(shim_path).parent
+        exe = (
+            shim_dir
+            / "node_modules"
+            / "@anthropic-ai"
+            / "claude-code"
+            / "bin"
+            / "claude.exe"
+        )
+        return str(exe) if exe.exists() else None
 
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Claude Code CLI command.

@@ -42,6 +42,47 @@ class TestClaudeCodeProperties:
         assert backend.is_interactive is True
 
 
+class TestClaudeCodeDiscoverBinary:
+    def test_resolves_native_windows_binary_from_npm_shim(
+        self, monkeypatch, tmp_path: Path
+    ):
+        shim = tmp_path / "npm" / "claude.CMD"
+        exe = (
+            tmp_path
+            / "npm"
+            / "node_modules"
+            / "@anthropic-ai"
+            / "claude-code"
+            / "bin"
+            / "claude.exe"
+        )
+        exe.parent.mkdir(parents=True)
+        shim.parent.mkdir(parents=True, exist_ok=True)
+        shim.write_text("@ECHO off\n", encoding="utf-8")
+        exe.write_text("", encoding="utf-8")
+        monkeypatch.setattr("os.name", "nt")
+        monkeypatch.setattr(
+            "claude_teams.backends.claude_code.shutil.which",
+            lambda name: str(shim) if name == "claude" else None,
+        )
+
+        assert ClaudeCodeBackend().discover_binary() == str(exe)
+
+    def test_falls_back_to_shim_when_native_binary_missing(
+        self, monkeypatch, tmp_path: Path
+    ):
+        shim = tmp_path / "npm" / "claude.CMD"
+        shim.parent.mkdir(parents=True)
+        shim.write_text("@ECHO off\n", encoding="utf-8")
+        monkeypatch.setattr("os.name", "nt")
+        monkeypatch.setattr(
+            "claude_teams.backends.claude_code.shutil.which",
+            lambda name: str(shim) if name == "claude" else None,
+        )
+
+        assert ClaudeCodeBackend().discover_binary() == str(shim)
+
+
 class TestClaudeCodeSupportedModels:
     def test_returns_expected_models(self):
         backend = ClaudeCodeBackend()

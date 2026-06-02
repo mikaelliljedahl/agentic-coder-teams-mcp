@@ -68,6 +68,30 @@ The server auto-injects `AGENT_NAME` and `AGENT_SESSION_ID` into the Codex confi
 
 `spawn_agent` starts a CLI process in its own console window and returns immediately with `{name, pid, backend, session_id}`. The agent runs independently — output is visible in the console window.
 
+Spawned agents are intentionally detached from the MCP server lifetime by
+default. This keeps a long-running Claude Code or Codex worker alive if Codex
+restarts, idles out, or closes its MCP server process. To restore strict child
+cleanup when the MCP process exits, set `WIN_AGENT_TEAMS_KILL_ON_EXIT=1` before
+starting the server.
+
+Interactive agents launch in their own console window by default so their live
+UI remains visible while they work. On Windows, set
+`WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE=0` to capture stdout/stderr to the
+per-agent log file instead.
+
+Lead MCP sessions are also persisted per parent process, workspace, and
+identity. If Codex or Claude restarts only the MCP server process, tools such as
+`list_agents`, `check_agent`, and `follow_up_agent` recover the prior
+`agents.json` and can resume stored backend sessions. If the parent process
+itself may change but should keep the same orchestration session, set a stable
+`WIN_AGENT_TEAMS_PARENT_ID` value before starting the MCP server.
+
+Nested orchestration shares the same session intentionally. For example, a
+Claude Desktop lead can spawn a Claude Code agent, and that agent can spawn a
+Codex worker under the same `agents.json`. Registry updates are guarded by a
+cross-process lock, and duplicate requested names are made unique within the
+session, for example `worker` then `worker-2`.
+
 ### Messaging
 
 Bidirectional 1:1 messaging between lead and agents via JSONL files:
@@ -110,7 +134,7 @@ The server detects its role from environment variables:
 
 ```
 1. Lead calls spawn_agent(prompt="Review auth.py and send_message results to lead", backend="codex", name="reviewer")
-2. Codex opens in a new console window, starts working
+2. Codex opens in a console window and starts working
 3. Codex calls send_message(to="lead", text="Found 3 issues in auth.py")
 4. Lead calls read_messages() → sees the message
 5. Lead calls kill_agent(name="reviewer") when done
