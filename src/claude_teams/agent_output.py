@@ -16,6 +16,7 @@ _MTIME_SLACK_SECONDS = 2.0
 _REVERSE_READ_CHUNK_SIZE = 64 * 1024
 _CODEX_CORRELATION_PREFIX = "wat-corr:"
 _CORRELATION_SCAN_MAX_LINES = 500
+_LAST_MESSAGE_BUDGET = 1000  # max chars returned for last_message (marker included)
 
 
 def codex_correlation_token(agent_id: str) -> str:
@@ -44,7 +45,7 @@ class AgentOutput:
 def read_codex_output(
     spawned_at: float,
     cwd: str,
-    max_bytes: int = 10_240,
+    max_bytes: int = _LAST_MESSAGE_BUDGET,
     *,
     backend_session_id: str | None = None,
     correlation_token: str | None = None,
@@ -69,7 +70,7 @@ def read_codex_output(
         return None
     return AgentOutput(
         last_activity_at=mtime,
-        last_message=_truncate_utf8(message, max_bytes) if message else None,
+        last_message=_truncate_tail(message, max_bytes) if message else None,
         rollout_path=str(path),
         backend_session_id=backend_session_id,
     )
@@ -78,7 +79,7 @@ def read_codex_output(
 def read_claude_output(
     spawned_at: float,
     cwd: str,
-    max_bytes: int = 10_240,
+    max_bytes: int = _LAST_MESSAGE_BUDGET,
     *,
     backend_session_id: str | None = None,
 ) -> AgentOutput | None:
@@ -111,7 +112,7 @@ def read_claude_output(
         return None
     return AgentOutput(
         last_activity_at=mtime,
-        last_message=_truncate_utf8(message, max_bytes) if message else None,
+        last_message=_truncate_tail(message, max_bytes) if message else None,
         rollout_path=str(path),
         backend_session_id=backend_session_id,
     )
@@ -382,13 +383,28 @@ def _iter_lines_reverse(path: Path) -> Iterator[str]:
         return
 
 
-def _truncate_utf8(text: str, max_bytes: int) -> str:
-    if max_bytes <= 0:
+def _truncate_tail(text: str, budget: int = _LAST_MESSAGE_BUDGET) -> str:
+    """Return at most ``budget`` characters, keeping the tail of ``text``.
+
+    Truncation is character/code-point based (``str`` slicing) and never splits
+    a UTF-8 byte sequence; it may split a grapheme cluster, which is acceptable.
+    When the text is truncated, an ASCII English marker is prepended and counted
+    against the budget, so ``len(result) <= budget`` holds for every positive
+    budget. When the budget is too small to fit a marker, a raw tail of
+    ``budget`` characters is returned instead.
+    """
+    if budget <= 0:
         return ""
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
+    if len(text) <= budget:
         return text
-    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+    marker = f"[truncated: showing last {{n}} of {len(text)} chars]\n"
+    rendered = marker.format(n=budget)  # upper bound on marker length
+    if len(rendered) >= budget:
+        # Budget too small for a marker -> return a raw tail.
+        return text[-budget:]
+    tail_budget = budget - len(rendered)
+    tail = text[-tail_budget:]
+    return marker.format(n=len(tail)) + tail
 
 
 def _normalize_path(value: str) -> str:

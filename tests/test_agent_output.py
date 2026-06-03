@@ -228,7 +228,49 @@ def test_read_codex_output_can_match_known_session_started_before_resume(
     assert output.last_message == "follow-up answer"
 
 
-def test_read_codex_output_truncates_at_utf8_boundary(
+def test_read_codex_output_truncates_keeping_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    text = "".join(str(i % 10) for i in range(5000))
+    _write_jsonl(
+        _codex_path(tmp_path, spawned_at, "rollout-long.jsonl"),
+        [_codex_meta(cwd), _codex_message(text)],
+        spawned_at + 10,
+    )
+
+    output = read_codex_output(spawned_at, str(cwd), max_bytes=1000)
+
+    assert output is not None
+    assert output.last_message is not None
+    assert len(output.last_message) <= 1000
+    assert output.last_message.startswith("[truncated: showing last ")
+    # The tail of the original text is retained.
+    assert output.last_message.endswith(text[-100:])
+
+
+def test_read_codex_output_does_not_truncate_short_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    _write_jsonl(
+        _codex_path(tmp_path, spawned_at, "rollout-short.jsonl"),
+        [_codex_meta(cwd), _codex_message("all done")],
+        spawned_at + 10,
+    )
+
+    output = read_codex_output(spawned_at, str(cwd))
+
+    assert output is not None
+    assert output.last_message == "all done"
+    assert "truncated" not in output.last_message
+
+
+def test_read_codex_output_small_budget_returns_raw_tail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -236,14 +278,58 @@ def test_read_codex_output_truncates_at_utf8_boundary(
     spawned_at = 1_762_969_000.0
     _write_jsonl(
         _codex_path(tmp_path, spawned_at, "rollout-long.jsonl"),
-        [_codex_meta(cwd), _codex_message("aaaaa")],
+        [_codex_meta(cwd), _codex_message("abcde")],
         spawned_at + 10,
     )
 
     output = read_codex_output(spawned_at, str(cwd), max_bytes=3)
 
     assert output is not None
-    assert output.last_message == "aaa"
+    assert output.last_message == "cde"
+    assert len(output.last_message) <= 3
+
+
+def test_read_codex_output_truncates_multibyte_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    text = "åäö" * 1000
+    _write_jsonl(
+        _codex_path(tmp_path, spawned_at, "rollout-multibyte.jsonl"),
+        [_codex_meta(cwd), _codex_message(text)],
+        spawned_at + 10,
+    )
+
+    output = read_codex_output(spawned_at, str(cwd), max_bytes=1000)
+
+    assert output is not None
+    assert output.last_message is not None
+    assert len(output.last_message) <= 1000
+    assert output.last_message.endswith(text[-50:])
+
+
+def test_read_claude_output_truncates_keeping_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    text = "".join(str(i % 10) for i in range(5000))
+    _write_jsonl(
+        _claude_project_dir(tmp_path, cwd) / "session.jsonl",
+        [_claude_message([{"type": "text", "text": text}])],
+        spawned_at + 10,
+    )
+
+    output = read_claude_output(spawned_at, str(cwd), max_bytes=1000)
+
+    assert output is not None
+    assert output.last_message is not None
+    assert len(output.last_message) <= 1000
+    assert output.last_message.startswith("[truncated: showing last ")
+    assert output.last_message.endswith(text[-100:])
 
 
 def _codex_user_prompt(text: str) -> dict:

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -80,6 +81,67 @@ def _session_meta_file(session_id: str) -> Path:
 
 def _inbox_file(session_id: str, name: str) -> Path:
     return _session_dir(session_id) / f"inbox-{name}.jsonl"
+
+
+def _inbox_cursor_file(session_id: str, name: str) -> Path:
+    """Return the per-sender unread-counter sidecar beside an inbox."""
+    return _session_dir(session_id) / f"inbox-{name}.pos.json"
+
+
+# In-process serialization of read_messages per inbox name. FastMCP runs the
+# blocking read body on a thread pool, so two concurrent tool calls for the same
+# inbox in this process must be serialized while they load/advance/save the
+# counter. This is in-process only; there is deliberately no cross-process file
+# lock (the owning reader identity is the single writer of its counter).
+_inbox_locks: dict[str, threading.Lock] = {}
+_inbox_locks_guard = threading.Lock()
+
+
+def _inbox_lock(name: str) -> threading.Lock:
+    with _inbox_locks_guard:
+        lock = _inbox_locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _inbox_locks[name] = lock
+        return lock
+
+
+def _load_inbox_cursors(path: Path) -> dict[str, int]:
+    """Load the per-sender counter sidecar, rejecting anything malformed.
+
+    Requires a JSON object whose keys are strings and values are non-negative
+    ints (``bool`` is excluded: ``isinstance(True, int)`` is ``True``). Any
+    corrupt or unreadable file is treated as empty and logged; this never
+    raises.
+    """
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        logger.warning("ignoring corrupt inbox cursor file %s: %s", path, err)
+        return {}
+    if not isinstance(value, dict):
+        logger.warning("ignoring non-dict inbox cursor file %s", path)
+        return {}
+    cursors: dict[str, int] = {}
+    for key, count in value.items():
+        if (
+            isinstance(key, str)
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= 0
+        ):
+            cursors[key] = count
+    return cursors
+
+
+def _save_inbox_cursors(path: Path, cursors: dict[str, int]) -> None:
+    """Atomically persist the counter via a uniquely named temp file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(cursors), encoding="utf-8")
+    tmp.replace(path)  # atomic rename onto the sidecar
 
 
 def _bindings_dir() -> Path:
@@ -490,28 +552,56 @@ async def send_message(to: str, text: str) -> dict:
 
 @mcp.tool()
 async def read_messages(from_agent: str = "") -> list[dict]:
-    """Read messages from own inbox, optionally filtered by sender."""
+    """Read unread messages from own inbox, optionally filtered by sender."""
     session_id = _active_session_id()
 
     def _do_read() -> list[dict]:
         if not session_id:
             return []
         inbox = _inbox_file(session_id, IDENTITY)
-        if not inbox.exists():
-            return []
-        messages = []
-        for raw in inbox.read_text(encoding="utf-8").splitlines():
-            stripped = raw.strip()
-            if not stripped:
-                continue
-            try:
-                msg = json.loads(stripped)
-            except json.JSONDecodeError:
-                continue
-            if from_agent and msg.get("from") != from_agent:
-                continue
-            messages.append(msg)
-        return messages
+        cursor_file = _inbox_cursor_file(session_id, IDENTITY)
+        with _inbox_lock(IDENTITY):
+            cursors = _load_inbox_cursors(cursor_file)
+            if not inbox.exists():
+                return []
+            # Group valid messages by sender in file order, tracking each
+            # message's global position so the result can preserve file order.
+            by_sender: dict[str, list[tuple[int, dict]]] = {}
+            for index, raw in enumerate(
+                inbox.read_text(encoding="utf-8").splitlines()
+            ):
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    msg = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                sender = msg.get("from")
+                if not isinstance(sender, str) or not sender:
+                    continue
+                by_sender.setdefault(sender, []).append((index, msg))
+
+            # Clamp any stored count that exceeds the observed valid-message
+            # count for that sender down to the observed count.
+            for sender, entries in by_sender.items():
+                if cursors.get(sender, 0) > len(entries):
+                    cursors[sender] = len(entries)
+
+            relevant = [from_agent] if from_agent else list(by_sender)
+            unread: list[tuple[int, dict]] = []
+            updated = dict(cursors)
+            for sender in relevant:
+                entries = by_sender.get(sender, [])
+                start = cursors.get(sender, 0)
+                unread.extend(entries[start:])
+                updated[sender] = len(entries)
+
+            _save_inbox_cursors(cursor_file, updated)
+            unread.sort(key=lambda item: item[0])
+            return [msg for _, msg in unread]
 
     return await run_blocking(_do_read)
 
