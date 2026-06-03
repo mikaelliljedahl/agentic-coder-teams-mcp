@@ -289,6 +289,30 @@ def test_read_codex_output_small_budget_returns_raw_tail(
     assert len(output.last_message) <= 3
 
 
+@pytest.mark.parametrize("budget", [1, 2, 3, 5, 10, 40, 41, 60])
+def test_read_codex_output_tiny_budget_within_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: int
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    # Unique, non-repeating tail so a wrong-length slice would be observable.
+    text = "".join(chr(ord("a") + (i % 26)) for i in range(200))
+    _write_jsonl(
+        _codex_path(tmp_path, spawned_at, "rollout-tiny.jsonl"),
+        [_codex_meta(cwd), _codex_message(text)],
+        spawned_at + 10,
+    )
+
+    output = read_codex_output(spawned_at, str(cwd), max_bytes=budget)
+
+    assert output is not None
+    assert output.last_message is not None
+    assert len(output.last_message) <= budget
+    # Whatever is returned must end with the genuine tail of the source text.
+    assert output.last_message.endswith(text[-1])
+
+
 def test_read_codex_output_truncates_multibyte_tail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

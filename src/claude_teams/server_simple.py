@@ -551,33 +551,38 @@ async def read_messages(from_agent: str = "") -> list[dict]:
         cursor_file = _inbox_cursor_file(session_id, IDENTITY)
         with _inbox_lock(IDENTITY):
             cursors = _load_inbox_cursors(cursor_file)
-            if not inbox.exists():
-                return []
-            # Group valid messages by sender in file order, tracking each
-            # message's global position so the result can preserve file order.
+            # A missing/empty inbox is just an empty snapshot. We must NOT
+            # early-return here: a stored forward cursor still needs clamping
+            # and persisting, otherwise a bad value would survive and could
+            # later swallow a sender's first message.
             by_sender: dict[str, list[tuple[int, dict]]] = {}
-            for index, raw in enumerate(
-                inbox.read_text(encoding="utf-8").splitlines()
-            ):
-                stripped = raw.strip()
-                if not stripped:
-                    continue
-                try:
-                    msg = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                sender = msg.get("from")
-                if not isinstance(sender, str) or not sender:
-                    continue
-                by_sender.setdefault(sender, []).append((index, msg))
+            if inbox.exists():
+                # Group valid messages by sender in file order, tracking each
+                # message's global position so the result preserves file order.
+                for index, raw in enumerate(
+                    inbox.read_text(encoding="utf-8").splitlines()
+                ):
+                    stripped = raw.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        msg = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    sender = msg.get("from")
+                    if not isinstance(sender, str) or not sender:
+                        continue
+                    by_sender.setdefault(sender, []).append((index, msg))
 
             # Clamp any stored count that exceeds the observed valid-message
-            # count for that sender down to the observed count.
-            for sender, entries in by_sender.items():
-                if cursors.get(sender, 0) > len(entries):
-                    cursors[sender] = len(entries)
+            # count for that sender down to the observed count. This covers
+            # senders absent from the current snapshot too (clamped to 0), so a
+            # bad forward cursor cannot skip that sender's first future message.
+            for sender in list(cursors):
+                observed = len(by_sender.get(sender, []))
+                cursors[sender] = min(cursors[sender], observed)
 
             relevant = [from_agent] if from_agent else list(by_sender)
             unread: list[tuple[int, dict]] = []
@@ -586,7 +591,11 @@ async def read_messages(from_agent: str = "") -> list[dict]:
                 entries = by_sender.get(sender, [])
                 start = cursors.get(sender, 0)
                 unread.extend(entries[start:])
-                updated[sender] = len(entries)
+                # Avoid creating a stray zero cursor for an unknown filtered
+                # sender; only persist a count for senders that have messages
+                # or already had a stored cursor.
+                if entries or sender in cursors:
+                    updated[sender] = len(entries)
 
             _save_inbox_cursors(cursor_file, updated)
             unread.sort(key=lambda item: item[0])

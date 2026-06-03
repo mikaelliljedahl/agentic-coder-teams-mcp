@@ -127,6 +127,24 @@ def test_clamps_forward_cursor_value(inbox: Path) -> None:
     assert _texts(_read()) == ["a2"]
 
 
+def test_forward_cursor_on_empty_inbox_does_not_skip_first_message(
+    inbox: Path,
+) -> None:
+    # Regression: a forward cursor for a sender absent from the (empty) snapshot
+    # must be clamped to 0 so the sender's first future message is delivered.
+    cursor_file = server_simple._inbox_cursor_file(
+        "test-session", server_simple.IDENTITY
+    )
+    cursor_file.write_text(json.dumps({"A": 999999}), encoding="utf-8")
+    # Inbox does not exist at this point.
+    assert not inbox.exists()
+
+    assert _read() == []
+    # The bad cursor was clamped and persisted; A's first message is delivered.
+    _append(inbox, "A", "a1")
+    assert _texts(_read()) == ["a1"]
+
+
 def test_mixed_ordering_per_sender_cursor(inbox: Path) -> None:
     # Inbox order: A1, B1, A2.
     _append(inbox, "A", "A1")
