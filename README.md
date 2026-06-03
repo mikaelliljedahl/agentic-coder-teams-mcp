@@ -8,7 +8,7 @@ Minimal MCP server for spawning and communicating with Claude Code and Codex age
 |------|-------------|
 | `spawn_agent` | Start an agent process (fire-and-forget) |
 | `send_message` | Send a message to an agent or lead |
-| `read_messages` | Read messages from own inbox |
+| `read_messages` | Read unread messages from own inbox |
 | `check_agent` | Check if an agent process is alive and read fallback output |
 | `follow_up_agent` | Resume an existing logical agent with a follow-up prompt |
 | `kill_agent` | Force-kill an agent process |
@@ -101,13 +101,28 @@ Bidirectional 1:1 messaging between lead and agents via JSONL files:
     agents.json              # agent registry
     inbox-lead.jsonl         # messages TO lead
     inbox-{agent}.jsonl      # messages TO agent
+    inbox-{agent}.pos.json   # per-sender unread cursor for that inbox
 ```
 
 Each line: `{"from": "agent-1", "text": "done", "ts": "2026-05-11T..."}`
 
+`read_messages` returns only **unread** messages. A per-sender counter
+sidecar (`inbox-{name}.pos.json`) tracks how much of each sender's stream
+the reader has already consumed, so reads stay O(n) instead of re-returning
+the whole inbox every call. `read_messages(from_agent="x")` advances only
+`x`'s cursor. Delivery is best-effort: a crashed reader or a lost/corrupt
+cursor file may cause a message to be re-delivered or, in the rare case of
+two lead processes sharing one inbox, consumed by the other process.
+
 ### Output Fallback
 
 `check_agent(name)` returns `{name, alive, pid, backend, backend_session_id, last_activity_at, last_message}`. For Codex and Claude Code workers, these fields are read from the CLIs' existing JSONL session logs. This is a fallback for workers that finish without calling `send_message`; it does not replace explicit agent-to-lead messaging.
+
+`last_message` is the **tail** of the worker's most recent assistant message,
+truncated to a 1000-character budget so repeated polling stays cheap. When
+truncated it is prefixed with a marker, e.g. `[truncated: showing last 950 of
+8200 chars]`. It is a status peek, not the full output — read the agent's own
+session log if you need the complete text.
 
 ### Follow-up / Resume
 
