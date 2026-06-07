@@ -528,7 +528,12 @@ async def spawn_agent(
 
 @mcp.tool()
 async def send_message(to: str, text: str) -> dict:
-    """Send a message to an agent or lead."""
+    """Write a message to an inbox for agents that actively poll read_messages.
+
+    This is not a push/resume mechanism: a spawned agent will only see this
+    message if it calls read_messages after the message is sent. If the agent
+    is not polling, use follow_up_agent instead.
+    """
     session_id = _active_session_id()
 
     def _do_send() -> dict:
@@ -643,7 +648,14 @@ async def follow_up_agent(
     prompt: str,
     replace_if_idle: bool = False,
 ) -> dict:
-    """Resume a logical agent with a follow-up prompt."""
+    """Resume a logical agent with a follow-up prompt through the backend CLI.
+
+    Use this instead of send_message when the target agent is not polling read_messages.
+    send_message only writes to an inbox; follow_up_agent is the mechanism for
+    continuing a spawned agent that would otherwise never read an inbox message.
+    It only runs when the agent is dead or idle; a live busy agent is refused
+    with reason="agent_busy".
+    """
     session_id = _active_session_id()
 
     def _do_follow_up() -> dict:  # noqa: PLR0911 - mirrors explicit refusal reasons.

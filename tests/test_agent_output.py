@@ -270,6 +270,28 @@ def test_read_codex_output_does_not_truncate_short_message(
     assert "truncated" not in output.last_message
 
 
+def test_read_codex_output_default_budget_truncates_to_one_thousand_chars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    text = "x" * 2500
+    _write_jsonl(
+        _codex_path(tmp_path, spawned_at, "rollout-default-budget.jsonl"),
+        [_codex_meta(cwd), _codex_message(text)],
+        spawned_at + 10,
+    )
+
+    output = read_codex_output(spawned_at, str(cwd))
+
+    assert output is not None
+    assert output.last_message is not None
+    assert len(output.last_message) <= 1000
+    assert output.last_message.startswith("[truncated: showing last ")
+    assert output.last_message.endswith(text[-100:])
+
+
 def test_read_codex_output_small_budget_returns_raw_tail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
