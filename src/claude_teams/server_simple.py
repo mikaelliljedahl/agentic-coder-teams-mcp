@@ -39,6 +39,13 @@ _AGENT_SESSION_ID: str = os.environ.get("AGENT_SESSION_ID", "").strip()
 _AGENT_PARENT_NAME: str = os.environ.get("AGENT_PARENT_NAME", "").strip()
 IDENTITY: str = _AGENT_NAME if _AGENT_NAME else "lead"
 
+# Names a subagent might reasonably use to mean "whoever spawned me". All of
+# these resolve to the lead/parent so a message is never lost to a typo'd
+# recipient. Compared case-insensitively.
+_LEAD_ALIASES: frozenset[str] = frozenset(
+    {"", "lead", "orchestrator", "parent", "boss", "manager", "up", "supervisor"}
+)
+
 _SESSION_BASE = Path.home() / ".claude" / "agent-sessions"
 _SESSION_META_NAME = "session.json"
 _BINDINGS_DIR_NAME = "bindings"
@@ -311,12 +318,35 @@ def _active_session_id(*, create: bool = False) -> str:
     return ""
 
 
-def _message_recipient(to: str) -> str:
-    """Resolve recipient aliases in nested agent trees."""
-    recipient = to.strip()
-    if recipient == "lead" and IDENTITY != "lead":
-        return _AGENT_PARENT_NAME or "lead"
-    return recipient
+def _message_recipient(to: str, session_id: str) -> tuple[str, str | None]:
+    """Resolve a ``send_message`` recipient, never dropping it to a dead inbox.
+
+    Returns ``(recipient, warning)``. Rules:
+
+    * ``"lead"`` (and common aliases like ``"orchestrator"``/``"parent"``)
+      resolve to the agent that spawned this one. For the root lead they stay
+      ``"lead"`` (its own inbox).
+    * A name that matches a known agent in this session is used verbatim
+      (a lead addressing a child, or a sibling).
+    * Any other / unknown name is routed to the lead anyway, with a warning,
+      so a typo'd recipient can never be silently written to an inbox no one
+      reads.
+    """
+    raw = to.strip()
+    lead_target = (_AGENT_PARENT_NAME or "lead") if IDENTITY != "lead" else "lead"
+
+    if raw.lower() in _LEAD_ALIASES:
+        return lead_target, None
+
+    known = {a.get("name") for a in _load_agents(session_id) if a.get("name")}
+    if raw in known:
+        return raw, None
+
+    warning = (
+        f"unknown recipient {to!r}; routed to {lead_target!r}. "
+        'Use to="lead" to reach whoever spawned you.'
+    )
+    return lead_target, warning
 
 
 def _empty_agent_check(name: str) -> dict:
@@ -527,8 +557,13 @@ async def spawn_agent(
 
 
 @mcp.tool()
-async def send_message(to: str, text: str) -> dict:
+async def send_message(text: str, to: str = "lead") -> dict:
     """Write a message to an inbox for agents that actively poll read_messages.
+
+    ``to`` defaults to ``"lead"``, which reaches the agent that spawned you —
+    that is almost always what you want from a subagent. A lead can target a
+    child by its agent name. Any unknown recipient is routed to the lead with a
+    ``warning`` in the result rather than silently written to a dead inbox.
 
     This is not a push/resume mechanism: a spawned agent will only see this
     message if it calls read_messages after the message is sent. If the agent
@@ -539,7 +574,7 @@ async def send_message(to: str, text: str) -> dict:
     def _do_send() -> dict:
         if not session_id:
             return {"success": False, "to": to, "reason": "session_not_found"}
-        recipient = _message_recipient(to)
+        recipient, warning = _message_recipient(to, session_id)
         inbox = _inbox_file(session_id, recipient)
         line = json.dumps(
             {
@@ -550,7 +585,10 @@ async def send_message(to: str, text: str) -> dict:
         )
         with inbox.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
-        return {"success": True, "to": recipient}
+        result = {"success": True, "to": recipient}
+        if warning:
+            result["warning"] = warning
+        return result
 
     return await run_blocking(_do_send)
 
@@ -646,7 +684,7 @@ async def check_agent(name: str) -> dict:
 async def follow_up_agent(
     name: str,
     prompt: str,
-    replace_if_idle: bool = False,
+    replace_if_idle: bool = True,
 ) -> dict:
     """Resume a logical agent with a follow-up prompt through the backend CLI.
 
@@ -655,6 +693,10 @@ async def follow_up_agent(
     continuing a spawned agent that would otherwise never read an inbox message.
     It only runs when the agent is dead or idle; a live busy agent is refused
     with reason="agent_busy".
+
+    replace_if_idle defaults to True: an idle-but-alive process is gracefully
+    shut down and resumed with the follow-up prompt. Set it to False to instead
+    refuse such an agent with reason="agent_idle_but_alive".
     """
     session_id = _active_session_id()
 

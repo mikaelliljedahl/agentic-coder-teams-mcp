@@ -18,6 +18,8 @@ from claude_teams.backends.base import (
 )
 from claude_teams.backends.contracts import BackendBinaryNotFoundError
 
+_LOCAL_PATH_CLS = type(Path.cwd())
+
 # Windows arch (``platform.machine()``) -> Codex npm platform-package suffix
 # and Rust target triple, mirroring the dispatch table in the npm wrapper's
 # ``bin/codex.js``.
@@ -161,10 +163,10 @@ class CodexBackend(BaseBackend):
         if target is None:
             return None
         arch_suffix, triple = target
-        shim_dir = Path(shim_path).parent
+        shim_dir = _LOCAL_PATH_CLS(shim_path).parent
         codex_pkg = shim_dir / "node_modules" / "@openai" / "codex"
         platform_pkg = f"codex-win32-{arch_suffix}"
-        vendor_rel = Path("vendor") / triple
+        vendor_rel = _LOCAL_PATH_CLS("vendor") / triple
         bases = [
             codex_pkg / "node_modules" / "@openai" / platform_pkg,
             shim_dir / "node_modules" / "@openai" / platform_pkg,
@@ -356,7 +358,7 @@ class CodexBackend(BaseBackend):
             # Bundled-tools dir was ``path`` in older Codex releases and
             # ``codex-path`` in newer ones; prepend whichever exists.
             for tools_subdir in ("codex-path", "path"):
-                path_dir = Path(arch_root) / tools_subdir
+                path_dir = _LOCAL_PATH_CLS(arch_root) / tools_subdir
                 if path_dir.is_dir():
                     current = os.environ.get("PATH", "")
                     env["PATH"] = f"{path_dir}{os.pathsep}{current}"

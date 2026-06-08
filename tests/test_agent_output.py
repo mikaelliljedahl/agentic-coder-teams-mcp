@@ -740,7 +740,7 @@ async def test_agent_send_message_to_lead_routes_to_parent_in_nested_session(
     monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "parent")
     (session_base / "session-id").mkdir(parents=True)
 
-    result = await server_simple.send_message("lead", "hello parent")
+    result = await server_simple.send_message(to="lead", text="hello parent")
 
     assert result == {"success": True, "to": "parent"}
     inbox = session_base / "session-id" / "inbox-parent.jsonl"
@@ -752,6 +752,65 @@ async def test_agent_send_message_to_lead_routes_to_parent_in_nested_session(
             "ts": rows[0]["ts"],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_send_message_defaults_recipient_to_lead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_base = tmp_path / "sessions"
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
+    monkeypatch.setattr(server_simple, "_session_id", "session-id")
+    monkeypatch.setattr(server_simple, "IDENTITY", "child")
+    monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "parent")
+    (session_base / "session-id").mkdir(parents=True)
+
+    # No `to` given: the lazy-but-correct call still reaches the parent.
+    result = await server_simple.send_message(text="hi")
+
+    assert result == {"success": True, "to": "parent"}
+    inbox = session_base / "session-id" / "inbox-parent.jsonl"
+    assert inbox.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_message_unknown_recipient_routes_to_lead_with_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_base = tmp_path / "sessions"
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
+    monkeypatch.setattr(server_simple, "_session_id", "session-id")
+    monkeypatch.setattr(server_simple, "IDENTITY", "child")
+    monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "parent")
+    (session_base / "session-id").mkdir(parents=True)
+
+    # A typo'd / unknown recipient must not be silently written to a dead inbox.
+    result = await server_simple.send_message(to="leed", text="hello")
+
+    assert result["success"] is True
+    assert result["to"] == "parent"
+    assert "warning" in result
+    assert "leed" in result["warning"]
+    # Routed to the parent inbox; no stray inbox-leed.jsonl created.
+    assert (session_base / "session-id" / "inbox-parent.jsonl").exists()
+    assert not (session_base / "session-id" / "inbox-leed.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_send_message_orchestrator_alias_routes_to_lead_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_base = tmp_path / "sessions"
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
+    monkeypatch.setattr(server_simple, "_session_id", "session-id")
+    monkeypatch.setattr(server_simple, "IDENTITY", "child")
+    monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "parent")
+    (session_base / "session-id").mkdir(parents=True)
+
+    # "orchestrator" is a recognized synonym for the lead: route cleanly, no warning.
+    result = await server_simple.send_message(to="orchestrator", text="hello")
+
+    assert result == {"success": True, "to": "parent"}
 
 
 @pytest.mark.asyncio
@@ -1027,7 +1086,9 @@ async def test_follow_up_agent_refuses_idle_live_agent_without_replace(
         ),
     )
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent(
+        "worker", "next prompt", replace_if_idle=False
+    )
 
     assert result["success"] is False
     assert result["reason"] == "agent_idle_but_alive"

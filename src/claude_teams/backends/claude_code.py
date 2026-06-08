@@ -19,6 +19,8 @@ from claude_teams.backends.contracts import (
     UnsupportedBackendModelError,
 )
 
+_LOCAL_PATH_CLS = type(Path.cwd())
+
 
 class ClaudeCodeBackend(BaseBackend):
     """Backend adapter for Claude Code CLI."""
@@ -126,7 +128,7 @@ class ClaudeCodeBackend(BaseBackend):
         """Locate npm's bundled ``claude.exe`` behind the shim."""
         if os.name != "nt":
             return None
-        shim_dir = Path(shim_path).parent
+        shim_dir = _LOCAL_PATH_CLS(shim_path).parent
         exe = (
             shim_dir
             / "node_modules"
