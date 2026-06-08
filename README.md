@@ -1,6 +1,6 @@
-# win-agent-teams-mcp
+# agentic-coder-teams-mcp
 
-Minimal MCP server for spawning and communicating with Claude Code and Codex agents on Windows. Fire-and-forget agent spawning with bidirectional 1:1 messaging.
+Minimal MCP server for spawning and communicating with Claude Code and Codex agents on Windows or Linux. Fire-and-forget agent spawning with bidirectional 1:1 messaging.
 
 ## Tools (8 total)
 
@@ -19,10 +19,11 @@ Minimal MCP server for spawning and communicating with Claude Code and Codex age
 
 ### Prerequisites
 
-- Windows 10 or Windows 11
+- Windows 10/11 or Linux
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
 - Claude Code CLI (`claude`) and/or OpenAI Codex CLI (`codex`) on `PATH`
+- `tmux` on Linux
 
 ### Setup — Claude Code as Lead
 
@@ -33,6 +34,19 @@ Add to your project's `.mcp.json` so Claude Code can spawn agents:
   "mcpServers": {
     "win-agent-teams": {
       "command": "C:\\path\\to\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "claude_teams.server_simple"]
+    }
+  }
+}
+```
+
+On Linux, use your virtualenv's Python path instead, for example:
+
+```json
+{
+  "mcpServers": {
+    "win-agent-teams": {
+      "command": "/path/to/.venv/bin/python",
       "args": ["-m", "claude_teams.server_simple"]
     }
   }
@@ -56,6 +70,16 @@ env = { "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass" }
 enabled = true
 ```
 
+Linux example:
+
+```toml
+[mcp_servers.win-agent-teams]
+command = "/path/to/.venv/bin/python"
+args = ["-m", "claude_teams.server_simple"]
+env = { "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass" }
+enabled = true
+```
+
 This is required in two scenarios:
 1. **Codex as lead** — Codex calls `spawn_agent` to start Claude Code or other Codex agents.
 2. **Codex as spawned agent using MCP tools** — when Claude Code spawns a Codex agent and expects that agent to call tools such as `send_message`.
@@ -66,13 +90,38 @@ The server auto-injects `AGENT_NAME` and `AGENT_SESSION_ID` into the Codex confi
 
 ### Spawning
 
-`spawn_agent` starts a CLI process in its own console window and returns immediately with `{name, pid, backend, session_id}`. The agent runs independently — output is visible in the console window.
+`spawn_agent` starts a CLI process and returns immediately with `{name, pid, backend, session_id}`. The agent runs independently.
+
+Display mode is selected automatically:
+- Windows uses native processes. Interactive agents can open their own console window, and captured output can be tailed in Windows Terminal when `wt.exe` is available.
+- Linux/POSIX defaults to spawning each agent in its own terminal emulator window. Set `WIN_AGENT_TEAMS_LINUX_LAUNCHER=tmux` to use `tmux` instead. In tmux mode, if the MCP server is already inside tmux, agents are spawned as split panes by default (set `USE_TMUX_WINDOWS=1` to use tmux windows); if the server is not inside tmux, agents are spawned into a detached session named `win-agent-teams-<session>`.
+
+If your MCP client does not pass its `TMUX` environment variable through to the
+MCP server, set `WIN_AGENT_TEAMS_TMUX_TARGET` to an existing session or pane,
+for example `codex-lead`. Agents will then spawn into that target instead of a
+detached session.
+
+On Linux, the terminal-window launcher is the default
+(`WIN_AGENT_TEAMS_LINUX_LAUNCHER=terminal`), which spawns each agent in a
+visible terminal emulator window. This is the recommended mode when running from
+**Claude Desktop**, which is not attached to a tmux session — tmux mode would
+spawn agents into a detached session you would never see. The launcher probes
+common terminals such as `qterminal` (the LXQt/Lubuntu default),
+`gnome-terminal`, `x-terminal-emulator`, `xfce4-terminal`, and `xterm`; set
+`WIN_AGENT_TEAMS_LINUX_TERMINAL` to force a specific terminal command. Set
+`WIN_AGENT_TEAMS_LINUX_LAUNCHER=tmux` only if you are running the server inside a
+tmux session and prefer panes/windows.
+
+> Note: `qterminal` may hand launches to an already-running instance via D-Bus.
+> The auto-discovery path skips it when one is already running and falls through
+> to the next available terminal. Set `WIN_AGENT_TEAMS_LINUX_TERMINAL` if you
+> want to force a specific emulator.
 
 Spawned agents are intentionally detached from the MCP server lifetime by
 default. This keeps a long-running Claude Code or Codex worker alive if Codex
 restarts, idles out, or closes its MCP server process. To restore strict child
 cleanup when the MCP process exits, set `WIN_AGENT_TEAMS_KILL_ON_EXIT=1` before
-starting the server.
+starting the server. This cleanup option is Windows-specific.
 
 Interactive agents launch in their own console window by default so their live
 UI remains visible while they work. On Windows, set
@@ -197,7 +246,7 @@ win-agent-teams backends   # List available backends
 
 ## Development
 
-```powershell
+```bash
 git clone https://github.com/mikaelliljedahl/agentic-coder-teams-mcp.git
 cd agentic-coder-teams-mcp
 uv sync --group dev

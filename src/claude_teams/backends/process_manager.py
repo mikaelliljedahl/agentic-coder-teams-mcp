@@ -1,9 +1,10 @@
-"""Windows-native process lifecycle management for agent backends."""
+"""Platform process lifecycle management for agent backends."""
 
 import contextlib
 import ctypes
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -16,10 +17,23 @@ from claude_teams.backends.contracts import SpawnRequest, SpawnResult
 
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_NAME_LEN = 64
+_TMUX_SPAWN_FIELD_COUNT = 3
+_PROC_STAT_SPLIT_FIELD_COUNT = 2
 _STILL_ACTIVE = 259
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _ERROR_ACCESS_DENIED = 5
 _KILL_ON_EXIT_ENV = "WIN_AGENT_TEAMS_KILL_ON_EXIT"
+_LINUX_LAUNCHER_ENV = "WIN_AGENT_TEAMS_LINUX_LAUNCHER"
+_LINUX_TERMINAL_ENV = "WIN_AGENT_TEAMS_LINUX_TERMINAL"
+_TERMINAL_LAUNCHER_VALUE = "terminal"
+_TMUX_LAUNCHER_VALUE = "tmux"
+_LINUX_TERMINAL_PID_GRACE_SECONDS = 5.0
+_LINUX_DESKTOP_ENV_KEYS = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+)
 
 
 def _validate_safe_name(name: str, label: str = "name") -> str:
@@ -39,6 +53,13 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _build_posix_shell_command(cwd: str, cmd: list[str], env: dict[str, str]) -> str:
+    """Build a shell command that exports env vars before execing the agent."""
+    export_parts = [f"export {key}={shlex.quote(value)};" for key, value in env.items()]
+    export_prefix = f"{' '.join(export_parts)} " if export_parts else ""
+    return f"cd {shlex.quote(cwd)} && {export_prefix}exec {shlex.join(cmd)}"
+
+
 @dataclass
 class ProcessInfo:
     """Runtime information for a spawned agent process."""
@@ -51,6 +72,37 @@ class ProcessInfo:
     process: subprocess.Popen[str]
     log_path: Path
     log_handle: IO[str] | None
+    started_at: float
+    exit_logged: bool = False
+
+
+@dataclass
+class TmuxProcessInfo:
+    """Runtime information for a spawned tmux pane/window."""
+
+    pid: int
+    name: str
+    agent_id: str
+    team_name: str
+    backend: str
+    target_id: str
+    pane_id: str
+    log_path: Path
+    started_at: float
+
+
+@dataclass
+class LinuxTerminalProcessInfo:
+    """Runtime information for a spawned Linux terminal window."""
+
+    pid: int
+    name: str
+    agent_id: str
+    team_name: str
+    backend: str
+    terminal_process: subprocess.Popen[str]
+    log_path: Path
+    agent_pid_path: Path
     started_at: float
     exit_logged: bool = False
 
@@ -401,6 +453,746 @@ class WindowsProcessManager:
         )
 
 
+class TmuxProcessManager:
+    """Manage spawned agent CLIs through tmux panes or windows."""
+
+    def __init__(self) -> None:
+        """Initialize the tmux target registry."""
+        self._processes: dict[str, TmuxProcessInfo] = {}
+
+    def spawn_process(
+        self,
+        request: SpawnRequest,
+        cmd: list[str],
+        env: dict[str, str],
+        backend_type: str,
+        *,
+        is_interactive: bool = False,
+    ) -> SpawnResult:
+        """Start an agent process in tmux and return its pane PID handle."""
+        _ = is_interactive
+        self._require_tmux()
+        if backend_type == "claude-code":
+            cmd = self._with_debug_file(
+                cmd, self.log_path(request.team_name, request.name)
+            )
+
+        log_path = self.log_path(request.team_name, request.name)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        command = self._build_shell_command(request.cwd, cmd, env)
+        tmux_args, target_kind = self._build_tmux_spawn_args(request, command)
+
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(f"\n[{started_at}] starting {cmd[0]} in tmux\n")
+            log_handle.flush()
+
+        merged_env = os.environ.copy()
+        merged_env.update(env)
+        result = subprocess.run(  # noqa: S603 - tmux argv is built internally.
+            tmux_args,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=merged_env,
+        )
+        window_id, pane_id, pid = self._parse_tmux_spawn_output(result.stdout)
+        target_id = window_id if target_kind == "window" else pane_id
+        handle = str(pid)
+        self._processes[handle] = TmuxProcessInfo(
+            pid=pid,
+            name=request.name,
+            agent_id=request.agent_id,
+            team_name=request.team_name,
+            backend=backend_type,
+            target_id=target_id,
+            pane_id=pane_id,
+            log_path=log_path,
+            started_at=time.time(),
+        )
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(f"[tmux] target={target_id} pane={pane_id} pid={pid}\n")
+        return SpawnResult(process_handle=handle, backend_type=backend_type)
+
+    def health_check(self, handle: str) -> tuple[bool, str]:
+        """Return process liveness for a PID handle."""
+        info = self._processes.get(handle)
+        if info is not None:
+            alive, detail = self._pane_alive(info.pane_id)
+            if alive:
+                return True, detail
+            if self._pid_alive(handle):
+                return True, "process exists by pid"
+            return False, detail
+        if self._pid_alive(handle):
+            return True, "process exists by pid"
+        return False, "process not found"
+
+    def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
+        """Kill a tmux pane/window or fall back to killing a PID."""
+        info = self._processes.pop(handle, None)
+        if info is not None:
+            self._kill_tmux_target(info.target_id)
+            if not self._wait_pid_exit(info.pid, timeout_s):
+                self._kill_pid(str(info.pid))
+            return
+        self._kill_pid(handle)
+
+    def graceful_shutdown(self, handle: str, timeout_s: float = 10.0) -> bool:
+        """Ask a tmux pane to stop with Ctrl-C before force-kill is needed."""
+        info = self._processes.get(handle)
+        if info is None:
+            return not self._pid_alive(handle)
+        if not self._pane_alive(info.pane_id)[0]:
+            return True
+        tmux = self._tmux_binary()
+        subprocess.run(  # noqa: S603 - tmux argv is built internally.
+            [tmux, "send-keys", "-t", info.pane_id, "C-c"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self._pane_alive(info.pane_id)[0]:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def capture(self, handle: str, lines: int | None = None) -> str:
+        """Capture output from the tmux pane."""
+        info = self._processes.get(handle)
+        if info is None:
+            return ""
+        args = [self._tmux_binary(), "capture-pane", "-p", "-t", info.pane_id, "-J"]
+        if lines is None:
+            args.extend(["-S", "-"])
+        elif lines <= 0:
+            return ""
+        else:
+            args.extend(["-S", f"-{lines}"])
+        result = subprocess.run(  # noqa: S603 - tmux argv is built internally.
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return ""
+        return result.stdout
+
+    def send(self, handle: str, text: str, *, enter: bool = True) -> None:
+        """Send literal text to a tmux pane."""
+        info = self._processes.get(handle)
+        if info is None:
+            return
+        tmux = self._tmux_binary()
+        subprocess.run(  # noqa: S603 - tmux argv is built internally.
+            [tmux, "send-keys", "-l", "-t", info.pane_id, "--", text],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if enter:
+            subprocess.run(  # noqa: S603 - tmux argv is built internally.
+                [tmux, "send-keys", "-t", info.pane_id, "Enter"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+    def log_path(self, team_name: str, agent_name: str) -> Path:
+        """Return the log file path for a team member."""
+        safe_team = _validate_safe_name(team_name, "team name")
+        safe_agent = _validate_safe_name(agent_name, "agent name")
+        override = os.environ.get("WIN_AGENT_TEAMS_LOG_DIR")
+        if override:
+            return Path(override).expanduser() / safe_team / f"{safe_agent}.log"
+        return (
+            Path.home() / ".claude" / "teams" / safe_team / "logs" / f"{safe_agent}.log"
+        )
+
+    def _build_shell_command(
+        self, cwd: str, cmd: list[str], env: dict[str, str]
+    ) -> str:
+        return _build_posix_shell_command(cwd, cmd, env)
+
+    def _build_tmux_spawn_args(
+        self, request: SpawnRequest, command: str
+    ) -> tuple[list[str], str]:
+        title = f"{request.name}@{request.team_name}"
+        fmt = "#{window_id}\t#{pane_id}\t#{pane_pid}"
+        explicit_target = os.environ.get("WIN_AGENT_TEAMS_TMUX_TARGET", "").strip()
+        if explicit_target:
+            if _env_flag("USE_TMUX_WINDOWS"):
+                return (
+                    [
+                        "tmux",
+                        "new-window",
+                        "-dP",
+                        "-t",
+                        explicit_target,
+                        "-F",
+                        fmt,
+                        "-n",
+                        title,
+                        command,
+                    ],
+                    "window",
+                )
+            return (
+                [
+                    "tmux",
+                    "split-window",
+                    "-dP",
+                    "-t",
+                    explicit_target,
+                    "-F",
+                    fmt,
+                    command,
+                ],
+                "pane",
+            )
+
+        if self._inside_tmux():
+            if _env_flag("USE_TMUX_WINDOWS"):
+                return (
+                    [
+                        "tmux",
+                        "new-window",
+                        "-dP",
+                        "-F",
+                        fmt,
+                        "-n",
+                        title,
+                        command,
+                    ],
+                    "window",
+                )
+            return (
+                ["tmux", "split-window", "-dP", "-F", fmt, command],
+                "pane",
+            )
+
+        session_name = self._session_name(request.team_name)
+        if self._tmux_session_exists(session_name):
+            return (
+                [
+                    "tmux",
+                    "new-window",
+                    "-dP",
+                    "-t",
+                    session_name,
+                    "-F",
+                    fmt,
+                    "-n",
+                    title,
+                    command,
+                ],
+                "window",
+            )
+        return (
+            [
+                "tmux",
+                "new-session",
+                "-dP",
+                "-s",
+                session_name,
+                "-n",
+                title,
+                "-F",
+                fmt,
+                command,
+            ],
+            "window",
+        )
+
+    def _parse_tmux_spawn_output(self, output: str) -> tuple[str, str, int]:
+        fields = output.strip().split("\t")
+        if len(fields) != _TMUX_SPAWN_FIELD_COUNT:
+            msg = f"Unexpected tmux spawn output: {output!r}"
+            raise RuntimeError(msg)
+        window_id, pane_id, pid_text = fields
+        try:
+            pid = int(pid_text)
+        except ValueError as err:
+            msg = f"Unexpected tmux pane PID: {pid_text!r}"
+            raise RuntimeError(msg) from err
+        return window_id, pane_id, pid
+
+    def _pane_alive(self, pane_id: str) -> tuple[bool, str]:
+        tmux = self._tmux_binary()
+        result = subprocess.run(  # noqa: S603 - tmux argv is built internally.
+            [tmux, "display-message", "-p", "-t", pane_id, "#{pane_dead}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False, result.stderr.strip() or "tmux target not found"
+        if result.stdout.strip() == "1":
+            return False, "tmux pane dead"
+        return True, "tmux pane running"
+
+    def _kill_tmux_target(self, target_id: str) -> None:
+        command = "kill-window" if target_id.startswith("@") else "kill-pane"
+        tmux = self._tmux_binary()
+        subprocess.run(  # noqa: S603 - tmux argv is built internally.
+            [tmux, command, "-t", target_id],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def _kill_pid(self, handle: str) -> None:
+        try:
+            pid = int(handle)
+        except ValueError:
+            return
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+    def _pid_alive(self, handle: str) -> bool:
+        try:
+            pid = int(handle)
+        except ValueError:
+            return False
+        if self._pid_is_zombie(pid):
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _wait_pid_exit(self, pid: int, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self._pid_alive(str(pid)):
+                return True
+            time.sleep(0.05)
+        return not self._pid_alive(str(pid))
+
+    def _pid_is_zombie(self, pid: int) -> bool:
+        stat_path = Path("/proc") / str(pid) / "stat"
+        try:
+            stat = stat_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        parts = stat.rsplit(") ", 1)
+        return len(parts) == _PROC_STAT_SPLIT_FIELD_COUNT and parts[1].startswith("Z ")
+
+    def _inside_tmux(self) -> bool:
+        return bool(os.environ.get("TMUX"))
+
+    def _tmux_session_exists(self, session_name: str) -> bool:
+        tmux = self._tmux_binary()
+        result = subprocess.run(  # noqa: S603 - session name is validated.
+            [tmux, "has-session", "-t", session_name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    def _session_name(self, team_name: str) -> str:
+        safe_team = _validate_safe_name(team_name, "team name")
+        return f"win-agent-teams-{safe_team[:40]}"
+
+    def _with_debug_file(self, cmd: list[str], log_path: Path) -> list[str]:
+        if "--debug-file" in cmd:
+            return cmd
+        updated = list(cmd)
+        insert_at = updated.index("--") if "--" in updated else len(updated)
+        updated[insert_at:insert_at] = ["--debug-file", str(log_path)]
+        return updated
+
+    def _tmux_binary(self) -> str:
+        return shutil.which("tmux") or "tmux"
+
+    def _require_tmux(self) -> None:
+        if shutil.which("tmux") is not None:
+            return
+        msg = "Could not find 'tmux' on PATH. Install tmux to spawn agents on Linux."
+        raise FileNotFoundError(msg)
+
+
+class LinuxTerminalProcessManager:
+    """Manage spawned agent CLIs through Linux terminal emulator windows."""
+
+    def __init__(self) -> None:
+        """Initialize the terminal process registry."""
+        self._processes: dict[str, LinuxTerminalProcessInfo] = {}
+
+    def spawn_process(
+        self,
+        request: SpawnRequest,
+        cmd: list[str],
+        env: dict[str, str],
+        backend_type: str,
+        *,
+        is_interactive: bool = False,
+    ) -> SpawnResult:
+        """Start an agent process in a new terminal emulator window."""
+        _ = is_interactive
+        log_path = self.log_path(request.team_name, request.name)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if backend_type == "claude-code":
+            cmd = self._with_debug_file(cmd, log_path)
+
+        terminal = self._discover_terminal()
+        title = f"{request.name}@{request.team_name}"
+        shell_command = self._build_shell_command(request.cwd, cmd, env)
+        agent_pid_path = self._agent_pid_path(log_path)
+        with contextlib.suppress(OSError):
+            agent_pid_path.unlink()
+        terminal_shell_command = self._with_agent_pid_file(
+            shell_command,
+            agent_pid_path,
+            log_path,
+        )
+        terminal_cmd = self._terminal_command(terminal, title, terminal_shell_command)
+        started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(f"\n[{started_at}] starting {cmd[0]} in {terminal}\n")
+            log_handle.write(f"[agent pid file] {agent_pid_path}\n")
+            log_handle.write(f"[terminal command] {shlex.join(terminal_cmd)}\n")
+            log_handle.flush()
+
+        merged_env = self._desktop_env(os.environ.copy())
+        merged_env.update(env)
+        with log_path.open("a", encoding="utf-8") as terminal_log:
+            process = subprocess.Popen(  # noqa: S603 - terminal argv is built internally.
+                terminal_cmd,
+                cwd=request.cwd,
+                env=merged_env,
+                stdin=None,
+                stdout=terminal_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+        handle = str(process.pid)
+        self._processes[handle] = LinuxTerminalProcessInfo(
+            pid=process.pid,
+            name=request.name,
+            agent_id=request.agent_id,
+            team_name=request.team_name,
+            backend=backend_type,
+            terminal_process=process,
+            log_path=log_path,
+            agent_pid_path=agent_pid_path,
+            started_at=time.time(),
+        )
+        return SpawnResult(process_handle=handle, backend_type=backend_type)
+
+    def health_check(self, handle: str) -> tuple[bool, str]:
+        """Return terminal process liveness for a PID handle."""
+        info = self._processes.get(handle)
+        if info is not None:
+            agent_status = self._agent_pid_health(info)
+            if agent_status is not None:
+                return agent_status
+            return self._terminal_launcher_health(info)
+        if self._pid_alive(handle):
+            return True, "process exists by pid"
+        return False, "process not found"
+
+    def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
+        """Terminate a terminal process by PID handle."""
+        info = self._processes.pop(handle, None)
+        if info is None:
+            self._kill_pid(handle)
+            return
+        agent_pid = self._read_pid_file(info.agent_pid_path)
+        if agent_pid is not None and self._pid_alive(str(agent_pid)):
+            with contextlib.suppress(OSError):
+                os.kill(agent_pid, signal.SIGTERM)
+            if not self._wait_pid_exit(agent_pid, timeout_s):
+                self._kill_pid(str(agent_pid))
+        process = info.terminal_process
+        if process.poll() is None:
+            with contextlib.suppress(OSError):
+                process.terminate()
+            try:
+                process.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                self._kill_pid(str(info.pid))
+                process.wait(timeout=timeout_s)
+
+    def graceful_shutdown(self, handle: str, timeout_s: float = 10.0) -> bool:
+        """Try to close a terminal window without force-killing it."""
+        info = self._processes.get(handle)
+        if info is None:
+            return not self._pid_alive(handle)
+        agent_pid = self._read_pid_file(info.agent_pid_path)
+        if agent_pid is not None:
+            if self._pid_alive(str(agent_pid)):
+                with contextlib.suppress(OSError):
+                    os.kill(agent_pid, signal.SIGTERM)
+                if not self._wait_pid_exit(agent_pid, timeout_s):
+                    return False
+            return self._terminate_terminal_process(info, timeout_s)
+        if info.terminal_process.poll() is not None:
+            return True
+        return self._terminate_terminal_process(info, timeout_s)
+
+    def _terminate_terminal_process(
+        self, info: LinuxTerminalProcessInfo, timeout_s: float
+    ) -> bool:
+        with contextlib.suppress(OSError):
+            info.terminal_process.terminate()
+        try:
+            info.terminal_process.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+    def capture(self, handle: str, lines: int | None = None) -> str:
+        """Read the terminal launch log."""
+        info = self._processes.get(handle)
+        if info is None:
+            return ""
+        return read_log_tail(info.log_path, lines)
+
+    def send(self, handle: str, text: str, *, enter: bool = True) -> None:
+        """Cannot send stdin to a separately managed terminal window."""
+        _ = handle, text, enter
+
+    def log_path(self, team_name: str, agent_name: str) -> Path:
+        """Return the log file path for a team member."""
+        safe_team = _validate_safe_name(team_name, "team name")
+        safe_agent = _validate_safe_name(agent_name, "agent name")
+        override = os.environ.get("WIN_AGENT_TEAMS_LOG_DIR")
+        if override:
+            return Path(override).expanduser() / safe_team / f"{safe_agent}.log"
+        return (
+            Path.home() / ".claude" / "teams" / safe_team / "logs" / f"{safe_agent}.log"
+        )
+
+    def _build_shell_command(
+        self, cwd: str, cmd: list[str], env: dict[str, str]
+    ) -> str:
+        return _build_posix_shell_command(cwd, cmd, env)
+
+    def _with_agent_pid_file(
+        self, shell_command: str, agent_pid_path: Path, log_path: Path
+    ) -> str:
+        pid_file = shlex.quote(str(agent_pid_path))
+        launch_log = shlex.quote(str(log_path))
+        return (
+            f"printf '%s\\n' \"$$\" > {pid_file}; "
+            f"printf '[agent pid] %s\\n' \"$$\" >> {launch_log}; "
+            f"{shell_command}"
+        )
+
+    def _agent_pid_health(
+        self, info: LinuxTerminalProcessInfo
+    ) -> tuple[bool, str] | None:
+        agent_pid = self._read_pid_file(info.agent_pid_path)
+        if agent_pid is None:
+            return None
+        if self._pid_alive(str(agent_pid)):
+            return True, "agent process running"
+        if not info.exit_logged:
+            info.exit_logged = True
+            with info.log_path.open("a", encoding="utf-8") as log_handle:
+                log_handle.write(f"[agent exited] pid={agent_pid}\n")
+        return False, "agent process exited"
+
+    def _terminal_launcher_health(
+        self, info: LinuxTerminalProcessInfo
+    ) -> tuple[bool, str]:
+        exit_code = info.terminal_process.poll()
+        if exit_code is None:
+            return True, "terminal process running"
+        if (
+            exit_code == 0
+            and time.time() - info.started_at < _LINUX_TERMINAL_PID_GRACE_SECONDS
+        ):
+            return True, "terminal launcher exited; waiting for agent pid"
+        if not info.exit_logged:
+            info.exit_logged = True
+            with info.log_path.open("a", encoding="utf-8") as log_handle:
+                log_handle.write(f"[terminal exited] code={exit_code}\n")
+        return False, f"terminal process exited ({exit_code})"
+
+    def _discover_terminal(self) -> str:
+        override = os.environ.get(_LINUX_TERMINAL_ENV, "").strip()
+        if override:
+            resolved = shutil.which(override)
+            if resolved:
+                return resolved
+            if Path(override).exists():
+                return override
+            msg = f"Configured terminal not found: {override!r}"
+            raise FileNotFoundError(msg)
+
+        for candidate in (
+            "qterminal",
+            "gnome-terminal",
+            "x-terminal-emulator",
+            "xfce4-terminal",
+            "konsole",
+            "mate-terminal",
+            "lxterminal",
+            "xterm",
+        ):
+            if candidate == "qterminal" and self._process_name_running(candidate):
+                continue
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+        msg = (
+            "Could not find a supported terminal emulator on PATH. "
+            f"Set {_LINUX_TERMINAL_ENV} to a terminal command."
+        )
+        raise FileNotFoundError(msg)
+
+    def _terminal_command(
+        self, terminal: str, title: str, shell_command: str
+    ) -> list[str]:
+        name = Path(terminal).name
+        if name == "qterminal":
+            return [terminal, "-e", "bash", "-lc", shell_command]
+        if name in {"gnome-terminal", "kgx"}:
+            # --wait keeps the client process alive for the agent's lifetime;
+            # without it gnome-terminal forks to a server and exits instantly,
+            # making health checks report a false exit.
+            return [
+                terminal,
+                "--wait",
+                "--title",
+                title,
+                "--",
+                "bash",
+                "-lc",
+                shell_command,
+            ]
+        if name == "xfce4-terminal":
+            return [
+                terminal,
+                "--title",
+                title,
+                "--command",
+                f"bash -lc {shlex.quote(shell_command)}",
+            ]
+        if name == "konsole":
+            return [
+                terminal,
+                "--new-tab",
+                "-p",
+                f"tabtitle={title}",
+                "-e",
+                "bash",
+                "-lc",
+                shell_command,
+            ]
+        if name in {"mate-terminal", "lxterminal"}:
+            return [
+                terminal,
+                "--title",
+                title,
+                "-e",
+                f"bash -lc {shlex.quote(shell_command)}",
+            ]
+        return [terminal, "-T", title, "-e", "bash", "-lc", shell_command]
+
+    def _desktop_env(self, env: dict[str, str]) -> dict[str, str]:
+        if all(env.get(key) for key in _LINUX_DESKTOP_ENV_KEYS):
+            return env
+        parent_env = self._read_process_env(os.getppid())
+        for key in _LINUX_DESKTOP_ENV_KEYS:
+            if not env.get(key) and parent_env.get(key):
+                env[key] = parent_env[key]
+        return env
+
+    def _agent_pid_path(self, log_path: Path) -> Path:
+        return log_path.with_suffix(".pid")
+
+    def _read_pid_file(self, path: Path) -> int | None:
+        try:
+            pid_text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        try:
+            return int(pid_text)
+        except ValueError:
+            return None
+
+    def _process_name_running(self, name: str) -> bool:
+        pgrep = shutil.which("pgrep")
+        if pgrep is None:
+            return False
+        result = subprocess.run(  # noqa: S603 - process name is controlled internally.
+            [pgrep, "-x", name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    def _read_process_env(self, pid: int) -> dict[str, str]:
+        environ = Path("/proc") / str(pid) / "environ"
+        try:
+            raw = environ.read_bytes()
+        except OSError:
+            return {}
+        result: dict[str, str] = {}
+        for item in raw.split(b"\0"):
+            if not item or b"=" not in item:
+                continue
+            key, value = item.split(b"=", 1)
+            result[key.decode(errors="replace")] = value.decode(errors="replace")
+        return result
+
+    def _with_debug_file(self, cmd: list[str], log_path: Path) -> list[str]:
+        if "--debug-file" in cmd:
+            return cmd
+        updated = list(cmd)
+        insert_at = updated.index("--") if "--" in updated else len(updated)
+        updated[insert_at:insert_at] = ["--debug-file", str(log_path)]
+        return updated
+
+    def _pid_alive(self, handle: str) -> bool:
+        try:
+            pid = int(handle)
+        except ValueError:
+            return False
+        if self._pid_is_zombie(pid):
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _wait_pid_exit(self, pid: int, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self._pid_alive(str(pid)):
+                return True
+            time.sleep(0.05)
+        return not self._pid_alive(str(pid))
+
+    def _pid_is_zombie(self, pid: int) -> bool:
+        stat_path = Path("/proc") / str(pid) / "stat"
+        try:
+            stat = stat_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        parts = stat.rsplit(") ", 1)
+        return len(parts) == _PROC_STAT_SPLIT_FIELD_COUNT and parts[1].startswith("Z ")
+
+    def _kill_pid(self, handle: str) -> None:
+        try:
+            pid = int(handle)
+        except ValueError:
+            return
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
 def read_log_tail(path: Path, lines: int | None = None) -> str:
     """Read a full log or its last ``lines`` lines."""
     if not path.exists():
@@ -449,4 +1241,9 @@ class _JobObjectExtendedLimitInformation(ctypes.Structure):
     ]
 
 
-process_manager = WindowsProcessManager()
+if os.name == "nt":
+    process_manager = WindowsProcessManager()
+elif os.environ.get(_LINUX_LAUNCHER_ENV, "").strip().lower() == _TMUX_LAUNCHER_VALUE:
+    process_manager = TmuxProcessManager()
+else:
+    process_manager = LinuxTerminalProcessManager()

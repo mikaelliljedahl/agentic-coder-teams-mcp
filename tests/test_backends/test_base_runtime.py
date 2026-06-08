@@ -218,7 +218,12 @@ class TestBaseBackendExecuteInPane:
 
         assert result == {"output": "ok\n", "exit_code": 0}
         run_mock.assert_called_once()
-        assert run_mock.call_args.args == (["cmd", "/c", "echo hello"],)
+        expected_cmd = (
+            ["cmd", "/c", "echo hello"]
+            if process_base.os.name == "nt"
+            else ["sh", "-lc", "echo hello"]
+        )
+        assert run_mock.call_args.args == (expected_cmd,)
         assert run_mock.call_args.kwargs["timeout"] == 30
 
     def test_respects_custom_timeout(self, monkeypatch):
@@ -295,8 +300,19 @@ class TestInteractiveConsoleSpawn:
         popen_mock = MagicMock(return_value=process)
         monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
         monkeypatch.setenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", "1")
+        monkeypatch.setattr(
+            process_manager_mod.subprocess,
+            "CREATE_NEW_CONSOLE",
+            0x10,
+            raising=False,
+        )
         monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
         monkeypatch.setattr(manager._job, "assign", lambda process: None)
+        monkeypatch.setattr(
+            manager,
+            "_should_use_interactive_console",
+            lambda backend_type, *, is_interactive=False: True,
+        )
         request = _make_spawn_request()
 
         result = manager.spawn_process(
@@ -359,8 +375,19 @@ class TestInteractiveConsoleSpawn:
         popen_mock = MagicMock(return_value=process)
         monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
         monkeypatch.delenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", raising=False)
+        monkeypatch.setattr(
+            process_manager_mod.subprocess,
+            "CREATE_NEW_CONSOLE",
+            0x10,
+            raising=False,
+        )
         monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
         monkeypatch.setattr(manager._job, "assign", lambda process: None)
+        monkeypatch.setattr(
+            manager,
+            "_should_use_interactive_console",
+            lambda backend_type, *, is_interactive=False: True,
+        )
 
         manager.spawn_process(
             _make_spawn_request(),
@@ -447,3 +474,397 @@ class TestWindowsTerminalTail:
         manager._open_windows_terminal_tail("team", "worker", tmp_path / "worker.log")
 
         popen_mock.assert_not_called()
+
+
+class TestPlatformProcessManagerSelection:
+    def test_defaults_to_terminal_on_posix_and_windows_manager_on_windows(self):
+        if process_manager_mod.os.name == "nt":
+            assert isinstance(
+                process_manager_mod.process_manager,
+                process_manager_mod.WindowsProcessManager,
+            )
+        elif (
+            process_manager_mod.os.environ.get(
+                process_manager_mod._LINUX_LAUNCHER_ENV, ""
+            )
+            .strip()
+            .lower()
+            == process_manager_mod._TMUX_LAUNCHER_VALUE
+        ):
+            assert isinstance(
+                process_manager_mod.process_manager,
+                process_manager_mod.TmuxProcessManager,
+            )
+        else:
+            assert isinstance(
+                process_manager_mod.process_manager,
+                process_manager_mod.LinuxTerminalProcessManager,
+            )
+
+
+class TestTmuxProcessManager:
+    def test_spawn_inside_tmux_uses_split_window_and_returns_pane_pid(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        manager = process_manager_mod.TmuxProcessManager()
+        run_mock = MagicMock(
+            return_value=MagicMock(stdout="@7\t%42\t4242\n", returncode=0)
+        )
+        monkeypatch.setenv("TMUX", "tmux-session-token")
+        monkeypatch.delenv("USE_TMUX_WINDOWS", raising=False)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
+        monkeypatch.setattr(process_manager_mod.subprocess, "run", run_mock)
+
+        result = manager.spawn_process(
+            _make_spawn_request(),
+            ["codex", "exec", "do stuff"],
+            {"AGENT_NAME": "worker"},
+            "codex",
+            is_interactive=True,
+        )
+
+        assert result.process_handle == "4242"
+        assert result.backend_type == "codex"
+        command = run_mock.call_args.args[0]
+        assert command[:5] == [
+            "tmux",
+            "split-window",
+            "-dP",
+            "-F",
+            "#{window_id}\t#{pane_id}\t#{pane_pid}",
+        ]
+        assert "cd " in command[-1]
+        assert "AGENT_NAME=worker" in command[-1]
+        assert "env AGENT_NAME=worker exec" not in command[-1]
+        assert "exec codex exec 'do stuff'" in command[-1]
+        assert manager._processes["4242"].target_id == "%42"
+
+    def test_spawn_inside_tmux_can_use_windows(self, _make_spawn_request, monkeypatch):
+        manager = process_manager_mod.TmuxProcessManager()
+        monkeypatch.setenv("TMUX", "tmux-session-token")
+        monkeypatch.setenv("USE_TMUX_WINDOWS", "1")
+
+        command, target_kind = manager._build_tmux_spawn_args(
+            _make_spawn_request(),
+            "exec worker",
+        )
+
+        assert target_kind == "window"
+        assert command[:5] == [
+            "tmux",
+            "new-window",
+            "-dP",
+            "-F",
+            "#{window_id}\t#{pane_id}\t#{pane_pid}",
+        ]
+
+    def test_explicit_tmux_target_uses_split_window_even_without_tmux_env(
+        self, _make_spawn_request, monkeypatch
+    ):
+        manager = process_manager_mod.TmuxProcessManager()
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_TMUX_TARGET", "codex-lead")
+
+        command, target_kind = manager._build_tmux_spawn_args(
+            _make_spawn_request(),
+            "exec worker",
+        )
+
+        assert target_kind == "pane"
+        assert command[:7] == [
+            "tmux",
+            "split-window",
+            "-dP",
+            "-t",
+            "codex-lead",
+            "-F",
+            "#{window_id}\t#{pane_id}\t#{pane_pid}",
+        ]
+
+    def test_explicit_tmux_target_can_use_windows(
+        self, _make_spawn_request, monkeypatch
+    ):
+        manager = process_manager_mod.TmuxProcessManager()
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_TMUX_TARGET", "codex-lead")
+        monkeypatch.setenv("USE_TMUX_WINDOWS", "1")
+
+        command, target_kind = manager._build_tmux_spawn_args(
+            _make_spawn_request(),
+            "exec worker",
+        )
+
+        assert target_kind == "window"
+        assert command[:7] == [
+            "tmux",
+            "new-window",
+            "-dP",
+            "-t",
+            "codex-lead",
+            "-F",
+            "#{window_id}\t#{pane_id}\t#{pane_pid}",
+        ]
+
+    def test_spawn_outside_tmux_creates_detached_session(
+        self, _make_spawn_request, monkeypatch
+    ):
+        manager = process_manager_mod.TmuxProcessManager()
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.setattr(manager, "_tmux_session_exists", lambda session_name: False)
+
+        command, target_kind = manager._build_tmux_spawn_args(
+            _make_spawn_request(team_name="session-123"),
+            "exec worker",
+        )
+
+        assert target_kind == "window"
+        assert command[:5] == [
+            "tmux",
+            "new-session",
+            "-dP",
+            "-s",
+            "win-agent-teams-session-123",
+        ]
+
+    def test_spawn_outside_tmux_reuses_detached_session(
+        self, _make_spawn_request, monkeypatch
+    ):
+        manager = process_manager_mod.TmuxProcessManager()
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.setattr(manager, "_tmux_session_exists", lambda session_name: True)
+
+        command, target_kind = manager._build_tmux_spawn_args(
+            _make_spawn_request(team_name="session-123"),
+            "exec worker",
+        )
+
+        assert target_kind == "window"
+        assert command[:5] == [
+            "tmux",
+            "new-window",
+            "-dP",
+            "-t",
+            "win-agent-teams-session-123",
+        ]
+
+    def test_kill_process_uses_tmux_target_when_known(self, monkeypatch, tmp_path):
+        manager = process_manager_mod.TmuxProcessManager()
+        run_mock = MagicMock()
+        monkeypatch.setattr(process_manager_mod.subprocess, "run", run_mock)
+        manager._processes["4242"] = process_manager_mod.TmuxProcessInfo(
+            pid=4242,
+            name="worker",
+            agent_id="worker@team",
+            team_name="team",
+            backend="codex",
+            target_id="@7",
+            pane_id="%42",
+            log_path=tmp_path / "worker.log",
+            started_at=1.0,
+        )
+
+        manager.kill_process("4242")
+
+        run_mock.assert_called_once()
+        command = run_mock.call_args.args[0]
+        assert command[0].endswith("tmux")
+        assert command[1:] == ["kill-window", "-t", "@7"]
+        assert run_mock.call_args.kwargs == {
+            "check": False,
+            "capture_output": True,
+            "text": True,
+        }
+
+
+class TestLinuxTerminalProcessManager:
+    def test_spawn_opens_terminal_and_returns_terminal_pid(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        process = MagicMock(pid=4242)
+        popen_mock = MagicMock(return_value=process)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            manager,
+            "_discover_terminal",
+            lambda: "/usr/bin/gnome-terminal",
+        )
+        monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
+
+        result = manager.spawn_process(
+            _make_spawn_request(),
+            ["codex", "exec", "do stuff"],
+            {"AGENT_NAME": "worker"},
+            "codex",
+            is_interactive=True,
+        )
+
+        assert result.process_handle == "4242"
+        command = popen_mock.call_args.args[0]
+        assert command[:6] == [
+            "/usr/bin/gnome-terminal",
+            "--wait",
+            "--title",
+            "worker@team",
+            "--",
+            "bash",
+        ]
+        assert "printf '%s\\n' \"$$\"" in command[-1]
+        assert str(tmp_path / "team" / "worker.pid") in command[-1]
+        assert "AGENT_NAME=worker" in command[-1]
+        assert "env AGENT_NAME=worker exec" not in command[-1]
+        assert "exec codex exec 'do stuff'" in command[-1]
+        kwargs = popen_mock.call_args.kwargs
+        assert kwargs["stdin"] is None
+        assert kwargs["stdout"].name == str(tmp_path / "team" / "worker.log")
+        assert kwargs["stderr"] == process_manager_mod.subprocess.STDOUT
+        assert kwargs["start_new_session"] is True
+
+    def test_discovers_terminal_from_env_override(self, monkeypatch):
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LINUX_TERMINAL", "custom-terminal")
+        monkeypatch.setattr(
+            process_manager_mod.shutil,
+            "which",
+            lambda name: (
+                "/opt/bin/custom-terminal" if name == "custom-terminal" else None
+            ),
+        )
+
+        assert manager._discover_terminal() == "/opt/bin/custom-terminal"
+
+    def test_skips_qterminal_when_an_instance_is_already_running(
+        self, monkeypatch
+    ):
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        terminal_paths = {
+            "qterminal": "/usr/bin/qterminal",
+            "xterm": "/usr/bin/xterm",
+        }
+
+        def fake_which(name: str) -> str | None:
+            return terminal_paths.get(name)
+
+        monkeypatch.delenv("WIN_AGENT_TEAMS_LINUX_TERMINAL", raising=False)
+        monkeypatch.setattr(process_manager_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(
+            manager,
+            "_process_name_running",
+            lambda name: name == "qterminal",
+        )
+
+        assert manager._discover_terminal() == "/usr/bin/xterm"
+
+    def test_health_follows_agent_pid_after_terminal_launcher_exits(
+        self, tmp_path, monkeypatch
+    ):
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        process = MagicMock(pid=4242)
+        process.poll.return_value = 0
+        log_path = tmp_path / "worker.log"
+        pid_path = tmp_path / "worker.pid"
+        pid_path.write_text("5150\n", encoding="utf-8")
+        manager._processes["4242"] = process_manager_mod.LinuxTerminalProcessInfo(
+            pid=4242,
+            name="worker",
+            agent_id="worker@team",
+            team_name="team",
+            backend="codex",
+            terminal_process=process,
+            log_path=log_path,
+            agent_pid_path=pid_path,
+            started_at=0.0,
+        )
+        monkeypatch.setattr(manager, "_pid_alive", lambda handle: handle == "5150")
+
+        assert manager.health_check("4242") == (True, "agent process running")
+
+    def test_health_allows_short_pid_file_race_after_clean_launcher_exit(
+        self, tmp_path
+    ):
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        process = MagicMock(pid=4242)
+        process.poll.return_value = 0
+        manager._processes["4242"] = process_manager_mod.LinuxTerminalProcessInfo(
+            pid=4242,
+            name="worker",
+            agent_id="worker@team",
+            team_name="team",
+            backend="codex",
+            terminal_process=process,
+            log_path=tmp_path / "worker.log",
+            agent_pid_path=tmp_path / "worker.pid",
+            started_at=process_manager_mod.time.time(),
+        )
+
+        assert manager.health_check("4242") == (
+            True,
+            "terminal launcher exited; waiting for agent pid",
+        )
+
+    def test_kill_stops_agent_pid_and_terminal_process(
+        self, tmp_path, monkeypatch
+    ):
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        process = MagicMock(pid=4242)
+        process.poll.return_value = None
+        pid_path = tmp_path / "worker.pid"
+        pid_path.write_text("5150\n", encoding="utf-8")
+        manager._processes["4242"] = process_manager_mod.LinuxTerminalProcessInfo(
+            pid=4242,
+            name="worker",
+            agent_id="worker@team",
+            team_name="team",
+            backend="codex",
+            terminal_process=process,
+            log_path=tmp_path / "worker.log",
+            agent_pid_path=pid_path,
+            started_at=1.0,
+        )
+        kill_mock = MagicMock()
+        monkeypatch.setattr(manager, "_pid_alive", lambda handle: handle == "5150")
+        monkeypatch.setattr(manager, "_wait_pid_exit", lambda pid, timeout_s: True)
+        monkeypatch.setattr(process_manager_mod.os, "kill", kill_mock)
+
+        manager.kill_process("4242")
+
+        kill_mock.assert_called_once_with(5150, process_manager_mod.signal.SIGTERM)
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=10.0)
+
+    def test_gnome_terminal_command_uses_title_and_shell(self):
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+
+        command = manager._terminal_command(
+            "/usr/bin/gnome-terminal",
+            "worker@team",
+            "exec worker",
+        )
+
+        assert command == [
+            "/usr/bin/gnome-terminal",
+            "--wait",
+            "--title",
+            "worker@team",
+            "--",
+            "bash",
+            "-lc",
+            "exec worker",
+        ]
+
+    def test_qterminal_command_omits_title(self):
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+
+        command = manager._terminal_command(
+            "/usr/bin/qterminal",
+            "worker@team",
+            "exec worker",
+        )
+
+        assert command == [
+            "/usr/bin/qterminal",
+            "-e",
+            "bash",
+            "-lc",
+            "exec worker",
+        ]
