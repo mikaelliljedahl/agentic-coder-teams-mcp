@@ -646,7 +646,7 @@ async def check_agent(name: str) -> dict:
 async def follow_up_agent(
     name: str,
     prompt: str,
-    replace_if_idle: bool = False,
+    replace_if_idle: bool = True,
 ) -> dict:
     """Resume a logical agent with a follow-up prompt through the backend CLI.
 
@@ -655,6 +655,10 @@ async def follow_up_agent(
     continuing a spawned agent that would otherwise never read an inbox message.
     It only runs when the agent is dead or idle; a live busy agent is refused
     with reason="agent_busy".
+
+    replace_if_idle defaults to True: an idle-but-alive process is gracefully
+    shut down and resumed with the follow-up prompt. Set it to False to instead
+    refuse such an agent with reason="agent_idle_but_alive".
     """
     session_id = _active_session_id()
 

@@ -1027,7 +1027,9 @@ async def test_follow_up_agent_refuses_idle_live_agent_without_replace(
         ),
     )
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent(
+        "worker", "next prompt", replace_if_idle=False
+    )
 
     assert result["success"] is False
     assert result["reason"] == "agent_idle_but_alive"
