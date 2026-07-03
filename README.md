@@ -213,14 +213,25 @@ agents (`--settings <path>`, on by default; disable with
 `WIN_AGENT_TEAMS_STATE_HOOKS=0`) and writes a per-agent marker file
 (`state-{name}.json`) mapping `SessionStart`/`UserPromptSubmit`/
 `PreToolUse`/`PostToolUse` → `running` and `Stop`/`SubagentStop` →
-`waiting`. Codex hook injection exists but is **off by default**
-(`WIN_AGENT_TEAMS_STATE_HOOKS_CODEX=1` to enable) pending a runtime spike.
+`waiting`. Codex agents get the same marker via an inline `-c` hook override
+plus `--dangerously-bypass-hook-trust` (Codex silently skips injected hooks
+without that flag); this is **on by default** — set
+`WIN_AGENT_TEAMS_STATE_HOOKS_CODEX=0` to disable it (or
+`WIN_AGENT_TEAMS_STATE_HOOKS=0` to disable hooks for both backends).
 When no marker exists yet (hooks disabled, or not fired), `state` falls back
 to an activity-recency heuristic: `running` if the agent produced output
 within the last `WIN_AGENT_TEAMS_IDLE_SECONDS` (default 60s), else `idle`. A
 dead process always reports `state="dead"`, regardless of a stale marker.
 `kill_agent` deletes the marker so a reused agent name never inherits a dead
 predecessor's state.
+
+State-marker environment variables:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `WIN_AGENT_TEAMS_STATE_HOOKS` | `1` (on) | Master switch for hook-driven state injection (both backends). `0` disables it; `state` then uses the activity-recency fallback only. |
+| `WIN_AGENT_TEAMS_STATE_HOOKS_CODEX` | `1` (on) | Codex-specific switch. `0` leaves Claude hooks on but skips Codex `-c` injection and its `--dangerously-bypass-hook-trust` flag. |
+| `WIN_AGENT_TEAMS_IDLE_SECONDS` | `60` | Age (seconds) beyond which an alive-but-quiet agent with no marker is reported `idle` instead of `running`. |
 
 ### Follow-up / Resume
 
@@ -292,6 +303,20 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 win-agent-teams serve      # Start the MCP server
 win-agent-teams backends   # List available backends
 ```
+
+## Roadmap / future work
+
+The delta-only monitoring model (compact `state`, cheap `agent_status`, per-agent hook
+markers) is deliberately poll-friendly. The following are **not implemented yet** but are the
+intended next steps — the hook markers already lay the groundwork for the first:
+
+- **Push over poll.** An event/notification channel (`agent X emitted` / `went idle` / `died`)
+  so a coordinator can be event-driven instead of polling. The per-agent state markers are the
+  natural emit point for this.
+- **`wait_for(agent, condition, timeout)`.** A server-side blocking wait (idle / mentions-token
+  / exit) so callers don't hand-roll poll loops.
+- **Server-side stall/heartbeat signal.** Derive a stall flag from `last_activity_ts` server-side
+  so callers stop reimplementing mtime-based stall detection.
 
 ## Development
 
