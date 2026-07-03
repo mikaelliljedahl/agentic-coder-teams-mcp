@@ -2,18 +2,19 @@
 
 Minimal MCP server for spawning and communicating with Claude Code and Codex agents on Windows or Linux. Fire-and-forget agent spawning with bidirectional 1:1 messaging.
 
-## Tools (9 total)
+## Tools (10 total)
 
 | Tool | Description |
 |------|-------------|
-| `spawn_agent` | Start an agent process (fire-and-forget) |
+| `spawn_agent` | Start an agent process (fire-and-forget); returns its state-marker path |
 | `send_message` | Send a message to an agent or lead |
 | `read_messages` | Read unread messages from own inbox (delta + watermark) |
-| `check_agent` | Check an agent's status: state, last line, unread count |
+| `check_agent` | Check an agent's status: state, last line, unread count, stall signal |
 | `follow_up_agent` | Resume an existing logical agent with a follow-up prompt |
 | `kill_agent` | Force-kill an agent process |
 | `list_agents` | List all agents with compact status rows |
-| `agent_status` | Cheap per-agent state/watermark rows (no bodies) |
+| `agent_status` | Cheap per-agent state/watermark/stall rows (no bodies) |
+| `agent_watch_paths` | Per-agent `{name, state_marker_path}` — what to file-watch |
 | `list_backends` | List available backends |
 
 ## Quick Start
@@ -200,10 +201,13 @@ bodies. Pass `full=True` to restore each agent's raw registry record plus a
 `last_line` peek.
 
 `agent_status(names=None)` returns the cheapest possible per-agent rows —
-exactly `{name, state, last_activity_ts, unread_count, seq}`, no bodies at
-all. It costs one state-marker read + one cursor read + one liveness check
-per agent (no transcript scan) once a marker exists, which is what makes it
-suitable for a tight coordinator poll loop across many agents.
+`{name, state, last_activity_ts, unread_count, seq, heartbeat_age_s,
+stalled}`, no bodies at all. It costs one state-marker read + one cursor read
++ one liveness check per agent (no transcript scan) once a marker exists,
+which is what makes it suitable for a coordinator sweep across many agents.
+`stalled` is `true` when an agent is alive and not `waiting`/`dead` but has
+produced nothing for longer than `WIN_AGENT_TEAMS_STALL_SECONDS` (default
+300) — i.e. alive-but-hung, detectable with zero transcript bytes.
 
 ### State
 
@@ -232,6 +236,45 @@ State-marker environment variables:
 | `WIN_AGENT_TEAMS_STATE_HOOKS` | `1` (on) | Master switch for hook-driven state injection (both backends). `0` disables it; `state` then uses the activity-recency fallback only. |
 | `WIN_AGENT_TEAMS_STATE_HOOKS_CODEX` | `1` (on) | Codex-specific switch. `0` leaves Claude hooks on but skips Codex `-c` injection and its `--dangerously-bypass-hook-trust` flag. |
 | `WIN_AGENT_TEAMS_IDLE_SECONDS` | `60` | Age (seconds) beyond which an alive-but-quiet agent with no marker is reported `idle` instead of `running`. |
+| `WIN_AGENT_TEAMS_STALL_SECONDS` | `300` | Age (seconds) beyond which an alive, non-`waiting` agent is flagged `stalled` (alive-but-hung). |
+
+### Coordinating without polling (the marker file bus)
+
+A coordinator cannot be *pushed* to: the harness never wakes an idle agent on
+an MCP event, and this MCP server itself may be shut down after a few minutes
+of host inactivity. What survives is the **file bus** — workers are detached
+processes and their state markers are on disk — so coordination is built on
+watching files, not on the server staying up. (The tool descriptions carry the
+same recipe, since a spawned agent only reads those, not this README.)
+
+The loop:
+
+1. `spawn_agent(..., expected_outputs=["report.md", ...])` returns
+   `state_marker_path`, `session_dir`, and echoes `expected_outputs`. Declare
+   the exact files the agent is told to create so you can watch precise paths.
+2. Watch those paths / the `session_dir` for changes. The injected worker hook
+   writes `state-{name}.json` on every lifecycle transition (→ `waiting` when a
+   turn ends), independent of this server.
+3. On a change, read the marker JSON directly (works even if the server is
+   down) or call `agent_status(names)` for the delta (this auto-restarts the
+   server if it had exited). Use `agent_watch_paths(names)` to (re)discover the
+   exact marker paths if you didn't keep the `spawn_agent` return.
+
+Wake wiring differs by orchestrator:
+
+- **Claude Code coordinator** — run the watch as a **background** command; its
+  completion triggers the harness background-task notification, waking you.
+  Then call `agent_status`. You can stay idle in between.
+- **Codex coordinator** — Codex has no idle-wake, so run a **bounded
+  foreground** watch inside the turn and read the marker from disk when it
+  returns; loop as needed.
+
+A ready-made bounded watcher ships as a CLI (needs no MCP server):
+
+```bash
+win-agent-teams watch <session-dir> [--timeout SECONDS] [--pattern 'state-*.json']
+# exit 0 + prints the changed path(s) on a change; exit 2 on timeout
+```
 
 ### Follow-up / Resume
 
@@ -302,21 +345,25 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 ```powershell
 win-agent-teams serve      # Start the MCP server
 win-agent-teams backends   # List available backends
+win-agent-teams watch DIR  # Block until a state marker under DIR changes (or --timeout)
 ```
 
 ## Roadmap / future work
 
-The delta-only monitoring model (compact `state`, cheap `agent_status`, per-agent hook
-markers) is deliberately poll-friendly. The following are **not implemented yet** but are the
-intended next steps — the hook markers already lay the groundwork for the first:
+Shipped since the initial monitoring model: the disk-derived **stall/heartbeat** signal
+(`stalled` / `heartbeat_age_s`) and the **marker file-bus** coordination loop
+(`agent_watch_paths`, `spawn_agent` marker paths, the `watch` CLI) — see *Coordinating without
+polling* above.
 
-- **Push over poll.** An event/notification channel (`agent X emitted` / `went idle` / `died`)
-  so a coordinator can be event-driven instead of polling. The per-agent state markers are the
-  natural emit point for this.
-- **`wait_for(agent, condition, timeout)`.** A server-side blocking wait (idle / mentions-token
-  / exit) so callers don't hand-roll poll loops.
-- **Server-side stall/heartbeat signal.** Derive a stall flag from `last_activity_ts` server-side
-  so callers stop reimplementing mtime-based stall detection.
+Still open, but constrained by the host harnesses rather than by this server:
+
+- **True push over poll.** A model-facing event that wakes an *idle* coordinator on an external
+  MCP event. Currently impossible: no harness surfaces MCP notifications (or a `FileChanged`
+  hook) as a mid-idle wake — only a background command's completion wakes the coordinator, which
+  is exactly what the marker + `watch` loop rides. A real push needs a harness change.
+- **`wait_for(agent, condition, timeout)`.** Deliberately *not* built as a blocking MCP tool:
+  the server can be shut down after a few minutes of host inactivity, so a long blocking call is
+  unreliable. The bounded `watch` CLI (server-independent) is the robust substitute.
 
 ## Development
 

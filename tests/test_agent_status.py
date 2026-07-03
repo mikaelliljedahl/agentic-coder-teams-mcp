@@ -76,6 +76,8 @@ class TestCheckAgentCompactShape:
             "seq",
             "truncated",
             "full_len",
+            "heartbeat_age_s",
+            "stalled",
         }
         assert "last_message" not in result
         assert "backend_session_id" not in result
@@ -366,7 +368,15 @@ class TestAgentStatus:
 
         assert len(result) == 1
         row = result[0]
-        assert set(row) == {"name", "state", "last_activity_ts", "unread_count", "seq"}
+        assert set(row) == {
+            "name",
+            "state",
+            "last_activity_ts",
+            "unread_count",
+            "seq",
+            "heartbeat_age_s",
+            "stalled",
+        }
         assert row["name"] == "worker"
         assert row["state"] == "waiting"
         assert row["last_activity_ts"] == 1234.5

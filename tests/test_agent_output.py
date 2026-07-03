@@ -880,6 +880,8 @@ async def test_check_agent_returns_stable_empty_fallback_for_unknown_agent(
         "seq": 0,
         "truncated": False,
         "full_len": 0,
+        "heartbeat_age_s": None,
+        "stalled": False,
     }
 
     full_result = await server_simple.check_agent("missing", full=True)
@@ -931,6 +933,8 @@ async def test_check_agent_skips_rollout_for_legacy_agent_record(
         "seq": 0,
         "truncated": False,
         "full_len": 0,
+        "heartbeat_age_s": None,
+        "stalled": False,
     }
 
 
