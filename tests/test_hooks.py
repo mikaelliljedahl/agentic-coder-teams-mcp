@@ -276,9 +276,14 @@ class TestCodexHookOverrides:
             assert rest.endswith('"}]}]')
         assert seen_events == events
 
-    def test_stop_event_command_string_is_toml_safe_no_raw_backslash(
-        self, tmp_path: Path
-    ) -> None:
+    def test_stop_event_command_string_is_toml_safe(self, tmp_path: Path) -> None:
+        # A backslash-containing path must not corrupt the TOML basic string:
+        # the invariant is that every backslash is ESCAPED (``\\``), never left
+        # raw. This is platform-independent — on Windows ``as_posix()`` renders
+        # forward slashes (no backslash at all), while on POSIX a literal
+        # backslash survives ``as_posix()`` and must be escaped by the TOML
+        # renderer. The earlier "no backslash at all" assertion only held on
+        # Windows and failed on Linux.
         windows_session_dir = Path("C:\\Users\\mlilj\\sessions\\abc")
         args = hooks.codex_hook_overrides(windows_session_dir, "worker")
 
@@ -287,17 +292,21 @@ class TestCodexHookOverrides:
             for k, v in zip(args[0::2], args[1::2], strict=True)
             if k == "-c" and v.startswith("hooks.Stop=")
         )
-        # Extract the command="..." payload.
+        # Extract the command="..." payload (still TOML-escaped).
         marker = 'command="'
         start = stop_value.index(marker) + len(marker)
         end = stop_value.rindex('"')
-        command_str = stop_value[start:end]
+        escaped = stop_value[start:end]
 
-        assert "\\" not in command_str
-        assert "claude_teams.hooks" in command_str
-        assert "emit" in command_str
-        assert "worker" in command_str
-        assert "C:/Users/mlilj/sessions/abc" in command_str
+        # No UNescaped backslash: after removing valid escape pairs (\\ and \")
+        # nothing containing a lone backslash may remain.
+        stripped = escaped.replace("\\\\", "").replace('\\"', "")
+        assert "\\" not in stripped, f"unescaped backslash in TOML value: {escaped!r}"
+        # Backslash-free substrings appear verbatim regardless of platform.
+        assert "claude_teams.hooks" in escaped
+        assert "emit" in escaped
+        assert "worker" in escaped
+        assert "sessions" in escaped
 
     def test_command_reads_event_from_stdin_and_takes_session_dir_and_agent_args(
         self,
