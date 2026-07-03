@@ -76,14 +76,23 @@ def emit(session_dir: Path, agent: str) -> None:
 
 
 def _emit_command(session_dir: Path, agent: str) -> list[str]:
-    """Return the argv for the hook command invoking ``emit`` for ``agent``."""
+    """Return the argv for the hook command invoking ``emit`` for ``agent``.
+
+    Paths are rendered with forward slashes (``Path.as_posix()``) rather than
+    the platform-native separator. This argv is also embedded verbatim into a
+    Codex ``-c`` TOML basic string (see :func:`codex_hook_overrides`), where
+    backslash is an escape character; a raw Windows backslash path would
+    corrupt the TOML value. Forward-slash paths parse correctly on Windows
+    too, so this is safe for both the Claude Code settings-file JSON use and
+    the Codex TOML use.
+    """
     return [
-        sys.executable,
+        Path(sys.executable).as_posix(),
         "-m",
         _HOOK_MODULE,
         "emit",
         "--session-dir",
-        str(session_dir),
+        Path(session_dir).as_posix(),
         "--agent",
         agent,
     ]
@@ -130,28 +139,49 @@ def codex_hook_overrides(session_dir: Path, agent_name: str) -> list[str]:
     """Return ``-c`` config-override argv expressing the state hooks for Codex.
 
     Pure function: does not write any file. Mirrors the same event -> emit
-    command wiring used for Claude Code, expressed as TOML-ish ``-c`` value
-    overrides (one per event) for the Codex hooks table.
+    command wiring used for Claude Code, expressed as ``-c`` value overrides
+    (one per event) for the Codex hooks table.
+
+    Confirmed shape (spike on codex-cli 0.142.5, hooks feature stable)::
+
+        hooks.<Event>=[{hooks=[{type="command",command="<CMD>"}]}]
+
+    ``<CMD>`` is the shell-quoted emit command as a single TOML basic string.
+    Basic strings treat backslash as an escape character, so any Windows path
+    baked into the command (interpreter, session dir) must use forward
+    slashes only — see :func:`_emit_command`.
     """
     session_dir = Path(session_dir)
     command = _emit_command(session_dir, agent_name)
-    command_toml = ", ".join(_toml_literal(part) for part in command)
+    command_str = _shell_quote_command_single(command)
     args: list[str] = []
     for event in sorted(_RUNNING_EVENTS | _WAITING_EVENTS):
         args.extend(
             [
                 "-c",
-                f"hooks.{event}=[{{ command=[{command_toml}] }}]",
+                f'hooks.{event}=[{{hooks=[{{type="command",command={_toml_basic_string(command_str)}}}]}}]',
             ]
         )
     return args
 
 
-def _toml_literal(value: str) -> str:
-    """Render ``value`` as a TOML single-quoted literal string."""
-    if "'" in value:
-        value = value.replace("'", "\\'")
-    return f"'{value}'"
+def _shell_quote_command_single(argv: list[str]) -> str:
+    """Render ``argv`` as a single shell command string, single-quoted.
+
+    Used only for the Codex ``-c`` hook override, which embeds this string
+    inside a TOML basic (double-quoted) string value. Single-quoting each
+    token (instead of double-quoting, as
+    :func:`_shell_quote_command` does for the Claude Code JSON settings file)
+    avoids introducing literal ``"`` characters that would otherwise need
+    escaping when nested inside the TOML basic string.
+    """
+    return " ".join(f"'{part}'" for part in argv)
+
+
+def _toml_basic_string(value: str) -> str:
+    """Render ``value`` as a TOML basic (double-quoted) string literal."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

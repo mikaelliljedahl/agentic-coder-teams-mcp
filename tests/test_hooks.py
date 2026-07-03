@@ -229,7 +229,7 @@ class TestWriteClaudeSettings:
         assert "claude_teams.hooks" in command
         assert "emit" in command
         assert "worker" in command
-        assert str(tmp_path) in command
+        assert tmp_path.as_posix() in command
 
 
 class TestCodexHookOverrides:
@@ -245,4 +245,70 @@ class TestCodexHookOverrides:
 
         joined = " ".join(args)
         assert "worker" in joined
-        assert str(tmp_path).replace("\\", "\\\\") in joined or str(tmp_path) in joined
+        assert tmp_path.as_posix() in joined
+
+    def test_emits_one_c_arg_per_lifecycle_event_in_confirmed_shape(
+        self, tmp_path: Path
+    ) -> None:
+        args = hooks.codex_hook_overrides(tmp_path, "worker")
+
+        # args is a flat ["-c", value, "-c", value, ...] list, one pair per event.
+        assert len(args) % 2 == 0
+        values = args[1::2]
+        assert all(a == "-c" for a in args[0::2])
+
+        events = {
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "SubagentStop",
+        }
+        seen_events = set()
+        for value in values:
+            key, _, rest = value.partition("=")
+            assert key.startswith("hooks.")
+            event = key[len("hooks.") :]
+            assert event in events
+            seen_events.add(event)
+            assert rest.startswith('[{hooks=[{type="command",command="')
+            assert rest.endswith('"}]}]')
+        assert seen_events == events
+
+    def test_stop_event_command_string_is_toml_safe_no_raw_backslash(
+        self, tmp_path: Path
+    ) -> None:
+        windows_session_dir = Path("C:\\Users\\mlilj\\sessions\\abc")
+        args = hooks.codex_hook_overrides(windows_session_dir, "worker")
+
+        stop_value = next(
+            v
+            for k, v in zip(args[0::2], args[1::2], strict=True)
+            if k == "-c" and v.startswith("hooks.Stop=")
+        )
+        # Extract the command="..." payload.
+        marker = 'command="'
+        start = stop_value.index(marker) + len(marker)
+        end = stop_value.rindex('"')
+        command_str = stop_value[start:end]
+
+        assert "\\" not in command_str
+        assert "claude_teams.hooks" in command_str
+        assert "emit" in command_str
+        assert "worker" in command_str
+        assert "C:/Users/mlilj/sessions/abc" in command_str
+
+    def test_command_reads_event_from_stdin_and_takes_session_dir_and_agent_args(
+        self,
+    ) -> None:
+        argv = hooks._emit_command(Path("C:/sessions/abc"), "worker")
+
+        assert argv[0] == Path(sys.executable).as_posix()
+        assert "-m" in argv
+        assert "claude_teams.hooks" in argv
+        assert "emit" in argv
+        assert "--session-dir" in argv
+        assert argv[argv.index("--session-dir") + 1] == "C:/sessions/abc"
+        assert "--agent" in argv
+        assert argv[argv.index("--agent") + 1] == "worker"
