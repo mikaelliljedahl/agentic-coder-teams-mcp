@@ -179,6 +179,7 @@ class ClaudeCodeBackend(BaseBackend):
         if request.reasoning_effort:
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
         cmd.extend(self._agent_args(request))
+        cmd.extend(self._hooks_settings_args(request))
         cmd.append("--")
         cmd.append(self._prompt_arg(request))
         return cmd
@@ -217,9 +218,26 @@ class ClaudeCodeBackend(BaseBackend):
         if request.reasoning_effort:
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
         cmd.extend(self._agent_args(request))
+        cmd.extend(self._hooks_settings_args(request))
         cmd.append("--")
         cmd.append(self._prompt_arg(request))
         return cmd
+
+    @staticmethod
+    def _hooks_settings_args(request: SpawnRequest) -> list[str]:
+        """Return ``--settings <path>`` args when state hooks are enabled.
+
+        Guarded by env ``WIN_AGENT_TEAMS_STATE_HOOKS`` (default on). The path
+        itself comes from ``request.extra["hooks_settings_path"]``, populated
+        by the server before spawn/resume via
+        :func:`claude_teams.hooks.write_claude_settings`.
+        """
+        if os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS", "1").strip() == "0":
+            return []
+        settings_path = (request.extra or {}).get("hooks_settings_path")
+        if not settings_path:
+            return []
+        return ["--settings", settings_path]
 
     def _prompt_arg(self, request: SpawnRequest) -> str:
         """Return the initial Claude prompt argument.

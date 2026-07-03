@@ -870,13 +870,20 @@ async def test_check_agent_returns_stable_empty_fallback_for_unknown_agent(
 
     assert result == {
         "name": "missing",
+        "state": "dead",
         "alive": False,
         "pid": None,
         "backend": None,
-        "backend_session_id": None,
         "last_activity_at": None,
-        "last_message": None,
+        "unread_count": 0,
+        "last_line": "",
+        "seq": 0,
+        "truncated": False,
     }
+
+    full_result = await server_simple.check_agent("missing", full=True)
+    assert full_result["last_message"] is None
+    assert full_result["backend_session_id"] is None
 
 
 @pytest.mark.asyncio
@@ -913,12 +920,15 @@ async def test_check_agent_skips_rollout_for_legacy_agent_record(
 
     assert result == {
         "name": "worker",
+        "state": "dead",
         "alive": False,
         "pid": 123,
         "backend": "codex",
-        "backend_session_id": None,
         "last_activity_at": None,
-        "last_message": None,
+        "unread_count": 0,
+        "last_line": "",
+        "seq": 0,
+        "truncated": False,
     }
 
 
@@ -959,7 +969,7 @@ async def test_check_agent_persists_backend_session_id_from_rollout(
         ),
     )
 
-    result = await server_simple.check_agent("worker")
+    result = await server_simple.check_agent("worker", full=True)
 
     assert result["backend_session_id"] == "backend-session-id"
     agents = server_simple._load_agents("session-id")

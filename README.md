@@ -2,17 +2,18 @@
 
 Minimal MCP server for spawning and communicating with Claude Code and Codex agents on Windows or Linux. Fire-and-forget agent spawning with bidirectional 1:1 messaging.
 
-## Tools (8 total)
+## Tools (9 total)
 
 | Tool | Description |
 |------|-------------|
 | `spawn_agent` | Start an agent process (fire-and-forget) |
 | `send_message` | Send a message to an agent or lead |
-| `read_messages` | Read unread messages from own inbox |
-| `check_agent` | Check if an agent process is alive and read fallback output |
+| `read_messages` | Read unread messages from own inbox (delta + watermark) |
+| `check_agent` | Check an agent's status: state, last line, unread count |
 | `follow_up_agent` | Resume an existing logical agent with a follow-up prompt |
 | `kill_agent` | Force-kill an agent process |
-| `list_agents` | List all agents and their status |
+| `list_agents` | List all agents with compact status rows |
+| `agent_status` | Cheap per-agent state/watermark rows (no bodies) |
 | `list_backends` | List available backends |
 
 ## Quick Start
@@ -155,37 +156,85 @@ Bidirectional 1:1 messaging between lead and agents via JSONL files:
 
 Each line: `{"from": "agent-1", "text": "done", "ts": "2026-05-11T..."}`
 
-`read_messages` returns only **unread** messages. A per-sender counter
-sidecar (`inbox-{name}.pos.json`) tracks how much of each sender's stream
-the reader has already consumed, so reads stay O(n) instead of re-returning
-the whole inbox every call. `read_messages(from_agent="x")` advances only
-`x`'s cursor. Delivery is best-effort: a crashed reader or a lost/corrupt
-cursor file may cause a message to be re-delivered or, in the rare case of
-two lead processes sharing one inbox, consumed by the other process.
+`read_messages` returns only **unread** messages, delta-by-default, plus a
+watermark. A per-sender counter sidecar (`inbox-{name}.pos.json`) tracks how
+much of each sender's stream the reader has already consumed, so reads stay
+O(n) instead of re-returning the whole inbox every call.
+
+Return shape: `{messages, cursors, seq, unread_count, has_more}`. Each
+message is `{from, text, ts, seq}`, where `seq` is that sender's per-sender
+COUNT after the message (the same number space as the persisted cursor).
+`cursors` (a `{sender: count}` map) is returned when `from_agent` is unset;
+a scalar `seq` is returned instead when `from_agent` is set. `read_messages(
+from_agent="x")` advances only `x`'s cursor. Pass `since_seq=<count>` (only
+valid together with `from_agent`) to fetch a specific tail and advance the
+cursor to `max(current, since_seq)` — no rewind, no boundary re-delivery.
+`limit` bounds a batch (default 50; `has_more` signals more remain);
+`full=True` ignores the limit. `max_chars` truncates each message's `text`
+(adds `truncated`/`full_len` per message). Delivery is best-effort: a
+crashed reader or a lost/corrupt cursor file may cause a message to be
+re-delivered or, in the rare case of two lead processes sharing one inbox,
+consumed by the other process.
 
 ### Output Fallback
 
-`check_agent(name)` returns `{name, alive, pid, backend, backend_session_id, last_activity_at, last_message}`. For Codex and Claude Code workers, these fields are read from the CLIs' existing JSONL session logs. This is a fallback for workers that finish without calling `send_message`; it does not replace explicit agent-to-lead messaging.
+`check_agent(name, full=False, max_chars=200)` returns a compact status peek
+by default: `{name, state, alive, pid, backend, last_activity_at,
+unread_count, last_line, seq, truncated}`. `state` is one of
+`running`/`waiting`/`idle`/`dead` (see "State" below). `last_line` is the
+last non-empty line of the worker's most recent assistant message, clipped
+to `max_chars` (default 200) with `truncated` signalling clipping.
+`unread_count`/`seq` count messages FROM this agent addressed to the caller.
 
-`last_message` is the **tail** of the worker's most recent assistant message,
-truncated to a 1000-character budget so repeated polling stays cheap. When
-truncated it is prefixed with a marker, e.g. `[truncated: showing last 950 of
-8200 chars]`. It is a status peek, not the full output — read the agent's own
-session log if you need the complete text.
+Pass `full=True` to restore the previous behavior: the full `last_message`
+(still bounded to 1000 chars, tail-truncated with a
+`[truncated: showing last N of M chars]` marker) plus `backend_session_id`,
+both read from the CLIs' existing JSONL session logs. This is a fallback for
+workers that finish without calling `send_message`; it does not replace
+explicit agent-to-lead messaging, and it is a status peek, not the full
+output — read the agent's own session log if you need the complete text.
+
+`list_agents(full=False)` returns compact rows by default: `{name, state,
+alive, pid, backend, last_activity_at, unread_count}` — no transcript
+bodies. Pass `full=True` to restore each agent's raw registry record plus a
+`last_line` peek.
+
+`agent_status(names=None)` returns the cheapest possible per-agent rows —
+exactly `{name, state, last_activity_ts, unread_count, seq}`, no bodies at
+all. It costs one state-marker read + one cursor read + one liveness check
+per agent (no transcript scan) once a marker exists, which is what makes it
+suitable for a tight coordinator poll loop across many agents.
+
+### State
+
+Agent `state` is hook-driven when possible: a small hook command
+(`python -m claude_teams.hooks emit`) is injected into spawned Claude Code
+agents (`--settings <path>`, on by default; disable with
+`WIN_AGENT_TEAMS_STATE_HOOKS=0`) and writes a per-agent marker file
+(`state-{name}.json`) mapping `SessionStart`/`UserPromptSubmit`/
+`PreToolUse`/`PostToolUse` → `running` and `Stop`/`SubagentStop` →
+`waiting`. Codex hook injection exists but is **off by default**
+(`WIN_AGENT_TEAMS_STATE_HOOKS_CODEX=1` to enable) pending a runtime spike.
+When no marker exists yet (hooks disabled, or not fired), `state` falls back
+to an activity-recency heuristic: `running` if the agent produced output
+within the last `WIN_AGENT_TEAMS_IDLE_SECONDS` (default 60s), else `idle`. A
+dead process always reports `state="dead"`, regardless of a stale marker.
+`kill_agent` deletes the marker so a reused agent name never inherits a dead
+predecessor's state.
 
 ### Follow-up / Resume
 
 `follow_up_agent(name, prompt, replace_if_idle=true)` continues the same logical agent by starting a new backend process with the CLI's native resume mechanism. Codex uses `codex resume` with the same permission/cwd/reasoning settings as spawn; Claude Code uses `claude --resume`. If the old process is still alive but idle, the tool replaces it by default; pass `replace_if_idle=false` to instead refuse with `agent_idle_but_alive`. A live, busy process is always refused with `agent_busy`.
 
-The tool relies on `backend_session_id`, which `check_agent` exposes from the backend's JSONL session logs. Once known, that session id is used as the correlation key so resume follow-ups keep reading the correct rollout even when multiple agents share a working directory.
+The tool relies on `backend_session_id`, which `check_agent(name, full=True)` exposes from the backend's JSONL session logs. Once known, that session id is used as the correlation key so resume follow-ups keep reading the correct rollout even when multiple agents share a working directory.
 
 Recommended follow-up pattern:
 
 ```
 1. Lead calls spawn_agent(..., name="worker")
-2. Lead polls check_agent("worker") until last_message and backend_session_id are present
+2. Lead polls check_agent("worker", full=True) until last_message and backend_session_id are present
 3. Lead calls follow_up_agent("worker", prompt="next task", replace_if_idle=true)
-4. Lead polls check_agent("worker") for the follow-up last_message
+4. Lead polls check_agent("worker", full=True) for the follow-up last_message
 ```
 
 ### Identity
@@ -213,7 +262,7 @@ Agents are still best treated as **single-prompt workers**. The prompt at spawn 
 - **Lead → Agent via resume**: Use `follow_up_agent`. It replaces/resumes the logical agent through the backend CLI's native resume command instead of relying on inbox polling.
 - **Multi-turn conversation**: Keep it deliberate. Use explicit `follow_up_agent` calls and verify each turn through `check_agent`.
 
-**Recommended pattern**: Spawn an agent per task. Put everything it needs in the prompt. Have it report back via `send_message` or rely on `check_agent` fallback output. For a second turn, use `follow_up_agent` and verify that `backend_session_id` remains stable.
+**Recommended pattern**: Spawn an agent per task. Put everything it needs in the prompt. Have it report back via `send_message` or rely on `check_agent(name, full=True)` fallback output. For a second turn, use `follow_up_agent` and verify that `backend_session_id` remains stable.
 
 ### Smoke-Tested Resume Chain
 
@@ -223,7 +272,7 @@ The native resume path has been smoke-tested with this chain:
 lead -> Claude Code orchestrator -> Codex CLI target
 ```
 
-The Claude orchestrator spawned a passive Codex target, observed its base answer with `check_agent`, called `follow_up_agent(..., replace_if_idle=true)`, and observed the follow-up answer. The Codex `backend_session_id` stayed unchanged across the base and follow-up turns, confirming that the follow-up resumed the same backend session.
+The Claude orchestrator spawned a passive Codex target, observed its base answer with `check_agent(name, full=True)`, called `follow_up_agent(..., replace_if_idle=true)`, and observed the follow-up answer. The Codex `backend_session_id` stayed unchanged across the base and follow-up turns, confirming that the follow-up resumed the same backend session.
 
 ## Spawn Options
 

@@ -203,6 +203,7 @@ class CodexBackend(BaseBackend):
             "-C",
             request.cwd,
             *self._mcp_identity_args(request),
+            *self._hook_override_args(request),
         ]
 
         if request.reasoning_effort:
@@ -229,6 +230,7 @@ class CodexBackend(BaseBackend):
             "-C",
             request.cwd,
             *self._mcp_identity_args(request),
+            *self._hook_override_args(request),
         ]
 
         if request.reasoning_effort:
@@ -243,6 +245,29 @@ class CodexBackend(BaseBackend):
             ]
         )
         return cmd
+
+    @staticmethod
+    def _hook_override_args(request: SpawnRequest) -> list[str]:
+        """Return the Codex ``-c`` hook-override argv when explicitly enabled.
+
+        Gated OFF by default behind env ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX``
+        (awaits a runtime spike confirming Codex accepts a hooks table via
+        ``-c``). ``request.extra["hook_overrides"]`` carries the JSON-encoded
+        argv list produced by
+        :func:`claude_teams.hooks.codex_hook_overrides`.
+        """
+        if os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "0").strip() != "1":
+            return []
+        raw = (request.extra or {}).get("hook_overrides")
+        if not raw:
+            return []
+        try:
+            args = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            return []
+        return args
 
     def _mcp_identity_args(self, request: SpawnRequest) -> list[str]:
         """Build a per-spawn ``-c`` override carrying this agent's identity.

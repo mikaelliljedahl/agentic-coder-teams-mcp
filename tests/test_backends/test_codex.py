@@ -260,6 +260,58 @@ class TestCodexMcpIdentity:
             backend.build_command(request)
 
 
+class TestCodexHookOverrides:
+    def test_build_command_omits_hook_overrides_by_default(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", raising=False)
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
+        )
+
+        cmd = backend.build_command(request)
+
+        assert not any("hooks." in arg for arg in cmd)
+
+    def test_build_command_includes_hook_overrides_when_enabled(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "1")
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
+        )
+
+        cmd = backend.build_command(request)
+
+        assert "hooks.Stop=[]" in cmd
+
+    def test_build_resume_command_includes_hook_overrides_when_enabled(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "1")
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
+        )
+
+        cmd = backend.build_resume_command(request, "resume-session-id")
+
+        assert "hooks.Stop=[]" in cmd
+
+    def test_build_command_omits_hook_overrides_when_extra_missing(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "1")
+        backend = CodexBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert not any("hooks." in arg for arg in cmd)
+
+
 class TestCodexAgentSelect:
     def test_spec_advertises_c_agents_template(self):
         backend = CodexBackend()
