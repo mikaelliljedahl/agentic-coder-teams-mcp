@@ -1,5 +1,7 @@
 """Tests for MCP tool descriptions exposed from docstrings."""
 
+import pytest
+
 from claude_teams import server_simple
 
 
@@ -46,16 +48,38 @@ def _assert_disk_contract_note(description: str) -> None:
     assert "Codex" in description
 
 
-def test_agent_status_description_documents_disk_contract_and_both_recipes() -> None:
-    description = server_simple.agent_status.__doc__ or ""
+async def _registered_description(tool_name: str) -> str:
+    """Return the client-visible ``Tool.description`` FastMCP registered.
+
+    This is the description FastMCP parsed from the docstring at
+    ``@mcp.tool()`` decoration time, i.e. exactly what a client sees from
+    ``list_tools``/``get_tool``. It is distinct from ``func.__doc__``, which
+    can be mutated after registration without affecting the client-visible
+    schema.
+    """
+    tool = await server_simple.mcp.get_tool(tool_name)
+    return tool.description or ""
+
+
+@pytest.mark.asyncio
+async def test_agent_status_description_documents_disk_contract_and_both_recipes() -> (
+    None
+):
+    description = await _registered_description("agent_status")
     _assert_disk_contract_note(description)
 
 
-def test_check_agent_description_documents_disk_contract_and_both_recipes() -> None:
-    description = server_simple.check_agent.__doc__ or ""
+@pytest.mark.asyncio
+async def test_check_agent_description_documents_disk_contract_and_both_recipes() -> (
+    None
+):
+    description = await _registered_description("check_agent")
     _assert_disk_contract_note(description)
 
 
-def test_list_agents_description_documents_disk_contract_and_both_recipes() -> None:
-    description = server_simple.list_agents.__doc__ or ""
+@pytest.mark.asyncio
+async def test_list_agents_description_documents_disk_contract_and_both_recipes() -> (
+    None
+):
+    description = await _registered_description("list_agents")
     _assert_disk_contract_note(description)

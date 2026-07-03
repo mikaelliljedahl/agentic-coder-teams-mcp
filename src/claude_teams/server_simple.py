@@ -495,6 +495,19 @@ Recommended low-token loop: watch the marker path(s) (from spawn_agent's
 """.strip()
 
 
+def _with_disk_note(fn):
+    """Append ``_DISK_CONTRACT_NOTE`` to ``fn.__doc__`` before registration.
+
+    Must be applied BELOW ``@mcp.tool()`` (i.e. closer to the function) so it
+    runs first and the note is part of the docstring FastMCP parses at
+    decoration time. Appending to ``__doc__`` after ``@mcp.tool()`` has
+    already run only mutates the function object, not the registered
+    ``Tool.description`` that clients actually see.
+    """
+    fn.__doc__ = (fn.__doc__ or "") + "\n\n" + _DISK_CONTRACT_NOTE
+    return fn
+
+
 def _empty_agent_check(name: str, *, full: bool = False) -> dict:
     """Return a stable empty ``check_agent`` payload for an unknown agent."""
     compact = {
@@ -1059,6 +1072,7 @@ async def read_messages(
 
 
 @mcp.tool()
+@_with_disk_note
 async def check_agent(
     name: str, full: bool = False, max_chars: int = _DEFAULT_LAST_LINE_MAX_CHARS
 ) -> dict:
@@ -1113,9 +1127,6 @@ async def check_agent(
             return view
 
     return await run_blocking(_do_check)
-
-
-check_agent.__doc__ = (check_agent.__doc__ or "") + "\n\n" + _DISK_CONTRACT_NOTE
 
 
 @mcp.tool()
@@ -1316,6 +1327,7 @@ def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:
 
 
 @mcp.tool()
+@_with_disk_note
 async def list_agents(full: bool = False) -> list[dict]:
     """List all agents with compact status rows.
 
@@ -1356,9 +1368,6 @@ async def list_agents(full: bool = False) -> list[dict]:
     return await run_blocking(_do_list)
 
 
-list_agents.__doc__ = (list_agents.__doc__ or "") + "\n\n" + _DISK_CONTRACT_NOTE
-
-
 def _agent_status_row(session_id: str, agent: dict) -> dict:
     """Build one ``agent_status`` row (marker + cursor reads only, no scan)."""
     name = str(agent.get("name") or "")
@@ -1388,6 +1397,7 @@ def _agent_status_row(session_id: str, agent: dict) -> dict:
 
 
 @mcp.tool()
+@_with_disk_note
 async def agent_status(names: list[str] | None = None) -> list[dict]:
     """Return cheap per-agent status rows: no bodies, no transcript scan.
 
@@ -1423,9 +1433,6 @@ async def agent_status(names: list[str] | None = None) -> list[dict]:
         return [_agent_status_row(session_id, agent) for agent in agents]
 
     return await run_blocking(_do_status)
-
-
-agent_status.__doc__ = (agent_status.__doc__ or "") + "\n\n" + _DISK_CONTRACT_NOTE
 
 
 @mcp.tool()

@@ -61,26 +61,34 @@ def backends(
     console.print(table)
 
 
-def _snapshot_mtimes(session_dir: Path, pattern: str) -> dict[str, float]:
-    """Return ``{path: mtime}`` for files in ``session_dir`` matching ``pattern``."""
-    snapshot: dict[str, float] = {}
+def _snapshot_mtimes(session_dir: Path, pattern: str) -> dict[str, tuple[int, int]]:
+    """Return ``{path: (mtime_ns, size)}`` for files matching ``pattern``.
+
+    Using ``(mtime_ns, size)`` instead of a bare ``st_mtime`` float catches
+    same-second (or same-tick) atomic-replace/rewrites that preserve the
+    exposed mtime but change file size, not just mtime increases.
+    """
+    snapshot: dict[str, tuple[int, int]] = {}
     if not session_dir.is_dir():
         return snapshot
     for entry in session_dir.iterdir():
         if entry.is_file() and fnmatch.fnmatch(entry.name, pattern):
             try:
-                snapshot[str(entry)] = entry.stat().st_mtime
+                stat = entry.stat()
+                snapshot[str(entry)] = (stat.st_mtime_ns, stat.st_size)
             except OSError:
                 continue
     return snapshot
 
 
-def _changed_paths(before: dict[str, float], after: dict[str, float]) -> list[str]:
-    """Return paths that are new in ``after`` or whose mtime advanced."""
+def _changed_paths(
+    before: dict[str, tuple[int, int]], after: dict[str, tuple[int, int]]
+) -> list[str]:
+    """Return paths that are new in ``after`` or whose ``(mtime_ns, size)`` differs."""
     changed = []
-    for path, mtime in after.items():
+    for path, identity in after.items():
         prior = before.get(path)
-        if prior is None or mtime > prior:
+        if prior is None or identity != prior:
             changed.append(path)
     return changed
 
