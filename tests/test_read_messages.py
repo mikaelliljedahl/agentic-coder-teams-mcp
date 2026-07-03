@@ -310,6 +310,36 @@ def test_limit_advances_each_sender_only_by_what_was_delivered(inbox: Path) -> N
     assert second["has_more"] is False
 
 
+def test_negative_limit_raises_value_error(inbox: Path) -> None:
+    _append(inbox, "A", "a1")
+
+    with pytest.raises(ValueError, match="limit"):
+        _read(from_agent="A", limit=-1)
+
+
+def test_limit_zero_returns_empty_batch_no_cursor_advance(inbox: Path) -> None:
+    _append(inbox, "A", "a1")
+    _append(inbox, "A", "a2")
+
+    result = _read(from_agent="A", limit=0)
+
+    assert _texts(result) == []
+    assert result["has_more"] is True
+    # Cursor must not advance past what was actually read (nothing).
+    assert result["seq"] == 0
+
+    # A follow-up unfiltered read still sees both original messages.
+    follow_up = _read(from_agent="A")
+    assert _texts(follow_up) == ["a1", "a2"]
+
+
+def test_limit_zero_has_more_false_when_nothing_pending(inbox: Path) -> None:
+    result = _read(from_agent="A", limit=0)
+
+    assert _texts(result) == []
+    assert result["has_more"] is False
+
+
 def test_max_chars_none_does_not_add_truncation_fields(inbox: Path) -> None:
     _append(inbox, "A", "hello")
 

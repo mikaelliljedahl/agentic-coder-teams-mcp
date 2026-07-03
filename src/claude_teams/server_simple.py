@@ -69,6 +69,9 @@ def _idle_seconds() -> float:
         return _FOLLOW_UP_IDLE_SECONDS
 
 
+_VALID_MARKER_STATES: frozenset[str] = frozenset({"running", "waiting"})
+
+
 def _resolve_agent_state(
     *,
     alive: bool,
@@ -80,14 +83,17 @@ def _resolve_agent_state(
 
     Precedence: liveness gates everything (a dead process is always
     ``"dead"``, even with a stale ``"running"`` marker); then a hook-written
-    marker's state is used verbatim; otherwise fall back to an
-    activity-recency heuristic (``"running"`` vs ``"idle"``).
+    marker's state is used when it is one of the public enum values
+    ``{"running", "waiting"}``; any other marker state (missing, malformed,
+    or semantically invalid, e.g. ``"paused"``) is treated as absent and
+    falls back to an activity-recency heuristic (``"running"`` vs
+    ``"idle"``).
     """
     if not alive:
         return "dead"
     if marker is not None:
         state = marker.get("state")
-        if isinstance(state, str) and state:
+        if isinstance(state, str) and state in _VALID_MARKER_STATES:
             return state
     if last_activity_at is None:
         return "idle"
@@ -439,6 +445,7 @@ def _empty_agent_check(name: str, *, full: bool = False) -> dict:
         "last_line": "",
         "seq": 0,
         "truncated": False,
+        "full_len": 0,
     }
     if not full:
         return compact
@@ -566,7 +573,7 @@ def _compact_check_view(
         marker=marker,
         last_activity_at=internal.get("last_activity_at"),
     )
-    last_line, truncated, _ = _truncate(
+    last_line, truncated, full_len = _truncate(
         _last_non_empty_line(internal.get("last_message")), max_chars
     )
     seq = _sender_message_count(session_id, IDENTITY, name)
@@ -582,6 +589,7 @@ def _compact_check_view(
         "last_line": last_line,
         "seq": seq,
         "truncated": truncated,
+        "full_len": full_len,
     }
 
 
@@ -802,11 +810,18 @@ async def read_messages(
 
     ``limit`` bounds the batch (default 50 when ``full=False``); ``has_more``
     is set when the batch was clipped. ``full=True`` ignores ``limit``.
+    ``limit=0`` is a no-body watermark poll: it returns an empty
+    ``messages`` list without advancing any cursor past what was already
+    read, while ``cursors``/``seq``/``has_more`` still reflect the current
+    state. Negative ``limit`` values raise ``ValueError``.
     ``max_chars`` truncates each message's ``text`` (``truncated``/
     ``full_len`` added per message) when set.
     """
     if since_seq is not None and not from_agent:
         msg = "since_seq requires from_agent to be set"
+        raise ValueError(msg)
+    if limit is not None and limit < 0:
+        msg = "limit must not be negative"
         raise ValueError(msg)
 
     session_id = _active_session_id()
@@ -880,7 +895,9 @@ async def read_messages(
                     if position >= start
                 ]
 
-            effective_limit = None if full else (limit or _DEFAULT_READ_LIMIT)
+            effective_limit = (
+                None if full else (_DEFAULT_READ_LIMIT if limit is None else limit)
+            )
             selected: list[tuple[str, int, int, dict]] = [
                 (sender, position, index, msg)
                 for sender in relevant
@@ -949,11 +966,12 @@ async def check_agent(
 
     Default (``full=False``) returns a compact status peek: ``{name, state,
     alive, pid, backend, last_activity_at, unread_count, last_line, seq,
-    truncated}``. ``state`` is ``running``/``waiting``/``idle``/``dead``.
+    truncated, full_len}``. ``state`` is ``running``/``waiting``/``idle``/``dead``.
     ``last_line`` is the last non-empty line of the agent's most recent
     assistant message, clipped to ``max_chars`` (default 200); ``truncated``
-    signals clipping happened. ``unread_count``/``seq`` count messages FROM
-    this agent addressed to the caller.
+    signals clipping happened and ``full_len`` is the untruncated character
+    count. ``unread_count``/``seq`` count messages FROM this agent addressed
+    to the caller.
 
     Pass ``full=True`` to restore the full ``last_message`` (bounded to 1000
     chars) and ``backend_session_id`` for follow-up/resume workflows.
@@ -1152,12 +1170,24 @@ async def kill_agent(name: str) -> dict:
     return await run_blocking(_do_kill)
 
 
+def _marker_timestamp(marker: dict | None) -> float | None:
+    """Return a numeric marker ``ts`` when present, else ``None``."""
+    if marker is None:
+        return None
+    ts = marker.get("ts")
+    if isinstance(ts, int | float) and not isinstance(ts, bool):
+        return float(ts)
+    return None
+
+
 def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:
     """Build a compact ``list_agents`` row (no leaked internal fields)."""
     name = str(agent.get("name") or "")
     marker = _read_state_marker(session_id, name)
-    output = _read_agent_output(agent) if marker is None else None
-    last_activity_at = output.last_activity_at if output else None
+    last_activity_at = _marker_timestamp(marker)
+    if last_activity_at is None:
+        output = _read_agent_output(agent)
+        last_activity_at = output.last_activity_at if output else None
     state = _resolve_agent_state(
         alive=alive, marker=marker, last_activity_at=last_activity_at
     )
@@ -1180,7 +1210,8 @@ async def list_agents(full: bool = False) -> list[dict]:
     Default (``full=False``) rows are ``{name, state, alive, pid, backend,
     last_activity_at, unread_count}`` — no transcript bodies. Pass
     ``full=True`` to restore each agent's raw registry record plus
-    ``last_line`` (the last non-empty line of its most recent message).
+    ``last_line`` (the last non-empty line of its most recent message),
+    ``truncated``, and ``full_len`` (the untruncated character count).
     """
     session_id = _active_session_id()
 
@@ -1195,11 +1226,19 @@ async def list_agents(full: bool = False) -> list[dict]:
                 result.append(_list_agents_row(session_id, agent, alive))
                 continue
             output = _read_agent_output(agent)
-            last_line, _, _ = _truncate(
+            last_line, truncated, full_len = _truncate(
                 _last_non_empty_line(output.last_message if output else None),
                 _DEFAULT_LAST_LINE_MAX_CHARS,
             )
-            result.append({**agent, "alive": alive, "last_line": last_line})
+            result.append(
+                {
+                    **agent,
+                    "alive": alive,
+                    "last_line": last_line,
+                    "truncated": truncated,
+                    "full_len": full_len,
+                }
+            )
         return result
 
     return await run_blocking(_do_list)
@@ -1210,11 +1249,7 @@ def _agent_status_row(session_id: str, agent: dict) -> dict:
     name = str(agent.get("name") or "")
     alive, _ = process_manager.health_check(str(agent.get("pid")))
     marker = _read_state_marker(session_id, name)
-    last_activity_ts: float | None = None
-    if marker is not None:
-        ts = marker.get("ts")
-        if isinstance(ts, int | float):
-            last_activity_ts = float(ts)
+    last_activity_ts = _marker_timestamp(marker)
     if last_activity_ts is None:
         output = _read_agent_output(agent)
         last_activity_ts = output.last_activity_at if output else None

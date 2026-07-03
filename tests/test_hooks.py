@@ -157,6 +157,40 @@ class TestResolveAgentState:
         )
         assert result == "idle"
 
+    def test_empty_marker_dict_falls_back_to_heuristic(self) -> None:
+        result = hooks_resolve_agent_state(
+            alive=True, marker={}, last_activity_at=1000.0, now=1010.0
+        )
+        assert result == "running"
+
+    def test_invalid_marker_state_falls_back_to_heuristic(self) -> None:
+        marker = {"state": "paused", "ts": 1000.0}
+        result = hooks_resolve_agent_state(
+            alive=True, marker=marker, last_activity_at=1000.0, now=1010.0
+        )
+        assert result == "running"
+
+    def test_invalid_marker_state_falls_back_to_idle_when_stale(self) -> None:
+        marker = {"state": "paused", "ts": 1000.0}
+        result = hooks_resolve_agent_state(
+            alive=True, marker=marker, last_activity_at=1000.0, now=1100.0
+        )
+        assert result == "idle"
+
+    def test_missing_ts_in_marker_still_uses_valid_state(self) -> None:
+        marker = {"state": "waiting"}
+        result = hooks_resolve_agent_state(
+            alive=True, marker=marker, last_activity_at=None, now=1100.0
+        )
+        assert result == "waiting"
+
+    def test_non_numeric_ts_does_not_affect_valid_state(self) -> None:
+        marker = {"state": "running", "ts": "not-a-number"}
+        result = hooks_resolve_agent_state(
+            alive=True, marker=marker, last_activity_at=1000.0, now=1010.0
+        )
+        assert result == "running"
+
 
 def hooks_resolve_agent_state(
     *, alive: bool, marker: dict | None, last_activity_at: float | None, now: float

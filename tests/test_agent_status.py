@@ -75,6 +75,7 @@ class TestCheckAgentCompactShape:
             "last_line",
             "seq",
             "truncated",
+            "full_len",
         }
         assert "last_message" not in result
         assert "backend_session_id" not in result
@@ -105,6 +106,32 @@ class TestCheckAgentCompactShape:
 
         assert len(result["last_line"]) == 50
         assert result["truncated"] is True
+        assert result["full_len"] == 500
+
+    def test_full_len_present_and_equal_when_not_truncated(
+        self, session: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _add_agent(session)
+        monkeypatch.setattr(
+            server_simple.process_manager, "health_check", lambda pid: (True, "")
+        )
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            server_simple,
+            "_read_agent_output",
+            lambda agent: SimpleNamespace(
+                last_activity_at=1000.0,
+                last_message="short line",
+                backend_session_id=None,
+                busy_hint=False,
+            ),
+        )
+
+        result = asyncio.run(server_simple.check_agent("worker"))
+
+        assert result["truncated"] is False
+        assert result["full_len"] == len("short line")
 
     def test_full_true_restores_last_message_and_session_id(
         self, session: str, monkeypatch: pytest.MonkeyPatch
@@ -135,6 +162,8 @@ class TestCheckAgentCompactShape:
         result = asyncio.run(server_simple.check_agent("ghost"))
         assert result["state"] == "dead"
         assert result["alive"] is False
+        assert result["full_len"] == 0
+        assert result["truncated"] is False
 
     def test_unread_count_counts_messages_from_named_agent(
         self, session: str, monkeypatch: pytest.MonkeyPatch
@@ -246,6 +275,26 @@ class TestListAgentsCompactRows:
 
         assert isinstance(result, list)
 
+    def test_marker_present_uses_marker_ts_no_transcript_scan(
+        self, session: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _add_agent(session)
+        _write_marker(session, "worker", "waiting", ts=1234.5)
+        monkeypatch.setattr(
+            server_simple.process_manager, "health_check", lambda pid: (True, "")
+        )
+
+        def fail_read(agent: dict) -> None:
+            pytest.fail(
+                "list_agents must not scan the transcript when a marker exists"
+            )
+
+        monkeypatch.setattr(server_simple, "_read_agent_output", fail_read)
+
+        result = asyncio.run(server_simple.list_agents())
+
+        assert result[0]["last_activity_at"] == 1234.5
+
     def test_full_true_includes_raw_record_and_last_line(
         self, session: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -271,6 +320,36 @@ class TestListAgentsCompactRows:
         row = result[0]
         assert row["model"] == "sonnet"
         assert row["last_line"] == "line two"
+        assert row["truncated"] is False
+        assert row["full_len"] == len("line two")
+
+    def test_full_true_last_line_truncation_metadata(
+        self, session: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _add_agent(session, model="sonnet")
+        monkeypatch.setattr(
+            server_simple.process_manager, "health_check", lambda pid: (True, "")
+        )
+        from types import SimpleNamespace
+
+        long_line = "y" * 500
+        monkeypatch.setattr(
+            server_simple,
+            "_read_agent_output",
+            lambda agent: SimpleNamespace(
+                last_activity_at=1000.0,
+                last_message=long_line,
+                backend_session_id=None,
+                busy_hint=False,
+            ),
+        )
+
+        result = asyncio.run(server_simple.list_agents(full=True))
+
+        row = result[0]
+        assert len(row["last_line"]) == server_simple._DEFAULT_LAST_LINE_MAX_CHARS
+        assert row["truncated"] is True
+        assert row["full_len"] == 500
 
 
 class TestAgentStatus:
