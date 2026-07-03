@@ -308,6 +308,34 @@ class TestCodexHookOverrides:
         assert "worker" in escaped
         assert "sessions" in escaped
 
+    def test_command_tokens_are_double_quoted_not_single_quoted(
+        self, tmp_path: Path
+    ) -> None:
+        # Regression: Codex runs a ``command`` hook through the platform shell,
+        # which on Windows is ``cmd.exe``. There a single quote is a literal
+        # character, so a single-quoted command (``'python' '-m' ...``) is not
+        # recognized and the hook exits 1 on every event. The command tokens
+        # must be DOUBLE-quoted (escaped to ``\"`` inside the TOML basic string).
+        args = hooks.codex_hook_overrides(tmp_path, "worker")
+        post_value = next(
+            v
+            for k, v in zip(args[0::2], args[1::2], strict=True)
+            if k == "-c" and v.startswith("hooks.PostToolUse=")
+        )
+        marker = 'command="'
+        start = post_value.index(marker) + len(marker)
+        end = post_value.rindex('"')
+        escaped = post_value[start:end]
+        # The interpreter/args must be wrapped in escaped double quotes...
+        assert '\\"' in escaped, f"expected escaped double quotes, got: {escaped!r}"
+        # ...and never in single quotes (which cmd.exe treats literally).
+        # Decode the TOML basic string to the real shell command Codex runs.
+        decoded = escaped.replace('\\"', '"').replace("\\\\", "\\")
+        assert "'" not in decoded, f"single-quoted tokens break cmd.exe: {decoded!r}"
+        assert decoded.startswith('"'), f"command must start double-quoted: {decoded!r}"
+        assert "claude_teams.hooks" in decoded
+        assert "worker" in decoded
+
     def test_command_reads_event_from_stdin_and_takes_session_dir_and_agent_args(
         self,
     ) -> None:
