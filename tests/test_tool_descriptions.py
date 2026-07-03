@@ -30,3 +30,32 @@ def test_list_agents_description_documents_full_len() -> None:
     description = server_simple.list_agents.__doc__ or ""
 
     assert "full_len" in description
+
+
+def _assert_disk_contract_note(description: str) -> None:
+    """Shared assertions for the item-2 uniform disk-contract docstring note."""
+    assert "state-{name}.json" in description
+    assert '"state"' in description
+    assert '"event"' in description
+    assert '"ts"' in description
+    assert "auto-restart" in description
+    assert "tight-poll" in description
+    assert "background" in description.lower()
+    assert "foreground" in description.lower()
+    assert "Claude Code" in description
+    assert "Codex" in description
+
+
+def test_agent_status_description_documents_disk_contract_and_both_recipes() -> None:
+    description = server_simple.agent_status.__doc__ or ""
+    _assert_disk_contract_note(description)
+
+
+def test_check_agent_description_documents_disk_contract_and_both_recipes() -> None:
+    description = server_simple.check_agent.__doc__ or ""
+    _assert_disk_contract_note(description)
+
+
+def test_list_agents_description_documents_disk_contract_and_both_recipes() -> None:
+    description = server_simple.list_agents.__doc__ or ""
+    _assert_disk_contract_note(description)

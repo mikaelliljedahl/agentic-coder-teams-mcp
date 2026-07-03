@@ -69,6 +69,42 @@ def _idle_seconds() -> float:
         return _FOLLOW_UP_IDLE_SECONDS
 
 
+STALL_SECONDS: float = 300.0
+
+
+def _stall_seconds() -> float:
+    """Return the stall threshold, overridable via ``WIN_AGENT_TEAMS_STALL_SECONDS``."""
+    raw = os.environ.get("WIN_AGENT_TEAMS_STALL_SECONDS", "").strip()
+    if not raw:
+        return STALL_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        return STALL_SECONDS
+
+
+def _heartbeat_fields(
+    *, alive: bool, state: str, last_activity_ts: float | None, now: float | None = None
+) -> tuple[float | None, bool]:
+    """Return ``(heartbeat_age_s, stalled)`` derived purely from disk-backed signals.
+
+    ``heartbeat_age_s`` is ``now - last_activity_ts`` (``None`` when no
+    activity signal is available at all). ``stalled`` is ``True`` only when
+    the agent is alive, its resolved ``state`` is neither ``"waiting"`` nor
+    ``"dead"``, and ``heartbeat_age_s`` exceeds ``_stall_seconds()``.
+    """
+    if last_activity_ts is None:
+        return None, False
+    current = time.time() if now is None else now
+    heartbeat_age_s = current - last_activity_ts
+    stalled = (
+        alive
+        and state not in {"waiting", "dead"}
+        and heartbeat_age_s > _stall_seconds()
+    )
+    return heartbeat_age_s, stalled
+
+
 _VALID_MARKER_STATES: frozenset[str] = frozenset({"running", "waiting"})
 
 
@@ -431,6 +467,33 @@ def _truncate(text: str | None, max_chars: int | None) -> tuple[str, bool, int]:
 
 _DEFAULT_LAST_LINE_MAX_CHARS = 200
 
+# Shared disk-contract + watch-recipe note, appended verbatim to the
+# docstrings of agent_status/check_agent/list_agents/agent_watch_paths (item
+# 2/3 of the coordinator-event-loop plan). The consuming agent only ever
+# reads tool docstrings and tool return values, never the README, so this
+# text (not any repo doc) is the actual contract surface.
+_DISK_CONTRACT_NOTE = """
+Disk contract: each agent's state is written by an injected lifecycle hook
+to `state-{name}.json` under the session dir, schema
+`{"state": "running" | "waiting", "event": "<hook>", "ts": <float epoch>}`.
+This file is on disk and survives MCP server restarts; this tool is cheap
+and auto-restarts the server if it had died from host idle timeout. Do not
+tight-poll this tool — use the watch recipe below instead.
+
+Recommended low-token loop: watch the marker path(s) (from spawn_agent's
+`state_marker_path`/`session_dir`/`expected_outputs`, or from
+`agent_watch_paths`) for a change, then call this tool for the delta.
+
+- Claude Code coordinator: run the watch as a BACKGROUND command. Its
+  completion triggers a harness wake for the idle coordinator; when woken,
+  call this tool.
+- Codex coordinator: Codex has no idle-wake, so run the watch as a BOUNDED
+  FOREGROUND command within the same turn (e.g. `win-agent-teams watch
+  <session-dir> --timeout 60`, looped). On return, read the marker JSON
+  directly from disk as the primary post-change read (server-independent),
+  and treat this tool as an optional richer follow-up.
+""".strip()
+
 
 def _empty_agent_check(name: str, *, full: bool = False) -> dict:
     """Return a stable empty ``check_agent`` payload for an unknown agent."""
@@ -446,6 +509,8 @@ def _empty_agent_check(name: str, *, full: bool = False) -> dict:
         "seq": 0,
         "truncated": False,
         "full_len": 0,
+        "heartbeat_age_s": None,
+        "stalled": False,
     }
     if not full:
         return compact
@@ -578,6 +643,14 @@ def _compact_check_view(
     )
     seq = _sender_message_count(session_id, IDENTITY, name)
     unread_count = _sender_unread_count(session_id, IDENTITY, name)
+    heartbeat_source = _marker_timestamp(marker)
+    if heartbeat_source is None:
+        heartbeat_source = internal.get("last_activity_at")
+    heartbeat_age_s, stalled = _heartbeat_fields(
+        alive=bool(internal.get("alive")),
+        state=state,
+        last_activity_ts=heartbeat_source,
+    )
     return {
         "name": name,
         "state": state,
@@ -590,6 +663,8 @@ def _compact_check_view(
         "seq": seq,
         "truncated": truncated,
         "full_len": full_len,
+        "heartbeat_age_s": heartbeat_age_s,
+        "stalled": stalled,
     }
 
 
@@ -669,11 +744,33 @@ async def spawn_agent(
     cwd: str = "",
     permission_mode: str = "bypass",
     reasoning_effort: str = "",
+    expected_outputs: list[str] | None = None,
 ) -> dict:
     """Spawn a new agent process.
 
     reasoning_effort: low/medium/high/xhigh for codex,
     low/medium/high/xhigh/max for claude-code.
+
+    expected_outputs (optional): the exact file paths you are instructing the
+    agent to create. Echoed back verbatim in the result so you can watch
+    those precise paths for completion.
+
+    The result includes the disk-backed coordination contract: an injected
+    lifecycle hook writes this agent's state to ``state_marker_path``
+    (absolute path to ``state-{name}.json``) on every state transition. The
+    marker JSON schema is ``{"state": "running" | "waiting", "event":
+    "<hook>", "ts": <float epoch seconds>}``. This file is on disk and
+    survives MCP server restarts — the server auto-restarts on the next tool
+    call, so you can always re-query even after it died from host
+    inactivity.
+
+    Recommended coordination pattern: do NOT tight-poll. Instead background-
+    watch ``session_dir`` (or the declared ``expected_outputs`` paths, the
+    precise-target variant) for a change, then call ``agent_status`` (or
+    ``check_agent``) once the watch reports a change. See the ``agent_status``
+    /``check_agent``/``list_agents``/``agent_watch_paths`` docstrings for the
+    full watch recipe (background watch for Claude Code coordinators,
+    bounded foreground watch for Codex coordinators).
     """
 
     def _do_spawn() -> dict:
@@ -738,6 +835,9 @@ async def spawn_agent(
             "pid": pid,
             "backend": backend_name,
             "session_id": session_id,
+            "state_marker_path": str(_state_marker_file(session_id, agent_name)),
+            "session_dir": str(_session_dir(session_id)),
+            "expected_outputs": list(expected_outputs) if expected_outputs else [],
         }
 
     return await run_blocking(_do_spawn)
@@ -966,12 +1066,21 @@ async def check_agent(
 
     Default (``full=False``) returns a compact status peek: ``{name, state,
     alive, pid, backend, last_activity_at, unread_count, last_line, seq,
-    truncated, full_len}``. ``state`` is ``running``/``waiting``/``idle``/``dead``.
-    ``last_line`` is the last non-empty line of the agent's most recent
-    assistant message, clipped to ``max_chars`` (default 200); ``truncated``
-    signals clipping happened and ``full_len`` is the untruncated character
-    count. ``unread_count``/``seq`` count messages FROM this agent addressed
-    to the caller.
+    truncated, full_len, heartbeat_age_s, stalled}``. ``state`` is
+    ``running``/``waiting``/``idle``/``dead``. ``last_line`` is the last
+    non-empty line of the agent's most recent assistant message, clipped to
+    ``max_chars`` (default 200); ``truncated`` signals clipping happened and
+    ``full_len`` is the untruncated character count. ``unread_count``/``seq``
+    count messages FROM this agent addressed to the caller.
+
+    ``heartbeat_age_s`` (float, disk-derived) is seconds since the agent's
+    last known activity (marker ``ts`` when available, else transcript
+    activity); ``None`` when no activity signal exists yet. ``stalled``
+    (bool) is ``True`` only when the agent is alive, its ``state`` is
+    neither ``waiting`` nor ``dead``, and ``heartbeat_age_s`` exceeds the
+    stall threshold (``STALL_SECONDS``, default 300s, env-overridable via
+    ``WIN_AGENT_TEAMS_STALL_SECONDS``). Answers "alive but hung" from disk
+    alone, with zero transcript bytes.
 
     Pass ``full=True`` to restore the full ``last_message`` (bounded to 1000
     chars) and ``backend_session_id`` for follow-up/resume workflows.
@@ -1004,6 +1113,9 @@ async def check_agent(
             return view
 
     return await run_blocking(_do_check)
+
+
+check_agent.__doc__ = (check_agent.__doc__ or "") + "\n\n" + _DISK_CONTRACT_NOTE
 
 
 @mcp.tool()
@@ -1244,6 +1356,9 @@ async def list_agents(full: bool = False) -> list[dict]:
     return await run_blocking(_do_list)
 
 
+list_agents.__doc__ = (list_agents.__doc__ or "") + "\n\n" + _DISK_CONTRACT_NOTE
+
+
 def _agent_status_row(session_id: str, agent: dict) -> dict:
     """Build one ``agent_status`` row (marker + cursor reads only, no scan)."""
     name = str(agent.get("name") or "")
@@ -1258,12 +1373,17 @@ def _agent_status_row(session_id: str, agent: dict) -> dict:
     )
     seq = _sender_message_count(session_id, IDENTITY, name)
     unread_count = _sender_unread_count(session_id, IDENTITY, name)
+    heartbeat_age_s, stalled = _heartbeat_fields(
+        alive=alive, state=state, last_activity_ts=last_activity_ts
+    )
     return {
         "name": name,
         "state": state,
         "last_activity_ts": last_activity_ts,
         "unread_count": unread_count,
         "seq": seq,
+        "heartbeat_age_s": heartbeat_age_s,
+        "stalled": stalled,
     }
 
 
@@ -1271,10 +1391,20 @@ def _agent_status_row(session_id: str, agent: dict) -> dict:
 async def agent_status(names: list[str] | None = None) -> list[dict]:
     """Return cheap per-agent status rows: no bodies, no transcript scan.
 
-    Each row is exactly ``{name, state, last_activity_ts, unread_count,
-    seq}``. ``seq``/``unread_count`` are the caller's per-sender count for
-    messages FROM that named agent. ``names=None`` returns all agents in the
-    session; otherwise only the named agents (unknown names are skipped).
+    Each row is exactly ``{name, state, last_activity_ts, unread_count, seq,
+    heartbeat_age_s, stalled}``. ``seq``/``unread_count`` are the caller's
+    per-sender count for messages FROM that named agent. ``names=None``
+    returns all agents in the session; otherwise only the named agents
+    (unknown names are skipped).
+
+    ``heartbeat_age_s`` (float, disk-derived) is seconds since the agent's
+    last known activity (marker ``ts`` when available, else transcript
+    activity); ``None`` when no activity signal exists yet. ``stalled``
+    (bool) is ``True`` only when the agent is alive, its ``state`` is
+    neither ``waiting`` nor ``dead``, and ``heartbeat_age_s`` exceeds the
+    stall threshold (``STALL_SECONDS``, default 300s, env-overridable via
+    ``WIN_AGENT_TEAMS_STALL_SECONDS``). Answers "alive but hung" from disk
+    alone, with zero transcript bytes.
 
     Cost model: one state-marker read + one cursor read + one liveness check
     per agent. The marker (written by a Stop/SessionStart/etc. hook) is used
@@ -1293,6 +1423,45 @@ async def agent_status(names: list[str] | None = None) -> list[dict]:
         return [_agent_status_row(session_id, agent) for agent in agents]
 
     return await run_blocking(_do_status)
+
+
+agent_status.__doc__ = (agent_status.__doc__ or "") + "\n\n" + _DISK_CONTRACT_NOTE
+
+
+@mcp.tool()
+async def agent_watch_paths(names: list[str] | None = None) -> list[dict]:
+    """Return each agent's watch path: ``{name, state_marker_path}``.
+
+    Rediscover exactly what to watch when you did not retain a
+    ``spawn_agent`` return (e.g. after resuming a session). ``names=None``
+    returns all agents in the session; otherwise only the named agents
+    (unknown names are skipped). Minimal payload, no bodies.
+
+    Canonical watch recipe: background-watch (or, for a Codex coordinator,
+    bounded-foreground-watch) these ``state_marker_path`` paths — e.g. via
+    ``win-agent-teams watch <session-dir>`` — and call ``agent_status`` (or
+    ``check_agent``) once a watched path changes, rather than tight-polling.
+    """
+    session_id = _active_session_id()
+
+    def _do_watch_paths() -> list[dict]:
+        if not session_id:
+            return []
+        agents = _load_agents(session_id)
+        if names is not None:
+            wanted = set(names)
+            agents = [a for a in agents if a.get("name") in wanted]
+        return [
+            {
+                "name": str(agent.get("name") or ""),
+                "state_marker_path": str(
+                    _state_marker_file(session_id, str(agent.get("name") or ""))
+                ),
+            }
+            for agent in agents
+        ]
+
+    return await run_blocking(_do_watch_paths)
 
 
 @mcp.tool()
