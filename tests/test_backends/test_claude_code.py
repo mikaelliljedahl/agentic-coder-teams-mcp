@@ -269,6 +269,81 @@ class TestClaudeCodeReasoningEffort:
         assert "--effort" not in cmd
 
 
+class TestClaudeCodeHooksSettings:
+    def test_build_command_appends_settings_flag_when_hooks_enabled(
+        self, _make_request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
+        settings_path = tmp_path / "hooks-worker.settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+        backend = ClaudeCodeBackend()
+        request = _make_request(
+            extra={"hooks_settings_path": str(settings_path)}
+        )
+
+        cmd = backend.build_command(request)
+
+        idx = cmd.index("--settings")
+        assert cmd[idx + 1] == str(settings_path)
+
+    def test_build_command_omits_settings_flag_when_hooks_disabled(
+        self, _make_request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS", "0")
+        settings_path = tmp_path / "hooks-worker.settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+        backend = ClaudeCodeBackend()
+        request = _make_request(
+            extra={"hooks_settings_path": str(settings_path)}
+        )
+
+        cmd = backend.build_command(request)
+
+        assert "--settings" not in cmd
+
+    def test_build_command_omits_settings_flag_when_path_absent(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
+        backend = ClaudeCodeBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert "--settings" not in cmd
+
+    def test_build_resume_command_appends_settings_flag_when_hooks_enabled(
+        self, _make_request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
+        settings_path = tmp_path / "hooks-worker.settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+        backend = ClaudeCodeBackend()
+        request = _make_request(
+            extra={"hooks_settings_path": str(settings_path)}
+        )
+
+        cmd = backend.build_resume_command(request, "resume-session-id")
+
+        idx = cmd.index("--settings")
+        assert cmd[idx + 1] == str(settings_path)
+
+    def test_build_resume_command_omits_settings_flag_when_hooks_disabled(
+        self, _make_request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS", "0")
+        settings_path = tmp_path / "hooks-worker.settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+        backend = ClaudeCodeBackend()
+        request = _make_request(
+            extra={"hooks_settings_path": str(settings_path)}
+        )
+
+        cmd = backend.build_resume_command(request, "resume-session-id")
+
+        assert "--settings" not in cmd
+
+
 class TestClaudeCodeAgentSelect:
     def test_spec_advertises_agent_flag(self):
         backend = ClaudeCodeBackend()

@@ -203,6 +203,7 @@ class CodexBackend(BaseBackend):
             "-C",
             request.cwd,
             *self._mcp_identity_args(request),
+            *self._hook_override_args(request),
         ]
 
         if request.reasoning_effort:
@@ -229,6 +230,7 @@ class CodexBackend(BaseBackend):
             "-C",
             request.cwd,
             *self._mcp_identity_args(request),
+            *self._hook_override_args(request),
         ]
 
         if request.reasoning_effort:
@@ -243,6 +245,50 @@ class CodexBackend(BaseBackend):
             ]
         )
         return cmd
+
+    @staticmethod
+    def _hook_override_args(request: SpawnRequest) -> list[str]:
+        """Return the Codex ``-c`` hook-override argv (plus trust-bypass flag).
+
+        Enabled by default (confirmed via runtime spike on codex-cli 0.142.5:
+        the ``-c`` inline hooks-table override is accepted and works,
+        provided ``--dangerously-bypass-hook-trust`` is also passed — without
+        it Codex silently skips injected hooks). Honors the global
+        ``WIN_AGENT_TEAMS_STATE_HOOKS=0`` kill switch and the Codex-specific
+        ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX=0`` override.
+
+        ``request.extra["hook_overrides"]`` carries the JSON-encoded argv
+        list produced by :func:`claude_teams.hooks.codex_hook_overrides`. The
+        trust-bypass flag is only appended alongside actual ``-c`` hook args
+        (i.e. not when ``hook_overrides`` is absent/empty), since there is
+        nothing to trust otherwise.
+        """
+        if not CodexBackend._codex_hooks_enabled():
+            return []
+        raw = (request.extra or {}).get("hook_overrides")
+        if not raw:
+            return []
+        try:
+            args = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(args, list) or not args or not all(
+            isinstance(a, str) for a in args
+        ):
+            return []
+        return [*args, "--dangerously-bypass-hook-trust"]
+
+    @staticmethod
+    def _codex_hooks_enabled() -> bool:
+        """Return whether Codex state hooks are enabled for this process.
+
+        Honors the global ``WIN_AGENT_TEAMS_STATE_HOOKS=0`` kill switch and
+        the Codex-specific ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX=0`` override;
+        enabled by default otherwise.
+        """
+        if os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS", "1").strip() == "0":
+            return False
+        return os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "1").strip() != "0"
 
     def _mcp_identity_args(self, request: SpawnRequest) -> list[str]:
         """Build a per-spawn ``-c`` override carrying this agent's identity.

@@ -20,6 +20,7 @@ else:
 
 from fastmcp import FastMCP
 
+from claude_teams import hooks
 from claude_teams.agent_output import (
     codex_correlation_token,
     read_claude_output,
@@ -55,6 +56,51 @@ _LOCK_RETRY_SECONDS = 0.05
 _LOCK_SIZE = 1
 _FOLLOW_UP_IDLE_SECONDS = 60.0
 logger = logging.getLogger(__name__)
+
+
+def _idle_seconds() -> float:
+    """Return the activity-fallback idle threshold, env-overridable."""
+    raw = os.environ.get("WIN_AGENT_TEAMS_IDLE_SECONDS", "").strip()
+    if not raw:
+        return _FOLLOW_UP_IDLE_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        return _FOLLOW_UP_IDLE_SECONDS
+
+
+_VALID_MARKER_STATES: frozenset[str] = frozenset({"running", "waiting"})
+
+
+def _resolve_agent_state(
+    *,
+    alive: bool,
+    marker: dict | None,
+    last_activity_at: float | None,
+    now: float | None = None,
+) -> str:
+    """Resolve an agent's coarse-grained state.
+
+    Precedence: liveness gates everything (a dead process is always
+    ``"dead"``, even with a stale ``"running"`` marker); then a hook-written
+    marker's state is used when it is one of the public enum values
+    ``{"running", "waiting"}``; any other marker state (missing, malformed,
+    or semantically invalid, e.g. ``"paused"``) is treated as absent and
+    falls back to an activity-recency heuristic (``"running"`` vs
+    ``"idle"``).
+    """
+    if not alive:
+        return "dead"
+    if marker is not None:
+        state = marker.get("state")
+        if isinstance(state, str) and state in _VALID_MARKER_STATES:
+            return state
+    if last_activity_at is None:
+        return "idle"
+    current = time.time() if now is None else now
+    if current - last_activity_at < _idle_seconds():
+        return "running"
+    return "idle"
 
 
 class AgentsFileLockTimeoutError(TimeoutError):
@@ -93,6 +139,23 @@ def _inbox_file(session_id: str, name: str) -> Path:
 def _inbox_cursor_file(session_id: str, name: str) -> Path:
     """Return the per-sender unread-counter sidecar beside an inbox."""
     return _session_dir(session_id) / f"inbox-{name}.pos.json"
+
+
+def _state_marker_file(session_id: str, name: str) -> Path:
+    """Return the hook-written state marker path for an agent (see hooks.py)."""
+    return _session_dir(session_id) / f"state-{name}.json"
+
+
+def _read_state_marker(session_id: str, name: str) -> dict | None:
+    """Read an agent's hook-written state marker, tolerating a missing/corrupt file."""
+    path = _state_marker_file(session_id, name)
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 # In-process serialization of read_messages per inbox name. FastMCP runs the
@@ -349,17 +412,45 @@ def _message_recipient(to: str, session_id: str) -> tuple[str, str | None]:
     return lead_target, warning
 
 
-def _empty_agent_check(name: str) -> dict:
-    """Return a stable empty ``check_agent`` payload."""
-    return {
+def _truncate(text: str | None, max_chars: int | None) -> tuple[str, bool, int]:
+    """Clip ``text`` to ``max_chars``, signalling whether it was truncated.
+
+    Returns ``(clipped, truncated, full_len)``. ``full_len`` is the character
+    count of the untruncated text. ``max_chars=None`` returns the text
+    unclipped; ``max_chars<=0`` clips to an empty string (but still reports
+    ``truncated=True`` when the original text was non-empty).
+    """
+    original = text or ""
+    full_len = len(original)
+    if max_chars is None:
+        return original, False, full_len
+    if full_len <= max_chars:
+        return original, False, full_len
+    return original[: max(max_chars, 0)], True, full_len
+
+
+_DEFAULT_LAST_LINE_MAX_CHARS = 200
+
+
+def _empty_agent_check(name: str, *, full: bool = False) -> dict:
+    """Return a stable empty ``check_agent`` payload for an unknown agent."""
+    compact = {
         "name": name,
+        "state": "dead",
         "alive": False,
         "pid": None,
         "backend": None,
-        "backend_session_id": None,
         "last_activity_at": None,
-        "last_message": None,
+        "unread_count": 0,
+        "last_line": "",
+        "seq": 0,
+        "truncated": False,
+        "full_len": 0,
     }
+    if not full:
+        return compact
+    compact.update({"last_message": None, "backend_session_id": None})
+    return compact
 
 
 def _safe_float(value: object) -> float:
@@ -412,7 +503,12 @@ def _sync_backend_session_id(agent: dict, output) -> bool:
 
 
 def _agent_check_payload(name: str, agent: dict, alive: bool, output) -> dict:
-    """Build the public check payload for an existing agent record."""
+    """Build the rich INTERNAL check payload for an existing agent record.
+
+    Consumed by ``follow_up_agent``/``_follow_up_failure`` (which need the
+    unbounded ``last_message`` to decide busy/idle) and projected down to the
+    compact public ``check_agent`` shape by ``_compact_check_view``.
+    """
     backend_session_id = _stored_backend_session_id(agent)
     return {
         "name": name,
@@ -422,6 +518,78 @@ def _agent_check_payload(name: str, agent: dict, alive: bool, output) -> dict:
         "backend_session_id": backend_session_id,
         "last_activity_at": output.last_activity_at if output else None,
         "last_message": output.last_message if output else None,
+    }
+
+
+def _last_non_empty_line(text: str | None) -> str:
+    """Return the last non-blank line of ``text``, or ``""`` when none exists."""
+    if not text:
+        return ""
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _sender_message_count(session_id: str, reader: str, sender: str) -> int:
+    """Return how many valid messages ``sender`` has sent to ``reader``'s inbox."""
+    inbox = _inbox_file(session_id, reader)
+    if not inbox.exists():
+        return 0
+    count = 0
+    for raw in inbox.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        try:
+            msg = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(msg, dict) and msg.get("from") == sender:
+            count += 1
+    return count
+
+
+def _sender_unread_count(session_id: str, reader: str, sender: str) -> int:
+    """Return ``sender``'s unread (not-yet-consumed) message count for ``reader``."""
+    total = _sender_message_count(session_id, reader, sender)
+    cursors = _load_inbox_cursors(_inbox_cursor_file(session_id, reader))
+    consumed = min(cursors.get(sender, 0), total)
+    return total - consumed
+
+
+def _compact_check_view(
+    session_id: str,
+    name: str,
+    internal: dict,
+    *,
+    max_chars: int = _DEFAULT_LAST_LINE_MAX_CHARS,
+) -> dict:
+    """Project the rich internal check payload to the compact public shape."""
+    marker = _read_state_marker(session_id, name)
+    state = _resolve_agent_state(
+        alive=bool(internal.get("alive")),
+        marker=marker,
+        last_activity_at=internal.get("last_activity_at"),
+    )
+    last_line, truncated, full_len = _truncate(
+        _last_non_empty_line(internal.get("last_message")), max_chars
+    )
+    seq = _sender_message_count(session_id, IDENTITY, name)
+    unread_count = _sender_unread_count(session_id, IDENTITY, name)
+    return {
+        "name": name,
+        "state": state,
+        "alive": internal.get("alive"),
+        "pid": internal.get("pid"),
+        "backend": internal.get("backend"),
+        "last_activity_at": internal.get("last_activity_at"),
+        "unread_count": unread_count,
+        "last_line": last_line,
+        "seq": seq,
+        "truncated": truncated,
+        "full_len": full_len,
     }
 
 
@@ -474,6 +642,24 @@ def _write_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Pat
     return path
 
 
+def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str, str]:
+    """Materialise per-backend hook wiring, added to ``SpawnRequest.extra``.
+
+    Claude Code gets a written settings-file path
+    (``extra["hooks_settings_path"]``); Codex gets a JSON-encoded ``-c``
+    override argv (``extra["hook_overrides"]``) evaluated only when
+    ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX`` is on (see ``CodexBackend``).
+    """
+    session_dir = _session_dir(session_id)
+    if backend_name == "claude-code":
+        settings_path = hooks.write_claude_settings(session_dir, agent_name)
+        return {"hooks_settings_path": str(settings_path)}
+    if backend_name == "codex":
+        overrides = hooks.codex_hook_overrides(session_dir, agent_name)
+        return {"hook_overrides": json.dumps(overrides)}
+    return {}
+
+
 @mcp.tool()
 async def spawn_agent(
     prompt: str,
@@ -510,6 +696,7 @@ async def spawn_agent(
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
+                **_hook_extra(session_id, agent_name, backend_name),
             }
 
             request = SpawnRequest(
@@ -593,14 +780,61 @@ async def send_message(text: str, to: str = "lead") -> dict:
     return await run_blocking(_do_send)
 
 
+_DEFAULT_READ_LIMIT = 50
+
+
 @mcp.tool()
-async def read_messages(from_agent: str = "") -> list[dict]:
-    """Read unread messages from own inbox, optionally filtered by sender."""
+async def read_messages(
+    from_agent: str = "",
+    since_seq: int | None = None,
+    full: bool = False,
+    limit: int | None = None,
+    max_chars: int | None = None,
+) -> dict:
+    """Read unread messages from own inbox, delta-by-default with a watermark.
+
+    Returns ``{messages, cursors, seq, unread_count, has_more}``. Each
+    message is ``{from, text, ts, seq}`` where ``seq`` is that sender's
+    1-based per-sender COUNT after this message (i.e. the sender's
+    high-water mark once this message is consumed) — the same number space
+    as the persisted per-sender cursor. ``cursors`` is the per-sender
+    high-water map; a scalar ``seq`` (instead of ``cursors``) is returned
+    only when ``from_agent`` is set.
+
+    Default (no ``since_seq``) drains and advances the cursor as before,
+    now also returning the watermark. With ``from_agent`` set, pass
+    ``since_seq`` to fetch only that sender's messages with index
+    ``>= since_seq`` and advance the persisted cursor to
+    ``max(current, since_seq)`` (no rewind, no re-delivery/skip at the
+    boundary). ``since_seq`` is invalid without ``from_agent``.
+
+    ``limit`` bounds the batch (default 50 when ``full=False``); ``has_more``
+    is set when the batch was clipped. ``full=True`` ignores ``limit``.
+    ``limit=0`` is a no-body watermark poll: it returns an empty
+    ``messages`` list without advancing any cursor past what was already
+    read, while ``cursors``/``seq``/``has_more`` still reflect the current
+    state. Negative ``limit`` values raise ``ValueError``.
+    ``max_chars`` truncates each message's ``text`` (``truncated``/
+    ``full_len`` added per message) when set.
+    """
+    if since_seq is not None and not from_agent:
+        msg = "since_seq requires from_agent to be set"
+        raise ValueError(msg)
+    if limit is not None and limit < 0:
+        msg = "limit must not be negative"
+        raise ValueError(msg)
+
     session_id = _active_session_id()
 
-    def _do_read() -> list[dict]:
+    def _do_read() -> dict:
         if not session_id:
-            return []
+            return {
+                "messages": [],
+                "cursors": {},
+                "seq": None,
+                "unread_count": 0,
+                "has_more": False,
+            }
         inbox = _inbox_file(session_id, IDENTITY)
         cursor_file = _inbox_cursor_file(session_id, IDENTITY)
         with _inbox_lock(IDENTITY):
@@ -639,43 +873,135 @@ async def read_messages(from_agent: str = "") -> list[dict]:
                 cursors[sender] = min(cursors[sender], observed)
 
             relevant = [from_agent] if from_agent else list(by_sender)
-            unread: list[tuple[int, dict]] = []
+            # start_overrides holds the effective read-start position (a
+            # per-sender COUNT) for THIS call, distinct from the persisted
+            # cursor value used as the no-newly-selected floor below.
+            start_overrides: dict[str, int] = {}
+            if since_seq is not None and from_agent:
+                floor = cursors.get(from_agent, 0)
+                start_overrides[from_agent] = max(since_seq, floor, 0)
+
+            # Per-sender batch entries, each tagged with its PER-SENDER
+            # position (0-based index into that sender's own entries list,
+            # i.e. seq - 1) so the global-index tuples from ``by_sender``
+            # never leak into cross-sender bookkeeping.
+            per_sender_batches: dict[str, list[tuple[int, int, dict]]] = {}
+            for sender in relevant:
+                entries = by_sender.get(sender, [])
+                start = start_overrides.get(sender, cursors.get(sender, 0))
+                per_sender_batches[sender] = [
+                    (position, index, msg)
+                    for position, (index, msg) in enumerate(entries)
+                    if position >= start
+                ]
+
+            effective_limit = (
+                None if full else (_DEFAULT_READ_LIMIT if limit is None else limit)
+            )
+            selected: list[tuple[str, int, int, dict]] = [
+                (sender, position, index, msg)
+                for sender in relevant
+                for position, index, msg in per_sender_batches[sender]
+            ]
+            selected.sort(key=lambda item: item[2])  # global file order
+            has_more = False
+            if effective_limit is not None and len(selected) > effective_limit:
+                selected = selected[:effective_limit]
+                has_more = True
+
             updated = dict(cursors)
             for sender in relevant:
                 entries = by_sender.get(sender, [])
-                start = cursors.get(sender, 0)
-                unread.extend(entries[start:])
-                # Avoid creating a stray zero cursor for an unknown filtered
-                # sender; only persist a count for senders that have messages
-                # or already had a stored cursor.
-                if entries or sender in cursors:
-                    updated[sender] = len(entries)
+                consumed_positions = [
+                    position
+                    for sel_sender, position, _, _ in selected
+                    if sel_sender == sender
+                ]
+                if consumed_positions:
+                    new_count = max(consumed_positions) + 1
+                else:
+                    new_count = start_overrides.get(sender, cursors.get(sender, 0))
+                floor = max(cursors.get(sender, 0), start_overrides.get(sender, 0))
+                new_count = max(new_count, floor)
+                if entries or sender in cursors or sender in start_overrides:
+                    updated[sender] = min(new_count, len(entries))
 
             _save_inbox_cursors(cursor_file, updated)
-            unread.sort(key=lambda item: item[0])
-            return [msg for _, msg in unread]
+
+            messages: list[dict] = []
+            for sender, position, _index, msg in selected:
+                text, truncated, full_len = _truncate(msg.get("text"), max_chars)
+                entry = {
+                    "from": sender,
+                    "text": text,
+                    "ts": msg.get("ts"),
+                    "seq": position + 1,
+                }
+                if max_chars is not None:
+                    entry["truncated"] = truncated
+                    entry["full_len"] = full_len
+                messages.append(entry)
+
+            result: dict = {
+                "messages": messages,
+                "unread_count": len(messages),
+                "has_more": has_more,
+            }
+            if from_agent:
+                result["cursors"] = None
+                result["seq"] = updated.get(from_agent, cursors.get(from_agent, 0))
+            else:
+                result["cursors"] = updated
+                result["seq"] = None
+            return result
 
     return await run_blocking(_do_read)
 
 
 @mcp.tool()
-async def check_agent(name: str) -> dict:
-    """Check whether an agent process is alive."""
+async def check_agent(
+    name: str, full: bool = False, max_chars: int = _DEFAULT_LAST_LINE_MAX_CHARS
+) -> dict:
+    """Check an agent's status: state, last line, and unread message count.
+
+    Default (``full=False``) returns a compact status peek: ``{name, state,
+    alive, pid, backend, last_activity_at, unread_count, last_line, seq,
+    truncated, full_len}``. ``state`` is ``running``/``waiting``/``idle``/``dead``.
+    ``last_line`` is the last non-empty line of the agent's most recent
+    assistant message, clipped to ``max_chars`` (default 200); ``truncated``
+    signals clipping happened and ``full_len`` is the untruncated character
+    count. ``unread_count``/``seq`` count messages FROM this agent addressed
+    to the caller.
+
+    Pass ``full=True`` to restore the full ``last_message`` (bounded to 1000
+    chars) and ``backend_session_id`` for follow-up/resume workflows.
+    """
     session_id = _active_session_id()
 
     def _do_check() -> dict:
         if not session_id:
-            return _empty_agent_check(name)
+            return _empty_agent_check(name, full=full)
         with _agents_transaction(session_id) as agents:
             agent = next((a for a in agents if a["name"] == name), None)
             if agent is None:
-                return _empty_agent_check(name)
+                return _empty_agent_check(name, full=full)
             pid = agent["pid"]
             alive, _ = process_manager.health_check(str(pid))
             output = _read_agent_output(agent)
             if _sync_backend_session_id(agent, output):
                 _save_agents_transaction(session_id, agents)
-            return _agent_check_payload(name, agent, alive, output)
+            internal = _agent_check_payload(name, agent, alive, output)
+            view = _compact_check_view(
+                session_id, name, internal, max_chars=max_chars
+            )
+            if full:
+                view.update(
+                    {
+                        "last_message": internal.get("last_message"),
+                        "backend_session_id": internal.get("backend_session_id"),
+                    }
+                )
+            return view
 
     return await run_blocking(_do_check)
 
@@ -767,6 +1093,7 @@ async def follow_up_agent(
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
+                **_hook_extra(session_id, agent_name, backend_name),
             }
             request = SpawnRequest(
                 agent_id=f"{agent_name}@{session_id}",
@@ -837,14 +1164,55 @@ async def kill_agent(name: str) -> dict:
                 if a["name"] == name:
                     a["status"] = "killed"
             _save_agents_transaction(session_id, agents)
+            _state_marker_file(session_id, name).unlink(missing_ok=True)
             return {"success": True, "name": name}
 
     return await run_blocking(_do_kill)
 
 
+def _marker_timestamp(marker: dict | None) -> float | None:
+    """Return a numeric marker ``ts`` when present, else ``None``."""
+    if marker is None:
+        return None
+    ts = marker.get("ts")
+    if isinstance(ts, int | float) and not isinstance(ts, bool):
+        return float(ts)
+    return None
+
+
+def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:
+    """Build a compact ``list_agents`` row (no leaked internal fields)."""
+    name = str(agent.get("name") or "")
+    marker = _read_state_marker(session_id, name)
+    last_activity_at = _marker_timestamp(marker)
+    if last_activity_at is None:
+        output = _read_agent_output(agent)
+        last_activity_at = output.last_activity_at if output else None
+    state = _resolve_agent_state(
+        alive=alive, marker=marker, last_activity_at=last_activity_at
+    )
+    unread_count = _sender_unread_count(session_id, IDENTITY, name)
+    return {
+        "name": name,
+        "state": state,
+        "alive": alive,
+        "pid": agent.get("pid"),
+        "backend": agent.get("backend"),
+        "last_activity_at": last_activity_at,
+        "unread_count": unread_count,
+    }
+
+
 @mcp.tool()
-async def list_agents() -> list[dict]:
-    """List all agents and their alive status."""
+async def list_agents(full: bool = False) -> list[dict]:
+    """List all agents with compact status rows.
+
+    Default (``full=False``) rows are ``{name, state, alive, pid, backend,
+    last_activity_at, unread_count}`` — no transcript bodies. Pass
+    ``full=True`` to restore each agent's raw registry record plus
+    ``last_line`` (the last non-empty line of its most recent message),
+    ``truncated``, and ``full_len`` (the untruncated character count).
+    """
     session_id = _active_session_id()
 
     def _do_list() -> list[dict]:
@@ -854,10 +1222,77 @@ async def list_agents() -> list[dict]:
         result = []
         for agent in agents:
             alive, _ = process_manager.health_check(str(agent["pid"]))
-            result.append({**agent, "alive": alive})
+            if not full:
+                result.append(_list_agents_row(session_id, agent, alive))
+                continue
+            output = _read_agent_output(agent)
+            last_line, truncated, full_len = _truncate(
+                _last_non_empty_line(output.last_message if output else None),
+                _DEFAULT_LAST_LINE_MAX_CHARS,
+            )
+            result.append(
+                {
+                    **agent,
+                    "alive": alive,
+                    "last_line": last_line,
+                    "truncated": truncated,
+                    "full_len": full_len,
+                }
+            )
         return result
 
     return await run_blocking(_do_list)
+
+
+def _agent_status_row(session_id: str, agent: dict) -> dict:
+    """Build one ``agent_status`` row (marker + cursor reads only, no scan)."""
+    name = str(agent.get("name") or "")
+    alive, _ = process_manager.health_check(str(agent.get("pid")))
+    marker = _read_state_marker(session_id, name)
+    last_activity_ts = _marker_timestamp(marker)
+    if last_activity_ts is None:
+        output = _read_agent_output(agent)
+        last_activity_ts = output.last_activity_at if output else None
+    state = _resolve_agent_state(
+        alive=alive, marker=marker, last_activity_at=last_activity_ts
+    )
+    seq = _sender_message_count(session_id, IDENTITY, name)
+    unread_count = _sender_unread_count(session_id, IDENTITY, name)
+    return {
+        "name": name,
+        "state": state,
+        "last_activity_ts": last_activity_ts,
+        "unread_count": unread_count,
+        "seq": seq,
+    }
+
+
+@mcp.tool()
+async def agent_status(names: list[str] | None = None) -> list[dict]:
+    """Return cheap per-agent status rows: no bodies, no transcript scan.
+
+    Each row is exactly ``{name, state, last_activity_ts, unread_count,
+    seq}``. ``seq``/``unread_count`` are the caller's per-sender count for
+    messages FROM that named agent. ``names=None`` returns all agents in the
+    session; otherwise only the named agents (unknown names are skipped).
+
+    Cost model: one state-marker read + one cursor read + one liveness check
+    per agent. The marker (written by a Stop/SessionStart/etc. hook) is used
+    directly when present; a transcript scan only happens as a fallback when
+    no marker exists yet (e.g. hooks disabled or not yet fired).
+    """
+    session_id = _active_session_id()
+
+    def _do_status() -> list[dict]:
+        if not session_id:
+            return []
+        agents = _load_agents(session_id)
+        if names is not None:
+            wanted = set(names)
+            agents = [a for a in agents if a.get("name") in wanted]
+        return [_agent_status_row(session_id, agent) for agent in agents]
+
+    return await run_blocking(_do_status)
 
 
 @mcp.tool()

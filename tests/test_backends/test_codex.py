@@ -260,6 +260,112 @@ class TestCodexMcpIdentity:
             backend.build_command(request)
 
 
+class TestCodexHookOverrides:
+    def test_build_command_includes_hook_overrides_by_default(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", raising=False)
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
+        )
+
+        cmd = backend.build_command(request)
+
+        assert "hooks.Stop=[]" in cmd
+        assert "--dangerously-bypass-hook-trust" in cmd
+
+    def test_build_command_includes_hook_overrides_when_explicitly_enabled(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "1")
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
+        )
+
+        cmd = backend.build_command(request)
+
+        assert "hooks.Stop=[]" in cmd
+        assert "--dangerously-bypass-hook-trust" in cmd
+
+    def test_build_resume_command_includes_hook_overrides_by_default(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", raising=False)
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
+        )
+
+        cmd = backend.build_resume_command(request, "resume-session-id")
+
+        assert "hooks.Stop=[]" in cmd
+        assert "--dangerously-bypass-hook-trust" in cmd
+
+    def test_build_command_omits_hook_overrides_when_extra_missing(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", raising=False)
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
+        backend = CodexBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert not any("hooks." in arg for arg in cmd)
+        # No hook overrides to trust, but hooks are conceptually enabled;
+        # the trust-bypass flag only accompanies actual -c hook args.
+        assert "--dangerously-bypass-hook-trust" not in cmd
+
+    def test_build_command_omits_hook_overrides_when_codex_specific_disabled(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "0")
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
+        )
+
+        cmd = backend.build_command(request)
+
+        assert not any("hooks." in arg for arg in cmd)
+        assert "--dangerously-bypass-hook-trust" not in cmd
+
+    def test_build_command_omits_hook_overrides_when_global_hooks_disabled(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS", "0")
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", raising=False)
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
+        )
+
+        cmd = backend.build_command(request)
+
+        assert not any("hooks." in arg for arg in cmd)
+        assert "--dangerously-bypass-hook-trust" not in cmd
+
+    def test_build_resume_command_omits_hook_overrides_when_codex_specific_disabled(
+        self, _make_request, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "0")
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
+        )
+
+        cmd = backend.build_resume_command(request, "resume-session-id")
+
+        assert not any("hooks." in arg for arg in cmd)
+        assert "--dangerously-bypass-hook-trust" not in cmd
+
+
 class TestCodexAgentSelect:
     def test_spec_advertises_c_agents_template(self):
         backend = CodexBackend()

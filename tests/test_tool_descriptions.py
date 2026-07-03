@@ -18,3 +18,15 @@ def test_follow_up_agent_description_explains_non_polling_use_case() -> None:
     assert "send_message only writes to an inbox" in description
     assert "continuing a spawned agent" in description
     assert 'reason="agent_busy"' in description
+
+
+def test_check_agent_description_documents_full_len() -> None:
+    description = server_simple.check_agent.__doc__ or ""
+
+    assert "full_len" in description
+
+
+def test_list_agents_description_documents_full_len() -> None:
+    description = server_simple.list_agents.__doc__ or ""
+
+    assert "full_len" in description
