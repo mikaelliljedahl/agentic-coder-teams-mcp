@@ -500,3 +500,51 @@ class TestCodexWindowsLauncher:
             check=False,
         )
         assert r2.returncode != 0
+
+    def test_commandWindows_bare_path_with_spaces_is_unquoted(  # noqa: N802
+        self, tmp_path: Path
+    ) -> None:
+        # The fix relies on Codex/cmd adding at most one quote pair around the
+        # single path token, so we must emit the path WITHOUT our own quotes
+        # even when it contains spaces.
+        launcher = r"C:\Users\me\ag ent\codex-hook-worker.cmd"
+        args = hooks.codex_hook_overrides(tmp_path, "worker", windows_launcher=launcher)
+        value = _field_value(_override_value(args, "PostToolUse"), "commandWindows")
+        assert value == launcher
+        assert not value.startswith('"')
+        assert not value.endswith('"')
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["../evil", "a/b", "a\\b", 'a"b', "a b", "", "x" * 65, "a;b", "a.cmd"],
+    )
+    def test_write_codex_launcher_rejects_unsafe_agent_name(
+        self, tmp_path: Path, bad: str
+    ) -> None:
+        # Safe-name invariant must be enforced BEFORE any path/content is
+        # written, so an unsafe name can't influence the on-disk launcher.
+        with pytest.raises(ValueError, match="unsafe agent name"):
+            hooks.write_codex_launcher(tmp_path, bad)
+        assert list(tmp_path.glob("*.cmd")) == []  # nothing written
+
+    @pytest.mark.skipif(
+        os.name != "nt", reason="cmd.exe launcher execution is Windows-only"
+    )
+    def test_launcher_run_writes_state_marker_end_to_end(self, tmp_path: Path) -> None:
+        # End-to-end: run the ACTUAL write_codex_launcher output via cmd with a
+        # real event JSON on stdin and assert the state marker is written — the
+        # full path Codex exercises on Windows.
+        launcher = hooks.write_codex_launcher(tmp_path, "worker")
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        r = subprocess.run(  # noqa: S603
+            [comspec, "/C", str(launcher)],
+            input='{"hook_event_name":"Stop","session_id":"s1"}',
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert r.returncode == 0, r.stderr
+        marker = tmp_path / "state-worker.json"
+        assert marker.exists(), "launcher did not write the state marker"
+        assert json.loads(marker.read_text(encoding="utf-8"))["state"] == "waiting"

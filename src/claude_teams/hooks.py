@@ -10,6 +10,7 @@ without scanning the agent's full transcript.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -21,6 +22,19 @@ _RUNNING_EVENTS: frozenset[str] = frozenset(
 _WAITING_EVENTS: frozenset[str] = frozenset({"Stop", "SubagentStop"})
 
 _HOOK_MODULE = "claude_teams.hooks"
+
+# Mirror of process_manager's safe-name invariant. Enforced here BEFORE an agent
+# name is interpolated into an on-disk launcher path/content, rather than relying
+# on the later (post-file-write) validation in the process manager.
+_SAFE_AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _require_safe_agent(agent_name: str) -> str:
+    """Return ``agent_name`` if it matches the safe-name invariant, else raise."""
+    if not _SAFE_AGENT_RE.match(agent_name):
+        msg = f"unsafe agent name: {agent_name!r}"
+        raise ValueError(msg)
+    return agent_name
 
 
 def _marker_file(session_dir: Path, agent: str) -> Path:
@@ -149,8 +163,14 @@ def write_codex_launcher(session_dir: Path, agent_name: str) -> Path:
     launcher, being a batch file, quotes the interpreter/args with normal cmd
     rules; and stdin (the event JSON) is inherited cmd -> launcher -> python, so
     ``emit`` still reads it. Native backslash paths are used (cmd-friendly).
+
+    ``agent_name`` is validated against the safe-name invariant BEFORE it is
+    interpolated into the launcher path or its batch content, so a name with
+    path separators or quotes can never influence what/where we write (the
+    process manager's later validation runs only after this file is created).
     """
     session_dir = Path(session_dir)
+    _require_safe_agent(agent_name)
     python = str(Path(sys.executable))
     sdir = str(session_dir)
     lines = [
