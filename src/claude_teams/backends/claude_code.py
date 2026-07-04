@@ -180,6 +180,7 @@ class ClaudeCodeBackend(BaseBackend):
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
         cmd.extend(self._agent_args(request))
         cmd.extend(self._hooks_settings_args(request))
+        cmd.extend(self._disallowed_tools_args())
         cmd.append("--")
         cmd.append(self._prompt_arg(request))
         return cmd
@@ -219,9 +220,25 @@ class ClaudeCodeBackend(BaseBackend):
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
         cmd.extend(self._agent_args(request))
         cmd.extend(self._hooks_settings_args(request))
+        cmd.extend(self._disallowed_tools_args())
         cmd.append("--")
         cmd.append(self._prompt_arg(request))
         return cmd
+
+    @staticmethod
+    def _disallowed_tools_args() -> list[str]:
+        """Return ``--disallowed-tools`` args for a spawned team worker.
+
+        Spawned agents run in Claude Code's native agent-teams mode (see
+        :meth:`build_env`), where ``AskUserQuestion`` is routed as a permission
+        request to the *team leader* session. In this system that "leader" is
+        the MCP orchestrator that spawned the agent; it runs no native approval
+        queue, so an ``AskUserQuestion`` call hangs forever on "Waiting for team
+        lead approval". These workers are autonomous with no interactive user,
+        so the tool is disabled outright -- a decision that needs the lead is
+        escalated via ``send_message`` to ``lead`` instead.
+        """
+        return ["--disallowed-tools", "AskUserQuestion"]
 
     @staticmethod
     def _hooks_settings_args(request: SpawnRequest) -> list[str]:

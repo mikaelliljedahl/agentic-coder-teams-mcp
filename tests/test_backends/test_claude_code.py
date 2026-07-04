@@ -344,6 +344,47 @@ class TestClaudeCodeHooksSettings:
         assert "--settings" not in cmd
 
 
+class TestClaudeCodeDisallowedTools:
+    """Spawned team agents are autonomous workers with no interactive user.
+
+    Claude Code's native agent-teams mode (enabled here via
+    ``CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`` + ``--parent-session-id``) routes
+    ``AskUserQuestion`` as a permission request to the *team leader* session,
+    which in this system is the MCP orchestrator that never runs a native
+    approval queue -- so the child hangs forever on "Waiting for team lead
+    approval". The tool is therefore disabled for spawned agents; they escalate
+    decisions via ``send_message`` to ``lead`` instead.
+    """
+
+    def test_build_command_disallows_askuserquestion(self, _make_request):
+        backend = ClaudeCodeBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert "--disallowed-tools" in cmd
+        idx = cmd.index("--disallowed-tools")
+        assert cmd[idx + 1] == "AskUserQuestion"
+
+    def test_build_resume_command_disallows_askuserquestion(self, _make_request):
+        backend = ClaudeCodeBackend()
+        request = _make_request()
+
+        cmd = backend.build_resume_command(request, "resume-session-id")
+
+        assert "--disallowed-tools" in cmd
+        idx = cmd.index("--disallowed-tools")
+        assert cmd[idx + 1] == "AskUserQuestion"
+
+    def test_disallowed_tools_precede_prompt_terminator(self, _make_request):
+        backend = ClaudeCodeBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert cmd.index("--disallowed-tools") < cmd.index("--")
+
+
 class TestClaudeCodeAgentSelect:
     def test_spec_advertises_agent_flag(self):
         backend = ClaudeCodeBackend()
