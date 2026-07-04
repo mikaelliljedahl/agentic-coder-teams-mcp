@@ -1141,7 +1141,18 @@ def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str
         settings_path = hooks.write_claude_settings(session_dir, agent_name)
         return {"hooks_settings_path": str(settings_path)}
     if backend_name == "codex":
-        overrides = hooks.codex_hook_overrides(session_dir, agent_name)
+        # On Windows, Codex runs the hook via `cmd /C` and mangles a multi-token
+        # double-quoted command; a bare-path launcher in `commandWindows` is the
+        # cmd-safe form (see hooks.write_codex_launcher). On Linux the POSIX
+        # `command` runs fine under `sh -c`, so no launcher is needed.
+        launcher = (
+            str(hooks.write_codex_launcher(session_dir, agent_name))
+            if os.name == "nt"
+            else None
+        )
+        overrides = hooks.codex_hook_overrides(
+            session_dir, agent_name, windows_launcher=launcher
+        )
         return {"hook_overrides": json.dumps(overrides)}
     return {}
 
