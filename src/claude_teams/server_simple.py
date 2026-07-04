@@ -4,12 +4,13 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -48,6 +49,7 @@ _LEAD_ALIASES: frozenset[str] = frozenset(
 )
 
 _SESSION_BASE = Path.home() / ".claude" / "agent-sessions"
+_TEAMS_BASE = Path.home() / ".claude" / "teams"
 _SESSION_META_NAME = "session.json"
 _BINDINGS_DIR_NAME = "bindings"
 _AGENTS_LOCK_NAME = "agents.lock"
@@ -55,7 +57,21 @@ _LOCK_TIMEOUT_SECONDS = 30.0
 _LOCK_RETRY_SECONDS = 0.05
 _LOCK_SIZE = 1
 _FOLLOW_UP_IDLE_SECONDS = 60.0
+_CLEANUP_STAMP_NAME = ".last-cleanup"
+_RETENTION_DAYS_DEFAULT = 30.0
+_NO_AUTOADOPT_ENV = "WIN_AGENT_TEAMS_NO_AUTOADOPT"
+_TERMINAL_STATUSES: frozenset[str] = frozenset({"killed"})
+_RETENTION_DAYS_ENV = "WIN_AGENT_TEAMS_RETENTION_DAYS"
+_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60.0
 logger = logging.getLogger(__name__)
+
+# Outcome of the most recent session recovery attempt, surfaced to the lead as
+# a nudge on dict-returning tools: either ``{"adopted_session": {...}}`` (a
+# single-lead prior session was auto-adopted — one-shot) or
+# ``{"recoverable_sessions": [...], "recovery_hint": "..."}`` (ambiguous /
+# multi-lead: the lead must pick one via ``resume_session``). Empty when the
+# session resolved cleanly.
+_pending_recovery: dict = {}
 
 
 def _idle_seconds() -> float:
@@ -364,10 +380,42 @@ def _unique_agent_name(requested_name: str, agents: list[dict]) -> str:
         counter += 1
 
 
+def _retention_days() -> float:
+    """Return the file-retention window in days (env-overridable, fail-safe).
+
+    Invalid, zero, or negative ``WIN_AGENT_TEAMS_RETENTION_DAYS`` values fall
+    back to the 30-day default rather than triggering mass deletion.
+    """
+    raw = os.environ.get(_RETENTION_DAYS_ENV, "").strip()
+    if not raw:
+        return _RETENTION_DAYS_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _RETENTION_DAYS_DEFAULT
+    return value if value > 0 else _RETENTION_DAYS_DEFAULT
+
+
+def _ensure_lead_token(session_id: str) -> str:
+    """Return the session's stable lead recovery token, creating it if absent."""
+    meta = _read_json_object(_session_meta_file(session_id))
+    token = meta.get("lead_token")
+    if isinstance(token, str) and token:
+        return token
+    return uuid.uuid4().hex
+
+
 def _persist_session_binding(session_id: str) -> None:
-    """Bind this parent/workspace to a session id for MCP restart recovery."""
+    """Bind this parent/workspace to a session id for MCP restart recovery.
+
+    Preserves the session's ``lead_token`` (the authoritative, re-presentable
+    recovery token) across rebindings, and prunes any *other* binding files
+    that reference the same session so a single lead keeps exactly one binding
+    across repeated restarts (keeping gated auto-adopt automatic).
+    """
     now = datetime.now(UTC).isoformat()
     key = _binding_key()
+    lead_token = _ensure_lead_token(session_id)
     meta = {
         "session_id": session_id,
         "binding_key": key,
@@ -375,6 +423,7 @@ def _persist_session_binding(session_id: str) -> None:
         "cwd": str(Path.cwd().resolve()),
         "parent_id": os.environ.get("WIN_AGENT_TEAMS_PARENT_ID", "").strip()
         or str(os.getppid()),
+        "lead_token": lead_token,
         "updated_at": now,
     }
     _session_meta_file(session_id).write_text(
@@ -383,10 +432,144 @@ def _persist_session_binding(session_id: str) -> None:
     )
     _bindings_dir().mkdir(parents=True, exist_ok=True)
     _binding_file().write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _prune_superseded_bindings(session_id)
+
+
+def _prune_superseded_bindings(session_id: str) -> None:
+    """Delete stale binding files pointing at ``session_id`` (keep the current)."""
+    keep = _binding_file()
+    bindings = _bindings_dir()
+    if not bindings.is_dir():
+        return
+    for path in bindings.iterdir():
+        if not path.is_file() or path.suffix != ".json" or path == keep:
+            continue
+        try:
+            meta = _read_json_object(path)
+        except OSError:
+            continue
+        if meta.get("session_id") == session_id:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+
+
+def _iter_binding_metas() -> Iterator[tuple[Path, dict, float]]:
+    """Yield ``(path, meta, mtime)`` for each readable binding file."""
+    bindings = _bindings_dir()
+    if not bindings.is_dir():
+        return
+    for path in bindings.iterdir():
+        if not path.is_file() or path.suffix != ".json":
+            continue
+        try:
+            meta = _read_json_object(path)
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        yield path, meta, mtime
+
+
+def _candidate_sessions() -> list[dict]:
+    """Recoverable prior sessions for this ``identity+cwd`` within retention.
+
+    A candidate is a binding whose ``agents.json`` still holds ≥1 (non-killed,
+    hence non-terminal) agent — kill removes records, so a non-empty registry
+    means resumable agents. Deduped by ``session_id`` (newest binding wins) and
+    sorted newest-first. Tolerates unreadable/corrupt binding or registry files
+    per candidate rather than failing recovery globally.
+    """
+    identity = IDENTITY
+    cwd = str(Path.cwd().resolve())
+    cutoff = time.time() - _retention_days() * 86400.0
+    by_session: dict[str, dict] = {}
+    for _path, meta, mtime in _iter_binding_metas():
+        if meta.get("identity") != identity or meta.get("cwd") != cwd:
+            continue
+        if mtime < cutoff:
+            continue
+        session_id = meta.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        try:
+            agents = _load_agents_unlocked(session_id)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(agents, list):
+            continue
+        resumable = _non_terminal_agents(agents)
+        if not resumable:
+            continue
+        existing = by_session.get(session_id)
+        if existing is None or mtime > existing["_mtime"]:
+            by_session[session_id] = {
+                "session_id": session_id,
+                "agent_count": len(resumable),
+                "last_activity": meta.get("updated_at"),
+                "_mtime": mtime,
+            }
+    candidates = sorted(by_session.values(), key=lambda c: c["_mtime"], reverse=True)
+    for c in candidates:
+        c.pop("_mtime", None)
+    return candidates
+
+
+def _non_terminal_agents(agents: list) -> list[dict]:
+    """Return only the resumable (non-terminal) agent records.
+
+    Terminal records (legacy ``status="killed"`` left by the pre-R5 kill, which
+    did not remove records) are excluded so a session holding only killed
+    agents is NOT treated as recoverable and silently resumed.
+    """
+    return [
+        a
+        for a in agents
+        if isinstance(a, dict) and a.get("status") not in _TERMINAL_STATUSES
+    ]
+
+
+def _distinct_binding_sessions() -> set[str]:
+    """Distinct ``session_id``s bound to this ``identity+cwd`` within retention.
+
+    Used as the multi-lead signal: two or more distinct sessions here means
+    another lead has operated in this workspace, so single-candidate
+    auto-adopt is disabled and the lead must disambiguate via resume_session.
+    """
+    identity = IDENTITY
+    cwd = str(Path.cwd().resolve())
+    cutoff = time.time() - _retention_days() * 86400.0
+    sessions: set[str] = set()
+    for _path, meta, mtime in _iter_binding_metas():
+        if meta.get("identity") != identity or meta.get("cwd") != cwd:
+            continue
+        if mtime < cutoff:
+            continue
+        session_id = meta.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            sessions.add(session_id)
+    return sessions
+
+
+def _autoadopt_enabled() -> bool:
+    return os.environ.get(_NO_AUTOADOPT_ENV, "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _recover_session_id() -> str:
-    """Recover the persisted lead session for this MCP parent/workspace."""
+    """Recover the persisted lead session for this MCP parent/workspace.
+
+    Precedence: (1) ``AGENT_SESSION_ID`` env (subagent path); (2) exact
+    binding-key match (fast path); (3) cwd+identity fallback. The fallback
+    auto-adopts a single candidate ONLY when this workspace has a single-lead
+    history (one distinct bound session); otherwise it leaves the session
+    unresolved and records candidates for the recovery nudge. Sets
+    ``_pending_recovery`` as a side effect.
+    """
+    global _pending_recovery  # noqa: PLW0603 - recovery nudge state.
+    _pending_recovery = {}
     if _AGENT_SESSION_ID:
         return _AGENT_SESSION_ID
     key = _binding_key()
@@ -398,7 +581,53 @@ def _recover_session_id() -> str:
         and _agents_file(session_id).exists()
     ):
         return session_id
+
+    candidates = _candidate_sessions()
+    if not candidates:
+        return ""
+    single_lead_history = len(_distinct_binding_sessions()) <= 1
+    if _autoadopt_enabled() and len(candidates) == 1 and single_lead_history:
+        adopted = candidates[0]
+        _pending_recovery = {
+            "adopted_session": {
+                "session_id": adopted["session_id"],
+                "agent_count": adopted["agent_count"],
+            }
+        }
+        return adopted["session_id"]
+    _pending_recovery = {
+        "recoverable_sessions": candidates,
+        "recovery_hint": (
+            "Recoverable prior session(s) exist for this workspace. Call "
+            "resume_session('<session_id>') to adopt one (see session_info)."
+        ),
+    }
     return ""
+
+
+def _recovery_note() -> dict:
+    """Return the pending recovery nudge for a dict-tool result.
+
+    ``adopted_session`` is one-shot (cleared after first surface); the
+    ``recoverable_sessions`` nudge persists because the session stays
+    unresolved (and is refreshed on every recovery attempt) until the lead
+    calls ``resume_session``.
+    """
+    global _pending_recovery  # noqa: PLW0603 - recovery nudge state.
+    note = dict(_pending_recovery)
+    if "adopted_session" in _pending_recovery:
+        _pending_recovery = {}
+    return note
+
+
+def _annotate(result: object) -> object:
+    """Merge the recovery nudge into a dict tool result (no-op otherwise)."""
+    note = _recovery_note()
+    if isinstance(result, dict) and note:
+        merged = dict(result)
+        merged.update(note)
+        return merged
+    return result
 
 
 def _active_session_id(*, create: bool = False) -> str:
@@ -410,11 +639,145 @@ def _active_session_id(*, create: bool = False) -> str:
     recovered = _recover_session_id()
     if recovered:
         _session_id = recovered
+        # A fallback auto-adoption must re-bind to the current parent key (so
+        # the next call hits the fast path) and prune the stale binding.
+        if _pending_recovery.get("adopted_session"):
+            _persist_session_binding(recovered)
         return _session_id
     if create:
+        _maybe_cleanup_old_sessions()
         _session_id = _create_session()
         return _session_id
     return ""
+
+
+def _is_session_dir(path: Path) -> bool:
+    """Whether ``path`` is a real session directory (UUID name + registry).
+
+    Guards cleanup from ever treating base-level control entries (the
+    ``bindings/`` dir, the ``.last-cleanup`` stamp, stray files) as sessions.
+    """
+    if not path.is_dir() or path.name == _BINDINGS_DIR_NAME:
+        return False
+    try:
+        uuid.UUID(path.name)
+    except ValueError:
+        return False
+    return (path / "agents.json").exists() or (path / _SESSION_META_NAME).exists()
+
+
+def _dir_newest_mtime(path: Path) -> float:
+    """Return the newest mtime across ``path`` and its descendants."""
+    newest = 0.0
+    with suppress(OSError):
+        newest = path.stat().st_mtime
+    try:
+        entries = list(path.rglob("*"))
+    except OSError:
+        return newest
+    for entry in entries:
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        newest = max(newest, mtime)
+    return newest
+
+
+def _session_has_live_agent(session_id: str) -> bool:
+    """Whether any agent in ``session_id`` is still a live (owned) process."""
+    try:
+        agents = _load_agents_unlocked(session_id)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(agents, list):
+        return False
+    return any(isinstance(a, dict) and _agent_alive(a) for a in agents)
+
+
+def _remove_team_logs(session_id: str) -> None:
+    """Remove the default team-log dir for a removed session (best-effort).
+
+    A ``WIN_AGENT_TEAMS_LOG_DIR`` override points at a user-chosen tree and is
+    intentionally left untouched (out of cleanup scope).
+    """
+    if os.environ.get("WIN_AGENT_TEAMS_LOG_DIR"):
+        return
+    with suppress(OSError):
+        shutil.rmtree(_TEAMS_BASE / session_id, ignore_errors=True)
+
+
+def _prune_orphan_bindings() -> None:
+    """Delete binding files whose session directory no longer exists."""
+    for path, meta, _mtime in _iter_binding_metas():
+        session_id = meta.get("session_id")
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or not _session_dir(session_id).is_dir()
+        ):
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+
+
+def cleanup_old_sessions(
+    max_age_days: float | None = None, now: float | None = None
+) -> list[str]:
+    """Remove session dirs older than the retention window; return removed ids.
+
+    Only real session directories (UUID-named, with a registry) are ever
+    considered — never ``bindings/`` or the cleanup stamp. The active session
+    and any session with a live agent are always kept. For each removed
+    session the matching default team-log dir is deleted; orphan binding files
+    are pruned afterwards. Fully best-effort per entry.
+    """
+    base = _SESSION_BASE
+    if not base.is_dir():
+        return []
+    max_age = _retention_days() if max_age_days is None else max_age_days
+    current = time.time() if now is None else now
+    cutoff = current - max_age * 86400.0
+    removed: list[str] = []
+    active = _session_id
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return []
+    for path in entries:
+        if not _is_session_dir(path):
+            continue
+        session_id = path.name
+        if session_id == active:
+            continue
+        if _dir_newest_mtime(path) >= cutoff:
+            continue
+        if _session_has_live_agent(session_id):
+            continue
+        with suppress(OSError):
+            shutil.rmtree(path, ignore_errors=True)
+        _remove_team_logs(session_id)
+        removed.append(session_id)
+    _prune_orphan_bindings()
+    return removed
+
+
+def _maybe_cleanup_old_sessions() -> None:
+    """Run cleanup at most once per interval; swallow every error."""
+    try:
+        _SESSION_BASE.mkdir(parents=True, exist_ok=True)
+        stamp = _SESSION_BASE / _CLEANUP_STAMP_NAME
+        now = time.time()
+        if stamp.exists():
+            try:
+                last = float(stamp.read_text(encoding="utf-8").strip() or "0")
+            except (OSError, ValueError):
+                last = 0.0
+            if now - last < _CLEANUP_INTERVAL_SECONDS:
+                return
+        stamp.write_text(str(now), encoding="utf-8")
+        cleanup_old_sessions()
+    except Exception:
+        logger.debug("session cleanup skipped", exc_info=True)
 
 
 def _message_recipient(to: str, session_id: str) -> tuple[str, str | None]:
@@ -568,6 +931,41 @@ def _read_agent_output(agent: dict):
             spawned_at, cwd, backend_session_id=backend_session_id
         )
     return None
+
+
+def _agent_create_token(agent: dict) -> str | None:
+    """Return the agent's stored PID creation token, or ``None`` if absent."""
+    token = agent.get("create_token")
+    return token if isinstance(token, str) and token else None
+
+
+def _agent_alive(agent: dict) -> bool:
+    """PID-reuse-safe liveness for an agent record.
+
+    Passes the record's stored ``create_token`` to the process manager so a
+    reused PID (after a server/host restart) is reported dead rather than
+    falsely alive. Records predating tokens fall back to bare PID liveness.
+
+    For launcher-style backends (Linux terminal) the stored ``pid`` is the
+    terminal launcher; the real agent PID lives in a sidecar that survives a
+    restart. We resolve it and report the agent's own liveness so a live agent
+    is never seen as dead just because its launcher exited (which would let
+    cleanup delete a session that still has a live agent).
+    """
+    launcher = str(agent.get("pid"))
+    authoritative = process_manager.resolve_agent_pid(
+        launcher, str(agent.get("session_id") or ""), str(agent.get("name") or "")
+    )
+    if authoritative != launcher:
+        # Distinct real agent PID from the sidecar; no stored token for it, so
+        # this is display/cleanup liveness only. Destructive ops still gate on
+        # owns_process against the stored launcher pid+token.
+        alive, _ = process_manager.health_check(authoritative)
+        return alive
+    alive, _ = process_manager.health_check(
+        launcher, expected_token=_agent_create_token(agent)
+    )
+    return alive
 
 
 def _sync_backend_session_id(agent: dict, output) -> bool:
@@ -826,6 +1224,11 @@ async def spawn_agent(
 
             result = b.spawn(request)
             pid = int(result.process_handle)
+            # Capture the PID's creation token now, from the just-spawned live
+            # process, so a later reused PID (after a host restart) can be told
+            # apart. Captured here (not by reopening the PID cold) per the
+            # plan's N1: the child is live and in-memory at this instant.
+            create_token = process_manager.creation_token(str(pid))
 
             agents.append(
                 {
@@ -839,6 +1242,7 @@ async def spawn_agent(
                     "model": resolved_model,
                     "permission_mode": permission_mode,
                     "reasoning_effort": effort,
+                    "create_token": create_token,
                 }
             )
             _save_agents_transaction(session_id, agents)
@@ -853,7 +1257,7 @@ async def spawn_agent(
             "expected_outputs": list(expected_outputs) if expected_outputs else [],
         }
 
-    return await run_blocking(_do_spawn)
+    return _annotate(await run_blocking(_do_spawn))
 
 
 @mcp.tool()
@@ -890,7 +1294,7 @@ async def send_message(text: str, to: str = "lead") -> dict:
             result["warning"] = warning
         return result
 
-    return await run_blocking(_do_send)
+    return _annotate(await run_blocking(_do_send))
 
 
 _DEFAULT_READ_LIMIT = 50
@@ -1068,7 +1472,7 @@ async def read_messages(
                 result["seq"] = None
             return result
 
-    return await run_blocking(_do_read)
+    return _annotate(await run_blocking(_do_read))
 
 
 @mcp.tool()
@@ -1108,15 +1512,12 @@ async def check_agent(
             agent = next((a for a in agents if a["name"] == name), None)
             if agent is None:
                 return _empty_agent_check(name, full=full)
-            pid = agent["pid"]
-            alive, _ = process_manager.health_check(str(pid))
+            alive = _agent_alive(agent)
             output = _read_agent_output(agent)
             if _sync_backend_session_id(agent, output):
                 _save_agents_transaction(session_id, agents)
             internal = _agent_check_payload(name, agent, alive, output)
-            view = _compact_check_view(
-                session_id, name, internal, max_chars=max_chars
-            )
+            view = _compact_check_view(session_id, name, internal, max_chars=max_chars)
             if full:
                 view.update(
                     {
@@ -1126,7 +1527,7 @@ async def check_agent(
                 )
             return view
 
-    return await run_blocking(_do_check)
+    return _annotate(await run_blocking(_do_check))
 
 
 @mcp.tool()
@@ -1168,7 +1569,7 @@ async def follow_up_agent(
                 return _follow_up_failure("backend_not_supported", name)
 
             pid = agent["pid"]
-            alive, _ = process_manager.health_check(str(pid))
+            alive = _agent_alive(agent)
             output = _read_agent_output(agent)
             changed = _sync_backend_session_id(agent, output)
             status = _agent_check_payload(name, agent, alive, output)
@@ -1202,7 +1603,14 @@ async def follow_up_agent(
                         _save_agents_transaction(session_id, agents)
                     return _follow_up_failure("agent_idle_but_alive", name, status)
 
-                if not process_manager.graceful_shutdown(str(pid), timeout_s=5.0):
+                # Fail closed: only shut down / kill the PID when we can prove
+                # it is still OUR process (in-memory ownership or a matching
+                # creation token). A tokenless recovered record or a reused PID
+                # is left untouched — we resume via backend_session_id instead
+                # of risking a foreign kill.
+                if process_manager.owns_process(
+                    str(pid), _agent_create_token(agent)
+                ) and not process_manager.graceful_shutdown(str(pid), timeout_s=5.0):
                     process_manager.kill_process(str(pid))
 
             agent_name = str(agent.get("name") or name)
@@ -1242,6 +1650,7 @@ async def follow_up_agent(
                 return _follow_up_failure("resume_failed", name, status)
 
             new_pid = int(result.process_handle)
+            new_create_token = process_manager.creation_token(str(new_pid))
             agent.update(
                 {
                     "pid": new_pid,
@@ -1254,6 +1663,7 @@ async def follow_up_agent(
                     "model": model,
                     "permission_mode": permission_mode,
                     "reasoning_effort": effort,
+                    "create_token": new_create_token,
                 }
             )
             _save_agents_transaction(session_id, agents)
@@ -1267,12 +1677,47 @@ async def follow_up_agent(
                 "session_id": session_id,
             }
 
-    return await run_blocking(_do_follow_up)
+    return _annotate(await run_blocking(_do_follow_up))
+
+
+def _cleanup_agent_artifacts(session_id: str, name: str) -> None:
+    """Best-effort removal of a killed agent's on-disk artifacts.
+
+    Prevents a later agent spawned with the same name from inheriting the dead
+    agent's state marker, inbox messages, or read cursors. Every operation is
+    best-effort and never raises.
+    """
+    for path in (
+        _state_marker_file(session_id, name),
+        _inbox_file(session_id, name),
+        _inbox_cursor_file(session_id, name),
+    ):
+        with suppress(OSError):
+            path.unlink(missing_ok=True)
+    # Drop the killed agent's sender entry from the lead/parent reader cursor so
+    # its stale per-sender high-water mark cannot suppress a same-name agent's
+    # first future message.
+    reader_cursor = _inbox_cursor_file(session_id, IDENTITY)
+    cursors = _load_inbox_cursors(reader_cursor)
+    if name in cursors:
+        del cursors[name]
+        with suppress(OSError):
+            _save_inbox_cursors(reader_cursor, cursors)
 
 
 @mcp.tool()
 async def kill_agent(name: str) -> dict:
-    """Force-kill an agent process."""
+    """Force-kill an agent and remove it from the session.
+
+    kill is terminal: the agent record is removed from ``agents.json`` (so it
+    no longer appears in ``list_agents`` and ``follow_up_agent`` returns
+    ``agent_not_found``), and its per-agent state marker, inbox, and inbox
+    cursor are cleaned up so a later agent spawned with the same name starts
+    clean. The OS process is only signalled when we can prove the PID is still
+    ours (matching creation token or live in-memory ownership) — a reused or
+    foreign PID is left untouched. A naturally-dead agent is NOT removed until
+    killed, so it remains listable and resumable.
+    """
     session_id = _active_session_id()
 
     def _do_kill() -> dict:
@@ -1282,15 +1727,109 @@ async def kill_agent(name: str) -> dict:
             agent = next((a for a in agents if a["name"] == name), None)
             if agent is None:
                 return {"success": False, "name": name}
-            process_manager.kill_process(str(agent["pid"]))
-            for a in agents:
-                if a["name"] == name:
-                    a["status"] = "killed"
+            # Fail closed: never kill a PID we cannot prove is still ours.
+            if process_manager.owns_process(
+                str(agent.get("pid")), _agent_create_token(agent)
+            ):
+                process_manager.kill_process(str(agent["pid"]))
+            remaining = [a for a in agents if a.get("name") != name]
+            agents[:] = remaining
             _save_agents_transaction(session_id, agents)
-            _state_marker_file(session_id, name).unlink(missing_ok=True)
+            _cleanup_agent_artifacts(session_id, name)
             return {"success": True, "name": name}
 
     return await run_blocking(_do_kill)
+
+
+@mcp.tool()
+async def resume_session(session_id: str) -> dict:
+    """Adopt a specific prior session by id after a restart.
+
+    Use this when ``session_info`` (or a tool's ``recoverable_sessions`` nudge)
+    reports more than one recoverable prior session for this workspace — e.g.
+    several leads were started in the same folder. Pass the ``session_id``
+    (the recovery token echoed by ``spawn_agent``/``session_info``, and visible
+    in your own earlier transcript) to re-bind this lead to that session; its
+    agents then reappear in ``list_agents`` and become resumable. Returns
+    ``{success, session_id, agent_count, lead_token}`` or
+    ``{success: False, reason}``.
+    """
+
+    def _do_resume() -> dict:
+        global _session_id  # noqa: PLW0603 - module-level lead session state.
+        sid = session_id.strip()
+        if not sid:
+            return {"success": False, "reason": "session_id_required"}
+        # Validate the id is UUID-shaped (blocks path traversal via ".." or
+        # separators) and that its directory resolves directly under the
+        # session base — never adopt an agents.json from an arbitrary path.
+        try:
+            uuid.UUID(sid)
+        except ValueError:
+            return {"success": False, "session_id": sid, "reason": "invalid_session_id"}
+        sdir = _session_dir(sid)
+        if (
+            sdir.resolve().parent != _SESSION_BASE.resolve()
+            or not _agents_file(sid).exists()
+        ):
+            return {"success": False, "session_id": sid, "reason": "session_not_found"}
+        _session_id = sid
+        _persist_session_binding(sid)  # re-bind current key + prune stale bindings
+        try:
+            agents = _load_agents(sid)
+        except (OSError, json.JSONDecodeError, ValueError):
+            agents = []
+        return {
+            "success": True,
+            "session_id": sid,
+            "agent_count": len(agents),
+            "lead_token": _ensure_lead_token(sid),
+        }
+
+    return await run_blocking(_do_resume)
+
+
+@mcp.tool()
+async def session_info() -> dict:
+    """Report the current session and any recoverable prior sessions.
+
+    Call this right after a restart if ``list_agents`` is unexpectedly empty:
+    it returns ``{session_id, identity, cwd, agent_count, lead_token,
+    recoverable_sessions}``. ``recoverable_sessions`` lists prior sessions for
+    this workspace (``{session_id, agent_count, last_activity}``) that still
+    hold resumable agents; adopt one with ``resume_session('<session_id>')``.
+    ``lead_token`` is this session's stable recovery token.
+    """
+    session_id = _active_session_id()
+
+    def _do_info() -> dict:
+        cwd = str(Path.cwd().resolve())
+        recoverable = [
+            c for c in _candidate_sessions() if c["session_id"] != session_id
+        ]
+        if not session_id:
+            return {
+                "session_id": "",
+                "identity": IDENTITY,
+                "cwd": cwd,
+                "agent_count": 0,
+                "lead_token": None,
+                "recoverable_sessions": recoverable,
+            }
+        try:
+            agents = _load_agents(session_id)
+        except (OSError, json.JSONDecodeError, ValueError):
+            agents = []
+        return {
+            "session_id": session_id,
+            "identity": IDENTITY,
+            "cwd": cwd,
+            "agent_count": len(agents),
+            "lead_token": _ensure_lead_token(session_id),
+            "recoverable_sessions": recoverable,
+        }
+
+    return await run_blocking(_do_info)
 
 
 def _marker_timestamp(marker: dict | None) -> float | None:
@@ -1336,6 +1875,10 @@ async def list_agents(full: bool = False) -> list[dict]:
     ``full=True`` to restore each agent's raw registry record plus
     ``last_line`` (the last non-empty line of its most recent message),
     ``truncated``, and ``full_len`` (the untruncated character count).
+
+    Recovery: if this returns empty right after a restart and you expected
+    agents, call ``session_info()`` — a prior session for this workspace may
+    be recoverable and adoptable via ``resume_session('<session_id>')``.
     """
     session_id = _active_session_id()
 
@@ -1345,7 +1888,7 @@ async def list_agents(full: bool = False) -> list[dict]:
         agents = _load_agents(session_id)
         result = []
         for agent in agents:
-            alive, _ = process_manager.health_check(str(agent["pid"]))
+            alive = _agent_alive(agent)
             if not full:
                 result.append(_list_agents_row(session_id, agent, alive))
                 continue
@@ -1371,7 +1914,7 @@ async def list_agents(full: bool = False) -> list[dict]:
 def _agent_status_row(session_id: str, agent: dict) -> dict:
     """Build one ``agent_status`` row (marker + cursor reads only, no scan)."""
     name = str(agent.get("name") or "")
-    alive, _ = process_manager.health_check(str(agent.get("pid")))
+    alive = _agent_alive(agent)
     marker = _read_state_marker(session_id, name)
     last_activity_ts = _marker_timestamp(marker)
     if last_activity_ts is None:
@@ -1420,6 +1963,10 @@ async def agent_status(names: list[str] | None = None) -> list[dict]:
     per agent. The marker (written by a Stop/SessionStart/etc. hook) is used
     directly when present; a transcript scan only happens as a fallback when
     no marker exists yet (e.g. hooks disabled or not yet fired).
+
+    Recovery: if this returns empty right after a restart and you expected
+    agents, call ``session_info()`` — a prior session for this workspace may
+    be recoverable and adoptable via ``resume_session('<session_id>')``.
     """
     session_id = _active_session_id()
 

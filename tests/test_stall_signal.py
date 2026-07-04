@@ -68,7 +68,9 @@ class TestAgentStatusStallFields:
         _write_marker(session, "worker", "running", ts=now - 5.0)
         monkeypatch.setattr(server_simple.time, "time", lambda: now)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         result = asyncio.run(server_simple.agent_status(names=["worker"]))
@@ -85,7 +87,9 @@ class TestAgentStatusStallFields:
         _write_marker(session, "worker", "running", ts=now - 400.0)
         monkeypatch.setattr(server_simple.time, "time", lambda: now)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         result = asyncio.run(server_simple.agent_status(names=["worker"]))
@@ -102,7 +106,9 @@ class TestAgentStatusStallFields:
         _write_marker(session, "worker", "waiting", ts=now - 400.0)
         monkeypatch.setattr(server_simple.time, "time", lambda: now)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         result = asyncio.run(server_simple.agent_status(names=["worker"]))
@@ -118,7 +124,9 @@ class TestAgentStatusStallFields:
         _write_marker(session, "worker", "running", ts=now - 400.0)
         monkeypatch.setattr(server_simple.time, "time", lambda: now)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (False, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (False, ""),
         )
 
         result = asyncio.run(server_simple.agent_status(names=["worker"]))
@@ -134,7 +142,9 @@ class TestAgentStatusStallFields:
         _write_marker(session, "worker", "running", ts=now - 50.0)
         monkeypatch.setattr(server_simple.time, "time", lambda: now)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         monkeypatch.setenv("WIN_AGENT_TEAMS_STALL_SECONDS", "10")
 
@@ -147,7 +157,9 @@ class TestAgentStatusStallFields:
     ) -> None:
         _add_agent(session)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
 
@@ -167,7 +179,9 @@ class TestCheckAgentStallFields:
         _write_marker(session, "worker", "running", ts=now - 1.0)
         monkeypatch.setattr(server_simple.time, "time", lambda: now)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         result = asyncio.run(server_simple.check_agent("worker"))
@@ -183,7 +197,9 @@ class TestCheckAgentStallFields:
         _write_marker(session, "worker", "running", ts=now - 500.0)
         monkeypatch.setattr(server_simple.time, "time", lambda: now)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         result = asyncio.run(server_simple.check_agent("worker"))
@@ -199,7 +215,9 @@ class TestCheckAgentStallFields:
         _write_marker(session, "worker", "waiting", ts=now - 500.0)
         monkeypatch.setattr(server_simple.time, "time", lambda: now)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         result = asyncio.run(server_simple.check_agent("worker"))
