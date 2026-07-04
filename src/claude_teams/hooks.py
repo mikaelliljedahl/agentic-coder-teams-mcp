@@ -150,10 +150,18 @@ def codex_hook_overrides(session_dir: Path, agent_name: str) -> list[str]:
     Basic strings treat backslash as an escape character, so any Windows path
     baked into the command (interpreter, session dir) must use forward
     slashes only — see :func:`_emit_command`.
+
+    Tokens are DOUBLE-quoted (not single-quoted): Codex runs a ``command``
+    hook through the platform shell, which on Windows is ``cmd.exe`` where a
+    single quote is a literal character, not a quote. A single-quoted command
+    therefore fails there with ``exit code 1`` on every hook event. Double
+    quotes work in both ``cmd.exe`` and POSIX ``sh``; the ``"`` characters are
+    escaped to ``\\"`` by :func:`_toml_basic_string` when nested in the TOML
+    basic string.
     """
     session_dir = Path(session_dir)
     command = _emit_command(session_dir, agent_name)
-    command_str = _shell_quote_command_single(command)
+    command_str = _shell_quote_command(command)
     args: list[str] = []
     for event in sorted(_RUNNING_EVENTS | _WAITING_EVENTS):
         args.extend(
@@ -163,19 +171,6 @@ def codex_hook_overrides(session_dir: Path, agent_name: str) -> list[str]:
             ]
         )
     return args
-
-
-def _shell_quote_command_single(argv: list[str]) -> str:
-    """Render ``argv`` as a single shell command string, single-quoted.
-
-    Used only for the Codex ``-c`` hook override, which embeds this string
-    inside a TOML basic (double-quoted) string value. Single-quoting each
-    token (instead of double-quoting, as
-    :func:`_shell_quote_command` does for the Claude Code JSON settings file)
-    avoids introducing literal ``"`` characters that would otherwise need
-    escaping when nested inside the TOML basic string.
-    """
-    return " ".join(f"'{part}'" for part in argv)
 
 
 def _toml_basic_string(value: str) -> str:

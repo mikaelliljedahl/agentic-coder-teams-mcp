@@ -23,6 +23,7 @@ _STILL_ACTIVE = 259
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _ERROR_ACCESS_DENIED = 5
 _KILL_ON_EXIT_ENV = "WIN_AGENT_TEAMS_KILL_ON_EXIT"
+_NO_BREAKAWAY_ENV = "WIN_AGENT_TEAMS_NO_BREAKAWAY"
 _LINUX_LAUNCHER_ENV = "WIN_AGENT_TEAMS_LINUX_LAUNCHER"
 _LINUX_TERMINAL_ENV = "WIN_AGENT_TEAMS_LINUX_TERMINAL"
 _TERMINAL_LAUNCHER_VALUE = "terminal"
@@ -184,6 +185,8 @@ class WindowsProcessManager:
         merged_env = os.environ.copy()
         merged_env.update(env)
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if not _env_flag(_NO_BREAKAWAY_ENV):
+            creationflags |= getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
         interactive_console = self._should_use_interactive_console(
             backend_type, is_interactive=is_interactive
         )
@@ -201,15 +204,15 @@ class WindowsProcessManager:
 
         try:
             if interactive_console:
-                process = subprocess.Popen(  # noqa: S603 - backend argv is built by adapters.
+                process = self._popen(
                     cmd,
+                    creationflags,
                     cwd=request.cwd,
                     env=merged_env,
                     stdin=None,
                     stdout=None,
                     stderr=None,
                     text=True,
-                    creationflags=creationflags,
                 )
             else:
                 stdin = (
@@ -217,15 +220,15 @@ class WindowsProcessManager:
                     if backend_type == "claude-code" and is_interactive
                     else subprocess.PIPE
                 )
-                process = subprocess.Popen(  # noqa: S603 - backend argv is built by adapters.
+                process = self._popen(
                     cmd,
+                    creationflags,
                     cwd=request.cwd,
                     env=merged_env,
                     stdin=stdin,
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    creationflags=creationflags,
                 )
         except BaseException:
             log_handle.close()
@@ -248,6 +251,43 @@ class WindowsProcessManager:
         if not interactive_console:
             self._open_windows_terminal_tail(request.team_name, request.name, log_path)
         return SpawnResult(process_handle=handle, backend_type=backend_type)
+
+    def _popen(
+        self, cmd: list[str], creationflags: int, **kwargs: object
+    ) -> subprocess.Popen[str]:
+        """Spawn a process, retrying once without breakaway if it's denied.
+
+        Some ambient Job Objects forbid ``CREATE_BREAKAWAY_FROM_JOB``, which
+        makes ``CreateProcess`` fail with ``OSError(winerror=5)``
+        (ERROR_ACCESS_DENIED). When that happens and the breakaway bit was
+        set, retry once with it cleared so the agent still spawns (falling
+        back to living inside the server's job, matching prior behavior).
+        Any other failure — or a failure when breakaway wasn't requested —
+        propagates unchanged.
+        """
+        breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        used_breakaway = bool(breakaway) and bool(creationflags & breakaway)
+        try:
+            return subprocess.Popen(  # noqa: S603 - backend argv is built by adapters.
+                cmd, creationflags=creationflags, **kwargs
+            )
+        except OSError as err:
+            denied = getattr(err, "winerror", None) == _ERROR_ACCESS_DENIED
+            if not used_breakaway or not denied:
+                raise
+            log_handle = kwargs.get("stdout")
+            warning = (
+                "[warning] CREATE_BREAKAWAY_FROM_JOB denied by ambient job; "
+                "retrying without breakaway\n"
+            )
+            if log_handle is not None and hasattr(log_handle, "write"):
+                with contextlib.suppress(ValueError, OSError):
+                    log_handle.write(warning)
+                    log_handle.flush()
+            fallback_flags = creationflags & ~breakaway
+            return subprocess.Popen(  # noqa: S603 - backend argv is built by adapters.
+                cmd, creationflags=fallback_flags, **kwargs
+            )
 
     def health_check(self, handle: str) -> tuple[bool, str]:
         """Return process liveness for a PID handle."""
