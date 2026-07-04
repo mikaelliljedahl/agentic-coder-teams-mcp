@@ -12,6 +12,7 @@ token path, i.e. the post-restart code path).
 """
 
 import os
+from types import SimpleNamespace
 
 from claude_teams.backends import process_manager as pm
 
@@ -78,6 +79,24 @@ class TestInMemoryOwnershipIsReuseSafe:
     def test_live_tracked_entry_is_owned(self) -> None:
         mgr = _StubOwnershipManager(_DEAD_PID, tracked_alive=True)
         assert mgr.owns_process(_DEAD_PID, None) is True
+
+    def test_linux_terminal_ownership_ignores_reused_sidecar_pid(self) -> None:
+        # A reused sidecar PID must NOT make a Linux-terminal record "owned":
+        # ownership is proven by our own terminal launcher child, not a bare PID.
+        mgr = pm.LinuxTerminalProcessManager()
+        dead_launcher = SimpleNamespace(
+            terminal_process=SimpleNamespace(poll=lambda: 0)
+        )
+        mgr._processes = {"launcher": dead_launcher}
+        assert mgr._tracked_alive(dead_launcher) is False
+        assert mgr.owns_process("launcher", None) is False
+        assert mgr.owns_process("launcher", "mismatch") is False
+
+        live_launcher = SimpleNamespace(
+            terminal_process=SimpleNamespace(poll=lambda: None)
+        )
+        mgr._processes = {"launcher": live_launcher}
+        assert mgr.owns_process("launcher", None) is True
 
 
 class TestTokenAwareHealthCheck:

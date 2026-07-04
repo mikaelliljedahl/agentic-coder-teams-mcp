@@ -1134,10 +1134,15 @@ class LinuxTerminalProcessManager(_PidOwnershipMixin):
         return self._pid_health_with_token(handle, expected_token)
 
     def _tracked_alive(self, info: object) -> bool:
-        """Prefer the real agent PID (sidecar); else the launcher child liveness."""
-        status = self._agent_pid_health(info)  # type: ignore[arg-type]
-        if status is not None:
-            return status[0]
+        """Ownership is proven by OUR terminal launcher child, never a bare PID.
+
+        Deliberately does NOT trust the sidecar agent PID's bare liveness: that
+        PID can be reused by a foreign process after the agent exits, and this
+        result gates destructive ops via ``owns_process``. If the launcher child
+        exited we fall through to the token comparison (fail closed). The
+        sidecar PID's liveness is still used for non-destructive display/cleanup
+        in ``server_simple._agent_alive`` (the accepted residual).
+        """
         return info.terminal_process.poll() is None  # type: ignore[attr-defined]
 
     def resolve_agent_pid(self, handle: str, team_name: str, agent_name: str) -> str:
