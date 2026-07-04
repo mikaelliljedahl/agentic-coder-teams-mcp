@@ -141,6 +141,25 @@ def test_reused_pid_does_not_get_graceful_shutdown(
     assert follow_up.backend.resume_calls[0][1] == "backend-session-id"
 
 
+def test_agent_alive_prefers_resolved_agent_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # B2: for launcher-style backends _agent_alive must check the resolved
+    # agent PID, not the (possibly exited) launcher PID.
+    agent = {"pid": 100, "session_id": "s", "name": "w", "create_token": None}
+    monkeypatch.setattr(ss.process_manager, "resolve_agent_pid", lambda h, t, a: "200")
+    seen: dict[str, str] = {}
+
+    def fake_health(handle: str, expected_token: str | None = None) -> tuple[bool, str]:
+        seen["handle"] = handle
+        return (True, "alive")
+
+    monkeypatch.setattr(ss.process_manager, "health_check", fake_health)
+
+    assert ss._agent_alive(agent) is True
+    assert seen["handle"] == "200"  # the real agent PID, not launcher 100
+
+
 def test_follow_up_resume_persists_new_create_token(
     follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

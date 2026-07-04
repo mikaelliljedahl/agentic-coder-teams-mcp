@@ -60,6 +60,7 @@ _FOLLOW_UP_IDLE_SECONDS = 60.0
 _CLEANUP_STAMP_NAME = ".last-cleanup"
 _RETENTION_DAYS_DEFAULT = 30.0
 _NO_AUTOADOPT_ENV = "WIN_AGENT_TEAMS_NO_AUTOADOPT"
+_TERMINAL_STATUSES: frozenset[str] = frozenset({"killed"})
 _RETENTION_DAYS_ENV = "WIN_AGENT_TEAMS_RETENTION_DAYS"
 _CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60.0
 logger = logging.getLogger(__name__)
@@ -493,13 +494,16 @@ def _candidate_sessions() -> list[dict]:
             agents = _load_agents_unlocked(session_id)
         except (OSError, json.JSONDecodeError, ValueError):
             continue
-        if not isinstance(agents, list) or not agents:
+        if not isinstance(agents, list):
+            continue
+        resumable = _non_terminal_agents(agents)
+        if not resumable:
             continue
         existing = by_session.get(session_id)
         if existing is None or mtime > existing["_mtime"]:
             by_session[session_id] = {
                 "session_id": session_id,
-                "agent_count": len(agents),
+                "agent_count": len(resumable),
                 "last_activity": meta.get("updated_at"),
                 "_mtime": mtime,
             }
@@ -507,6 +511,20 @@ def _candidate_sessions() -> list[dict]:
     for c in candidates:
         c.pop("_mtime", None)
     return candidates
+
+
+def _non_terminal_agents(agents: list) -> list[dict]:
+    """Return only the resumable (non-terminal) agent records.
+
+    Terminal records (legacy ``status="killed"`` left by the pre-R5 kill, which
+    did not remove records) are excluded so a session holding only killed
+    agents is NOT treated as recoverable and silently resumed.
+    """
+    return [
+        a
+        for a in agents
+        if isinstance(a, dict) and a.get("status") not in _TERMINAL_STATUSES
+    ]
 
 
 def _distinct_binding_sessions() -> set[str]:
@@ -927,9 +945,25 @@ def _agent_alive(agent: dict) -> bool:
     Passes the record's stored ``create_token`` to the process manager so a
     reused PID (after a server/host restart) is reported dead rather than
     falsely alive. Records predating tokens fall back to bare PID liveness.
+
+    For launcher-style backends (Linux terminal) the stored ``pid`` is the
+    terminal launcher; the real agent PID lives in a sidecar that survives a
+    restart. We resolve it and report the agent's own liveness so a live agent
+    is never seen as dead just because its launcher exited (which would let
+    cleanup delete a session that still has a live agent).
     """
+    launcher = str(agent.get("pid"))
+    authoritative = process_manager.resolve_agent_pid(
+        launcher, str(agent.get("session_id") or ""), str(agent.get("name") or "")
+    )
+    if authoritative != launcher:
+        # Distinct real agent PID from the sidecar; no stored token for it, so
+        # this is display/cleanup liveness only. Destructive ops still gate on
+        # owns_process against the stored launcher pid+token.
+        alive, _ = process_manager.health_check(authoritative)
+        return alive
     alive, _ = process_manager.health_check(
-        str(agent.get("pid")), expected_token=_agent_create_token(agent)
+        launcher, expected_token=_agent_create_token(agent)
     )
     return alive
 
@@ -1726,7 +1760,18 @@ async def resume_session(session_id: str) -> dict:
         sid = session_id.strip()
         if not sid:
             return {"success": False, "reason": "session_id_required"}
-        if not _agents_file(sid).exists():
+        # Validate the id is UUID-shaped (blocks path traversal via ".." or
+        # separators) and that its directory resolves directly under the
+        # session base — never adopt an agents.json from an arbitrary path.
+        try:
+            uuid.UUID(sid)
+        except ValueError:
+            return {"success": False, "session_id": sid, "reason": "invalid_session_id"}
+        sdir = _session_dir(sid)
+        if (
+            sdir.resolve().parent != _SESSION_BASE.resolve()
+            or not _agents_file(sid).exists()
+        ):
             return {"success": False, "session_id": sid, "reason": "session_not_found"}
         _session_id = sid
         _persist_session_binding(sid)  # re-bind current key + prune stale bindings

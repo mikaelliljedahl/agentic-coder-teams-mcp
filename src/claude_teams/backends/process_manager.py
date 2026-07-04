@@ -163,9 +163,38 @@ class _PidOwnershipMixin:
         """Return the live creation token for ``handle`` (module-level compute)."""
         return creation_token(handle)
 
+    def resolve_agent_pid(
+        self,
+        handle: str,
+        team_name: str,  # noqa: ARG002 - part of the override interface
+        agent_name: str,  # noqa: ARG002 - part of the override interface
+    ) -> str:
+        """Return the authoritative agent PID for ``handle`` (default: ``handle``).
+
+        Overridden by launcher-style managers (Linux terminal) where ``handle``
+        is a launcher PID and the real agent runs under a different PID
+        recorded in a sidecar.
+        """
+        return handle
+
+    def _tracked_alive(self, info: object) -> bool:  # pragma: no cover - subclass
+        """Whether the in-memory tracked child/pane for ``info`` is really alive.
+
+        Manager-specific and PID-reuse-safe: it must prove OUR original
+        process/pane is still running, never merely that some process owns the
+        numeric PID (which a reused PID would satisfy).
+        """
+        raise NotImplementedError
+
     def _has_live_registry_entry(self, handle: str) -> bool:
-        """Whether this manager still owns a live in-memory child for ``handle``."""
-        return handle in self._processes and self._pid_alive(handle)
+        """Whether this manager still owns a live in-memory child for ``handle``.
+
+        Proves the tracked child/pane is alive (``_tracked_alive``) rather than
+        trusting bare PID existence, so a stale in-memory entry whose PID was
+        reused by a foreign process is NOT treated as owned.
+        """
+        info = self._processes.get(handle)
+        return info is not None and self._tracked_alive(info)
 
     def owns_process(self, handle: str, expected_token: str | None) -> bool:
         """Return whether ``handle`` is provably still our process (fail-closed).
@@ -454,6 +483,10 @@ class WindowsProcessManager(_PidOwnershipMixin):
             return False, f"process exited ({exit_code})"
         return self._pid_health_with_token(handle, expected_token)
 
+    def _tracked_alive(self, info: object) -> bool:
+        """Our tracked Popen child is alive only while ``poll()`` is ``None``."""
+        return info.process.poll() is None  # type: ignore[attr-defined]
+
     def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
         """Terminate a process by PID handle, escalating to kill if needed."""
         info = self._processes.get(handle)
@@ -717,6 +750,11 @@ class TmuxProcessManager(_PidOwnershipMixin):
                 return True, "process exists by pid"
             return False, detail
         return self._pid_health_with_token(handle, expected_token)
+
+    def _tracked_alive(self, info: object) -> bool:
+        """Ownership is proven by pane liveness, never a (reusable) bare PID."""
+        alive, _ = self._pane_alive(info.pane_id)  # type: ignore[attr-defined]
+        return alive
 
     def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
         """Kill a tmux pane/window or fall back to killing a PID."""
@@ -1094,6 +1132,31 @@ class LinuxTerminalProcessManager(_PidOwnershipMixin):
                 return agent_status
             return self._terminal_launcher_health(info)
         return self._pid_health_with_token(handle, expected_token)
+
+    def _tracked_alive(self, info: object) -> bool:
+        """Prefer the real agent PID (sidecar); else the launcher child liveness."""
+        status = self._agent_pid_health(info)  # type: ignore[arg-type]
+        if status is not None:
+            return status[0]
+        return info.terminal_process.poll() is None  # type: ignore[attr-defined]
+
+    def resolve_agent_pid(self, handle: str, team_name: str, agent_name: str) -> str:
+        """Return the real agent PID from the sidecar, else the launcher handle.
+
+        The sidecar path is deterministic from the log path, so the agent PID
+        is recoverable after a restart (no in-memory info) too — which lets the
+        server report the true agent liveness rather than the exited launcher's.
+        """
+        info = self._processes.get(handle)
+        if info is not None:
+            pid = self._read_pid_file(info.agent_pid_path)
+            return str(pid) if pid is not None else handle
+        try:
+            path = self._agent_pid_path(self.log_path(team_name, agent_name))
+        except ValueError:
+            return handle
+        pid = self._read_pid_file(path)
+        return str(pid) if pid is not None else handle
 
     def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
         """Terminate a terminal process by PID handle."""

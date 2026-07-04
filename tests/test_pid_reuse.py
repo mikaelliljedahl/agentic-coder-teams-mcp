@@ -53,6 +53,33 @@ class TestOwnsProcess:
         assert pm.process_manager.owns_process(_DEAD_PID, "whatever") is False
 
 
+class _StubOwnershipManager(pm._PidOwnershipMixin):
+    """Minimal manager to exercise the in-memory ownership shortcut."""
+
+    def __init__(self, handle: str, *, tracked_alive: bool) -> None:
+        self._processes = {handle: object()}
+        self._tracked = tracked_alive
+
+    def _pid_alive(self, handle: str) -> bool:
+        return True  # a reused PID would satisfy bare liveness
+
+    def _tracked_alive(self, info: object) -> bool:
+        return self._tracked
+
+
+class TestInMemoryOwnershipIsReuseSafe:
+    def test_stale_entry_with_dead_child_is_not_owned(self) -> None:
+        # B1: the PID is "in _processes" and bare-alive, but OUR tracked
+        # child/pane is dead → must NOT be treated as owned (a reused PID).
+        mgr = _StubOwnershipManager(_DEAD_PID, tracked_alive=False)
+        assert mgr.owns_process(_DEAD_PID, None) is False
+        assert mgr.owns_process(_DEAD_PID, "mismatch") is False
+
+    def test_live_tracked_entry_is_owned(self) -> None:
+        mgr = _StubOwnershipManager(_DEAD_PID, tracked_alive=True)
+        assert mgr.owns_process(_DEAD_PID, None) is True
+
+
 class TestTokenAwareHealthCheck:
     def test_reports_dead_on_token_mismatch(self) -> None:
         handle = str(os.getpid())

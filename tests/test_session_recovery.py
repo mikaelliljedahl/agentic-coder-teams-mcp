@@ -104,6 +104,19 @@ class TestCwdFallback:
 
         assert ss._recover_session_id() == ""
 
+    def test_ignores_session_with_only_killed_agents(
+        self, workspace: SimpleNamespace
+    ) -> None:
+        # B3: legacy pre-R5 kill left status="killed" records; a session with
+        # ONLY killed agents must not be adopted as recoverable.
+        sid = "3a3a3a3a-3a3a-3a3a-3a3a-3a3a3a3a3a3a"
+        _write_session(
+            workspace.base, sid, [{"name": "w", "pid": 1, "status": "killed"}]
+        )
+        _write_binding(workspace.base, "b", sid)
+
+        assert ss._recover_session_id() == ""
+
     def test_ignores_binding_beyond_retention(self, workspace: SimpleNamespace) -> None:
         sid = "44444444-4444-4444-4444-444444444444"
         _write_session(workspace.base, sid, [_agent()])
@@ -200,10 +213,20 @@ class TestRecoveryNudgeAndTools:
         monkeypatch.setattr(ss, "_session_id", "")
         assert ss._recover_session_id() == sid2
 
-    def test_resume_session_unknown_id_fails(self, workspace: SimpleNamespace) -> None:
-        result = asyncio.run(ss.resume_session("does-not-exist"))
+    def test_resume_session_unknown_uuid_fails(
+        self, workspace: SimpleNamespace
+    ) -> None:
+        result = asyncio.run(ss.resume_session("40000000-0000-0000-0000-000000000009"))
         assert result["success"] is False
         assert result["reason"] == "session_not_found"
+
+    def test_resume_session_rejects_non_uuid_and_traversal(
+        self, workspace: SimpleNamespace
+    ) -> None:
+        for bad in ("does-not-exist", "../../etc", "..", "a/b"):
+            result = asyncio.run(ss.resume_session(bad))
+            assert result["success"] is False
+            assert result["reason"] == "invalid_session_id"
 
     def test_session_info_lists_candidates(self, workspace: SimpleNamespace) -> None:
         sid1 = "30000000-0000-0000-0000-000000000001"
