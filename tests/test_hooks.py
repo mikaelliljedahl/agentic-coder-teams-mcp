@@ -2,12 +2,52 @@
 
 import io
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 from claude_teams import hooks
+
+
+def _toml_decode(value: str) -> str:
+    r"""Decode a TOML basic string body (``\\`` and ``\"`` escapes)."""
+    return value.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _override_value(args: list[str], event: str) -> str:
+    """Return the single ``-c`` value for ``hooks.<event>=`` in ``args``."""
+    prefix = f"hooks.{event}="
+    return next(
+        v
+        for k, v in zip(args[0::2], args[1::2], strict=True)
+        if k == "-c" and v.startswith(prefix)
+    )
+
+
+def _field_value(override: str, field: str) -> str:
+    """Extract and TOML-decode ``<field>="..."`` from an override value.
+
+    Walks the TOML basic string honouring escape pairs (``\\\\``/``\\"``) so the
+    scan stops at the first UNescaped ``"`` — correct for ``command`` (whose
+    body contains escaped quotes) as well as ``commandWindows``.
+    """
+    marker = f'{field}="'
+    i = override.index(marker) + len(marker)
+    out: list[str] = []
+    while i < len(override):
+        ch = override[i]
+        if ch == "\\":
+            out.append(override[i : i + 2])
+            i += 2
+            continue
+        if ch == '"':
+            break
+        out.append(ch)
+        i += 1
+    return _toml_decode("".join(out))
 
 
 def _marker_path(session_dir: Path, agent: str) -> Path:
@@ -148,9 +188,7 @@ class TestResolveAgentState:
         )
         assert result == "idle"
 
-    def test_idle_threshold_env_override(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_idle_threshold_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("WIN_AGENT_TEAMS_IDLE_SECONDS", "5")
         result = hooks_resolve_agent_state(
             alive=True, marker=None, last_activity_at=1000.0, now=1006.0
@@ -349,3 +387,164 @@ class TestCodexHookOverrides:
         assert argv[argv.index("--session-dir") + 1] == "C:/sessions/abc"
         assert "--agent" in argv
         assert argv[argv.index("--agent") + 1] == "worker"
+
+
+_EVENTS = (
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "SubagentStop",
+)
+
+
+class TestCodexWindowsLauncher:
+    def test_overrides_omit_commandWindows_without_launcher(  # noqa: N802
+        self, tmp_path: Path
+    ) -> None:
+        # Linux path: no launcher -> command only, no commandWindows.
+        args = hooks.codex_hook_overrides(tmp_path, "worker")
+        assert "commandWindows" not in " ".join(args)
+
+    def test_overrides_include_commandWindows_for_every_event_with_launcher(  # noqa: N802
+        self, tmp_path: Path
+    ) -> None:
+        launcher = r"C:\s\codex-hook-worker.cmd"
+        args = hooks.codex_hook_overrides(tmp_path, "worker", windows_launcher=launcher)
+        for event in _EVENTS:
+            override = _override_value(args, event)
+            assert "commandWindows=" in override, event
+            # POSIX command must still be present alongside it.
+            assert "command=" in override
+
+    def test_commandWindows_is_bare_launcher_path_no_extra_quotes(  # noqa: N802
+        self, tmp_path: Path
+    ) -> None:
+        launcher = r"C:\Users\me\.claude\agent-sessions\s1\codex-hook-worker.cmd"
+        args = hooks.codex_hook_overrides(tmp_path, "worker", windows_launcher=launcher)
+        value = _field_value(_override_value(args, "PostToolUse"), "commandWindows")
+        # Decoded value is exactly the launcher path — no wrapping quotes (Codex
+        # adds its own single-level quoting; multiple quote pairs break cmd /C).
+        assert value == launcher
+        assert not value.startswith('"')
+
+    def test_posix_command_still_double_quoted(self, tmp_path: Path) -> None:
+        # Regression: the Linux `command` form is unchanged (double-quoted argv).
+        args = hooks.codex_hook_overrides(
+            tmp_path, "worker", windows_launcher=r"C:\s\l.cmd"
+        )
+        command = _field_value(_override_value(args, "Stop"), "command")
+        assert command.startswith('"')
+        assert "'" not in command
+        assert "claude_teams.hooks" in command
+        assert "worker" in command
+
+    def test_write_codex_launcher_invokes_emit_with_session_and_agent(
+        self, tmp_path: Path
+    ) -> None:
+        path = hooks.write_codex_launcher(tmp_path, "worker")
+        assert path.exists()
+        assert path.suffix == ".cmd"
+        assert path.name == "codex-hook-worker.cmd"
+        content = path.read_text(encoding="utf-8")
+        assert "claude_teams.hooks" in content
+        assert "emit" in content
+        assert "--agent" in content
+        assert "worker" in content
+        assert str(tmp_path) in content  # native session-dir path referenced
+        # Interpreter path is quoted (may contain spaces on Windows).
+        assert f'"{Path(sys.executable)!s}"' in content
+
+    @pytest.mark.skipif(
+        os.name != "nt", reason="cmd.exe arg-escaping behaviour is Windows-only"
+    )
+    def test_commandWindows_survives_cmd_arg_escaping(  # noqa: N802
+        self, tmp_path: Path
+    ) -> None:
+        # Ground-truth fidelity model of how Codex runs the hook on Windows:
+        # `subprocess.run(["cmd", "/C", value])` escapes argv exactly like Rust
+        # std's Command::arg (which matched the live failure). The bare-path
+        # commandWindows value must run under it; the multi-quote `command` does
+        # not.
+        marker = tmp_path / "ran.txt"
+        launcher = tmp_path / "probe.cmd"
+        launcher.write_text(
+            f'@echo off\r\n> "{marker}" echo ok\r\nexit /b 0\r\n', encoding="utf-8"
+        )
+        args = hooks.codex_hook_overrides(
+            tmp_path, "worker", windows_launcher=str(launcher)
+        )
+        win_value = _field_value(_override_value(args, "PostToolUse"), "commandWindows")
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+
+        r = subprocess.run(  # noqa: S603
+            [comspec, "/C", win_value],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+        assert r.returncode == 0, r.stderr
+        assert marker.exists(), "launcher did not run under cmd /C arg-escaping"
+
+        # And prove the old multi-quote `command` form would NOT have run.
+        bad_value = _field_value(_override_value(args, "PostToolUse"), "command")
+        r2 = subprocess.run(  # noqa: S603
+            [comspec, "/C", bad_value],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+        assert r2.returncode != 0
+
+    def test_commandWindows_bare_path_with_spaces_is_unquoted(  # noqa: N802
+        self, tmp_path: Path
+    ) -> None:
+        # The fix relies on Codex/cmd adding at most one quote pair around the
+        # single path token, so we must emit the path WITHOUT our own quotes
+        # even when it contains spaces.
+        launcher = r"C:\Users\me\ag ent\codex-hook-worker.cmd"
+        args = hooks.codex_hook_overrides(tmp_path, "worker", windows_launcher=launcher)
+        value = _field_value(_override_value(args, "PostToolUse"), "commandWindows")
+        assert value == launcher
+        assert not value.startswith('"')
+        assert not value.endswith('"')
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["../evil", "a/b", "a\\b", 'a"b', "a b", "", "x" * 65, "a;b", "a.cmd"],
+    )
+    def test_write_codex_launcher_rejects_unsafe_agent_name(
+        self, tmp_path: Path, bad: str
+    ) -> None:
+        # Safe-name invariant must be enforced BEFORE any path/content is
+        # written, so an unsafe name can't influence the on-disk launcher.
+        with pytest.raises(ValueError, match="unsafe agent name"):
+            hooks.write_codex_launcher(tmp_path, bad)
+        assert list(tmp_path.glob("*.cmd")) == []  # nothing written
+
+    @pytest.mark.skipif(
+        os.name != "nt", reason="cmd.exe launcher execution is Windows-only"
+    )
+    def test_launcher_run_writes_state_marker_end_to_end(self, tmp_path: Path) -> None:
+        # End-to-end: run the ACTUAL write_codex_launcher output via cmd with a
+        # real event JSON on stdin and assert the state marker is written — the
+        # full path Codex exercises on Windows.
+        launcher = hooks.write_codex_launcher(tmp_path, "worker")
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        r = subprocess.run(  # noqa: S603
+            [comspec, "/C", str(launcher)],
+            input='{"hook_event_name":"Stop","session_id":"s1"}',
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert r.returncode == 0, r.stderr
+        marker = tmp_path / "state-worker.json"
+        assert marker.exists(), "launcher did not write the state marker"
+        assert json.loads(marker.read_text(encoding="utf-8"))["state"] == "waiting"

@@ -10,6 +10,7 @@ without scanning the agent's full transcript.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -21,6 +22,19 @@ _RUNNING_EVENTS: frozenset[str] = frozenset(
 _WAITING_EVENTS: frozenset[str] = frozenset({"Stop", "SubagentStop"})
 
 _HOOK_MODULE = "claude_teams.hooks"
+
+# Mirror of process_manager's safe-name invariant. Enforced here BEFORE an agent
+# name is interpolated into an on-disk launcher path/content, rather than relying
+# on the later (post-file-write) validation in the process manager.
+_SAFE_AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _require_safe_agent(agent_name: str) -> str:
+    """Return ``agent_name`` if it matches the safe-name invariant, else raise."""
+    if not _SAFE_AGENT_RE.match(agent_name):
+        msg = f"unsafe agent name: {agent_name!r}"
+        raise ValueError(msg)
+    return agent_name
 
 
 def _marker_file(session_dir: Path, agent: str) -> Path:
@@ -135,39 +149,81 @@ def write_claude_settings(session_dir: Path, agent_name: str) -> Path:
     return path
 
 
-def codex_hook_overrides(session_dir: Path, agent_name: str) -> list[str]:
+def write_codex_launcher(session_dir: Path, agent_name: str) -> Path:
+    """Write a Windows ``.cmd`` launcher that runs the state-marker emit.
+
+    Why a launcher (see ``docs/tickets/codex-hook-windows-cmd``): Codex runs a
+    ``command`` hook by handing the string to ``cmd /C`` via argv-escaping
+    (Rust ``Command::arg``). That corrupts our multi-token double-quoted
+    command — the manually added inner quotes get backslash-escaped and
+    ``cmd.exe`` rejects them (``'"…"' is not recognized`` → exit 1, marker
+    never written). A launcher referenced as a SINGLE bare path in the
+    ``commandWindows`` override sidesteps this: Codex quotes the lone path at
+    most once (only if it contains spaces), which ``cmd /C`` handles fine. The
+    launcher, being a batch file, quotes the interpreter/args with normal cmd
+    rules; and stdin (the event JSON) is inherited cmd -> launcher -> python, so
+    ``emit`` still reads it. Native backslash paths are used (cmd-friendly).
+
+    ``agent_name`` is validated against the safe-name invariant BEFORE it is
+    interpolated into the launcher path or its batch content, so a name with
+    path separators or quotes can never influence what/where we write (the
+    process manager's later validation runs only after this file is created).
+    """
+    session_dir = Path(session_dir)
+    _require_safe_agent(agent_name)
+    python = str(Path(sys.executable))
+    sdir = str(session_dir)
+    lines = [
+        "@echo off",
+        f'"{python}" -m {_HOOK_MODULE} emit '
+        f'--session-dir "{sdir}" --agent "{agent_name}"',
+        "exit /b %errorlevel%",
+    ]
+    path = session_dir / f"codex-hook-{agent_name}.cmd"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    return path
+
+
+def codex_hook_overrides(
+    session_dir: Path, agent_name: str, windows_launcher: str | None = None
+) -> list[str]:
     """Return ``-c`` config-override argv expressing the state hooks for Codex.
 
-    Pure function: does not write any file. Mirrors the same event -> emit
-    command wiring used for Claude Code, expressed as ``-c`` value overrides
-    (one per event) for the Codex hooks table.
+    Mirrors the same event -> emit command wiring used for Claude Code,
+    expressed as ``-c`` value overrides (one per event) for the Codex hooks
+    table.
 
-    Confirmed shape (spike on codex-cli 0.142.5, hooks feature stable)::
+    Confirmed shape (codex-cli 0.142.5)::
 
         hooks.<Event>=[{hooks=[{type="command",command="<CMD>"}]}]
 
-    ``<CMD>`` is the shell-quoted emit command as a single TOML basic string.
-    Basic strings treat backslash as an escape character, so any Windows path
-    baked into the command (interpreter, session dir) must use forward
-    slashes only — see :func:`_emit_command`.
+    ``command`` (``<CMD>``) is the POSIX form: the double-quoted emit argv as a
+    TOML basic string. It works under ``sh -c`` on Unix. Backslash is a TOML
+    escape char, so the paths baked into it use forward slashes only — see
+    :func:`_emit_command`.
 
-    Tokens are DOUBLE-quoted (not single-quoted): Codex runs a ``command``
-    hook through the platform shell, which on Windows is ``cmd.exe`` where a
-    single quote is a literal character, not a quote. A single-quoted command
-    therefore fails there with ``exit code 1`` on every hook event. Double
-    quotes work in both ``cmd.exe`` and POSIX ``sh``; the ``"`` characters are
-    escaped to ``\\"`` by :func:`_toml_basic_string` when nested in the TOML
-    basic string.
+    ``windows_launcher`` (a :func:`write_codex_launcher` path) adds a
+    ``commandWindows=<path>`` override to each event. On Windows Codex runs
+    ``commandWindows`` instead of ``command``, via ``cmd /C``. The value is the
+    BARE launcher path (no manually added quotes): Codex's argv-escaping quotes
+    it at most once, which ``cmd.exe`` handles — a multi-token double-quoted
+    string does not (its inner quotes get escaped and rejected). Pass ``None``
+    (the Linux case) to omit ``commandWindows`` and rely on ``command``.
     """
     session_dir = Path(session_dir)
     command = _emit_command(session_dir, agent_name)
     command_str = _shell_quote_command(command)
+    win_fragment = ""
+    if windows_launcher:
+        win_fragment = f",commandWindows={_toml_basic_string(windows_launcher)}"
     args: list[str] = []
     for event in sorted(_RUNNING_EVENTS | _WAITING_EVENTS):
         args.extend(
             [
                 "-c",
-                f'hooks.{event}=[{{hooks=[{{type="command",command={_toml_basic_string(command_str)}}}]}}]',
+                f'hooks.{event}=[{{hooks=[{{type="command",'
+                f"command={_toml_basic_string(command_str)}{win_fragment}}}]}}]",
             ]
         )
     return args
