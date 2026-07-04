@@ -116,7 +116,9 @@ def test_marker_roundtrip_drives_check_agent_state(
         ],
     )
     monkeypatch.setattr(
-        server_simple.process_manager, "health_check", lambda pid: (True, "")
+        server_simple.process_manager,
+        "health_check",
+        lambda pid, expected_token=None: (True, ""),
     )
     monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
 
@@ -157,9 +159,7 @@ def test_kill_agent_deletes_marker_so_reused_name_starts_clean(
         json.dumps({"state": "running", "event": "Stop", "ts": 1.0}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        server_simple.process_manager, "kill_process", lambda pid: None
-    )
+    monkeypatch.setattr(server_simple.process_manager, "kill_process", lambda pid: None)
 
     asyncio.run(server_simple.kill_agent("worker"))
 

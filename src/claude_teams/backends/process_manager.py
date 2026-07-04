@@ -61,6 +61,150 @@ def _build_posix_shell_command(cwd: str, cmd: list[str], env: dict[str, str]) ->
     return f"cd {shlex.quote(cwd)} && {export_prefix}exec {shlex.join(cmd)}"
 
 
+def _read_windows_creation_token(pid: int) -> str | None:
+    """Return a Windows process's creation FILETIME as an opaque string token.
+
+    Uses ``GetProcessTimes`` (creation time is immutable for a process's
+    lifetime), so a reused PID yields a different token. Returns ``None`` when
+    the process is gone or the times are unreadable (e.g. access denied) — the
+    caller must fail closed on ``None``.
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [
+        ctypes.POINTER(ctypes.c_uint64)
+    ] * 4
+    kernel32.GetProcessTimes.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    process_handle = kernel32.OpenProcess(
+        _PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+    )
+    if not process_handle:
+        return None
+    try:
+        creation = ctypes.c_uint64()
+        exit_t = ctypes.c_uint64()
+        kernel_t = ctypes.c_uint64()
+        user_t = ctypes.c_uint64()
+        ok = kernel32.GetProcessTimes(
+            process_handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_t),
+            ctypes.byref(kernel_t),
+            ctypes.byref(user_t),
+        )
+        if not ok or creation.value == 0:
+            return None
+        return str(creation.value)
+    finally:
+        kernel32.CloseHandle(process_handle)
+
+
+def _read_linux_creation_token(pid: int) -> str | None:
+    """Return a Linux process's ``starttime`` (field 22) as an opaque token.
+
+    ``starttime`` (clock ticks since boot) is fixed per process, so a reused
+    PID yields a different token. The stat line is split with ``rsplit(") ", 1)``
+    first because ``comm`` (field 2) can itself contain spaces and parentheses;
+    only after the final ``") "`` are the space-delimited fields safe to index.
+    Field 22 is index 19 of the post-``comm`` remainder. Returns ``None`` on any
+    read/parse failure.
+    """
+    stat_path = Path("/proc") / str(pid) / "stat"
+    try:
+        stat = stat_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    parts = stat.rsplit(") ", 1)
+    if len(parts) != _PROC_STAT_SPLIT_FIELD_COUNT:
+        return None
+    fields = parts[1].split()
+    # Field 3 (state) is fields[0]; field 22 (starttime) is fields[19].
+    if len(fields) <= 19:  # noqa: PLR2004 - field index from proc(5).
+        return None
+    starttime = fields[19]
+    return starttime if starttime.isdigit() else None
+
+
+def creation_token(handle: str) -> str | None:
+    """Return an opaque, PID-reuse-distinguishing creation token, or ``None``.
+
+    ``None`` means the PID is not live or its creation metadata is unreadable;
+    callers gating destructive operations must treat ``None`` as "not owned".
+    """
+    try:
+        pid = int(handle)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        return _read_windows_creation_token(pid)
+    return _read_linux_creation_token(pid)
+
+
+class _PidOwnershipMixin:
+    """Shared PID-reuse-safe ownership/liveness for all process managers.
+
+    Provides the fail-closed ``owns_process`` gate (used before any destructive
+    PID operation) and the token-aware liveness tail shared by the managers'
+    ``health_check`` implementations. Subclasses supply ``self._processes`` and
+    ``self._pid_alive``.
+    """
+
+    _processes: dict
+
+    def _pid_alive(self, handle: str) -> bool:  # pragma: no cover - subclass provides
+        raise NotImplementedError
+
+    def creation_token(self, handle: str) -> str | None:
+        """Return the live creation token for ``handle`` (module-level compute)."""
+        return creation_token(handle)
+
+    def _has_live_registry_entry(self, handle: str) -> bool:
+        """Whether this manager still owns a live in-memory child for ``handle``."""
+        return handle in self._processes and self._pid_alive(handle)
+
+    def owns_process(self, handle: str, expected_token: str | None) -> bool:
+        """Return whether ``handle`` is provably still our process (fail-closed).
+
+        ``True`` only when EITHER this manager still has current in-memory
+        ownership of a live child for ``handle``, OR the live PID's creation
+        token equals ``expected_token``. A tokenless expectation, an unreadable
+        live token (dead / access denied), or a mismatch all return ``False`` —
+        so a reused or foreign PID is never gracefully-shut-down or killed.
+        """
+        if self._has_live_registry_entry(handle):
+            return True
+        if not expected_token:
+            return False
+        live = creation_token(handle)
+        return live is not None and live == expected_token
+
+    def _pid_health_with_token(
+        self, handle: str, expected_token: str | None
+    ) -> tuple[bool, str]:
+        """Token-aware liveness for the no-in-memory-registry case.
+
+        With ``expected_token`` set, a live PID whose token differs (reuse) or
+        is unreadable is reported dead. Without a token, falls back to bare PID
+        liveness (backward compatible for records predating tokens — display
+        only; destructive ops still gate on ``owns_process``).
+        """
+        if expected_token:
+            live = creation_token(handle)
+            if live is None:
+                return False, "process not found or token unreadable"
+            if live != expected_token:
+                return False, "pid reused (token mismatch)"
+            return True, "process exists by pid (token match)"
+        if self._pid_alive(handle):
+            return True, "process exists by pid"
+        return False, "process not found"
+
+
 @dataclass
 class ProcessInfo:
     """Runtime information for a spawned agent process."""
@@ -156,7 +300,7 @@ class WindowsJobObject:
         self._handle = None
 
 
-class WindowsProcessManager:
+class WindowsProcessManager(_PidOwnershipMixin):
     """Manage spawned agent CLIs through ``subprocess.Popen``."""
 
     def __init__(self) -> None:
@@ -289,8 +433,16 @@ class WindowsProcessManager:
                 cmd, creationflags=fallback_flags, **kwargs
             )
 
-    def health_check(self, handle: str) -> tuple[bool, str]:
-        """Return process liveness for a PID handle."""
+    def health_check(
+        self, handle: str, expected_token: str | None = None
+    ) -> tuple[bool, str]:
+        """Return process liveness for a PID handle.
+
+        ``expected_token`` (a prior :func:`creation_token`) makes liveness
+        PID-reuse-safe for recovered records after a server/host restart: a
+        live-but-reused PID is reported dead. Ignored while this manager still
+        owns the child in-memory (same-process spawn).
+        """
         info = self._processes.get(handle)
         if info is not None:
             exit_code = info.process.poll()
@@ -300,9 +452,7 @@ class WindowsProcessManager:
                 info.exit_logged = True
                 self._close_log(info)
             return False, f"process exited ({exit_code})"
-        if self._pid_alive(handle):
-            return True, "process exists by pid"
-        return False, "process not found"
+        return self._pid_health_with_token(handle, expected_token)
 
     def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
         """Terminate a process by PID handle, escalating to kill if needed."""
@@ -493,7 +643,7 @@ class WindowsProcessManager:
         )
 
 
-class TmuxProcessManager:
+class TmuxProcessManager(_PidOwnershipMixin):
     """Manage spawned agent CLIs through tmux panes or windows."""
 
     def __init__(self) -> None:
@@ -554,8 +704,10 @@ class TmuxProcessManager:
             log_handle.write(f"[tmux] target={target_id} pane={pane_id} pid={pid}\n")
         return SpawnResult(process_handle=handle, backend_type=backend_type)
 
-    def health_check(self, handle: str) -> tuple[bool, str]:
-        """Return process liveness for a PID handle."""
+    def health_check(
+        self, handle: str, expected_token: str | None = None
+    ) -> tuple[bool, str]:
+        """Return process liveness for a PID handle (token-aware after restart)."""
         info = self._processes.get(handle)
         if info is not None:
             alive, detail = self._pane_alive(info.pane_id)
@@ -564,9 +716,7 @@ class TmuxProcessManager:
             if self._pid_alive(handle):
                 return True, "process exists by pid"
             return False, detail
-        if self._pid_alive(handle):
-            return True, "process exists by pid"
-        return False, "process not found"
+        return self._pid_health_with_token(handle, expected_token)
 
     def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
         """Kill a tmux pane/window or fall back to killing a PID."""
@@ -857,7 +1007,7 @@ class TmuxProcessManager:
         raise FileNotFoundError(msg)
 
 
-class LinuxTerminalProcessManager:
+class LinuxTerminalProcessManager(_PidOwnershipMixin):
     """Manage spawned agent CLIs through Linux terminal emulator windows."""
 
     def __init__(self) -> None:
@@ -926,17 +1076,24 @@ class LinuxTerminalProcessManager:
         )
         return SpawnResult(process_handle=handle, backend_type=backend_type)
 
-    def health_check(self, handle: str) -> tuple[bool, str]:
-        """Return terminal process liveness for a PID handle."""
+    def health_check(
+        self, handle: str, expected_token: str | None = None
+    ) -> tuple[bool, str]:
+        """Return terminal process liveness for a PID handle (token-aware).
+
+        While this manager still owns the launcher in-memory it prefers the
+        real agent PID (from the sidecar). After a restart there is no
+        in-memory info; the persisted ``expected_token`` (the launcher PID's
+        token — see the plan's documented residual) gates liveness so a reused
+        launcher PID is reported dead rather than falsely alive.
+        """
         info = self._processes.get(handle)
         if info is not None:
             agent_status = self._agent_pid_health(info)
             if agent_status is not None:
                 return agent_status
             return self._terminal_launcher_health(info)
-        if self._pid_alive(handle):
-            return True, "process exists by pid"
-        return False, "process not found"
+        return self._pid_health_with_token(handle, expected_token)
 
     def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
         """Terminate a terminal process by PID handle."""

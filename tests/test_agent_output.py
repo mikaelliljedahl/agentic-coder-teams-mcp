@@ -596,9 +596,7 @@ def test_codex_resume_command_preserves_permissions_and_prompt(
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert cmd[cmd.index("-C") + 1] == str(tmp_path)
     assert "model_reasoning_effort=high" in cmd
-    assert any(
-        arg.startswith("mcp_servers.win-agent-teams.env=") for arg in cmd
-    )
+    assert any(arg.startswith("mcp_servers.win-agent-teams.env=") for arg in cmd)
     assert cmd[-3] == "resume"
     assert cmd[-2] == "codex-session-id"
     # /usr/bin/codex is the native binary (not the cmd.exe shim), so the
@@ -682,6 +680,7 @@ async def test_spawn_agent_persists_output_lookup_metadata(
             "model": "model",
             "permission_mode": "bypass",
             "reasoning_effort": None,
+            "create_token": None,
         }
     ]
 
@@ -847,7 +846,7 @@ async def test_list_agents_recovers_lead_session_after_mcp_restart(
     monkeypatch.setattr(
         server_simple.process_manager,
         "health_check",
-        lambda handle: (True, "running"),
+        lambda handle, expected_token=None: (True, "running"),
     )
 
     result = await server_simple.list_agents()
@@ -911,7 +910,7 @@ async def test_check_agent_skips_rollout_for_legacy_agent_record(
     monkeypatch.setattr(
         server_simple.process_manager,
         "health_check",
-        lambda handle: (False, f"{handle} exited"),
+        lambda handle, expected_token=None: (False, f"{handle} exited"),
     )
 
     def fail_read(*args: object, **kwargs: object) -> None:
@@ -962,7 +961,7 @@ async def test_check_agent_persists_backend_session_id_from_rollout(
     monkeypatch.setattr(
         server_simple.process_manager,
         "health_check",
-        lambda handle: (False, f"{handle} exited"),
+        lambda handle, expected_token=None: (False, f"{handle} exited"),
     )
     monkeypatch.setattr(
         server_simple,
@@ -1043,7 +1042,9 @@ async def test_follow_up_agent_resumes_dead_agent(
     _setup_follow_up_session(tmp_path, monkeypatch, backend)
     _write_agent_for_follow_up(tmp_path)
     monkeypatch.setattr(
-        server_simple.process_manager, "health_check", lambda handle: (False, "dead")
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (False, "dead"),
     )
     monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
 
@@ -1070,7 +1071,9 @@ async def test_follow_up_agent_refuses_busy_live_agent(
     _setup_follow_up_session(tmp_path, monkeypatch, backend)
     _write_agent_for_follow_up(tmp_path)
     monkeypatch.setattr(
-        server_simple.process_manager, "health_check", lambda handle: (True, "alive")
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (True, "alive"),
     )
 
     result = await server_simple.follow_up_agent("worker", "next prompt")
@@ -1088,7 +1091,9 @@ async def test_follow_up_agent_refuses_idle_live_agent_without_replace(
     _setup_follow_up_session(tmp_path, monkeypatch, backend)
     _write_agent_for_follow_up(tmp_path)
     monkeypatch.setattr(
-        server_simple.process_manager, "health_check", lambda handle: (True, "alive")
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (True, "alive"),
     )
     monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
     monkeypatch.setattr(
@@ -1119,7 +1124,9 @@ async def test_follow_up_agent_replaces_idle_live_agent_when_allowed(
     _setup_follow_up_session(tmp_path, monkeypatch, backend)
     _write_agent_for_follow_up(tmp_path)
     monkeypatch.setattr(
-        server_simple.process_manager, "health_check", lambda handle: (True, "alive")
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (True, "alive"),
     )
     monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
     monkeypatch.setattr(
@@ -1131,6 +1138,11 @@ async def test_follow_up_agent_replaces_idle_live_agent_when_allowed(
             backend_session_id="backend-session-id",
             busy_hint=False,
         ),
+    )
+    # The idle-but-alive agent is genuinely ours, so ownership holds and the
+    # graceful shutdown proceeds (fail-closed gate returns True here).
+    monkeypatch.setattr(
+        server_simple.process_manager, "owns_process", lambda handle, token: True
     )
     graceful_calls = []
     monkeypatch.setattr(
@@ -1198,7 +1210,9 @@ async def test_follow_up_agent_recovers_session_after_mcp_restart(
     )
     monkeypatch.setattr(server_simple, "_session_id", "")
     monkeypatch.setattr(
-        server_simple.process_manager, "health_check", lambda handle: (False, "dead")
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (False, "dead"),
     )
     monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
 

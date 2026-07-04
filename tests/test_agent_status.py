@@ -58,7 +58,9 @@ class TestCheckAgentCompactShape:
         _add_agent(session)
         _write_marker(session, "worker", "running")
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
 
@@ -88,7 +90,9 @@ class TestCheckAgentCompactShape:
     ) -> None:
         _add_agent(session)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         from types import SimpleNamespace
 
@@ -115,7 +119,9 @@ class TestCheckAgentCompactShape:
     ) -> None:
         _add_agent(session)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         from types import SimpleNamespace
 
@@ -140,7 +146,9 @@ class TestCheckAgentCompactShape:
     ) -> None:
         _add_agent(session)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         from types import SimpleNamespace
 
@@ -172,7 +180,9 @@ class TestCheckAgentCompactShape:
     ) -> None:
         _add_agent(session)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
         _append_message(session, server_simple.IDENTITY, "worker", "hi")
@@ -193,7 +203,9 @@ class TestFollowUpAgentInternalDict:
     ) -> None:
         _add_agent(session, spawned_at=1000.0, cwd="C:\\project")
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         from types import SimpleNamespace
 
@@ -208,9 +220,7 @@ class TestFollowUpAgentInternalDict:
             ),
         )
 
-        result = asyncio.run(
-            server_simple.follow_up_agent("worker", "next task")
-        )
+        result = asyncio.run(server_simple.follow_up_agent("worker", "next task"))
 
         assert result["success"] is False
         assert result["reason"] == "agent_busy"
@@ -222,13 +232,13 @@ class TestFollowUpAgentInternalDict:
     ) -> None:
         _add_agent(session, spawned_at=1000.0, cwd="C:\\project")
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
 
-        result = asyncio.run(
-            server_simple.follow_up_agent("worker", "next task")
-        )
+        result = asyncio.run(server_simple.follow_up_agent("worker", "next task"))
 
         assert result["success"] is False
         assert result["reason"] == "backend_session_missing"
@@ -244,7 +254,9 @@ class TestListAgentsCompactRows:
             permission_mode="bypass",
         )
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
 
@@ -269,7 +281,9 @@ class TestListAgentsCompactRows:
     ) -> None:
         _add_agent(session)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
 
@@ -283,13 +297,13 @@ class TestListAgentsCompactRows:
         _add_agent(session)
         _write_marker(session, "worker", "waiting", ts=1234.5)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         def fail_read(agent: dict) -> None:
-            pytest.fail(
-                "list_agents must not scan the transcript when a marker exists"
-            )
+            pytest.fail("list_agents must not scan the transcript when a marker exists")
 
         monkeypatch.setattr(server_simple, "_read_agent_output", fail_read)
 
@@ -302,7 +316,9 @@ class TestListAgentsCompactRows:
     ) -> None:
         _add_agent(session, model="sonnet")
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         from types import SimpleNamespace
 
@@ -330,7 +346,9 @@ class TestListAgentsCompactRows:
     ) -> None:
         _add_agent(session, model="sonnet")
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         from types import SimpleNamespace
 
@@ -361,7 +379,9 @@ class TestAgentStatus:
         _add_agent(session)
         _write_marker(session, "worker", "waiting", ts=1234.5)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         result = asyncio.run(server_simple.agent_status())
@@ -406,7 +426,9 @@ class TestAgentStatus:
         ]
         server_simple._save_agents(session, agents)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         result = asyncio.run(server_simple.agent_status(names=["worker-1"]))
@@ -422,7 +444,9 @@ class TestAgentStatus:
     ) -> None:
         _add_agent(session)
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
         _append_message(session, server_simple.IDENTITY, "worker", "hi")
         _append_message(session, server_simple.IDENTITY, "worker", "there")
@@ -439,7 +463,9 @@ class TestAgentStatus:
         _add_agent(session)
         _write_marker(session, "worker", "running")
         monkeypatch.setattr(
-            server_simple.process_manager, "health_check", lambda pid: (True, "")
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
         )
 
         def fail_read(agent: dict) -> None:
