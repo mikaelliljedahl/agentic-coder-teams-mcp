@@ -1,5 +1,6 @@
 """Runtime BaseBackend process-manager operation tests."""
 
+import json
 import subprocess
 import sys
 from unittest.mock import MagicMock
@@ -580,11 +581,172 @@ class TestWindowsTerminalTabSpawn:
             wrapper, "C:\\proj", ["claude", "it's"], {"K": "a'b"}, sidecar
         )
 
-        text = wrapper.read_text(encoding="utf-8")
+        text = wrapper.read_text(encoding="utf-8-sig")
         assert "$env:K = 'a''b'" in text
         assert "'it''s'" in text
         # Always exit 0 so Windows Terminal closes the tab on completion/kill.
         assert "exit 0" in text
+
+    def test_wrapper_written_with_utf8_bom(self, tmp_path):
+        manager = process_manager_mod.WindowsProcessManager()
+        wrapper = tmp_path / "w.launch.ps1"
+        sidecar = tmp_path / "w.pid"
+
+        manager._write_tab_wrapper(
+            wrapper, "C:\\proj", ["claude", "em—dash"], {"K": "v"}, sidecar
+        )
+
+        raw = wrapper.read_bytes()
+        # Windows PowerShell 5.1 decodes a BOM-less .ps1 as ANSI, corrupting the
+        # em-dash the correlation marker uses; the BOM forces UTF-8 decoding.
+        assert raw.startswith(b"\xef\xbb\xbf")
+        assert "em—dash" in raw.decode("utf-8-sig")
+
+    def test_codex_tab_launches_codex_directly_without_wrapper(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        manager, popen_mock = self._prep_manager(monkeypatch, tmp_path)
+        seen: dict[str, str] = {}
+
+        def fake_discover(token: str) -> int:
+            seen["token"] = token
+            return 7777
+
+        monkeypatch.setattr(manager, "_await_codex_tab_pid", fake_discover)
+
+        result = manager.spawn_process(
+            _make_spawn_request(),
+            ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:worker@team"],
+            {"PATH": "x"},
+            "codex",
+            is_interactive=True,
+        )
+
+        assert result.process_handle == "7777"
+        cmd = popen_mock.call_args.args[0]
+        assert cmd[0] == "C:\\wt.exe"
+        assert "--suppressApplicationTitle" in cmd
+        # codex launches directly: no powershell wrapper in the argv.
+        assert "powershell" not in cmd
+        assert "C:\\codex.exe" in cmd
+        assert "-d" in cmd
+        # No wrapper .ps1 is written for codex.
+        assert not (tmp_path / "team" / "worker.launch.ps1").exists()
+        # The discovered codex PID is persisted for restart recovery.
+        assert (tmp_path / "team" / "worker.pid").read_text().strip() == "7777"
+        # Discovery keyed on the exact correlation token of the agent_id.
+        assert seen["token"] == "wat-corr:worker@team"  # noqa: S105 - correlation marker
+        tab = manager._tabs["7777"]
+        assert tab.wrapper_path is None
+        assert tab.backend == "codex"
+
+    def test_codex_tab_terminate_taskkills_codex_pid(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        manager, _ = self._prep_manager(monkeypatch, tmp_path)
+        monkeypatch.setattr(manager, "_await_codex_tab_pid", lambda token: 7777)
+        manager.spawn_process(
+            _make_spawn_request(),
+            ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:worker@team"],
+            {},
+            "codex",
+            is_interactive=True,
+        )
+
+        killed: list[str] = []
+        alive = {"v": True}
+        monkeypatch.setattr(manager, "_pid_alive", lambda handle: alive["v"])
+
+        def kill(handle: str) -> None:
+            killed.append(handle)
+            alive["v"] = False
+
+        monkeypatch.setattr(manager, "_kill_pid", kill)
+        child_calls: list[str] = []
+        monkeypatch.setattr(
+            manager, "_child_pids", lambda h: child_calls.append(h) or []
+        )
+        monkeypatch.setattr(
+            manager, "_win_wait_pid_exit", lambda h, t: not alive["v"]
+        )
+
+        manager.kill_process("7777")
+
+        # codex kills its own PID subtree directly -- no wrapper-children dance.
+        assert killed == ["7777"]
+        assert child_calls == []
+        assert "7777" not in manager._tabs
+
+    def test_codex_tab_raises_when_pid_never_found(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        manager, _ = self._prep_manager(monkeypatch, tmp_path)
+        monkeypatch.setattr(manager, "_await_codex_tab_pid", lambda token: None)
+
+        with pytest.raises(process_manager_mod.WindowsTerminalTabSpawnError):
+            manager.spawn_process(
+                _make_spawn_request(),
+                ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:worker@team"],
+                {},
+                "codex",
+                is_interactive=True,
+            )
+
+    def test_find_codex_pid_by_token_selects_newest(self, monkeypatch):
+        manager = process_manager_mod.WindowsProcessManager()
+        payload = json.dumps(
+            [
+                {
+                    "ProcessId": 100,
+                    "CommandLine": "codex a wat-corr:worker@team",
+                    "CreationDate": "/Date(1000)/",
+                },
+                {
+                    "ProcessId": 200,
+                    "CommandLine": "codex b wat-corr:worker@team",
+                    "CreationDate": "/Date(2000)/",
+                },
+                {
+                    "ProcessId": 300,
+                    "CommandLine": "codex c wat-corr:other@team",
+                    "CreationDate": "/Date(3000)/",
+                },
+            ]
+        )
+        monkeypatch.setattr(
+            process_manager_mod.subprocess,
+            "run",
+            lambda *a, **k: MagicMock(stdout=payload),
+        )
+
+        assert manager._find_codex_pid_by_token("wat-corr:worker@team") == 200
+
+    def test_find_codex_pid_handles_single_and_missing(self, monkeypatch):
+        manager = process_manager_mod.WindowsProcessManager()
+        single = json.dumps(
+            {
+                "ProcessId": 55,
+                "CommandLine": "codex wat-corr:worker@team",
+                "CreationDate": "/Date(5)/",
+            }
+        )
+        monkeypatch.setattr(
+            process_manager_mod.subprocess,
+            "run",
+            lambda *a, **k: MagicMock(stdout=single),
+        )
+        # ConvertTo-Json emits a bare object (not a list) for a single match.
+        assert manager._find_codex_pid_by_token("wat-corr:worker@team") == 55
+        # No token match anywhere → None.
+        assert manager._find_codex_pid_by_token("wat-corr:nobody") is None
+
+        monkeypatch.setattr(
+            process_manager_mod.subprocess,
+            "run",
+            lambda *a, **k: MagicMock(stdout="   "),
+        )
+        # No codex.exe processes at all → None.
+        assert manager._find_codex_pid_by_token("wat-corr:worker@team") is None
 
 
 class TestProcessLivenessFallback:
