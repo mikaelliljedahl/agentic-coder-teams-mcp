@@ -95,7 +95,7 @@ The server auto-injects `AGENT_NAME` and `AGENT_SESSION_ID` into the Codex confi
 `spawn_agent` starts a CLI process and returns immediately with `{name, pid, backend, session_id}`. The agent runs independently.
 
 Display mode is selected automatically:
-- Windows uses native processes. When Windows Terminal (`wt.exe`) is available, interactive agents open as **tabs grouped in one window per team** (`wt -w wt-team-<team>`), each tab titled `<agent>@<team>`; the tab closes when the agent exits or is killed. If `wt.exe` is not on PATH, each interactive agent falls back to its own console window. Set `WIN_AGENT_TEAMS_NO_WT_TABS=1` to force the classic one-window-per-agent console even when `wt.exe` is present.
+- Windows uses native processes. Interactive agents can open their own console window, and captured output can be tailed in Windows Terminal when `wt.exe` is available.
 - Linux/POSIX defaults to spawning each agent in its own terminal emulator window. Set `WIN_AGENT_TEAMS_LINUX_LAUNCHER=tmux` to use `tmux` instead. In tmux mode, if the MCP server is already inside tmux, agents are spawned as split panes by default (set `USE_TMUX_WINDOWS=1` to use tmux windows); if the server is not inside tmux, agents are spawned into a detached session named `win-agent-teams-<session>`.
 
 If your MCP client does not pass its `TMUX` environment variable through to the
@@ -125,12 +125,10 @@ restarts, idles out, or closes its MCP server process. To restore strict child
 cleanup when the MCP process exits, set `WIN_AGENT_TEAMS_KILL_ON_EXIT=1` before
 starting the server. This cleanup option is Windows-specific.
 
-Interactive agents launch in a visible console by default so their live UI
-remains visible while they work — a Windows Terminal tab (grouped per team)
-when `wt.exe` is available, otherwise a standalone console window. On Windows,
-set `WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE=0` to capture stdout/stderr to the
-per-agent log file instead, or `WIN_AGENT_TEAMS_NO_WT_TABS=1` to keep the
-visible console but force a separate window per agent instead of tabs.
+Interactive agents launch in their own console window by default so their live
+UI remains visible while they work. On Windows, set
+`WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE=0` to capture stdout/stderr to the
+per-agent log file instead.
 
 Lead MCP sessions are also persisted per parent process, workspace, and
 identity. If Codex or Claude restarts only the MCP server process, tools such as
