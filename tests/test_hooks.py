@@ -50,6 +50,17 @@ def _field_value(override: str, field: str) -> str:
     return _toml_decode("".join(out))
 
 
+def _single_quoted_field(override: str, field: str) -> str:
+    """Extract ``<field>='...'`` from a single-quoted (Windows) override value.
+
+    TOML literal strings do no escaping, so the value ends at the next single
+    quote.
+    """
+    marker = f"{field}='"
+    i = override.index(marker) + len(marker)
+    return override[i : override.index("'", i)]
+
+
 def _marker_path(session_dir: Path, agent: str) -> Path:
     return session_dir / f"state-{agent}.json"
 
@@ -415,30 +426,33 @@ class TestCodexWindowsLauncher:
         for event in _EVENTS:
             override = _override_value(args, event)
             assert "commandWindows=" in override, event
-            # POSIX command must still be present alongside it.
+            # A placeholder `command` is still present alongside it.
             assert "command=" in override
 
-    def test_commandWindows_is_bare_launcher_path_no_extra_quotes(  # noqa: N802
+    def test_commandWindows_is_bare_launcher_path_single_quoted(  # noqa: N802
         self, tmp_path: Path
     ) -> None:
         launcher = r"C:\Users\me\.claude\agent-sessions\s1\codex-hook-worker.cmd"
         args = hooks.codex_hook_overrides(tmp_path, "worker", windows_launcher=launcher)
-        value = _field_value(_override_value(args, "PostToolUse"), "commandWindows")
-        # Decoded value is exactly the launcher path — no wrapping quotes (Codex
-        # adds its own single-level quoting; multiple quote pairs break cmd /C).
+        override = _override_value(args, "PostToolUse")
+        value = _single_quoted_field(override, "commandWindows")
+        # Decoded value is exactly the bare launcher path (Codex adds its own
+        # single-level quoting; extra quote pairs would break cmd /C).
         assert value == launcher
-        assert not value.startswith('"')
 
-    def test_posix_command_still_double_quoted(self, tmp_path: Path) -> None:
-        # Regression: the Linux `command` form is unchanged (double-quoted argv).
+    def test_windows_override_has_no_double_quotes(self, tmp_path: Path) -> None:
+        # The wt.exe safety invariant: a codex agent launched directly in a
+        # Windows Terminal tab (`wt -- codex ...`) receives corrupt argv if the
+        # hook override contains double quotes (wt's parser mangles them), so the
+        # Windows form must be entirely single-quoted TOML literals.
         args = hooks.codex_hook_overrides(
             tmp_path, "worker", windows_launcher=r"C:\s\l.cmd"
         )
-        command = _field_value(_override_value(args, "Stop"), "command")
-        assert command.startswith('"')
-        assert "'" not in command
-        assert "claude_teams.hooks" in command
-        assert "worker" in command
+        for event in _EVENTS:
+            override = _override_value(args, event)
+            assert '"' not in override, f"{event}: {override!r}"
+            # command is the inert single-quoted placeholder, not the emit argv.
+            assert "command='true'" in override
 
     def test_write_codex_launcher_invokes_emit_with_session_and_agent(
         self, tmp_path: Path
@@ -475,7 +489,9 @@ class TestCodexWindowsLauncher:
         args = hooks.codex_hook_overrides(
             tmp_path, "worker", windows_launcher=str(launcher)
         )
-        win_value = _field_value(_override_value(args, "PostToolUse"), "commandWindows")
+        win_value = _single_quoted_field(
+            _override_value(args, "PostToolUse"), "commandWindows"
+        )
         comspec = os.environ.get("COMSPEC", "cmd.exe")
 
         r = subprocess.run(  # noqa: S603
@@ -489,30 +505,20 @@ class TestCodexWindowsLauncher:
         assert r.returncode == 0, r.stderr
         assert marker.exists(), "launcher did not run under cmd /C arg-escaping"
 
-        # And prove the old multi-quote `command` form would NOT have run.
-        bad_value = _field_value(_override_value(args, "PostToolUse"), "command")
-        r2 = subprocess.run(  # noqa: S603
-            [comspec, "/C", bad_value],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=15,
-            check=False,
-        )
-        assert r2.returncode != 0
-
     def test_commandWindows_bare_path_with_spaces_is_unquoted(  # noqa: N802
         self, tmp_path: Path
     ) -> None:
         # The fix relies on Codex/cmd adding at most one quote pair around the
         # single path token, so we must emit the path WITHOUT our own quotes
-        # even when it contains spaces.
+        # even when it contains spaces. A single-quoted TOML literal preserves
+        # the spaces without introducing double quotes (which wt.exe mangles).
         launcher = r"C:\Users\me\ag ent\codex-hook-worker.cmd"
         args = hooks.codex_hook_overrides(tmp_path, "worker", windows_launcher=launcher)
-        value = _field_value(_override_value(args, "PostToolUse"), "commandWindows")
+        value = _single_quoted_field(
+            _override_value(args, "PostToolUse"), "commandWindows"
+        )
         assert value == launcher
-        assert not value.startswith('"')
-        assert not value.endswith('"')
+        assert '"' not in value
 
     @pytest.mark.parametrize(
         "bad",

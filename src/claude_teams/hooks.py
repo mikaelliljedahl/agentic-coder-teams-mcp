@@ -203,27 +203,63 @@ def codex_hook_overrides(
     escape char, so the paths baked into it use forward slashes only — see
     :func:`_emit_command`.
 
-    ``windows_launcher`` (a :func:`write_codex_launcher` path) adds a
-    ``commandWindows=<path>`` override to each event. On Windows Codex runs
-    ``commandWindows`` instead of ``command``, via ``cmd /C``. The value is the
-    BARE launcher path (no manually added quotes): Codex's argv-escaping quotes
-    it at most once, which ``cmd.exe`` handles — a multi-token double-quoted
-    string does not (its inner quotes get escaped and rejected). Pass ``None``
-    (the Linux case) to omit ``commandWindows`` and rely on ``command``.
+    ``windows_launcher`` (a :func:`write_codex_launcher` path) selects the
+    Windows form. On Windows Codex runs ``commandWindows`` (a bare ``.cmd``
+    path) for each event, never the POSIX ``command``. The Windows override is
+    therefore built entirely from single-quoted TOML *literal* strings with **no
+    double-quote characters anywhere** — see :func:`_codex_hook_overrides_windows`
+    for why (Windows Terminal's command-line parser corrupts the double-quoted
+    form). Pass ``None`` (the Linux case) for the POSIX ``command`` form.
     """
     session_dir = Path(session_dir)
-    command = _emit_command(session_dir, agent_name)
-    command_str = _shell_quote_command(command)
-    win_fragment = ""
-    if windows_launcher:
-        win_fragment = f",commandWindows={_toml_basic_string(windows_launcher)}"
+    if windows_launcher is not None:
+        return _codex_hook_overrides_windows(windows_launcher)
+    command_str = _shell_quote_command(_emit_command(session_dir, agent_name))
     args: list[str] = []
     for event in sorted(_RUNNING_EVENTS | _WAITING_EVENTS):
         args.extend(
             [
                 "-c",
                 f'hooks.{event}=[{{hooks=[{{type="command",'
-                f"command={_toml_basic_string(command_str)}{win_fragment}}}]}}]",
+                f"command={_toml_basic_string(command_str)}}}]}}]",
+            ]
+        )
+    return args
+
+
+# ``command`` is required by Codex's hook schema but is never executed on
+# Windows (``commandWindows`` runs instead), so it carries this inert, quote-free
+# placeholder to keep the override entirely free of double-quote characters.
+_WINDOWS_COMMAND_PLACEHOLDER = "true"
+
+
+def _codex_hook_overrides_windows(windows_launcher: str) -> list[str]:
+    r"""Return Windows ``-c`` hook overrides that survive wt.exe's arg parser.
+
+    On Windows Codex runs ``commandWindows`` (the bare launcher path) for each
+    event, so the POSIX ``command`` is unused. The earlier form rendered
+    ``command`` as a double-quoted TOML basic string (escaped ``\\"``); when the
+    agent is launched directly in a Windows Terminal tab (``wt … -- codex …``),
+    wt.exe's own command-line parser mangles those embedded double quotes, Codex
+    receives corrupt argv and exits instantly (no child ever appears). Building
+    the whole override from single-quoted TOML *literal* strings — with **no
+    double-quote characters at all** — passes through wt intact. This mirrors
+    :meth:`CodexBackend._mcp_identity_args`, which is single-quoted for the same
+    Windows-quoting reason and is known to survive wt.
+
+    The launcher path already encodes the session dir and agent name, so those
+    are not needed here. It must not contain a single quote —
+    :func:`_toml_literal_string` rejects one rather than emit a corrupt override.
+    """
+    win = _toml_literal_string(windows_launcher)
+    placeholder = _toml_literal_string(_WINDOWS_COMMAND_PLACEHOLDER)
+    args: list[str] = []
+    for event in sorted(_RUNNING_EVENTS | _WAITING_EVENTS):
+        args.extend(
+            [
+                "-c",
+                f"hooks.{event}=[{{hooks=[{{type='command',"
+                f"command={placeholder},commandWindows={win}}}]}}]",
             ]
         )
     return args
@@ -233,6 +269,20 @@ def _toml_basic_string(value: str) -> str:
     """Render ``value`` as a TOML basic (double-quoted) string literal."""
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _toml_literal_string(value: str) -> str:
+    """Render ``value`` as a TOML literal (single-quoted) string.
+
+    Literal strings perform no escaping and cannot contain a single quote, so a
+    value with one is rejected rather than silently corrupted. Backslashes and
+    double quotes are preserved verbatim — ideal for a bare Windows path and for
+    keeping the rendered override free of the double quotes wt.exe mangles.
+    """
+    if "'" in value:
+        msg = f"cannot render as TOML literal (contains single quote): {value!r}"
+        raise ValueError(msg)
+    return f"'{value}'"
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

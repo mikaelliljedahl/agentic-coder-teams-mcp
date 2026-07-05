@@ -2,6 +2,7 @@
 
 import contextlib
 import ctypes
+import json
 import os
 import re
 import shlex
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, ClassVar
 
+from claude_teams.agent_output import codex_correlation_token
 from claude_teams.backends.contracts import SpawnRequest, SpawnResult
 
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -24,6 +26,9 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _ERROR_ACCESS_DENIED = 5
 _KILL_ON_EXIT_ENV = "WIN_AGENT_TEAMS_KILL_ON_EXIT"
 _NO_BREAKAWAY_ENV = "WIN_AGENT_TEAMS_NO_BREAKAWAY"
+_NO_WT_TABS_ENV = "WIN_AGENT_TEAMS_NO_WT_TABS"
+_WT_TAB_PID_TIMEOUT_SECONDS = 12.0
+_WT_TAB_PID_POLL_SECONDS = 0.1
 _LINUX_LAUNCHER_ENV = "WIN_AGENT_TEAMS_LINUX_LAUNCHER"
 _LINUX_TERMINAL_ENV = "WIN_AGENT_TEAMS_LINUX_TERMINAL"
 _TERMINAL_LAUNCHER_VALUE = "terminal"
@@ -59,6 +64,11 @@ def _build_posix_shell_command(cwd: str, cmd: list[str], env: dict[str, str]) ->
     export_parts = [f"export {key}={shlex.quote(value)};" for key, value in env.items()]
     export_prefix = f"{' '.join(export_parts)} " if export_parts else ""
     return f"cd {shlex.quote(cwd)} && {export_prefix}exec {shlex.join(cmd)}"
+
+
+def _powershell_quote(value: str) -> str:
+    """Quote a value as a PowerShell single-quoted literal (``'`` -> ``''``)."""
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def _read_windows_creation_token(pid: int) -> str | None:
@@ -126,6 +136,21 @@ def _read_linux_creation_token(pid: int) -> str | None:
         return None
     starttime = fields[19]
     return starttime if starttime.isdigit() else None
+
+
+def _codex_creation_epoch_ms(value: object) -> int:
+    """Return a monotonic sort key from a WMI CreationDate JSON value.
+
+    ``ConvertTo-Json`` renders the ``CreationDate`` DateTime either as
+    ``/Date(<ms>)/`` or as an ISO-8601 string depending on the PowerShell
+    version. Both are monotonically increasing once reduced to their digits, and
+    a single query uses one consistent format, so extracting the digits yields a
+    valid newest-first ordering key. Unparseable values sort oldest.
+    """
+    if not isinstance(value, str):
+        return 0
+    digits = re.sub(r"\D", "", value)
+    return int(digits) if digits else 0
 
 
 def creation_token(handle: str) -> str | None:
@@ -251,6 +276,43 @@ class ProcessInfo:
 
 
 @dataclass
+class WindowsTerminalTabInfo:
+    """Runtime information for an agent launched in a Windows Terminal tab.
+
+    ``pid`` is the in-tab PowerShell launcher's PID (the real process whose
+    lifetime wraps the agent's), NOT the transient ``wt.exe`` PID — see
+    :meth:`WindowsProcessManager._spawn_in_terminal_tab`. ``token`` is that
+    PID's creation token captured at spawn so liveness is PID-reuse-safe.
+    """
+
+    pid: int
+    token: str | None
+    name: str
+    agent_id: str
+    team_name: str
+    backend: str
+    launcher: subprocess.Popen[str]
+    log_path: Path
+    sidecar_path: Path
+    # ``None`` for codex tabs, which launch ``codex.exe`` directly (no
+    # powershell wrapper) and recover the PID via the correlation token.
+    wrapper_path: Path | None
+    started_at: float
+    exit_logged: bool = False
+
+
+class WindowsTerminalTabSpawnError(RuntimeError):
+    """Raised when a Windows Terminal tab agent never reports its PID."""
+
+    def __init__(self, title: str) -> None:
+        """Record which tab failed to confirm its launcher PID."""
+        super().__init__(
+            f"Windows Terminal tab {title!r} did not report an agent PID "
+            f"within {_WT_TAB_PID_TIMEOUT_SECONDS:.0f}s"
+        )
+
+
+@dataclass
 class TmuxProcessInfo:
     """Runtime information for a spawned tmux pane/window."""
 
@@ -335,6 +397,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
     def __init__(self) -> None:
         """Initialize the process registry and shared job object."""
         self._processes: dict[str, ProcessInfo] = {}
+        self._tabs: dict[str, WindowsTerminalTabInfo] = {}
         self._kill_on_exit = _env_flag(_KILL_ON_EXIT_ENV)
         self._job = WindowsJobObject()
 
@@ -363,6 +426,19 @@ class WindowsProcessManager(_PidOwnershipMixin):
         interactive_console = self._should_use_interactive_console(
             backend_type, is_interactive=is_interactive
         )
+        if interactive_console and not _env_flag(_NO_WT_TABS_ENV):
+            wt = shutil.which("wt.exe")
+            if wt is not None:
+                return self._spawn_in_terminal_tab(
+                    request,
+                    cmd,
+                    env,
+                    backend_type,
+                    log_path,
+                    log_handle,
+                    wt=wt,
+                    creationflags=creationflags,
+                )
         popen_log_handle: IO[str] | None = log_handle
         if interactive_console:
             if backend_type == "claude-code":
@@ -472,6 +548,9 @@ class WindowsProcessManager(_PidOwnershipMixin):
         live-but-reused PID is reported dead. Ignored while this manager still
         owns the child in-memory (same-process spawn).
         """
+        tab = self._tabs.get(handle)
+        if tab is not None:
+            return self._tab_health(handle, tab, expected_token)
         info = self._processes.get(handle)
         if info is not None:
             exit_code = info.process.poll()
@@ -489,6 +568,10 @@ class WindowsProcessManager(_PidOwnershipMixin):
 
     def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
         """Terminate a process by PID handle, escalating to kill if needed."""
+        tab = self._tabs.get(handle)
+        if tab is not None:
+            self._terminate_tab(handle, tab, timeout_s)
+            return
         info = self._processes.get(handle)
         if info is None:
             self._kill_pid(handle)
@@ -506,6 +589,9 @@ class WindowsProcessManager(_PidOwnershipMixin):
 
     def graceful_shutdown(self, handle: str, timeout_s: float = 10.0) -> bool:
         """Try to stop a process without force-killing it."""
+        tab = self._tabs.get(handle)
+        if tab is not None:
+            return self._graceful_shutdown_tab(handle, tab, timeout_s)
         info = self._processes.get(handle)
         if info is None:
             return not self._pid_alive(handle)
@@ -521,6 +607,9 @@ class WindowsProcessManager(_PidOwnershipMixin):
 
     def capture(self, handle: str, lines: int | None = None) -> str:
         """Read captured stdout/stderr from the process log."""
+        tab = self._tabs.get(handle)
+        if tab is not None:
+            return read_log_tail(tab.log_path, lines)
         info = self._processes.get(handle)
         if info is None:
             return ""
@@ -528,6 +617,8 @@ class WindowsProcessManager(_PidOwnershipMixin):
 
     def send(self, handle: str, text: str, *, enter: bool = True) -> None:
         """Write text to a running process stdin when a pipe exists."""
+        if handle in self._tabs:
+            return
         info = self._processes.get(handle)
         if info is None or info.process.stdin is None:
             return
@@ -674,6 +765,354 @@ class WindowsProcessManager(_PidOwnershipMixin):
             command,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
+
+    def _spawn_in_terminal_tab(
+        self,
+        request: SpawnRequest,
+        cmd: list[str],
+        env: dict[str, str],
+        backend_type: str,
+        log_path: Path,
+        log_handle: IO[str],
+        *,
+        wt: str,
+        creationflags: int,
+    ) -> SpawnResult:
+        """Launch an interactive agent as a tab in a per-team Windows Terminal.
+
+        Agents in the same team share one window (``-w wt-team-<team>``); each
+        gets its own ``nt`` tab titled ``<agent>@<team>``. Because ``wt.exe`` is
+        a launcher that hands off to a running Windows Terminal and exits at
+        once, its PID is useless for lifecycle. Instead a generated wrapper
+        ``.ps1`` records the in-tab PowerShell PID to a sidecar file (the same
+        pattern the Linux terminal manager uses) and that PID becomes the
+        handle, so ``health_check``/``kill``/token liveness all work.
+        """
+        sidecar_path = log_path.with_name(f"{log_path.stem}.pid")
+        with contextlib.suppress(OSError):
+            sidecar_path.unlink()
+        title = f"{request.name}@{request.team_name}"
+        window_id = self._tab_window_id(request.team_name)
+        # Shared across both backends. ``--suppressApplicationTitle`` keeps the
+        # tab labelled with the agent name (the agent CLI otherwise rewrites the
+        # console title at runtime, reverting the tab to a generic name).
+        wt_head = [wt, "-w", window_id, "nt", "--title", title,
+                   "--suppressApplicationTitle"]
+
+        is_codex = backend_type == "codex"
+        wrapper_path: Path | None = None
+        if is_codex:
+            # Direction A: launch ``codex.exe`` as the tab's direct process.
+            # Codex's interactive TUI + state hooks exit instantly when codex is
+            # not the console root (i.e. parented by our powershell wrapper), so
+            # we drop the wrapper entirely and recover the agent PID afterwards
+            # by scanning for the ``codex.exe`` whose argv carries the unique
+            # per-agent correlation token. ``-d`` sets the tab's start dir (codex
+            # itself also gets ``-C <cwd>`` in build_command).
+            wt_cmd = [*wt_head, "-d", request.cwd, "--", *cmd]
+        else:
+            if backend_type == "claude-code":
+                cmd = self._with_debug_file(cmd, log_path)
+            wrapper_path = log_path.with_name(f"{log_path.stem}.launch.ps1")
+            self._write_tab_wrapper(wrapper_path, request.cwd, cmd, env, sidecar_path)
+            wt_cmd = [
+                *wt_head,
+                "--",
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(wrapper_path),
+            ]
+        log_handle.write(
+            f"[windows terminal tab] window={window_id!r} title={title!r}\n"
+            f"[wt command] {subprocess.list2cmdline(wt_cmd)}\n"
+        )
+        log_handle.flush()
+        log_handle.close()
+
+        # NOTE: a tab attached to an EXISTING Windows Terminal window does not
+        # inherit this Popen env. Codex identity is delivered via argv, so the
+        # only env at risk is the bundled-tools PATH prepend + CODEX_MANAGED_BY_NPM
+        # (build_env). If a second-tab codex fails to resolve bundled tools in
+        # smoke, relocate the PATH prepend to a codex ``-c shell_environment_policy``
+        # override.
+        merged_env = os.environ.copy()
+        merged_env.update(env)
+        launcher = self._popen(
+            wt_cmd,
+            creationflags,
+            cwd=request.cwd,
+            env=merged_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if is_codex:
+            token = codex_correlation_token(request.agent_id)
+            pid = self._await_codex_tab_pid(token)
+            if pid is None:
+                raise WindowsTerminalTabSpawnError(title)
+            # Persist the discovered PID to the same sidecar so restart recovery
+            # (_read_pid_file) is unchanged whether or not a wrapper was used.
+            with contextlib.suppress(OSError):
+                sidecar_path.write_text(str(pid), encoding="utf-8")
+        else:
+            pid = self._await_tab_pid(sidecar_path)
+            if pid is None:
+                raise WindowsTerminalTabSpawnError(title)
+        handle = str(pid)
+        self._tabs[handle] = WindowsTerminalTabInfo(
+            pid=pid,
+            token=creation_token(handle),
+            name=request.name,
+            agent_id=request.agent_id,
+            team_name=request.team_name,
+            backend=backend_type,
+            launcher=launcher,
+            log_path=log_path,
+            sidecar_path=sidecar_path,
+            wrapper_path=wrapper_path,
+            started_at=time.time(),
+        )
+        return SpawnResult(process_handle=handle, backend_type=backend_type)
+
+    def _write_tab_wrapper(
+        self,
+        wrapper_path: Path,
+        cwd: str,
+        cmd: list[str],
+        env: dict[str, str],
+        sidecar_path: Path,
+    ) -> None:
+        """Write the per-spawn PowerShell wrapper that runs the agent in a tab.
+
+        The wrapper sets the per-agent env overrides explicitly (a tab attached
+        to an existing Windows Terminal does NOT inherit our env), records its
+        own ``$PID`` to the sidecar, then runs the agent in the foreground so
+        the PowerShell process's lifetime tracks the agent's. The agent argv is
+        baked in as PowerShell single-quoted literals, so the free-form prompt
+        argument needs no fragile cross-shell quoting.
+        """
+        lines = ["$ErrorActionPreference = 'Stop'"]
+        lines.extend(
+            f"$env:{key} = {_powershell_quote(value)}" for key, value in env.items()
+        )
+        lines.append(f"Set-Location -LiteralPath {_powershell_quote(cwd)}")
+        lines.append(
+            f'"$PID" | Out-File -FilePath {_powershell_quote(str(sidecar_path))} '
+            f"-Encoding ascii"
+        )
+        agent_call = "& " + " ".join(_powershell_quote(part) for part in cmd)
+        lines.append(agent_call)
+        # Always exit 0 so Windows Terminal's default graceful ``closeOnExit``
+        # closes the tab when the agent finishes OR is killed. On kill we
+        # terminate the agent subtree (not this shell), so control returns here
+        # and the shell exits cleanly -- matching the old console's auto-close.
+        lines.append("exit 0")
+        wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+        # BOM required: Windows PowerShell 5.1 decodes a BOM-less file as ANSI
+        # (Windows-1252), corrupting non-ASCII bytes (e.g. the correlation-marker
+        # em-dash). utf-8-sig writes the BOM so 5.1 reads it as UTF-8.
+        wrapper_path.write_text(
+            "\r\n".join(lines) + "\r\n", encoding="utf-8-sig"
+        )
+
+    def _tab_window_id(self, team_name: str) -> str:
+        """Return the Windows Terminal ``-w`` window name for a team.
+
+        Prefixed so an all-numeric team name is not misread by ``wt`` as a
+        numeric window id (e.g. ``-w 0`` = most-recent window).
+        """
+        return f"wt-team-{_validate_safe_name(team_name, 'team name')}"
+
+    def _await_tab_pid(self, sidecar_path: Path) -> int | None:
+        """Poll the sidecar for the in-tab PowerShell PID until it appears."""
+        deadline = time.monotonic() + _WT_TAB_PID_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            pid = self._read_pid_file(sidecar_path)
+            if pid is not None:
+                return pid
+            time.sleep(_WT_TAB_PID_POLL_SECONDS)
+        return self._read_pid_file(sidecar_path)
+
+    def _read_pid_file(self, path: Path) -> int | None:
+        try:
+            pid_text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        try:
+            return int(pid_text)
+        except ValueError:
+            return None
+
+    def _await_codex_tab_pid(self, token: str) -> int | None:
+        """Discover the codex.exe PID whose argv carries ``token``.
+
+        The codex backend appends the per-agent correlation token to the prompt
+        argv, so it appears in the child ``codex.exe``'s CommandLine. Poll until
+        it shows up (the tab child spawns slightly after ``wt`` returns), then
+        return its PID (newest by CreationDate if several match).
+        """
+        deadline = time.monotonic() + _WT_TAB_PID_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            pid = self._find_codex_pid_by_token(token)
+            if pid is not None:
+                return pid
+            time.sleep(_WT_TAB_PID_POLL_SECONDS)
+        return self._find_codex_pid_by_token(token)
+
+    def _find_codex_pid_by_token(self, token: str) -> int | None:
+        """Return the codex.exe PID whose CommandLine contains ``token``.
+
+        Matching is done in Python (not a WQL ``LIKE``) to avoid escaping the
+        token and to allow newest-first selection on duplicate matches.
+        """
+        powershell = shutil.which("powershell") or "powershell"
+        result = subprocess.run(  # noqa: S603 - fixed argv, token filtered in Python.
+            [
+                powershell,
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" "
+                "| Select-Object ProcessId,CommandLine,CreationDate "
+                "| ConvertTo-Json -Compress",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        stdout = result.stdout.strip()
+        if not stdout:
+            return None
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        records = parsed if isinstance(parsed, list) else [parsed]
+        matches: list[tuple[int, int]] = []  # (creation_epoch_ms, pid)
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            command_line = record.get("CommandLine") or ""
+            if token not in command_line:
+                continue
+            try:
+                pid = int(record.get("ProcessId"))
+            except (TypeError, ValueError):
+                continue
+            matches.append(
+                (_codex_creation_epoch_ms(record.get("CreationDate")), pid)
+            )
+        if not matches:
+            return None
+        # Newest CreationDate wins so a stale same-token process can't shadow the
+        # freshly spawned tab.
+        matches.sort(key=lambda item: item[0], reverse=True)
+        return matches[0][1]
+
+    def _tab_health(
+        self, handle: str, tab: WindowsTerminalTabInfo, expected_token: str | None
+    ) -> tuple[bool, str]:
+        """PID-reuse-safe liveness for a tab agent via its launcher token."""
+        alive, detail = self._pid_health_with_token(
+            handle, expected_token or tab.token
+        )
+        if not alive and not tab.exit_logged:
+            tab.exit_logged = True
+            with contextlib.suppress(OSError), tab.log_path.open(
+                "a", encoding="utf-8"
+            ) as fh:
+                fh.write(f"[tab agent exited] {detail}\n")
+        return alive, detail
+
+    def _graceful_shutdown_tab(
+        self, handle: str, tab: WindowsTerminalTabInfo, timeout_s: float
+    ) -> bool:
+        """Stop a tab agent by terminating its subtree; reap files if it stops."""
+        return self._terminate_tab(handle, tab, timeout_s)
+
+    def _terminate_tab(
+        self, handle: str, tab: WindowsTerminalTabInfo, timeout_s: float
+    ) -> bool:
+        """Kill the agent subtree so the wrapper shell exits 0 and the tab closes.
+
+        The handle is the wrapper PowerShell's PID; its children are the agent
+        (and any grandchildren). Killing the children -- not the shell -- lets
+        the shell's ``& agent`` call return and reach ``exit 0``, so Windows
+        Terminal's graceful ``closeOnExit`` removes the tab. Only if the shell
+        refuses to exit is it force-killed (leaving a lingering tab, but a dead
+        agent).
+        """
+        if tab.wrapper_path is None:
+            # Codex tab: the handle IS the codex PID (no wrapper shell in
+            # between), so kill its subtree directly. WT is left showing a
+            # "[process exited]" tab because codex exits non-zero on kill -- the
+            # wrapper's ``exit 0`` auto-close trick is unavailable here.
+            stopped = not self._pid_alive(handle)
+            if not stopped:
+                self._kill_pid(handle)  # taskkill /PID <pid> /T /F
+                stopped = self._win_wait_pid_exit(handle, timeout_s) or (
+                    not self._pid_alive(handle)
+                )
+            self._tabs.pop(handle, None)
+            self._cleanup_tab_files(tab)
+            return stopped
+        stopped = not self._pid_alive(handle)
+        if not stopped:
+            for child in self._child_pids(handle):
+                self._kill_pid(str(child))
+            stopped = self._win_wait_pid_exit(handle, timeout_s)
+            if not stopped:
+                self._kill_pid(handle)
+                stopped = not self._pid_alive(handle)
+        self._tabs.pop(handle, None)
+        self._cleanup_tab_files(tab)
+        return stopped
+
+    def _cleanup_tab_files(self, tab: WindowsTerminalTabInfo) -> None:
+        for path in (tab.sidecar_path, tab.wrapper_path):
+            if path is None:
+                continue
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+    def _child_pids(self, handle: str) -> list[int]:
+        """Return the direct child PIDs of ``handle`` (the wrapper shell)."""
+        try:
+            pid = int(handle)
+        except ValueError:
+            return []
+        powershell = shutil.which("powershell") or "powershell"
+        result = subprocess.run(  # noqa: S603 - PID is parsed as int before use.
+            [
+                powershell,
+                "-NoProfile",
+                "-Command",
+                f"Get-CimInstance Win32_Process -Filter 'ParentProcessId={pid}' "
+                f"| Select-Object -ExpandProperty ProcessId",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        pids: list[int] = []
+        for token in result.stdout.split():
+            try:
+                pids.append(int(token))
+            except ValueError:
+                continue
+        return pids
+
+    def _win_wait_pid_exit(self, handle: str, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self._pid_alive(handle):
+                return True
+            time.sleep(0.05)
+        return not self._pid_alive(handle)
 
 
 class TmuxProcessManager(_PidOwnershipMixin):
