@@ -11,7 +11,7 @@ This skill is **backend-agnostic**: you may be running as Claude Code or Codex, 
 
 ## Why spawn via the MCP (not a raw CLI in a subagent)
 
-Spawn workers with `spawn_agent`, not by shelling out to `claude ...` or `codex exec ...` from inside a coordinator subagent. A raw CLI worker launched from a harnessed subagent can have its flags blocked, run without the MCP wired in, or silently no-op while reporting "done". The MCP spawner launches a real process with the team MCP injected (so the worker can message back) and a lifecycle you can observe, resume, and kill. That observability is the entire point of the server.
+Spawn workers with `spawn_agent`, not by shelling out to `claude ...` or `codex exec ...` from inside a coordinator subagent. A raw CLI worker launched from a harnessed subagent can have its flags blocked, run without the MCP wired in, or silently no-op while reporting "done". The MCP spawner launches a real process with the team MCP injected (so the worker can message back) and a lifecycle you can observe, resume, and kill. That observability is the entire point of the server; it is also how a Codex coordinator can drive a Claude Code worker, since Codex cannot natively spawn and supervise Claude Code as its own subagent.
 
 ## The direction matrix
 
@@ -24,7 +24,7 @@ Two axes drive every difference:
 
 - **Who coordinates → how you wait.**
   - **As a Claude Code coordinator** you can idle-wake: run the marker-watch as a **background** command; the harness wakes you when it exits. Between wakes you spend no tokens.
-  - **As a Codex coordinator** you have *no* idle-wake between turns: run the marker-watch as a **bounded foreground** command *inside the current turn*, looped, until it signals completion. Never end the turn "waiting" — nothing will wake you.
+  - **As a Codex coordinator** you have no event-driven idle-wake from the marker bus between ordinary turns. If you want to keep coordinating in the current turn, run the marker-watch as a **bounded foreground** command, looped: each watch exit means "something changed" or "timeout", then you inspect marker/messages/output to decide whether the worker is done. For work that should continue across turns, use a Codex **thread automation** as a scheduled heartbeat that wakes this same thread to check the marker/messages again. Do not simply end the turn "waiting" and expect the marker or MCP event to wake you.
 - **Who works → how you reach it.** A spawned worker does **not** reliably poll its own inbox (a Codex worker never does). So `send_message` *to* a worker may go unread — the reliable way to push a follow-up to any worker is **`follow_up_agent`**. Because the worker is otherwise silent and the inbox is pull-only, put an explicit **reporting protocol** in the spawn prompt so the worker signals completion.
 
 Everything else — spawn params, marker-watch, delta reads, terminal kill, restart recovery, output verification — is identical across all four cells.
@@ -36,7 +36,7 @@ Your caller (a workflow, a command, or the user) gives you:
 - `<REPO-PATH>` — absolute path used as the worker's `cwd`.
 - `<OUTPUT-PATH>` — absolute path the worker must write its deliverable to (e.g. a review/report/summary file).
 - `<AGENT-NAME>` — a stable logical name for the worker, reused across follow-ups (e.g. `reviewer-1`, `impl-auth`).
-- `<BACKEND>` — `"claude"` or `"codex"` (confirm it exists in pre-flight).
+- `<BACKEND>` — `"claude-code"` or `"codex"` (confirm it exists in pre-flight).
 - The prompt body — the task instructions.
 
 ## The core loop (every direction)
@@ -67,7 +67,7 @@ Call `mcp__win-agent-teams__list_backends` and confirm `<BACKEND>` is present. I
 
 Call `mcp__win-agent-teams__spawn_agent` with:
 
-- `backend`: `<BACKEND>` (`"claude"` or `"codex"`)
+- `backend`: `<BACKEND>` (`"claude-code"` or `"codex"`)
 - `name`: `<AGENT-NAME>`
 - `cwd`: `<REPO-PATH>`
 - `reasoning_effort` (Codex): `"low" | "medium" | "high"` for the task's difficulty. Omit `model` unless you deliberately need to pin one.
@@ -101,7 +101,8 @@ win-agent-teams watch <session_dir> --timeout 60 --pattern "state-*.json"
 ```
 
 - **Claude Code coordinator** → run the watch as a **background** command. Its completion wakes you; then call `agent_status`/`check_agent` for the delta. You spend no tokens while it blocks.
-- **Codex coordinator** (no idle-wake) → run the watch as a **bounded foreground** command in the **current turn**, looped: on each exit, read the marker JSON (and/or call `agent_status`); if not done and the worker is still alive, watch again. Longer tasks take several rounds — that is normal. Never end the turn in a "waiting" state.
+- **Codex coordinator** (no marker-event idle-wake) → for same-turn coordination, run the watch as a **bounded foreground** command in the **current turn**, looped: exit `0` means a watched file changed and exit `2` means timeout; on each exit, read the marker JSON (and/or call `agent_status`), then read messages and verify the output file before deciding the worker is done. If not done and the worker is still alive, watch again. Longer tasks can take several rounds — that is normal.
+- **Codex thread automation variant** → for long-running work where you do not want to hold the current turn open, create/use a Codex thread automation as a scheduled heartbeat for this same thread. On each wake, rediscover paths if needed (`agent_watch_paths` / retained `session_dir`), inspect marker/messages/output, then either stop/report or schedule/allow the next heartbeat. This is time-based polling, not an event wake from the marker file.
 
 On a change, check liveness with `agent_status` (or `check_agent` for one, `list_agents` for all). These are **compact by default** — a coarse `state` (`running`/`waiting`/`idle`/`dead`) plus `heartbeat_age_s` and `stalled`, with no transcript bodies. Use `stalled: true` to detect "alive but hung". Pass `full=True` only when you actually need `last_message` / `backend_session_id`.
 
@@ -157,7 +158,7 @@ For implementation tasks, additionally `git diff` and **grep the diff for the ch
 ## Anti-patterns (each seen in real runs)
 
 - **Raw CLI worker from a coordinator subagent** → flags blocked / MCP not wired in → silent no-op that claims "completed". Spawn via `spawn_agent`.
-- **Codex coordinator ending its turn "waiting"** → nothing wakes it; the run stalls forever. Codex coordinators must watch in a bounded foreground loop within the turn.
+- **Codex coordinator ending its turn "waiting" with no heartbeat** → marker changes do not wake the thread by themselves. Use a bounded foreground watch in the current turn, or a Codex thread automation heartbeat for cross-turn follow-up.
 - **Tight-polling `check_agent` in a spin loop** → wastes tokens and is server-dependent. Block on the marker-watch.
 - **`send_message` to a worker and waiting for a reply** → may never be read (a Codex worker never polls its inbox). Use `follow_up_agent`.
 - **Treating `check_agent.last_message` as the report** → it's a truncated tail. The file is the deliverable.
