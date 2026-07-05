@@ -5,11 +5,9 @@ description: Spawn and drive one or more worker agents (Claude Code or Codex) fr
 
 # Agent orchestration (win-agent-teams MCP)
 
-A **coordinator** agent spawns and drives one or more **worker** agents through the `win-agent-teams` MCP. Each worker is a real, separate OS process (its own model, its own context) that the coordinator talks to over MCP tools — never a subagent inside the coordinator's own process.
+You are the **coordinator**: you spawn and drive one or more **worker** agents through the `win-agent-teams` MCP. Each worker is a real, separate OS process (its own model, its own context) that you talk to over MCP tools — never a subagent inside your own process.
 
-This skill is **backend-agnostic**. The coordinator can be Claude Code or Codex; each worker can be Claude Code or Codex. The mechanics below are the same in all four directions; the only thing that changes is **how the coordinator waits** (see the direction matrix). Adapt the *prompt body* to your task (review, implement, research, test) — the *mechanics never change*.
-
-> This is a generic, teachable baseline for the open-source `win-agent-teams` MCP. It contains nothing project-specific — drop in your own repo paths, backends, and prompt bodies.
+This skill is **backend-agnostic**: you may be running as Claude Code or Codex, and each worker you spawn may be Claude Code or Codex. The mechanics below are identical in all four directions — the only thing that changes is **how you wait** (see the direction matrix). You supply the *prompt body* per task (review, implement, research, test); the *mechanics never change*. The skill itself carries no project-specific paths or backends — your caller (a workflow, a command, or the user) hands you those as the parameters below.
 
 ## Why spawn via the MCP (not a raw CLI in a subagent)
 
@@ -25,15 +23,15 @@ Spawn workers with `spawn_agent`, not by shelling out to `claude ...` or `codex 
 Two axes drive every difference:
 
 - **Who coordinates → how you wait.**
-  - **Claude Code coordinator** can idle-wake: run the marker-watch as a **background** command; the harness wakes the coordinator when it exits. Between wakes the coordinator uses no tokens.
-  - **Codex coordinator** has *no* idle-wake between turns: run the marker-watch as a **bounded foreground** command *inside the current turn*, looped, until it signals completion. Never end the turn "waiting" — nothing will wake you.
+  - **As a Claude Code coordinator** you can idle-wake: run the marker-watch as a **background** command; the harness wakes you when it exits. Between wakes you spend no tokens.
+  - **As a Codex coordinator** you have *no* idle-wake between turns: run the marker-watch as a **bounded foreground** command *inside the current turn*, looped, until it signals completion. Never end the turn "waiting" — nothing will wake you.
 - **Who works → how you reach it.** A spawned worker does **not** reliably poll its own inbox (a Codex worker never does). So `send_message` *to* a worker may go unread — the reliable way to push a follow-up to any worker is **`follow_up_agent`**. Because the worker is otherwise silent and the inbox is pull-only, put an explicit **reporting protocol** in the spawn prompt so the worker signals completion.
 
 Everything else — spawn params, marker-watch, delta reads, terminal kill, restart recovery, output verification — is identical across all four cells.
 
 ## Caller-supplied parameters
 
-The invoking workflow provides:
+Your caller (a workflow, a command, or the user) gives you:
 
 - `<REPO-PATH>` — absolute path used as the worker's `cwd`.
 - `<OUTPUT-PATH>` — absolute path the worker must write its deliverable to (e.g. a review/report/summary file).
