@@ -1,6 +1,4 @@
 """Claude Code backend integration."""
-
-import json
 import os
 import shutil
 from pathlib import Path
@@ -259,15 +257,17 @@ class ClaudeCodeBackend(BaseBackend):
     def _prompt_arg(self, request: SpawnRequest) -> str:
         """Return the initial Claude prompt argument.
 
-        Multi-line tasks are carried as a single JSON string argument to avoid
-        CLI/TUI line-boundary handling differences on Windows.
+        Lossless prompts that contain CLI-sensitive characters can be written
+        to a per-agent UTF-8 file by the server. In that case only the stable
+        file-read instruction travels through argv.
         """
-        if "\n" not in request.prompt and "\r" not in request.prompt:
-            return request.prompt
-        return (
-            "Decode this JSON string as your complete task prompt, then follow "
-            f"the decoded text exactly: {json.dumps(request.prompt)}"
-        )
+        prompt_file_path = (request.extra or {}).get("prompt_file_path")
+        if prompt_file_path:
+            return (
+                "Read your complete task prompt from UTF-8 file path "
+                f"{prompt_file_path} then follow the file contents exactly."
+            )
+        return request.prompt
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
         """Return Claude Code environment variables.

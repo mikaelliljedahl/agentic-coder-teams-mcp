@@ -88,6 +88,30 @@ async def test_spawn_agent_echoes_expected_outputs(
 
 
 @pytest.mark.asyncio
+async def test_spawn_agent_writes_claude_prompt_file_for_sensitive_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _FakeBackend()
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path / "sessions")
+    monkeypatch.setattr(server_simple, "_session_id", "")
+    monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
+    prompt = "first 'line'\nsecond \"line\""
+
+    result = await server_simple.spawn_agent(
+        prompt, name="worker", backend="claude-code", cwd=str(tmp_path)
+    )
+
+    prompt_path = (
+        server_simple._session_dir(result["session_id"])
+        / "prompts"
+        / "worker.prompt.txt"
+    )
+    assert prompt_path.read_text(encoding="utf-8") == prompt
+    assert backend.last_request.prompt == prompt
+    assert backend.last_request.extra["prompt_file_path"] == str(prompt_path)
+
+
+@pytest.mark.asyncio
 async def test_spawn_agent_expected_outputs_defaults_to_empty_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

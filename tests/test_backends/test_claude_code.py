@@ -211,17 +211,33 @@ class TestClaudeCodeBuildCommand:
 
         assert cmd[-2:] == ["--", "do stuff"]
 
-    def test_encodes_multiline_prompt_as_single_arg(self, _make_request):
+    def test_preserves_multiline_prompt_as_single_arg(self, _make_request):
         backend = ClaudeCodeBackend()
-        request = _make_request(prompt="first line\nsecond line")
+        prompt = "first line\nsecond 'line'\nname: \u00c5sa"
+        request = _make_request(prompt=prompt)
+
+        cmd = backend.build_command(request)
+
+        assert cmd[-1] == prompt
+        assert "Decode this JSON string" not in cmd[-1]
+
+    def test_uses_prompt_file_instruction_when_provided(self, _make_request):
+        backend = ClaudeCodeBackend()
+        prompt = "first 'line' and \"second\""
+        request = _make_request(
+            prompt=prompt,
+            extra={"prompt_file_path": "C:\\sessions\\worker.prompt.txt"},
+        )
 
         cmd = backend.build_command(request)
 
         assert cmd[-1] == (
-            "Decode this JSON string as your complete task prompt, then follow "
-            'the decoded text exactly: "first line\\nsecond line"'
+            "Read your complete task prompt from UTF-8 file path "
+            "C:\\sessions\\worker.prompt.txt then follow the file contents exactly."
         )
-        assert "\n" not in cmd[-1]
+        assert prompt not in cmd[-1]
+        assert "'" not in cmd[-1]
+        assert '"' not in cmd[-1]
 
 
 class TestClaudeCodeBuildEnv:

@@ -63,6 +63,7 @@ _NO_AUTOADOPT_ENV = "WIN_AGENT_TEAMS_NO_AUTOADOPT"
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"killed"})
 _RETENTION_DAYS_ENV = "WIN_AGENT_TEAMS_RETENTION_DAYS"
 _CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60.0
+_CLAUDE_PROMPT_FILE_CHARS: frozenset[str] = frozenset({"'", '"', "\n", "\r"})
 logger = logging.getLogger(__name__)
 
 # Outcome of the most recent session recovery attempt, surfaced to the lead as
@@ -196,6 +197,11 @@ def _inbox_cursor_file(session_id: str, name: str) -> Path:
 def _state_marker_file(session_id: str, name: str) -> Path:
     """Return the hook-written state marker path for an agent (see hooks.py)."""
     return _session_dir(session_id) / f"state-{name}.json"
+
+
+def _prompt_file(session_id: str, name: str) -> Path:
+    """Return the per-agent prompt sidecar path for lossless Claude launches."""
+    return _session_dir(session_id) / "prompts" / f"{name}.prompt.txt"
 
 
 def _read_state_marker(session_id: str, name: str) -> dict | None:
@@ -1128,6 +1134,20 @@ def _write_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Pat
     return path
 
 
+def _write_prompt_file_extra(
+    session_id: str, agent_name: str, backend_name: str, prompt: str
+) -> dict[str, str]:
+    """Write a lossless Claude prompt sidecar when argv transport is risky."""
+    if backend_name != "claude-code" or not any(
+        char in prompt for char in _CLAUDE_PROMPT_FILE_CHARS
+    ):
+        return {}
+    path = _prompt_file(session_id, agent_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(prompt, encoding="utf-8")
+    return {"prompt_file_path": str(path)}
+
+
 def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str, str]:
     """Materialise per-backend hook wiring, added to ``SpawnRequest.extra``.
 
@@ -1215,6 +1235,9 @@ async def spawn_agent(
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
+                **_write_prompt_file_extra(
+                    session_id, agent_name, backend_name, prompt
+                ),
                 **_hook_extra(session_id, agent_name, backend_name),
             }
 
@@ -1635,6 +1658,9 @@ async def follow_up_agent(
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
+                **_write_prompt_file_extra(
+                    session_id, agent_name, backend_name, prompt
+                ),
                 **_hook_extra(session_id, agent_name, backend_name),
             }
             request = SpawnRequest(
@@ -1695,11 +1721,12 @@ def _cleanup_agent_artifacts(session_id: str, name: str) -> None:
     """Best-effort removal of a killed agent's on-disk artifacts.
 
     Prevents a later agent spawned with the same name from inheriting the dead
-    agent's state marker, inbox messages, or read cursors. Every operation is
-    best-effort and never raises.
+    agent's state marker, prompt sidecar, inbox messages, or read cursors.
+    Every operation is best-effort and never raises.
     """
     for path in (
         _state_marker_file(session_id, name),
+        _prompt_file(session_id, name),
         _inbox_file(session_id, name),
         _inbox_cursor_file(session_id, name),
     ):
@@ -1722,9 +1749,9 @@ async def kill_agent(name: str) -> dict:
 
     kill is terminal: the agent record is removed from ``agents.json`` (so it
     no longer appears in ``list_agents`` and ``follow_up_agent`` returns
-    ``agent_not_found``), and its per-agent state marker, inbox, and inbox
-    cursor are cleaned up so a later agent spawned with the same name starts
-    clean. The OS process is only signalled when we can prove the PID is still
+    ``agent_not_found``), and its per-agent state marker, prompt sidecar,
+    inbox, and inbox cursor are cleaned up so a later agent spawned with the
+    same name starts clean. The OS process is only signalled when we can prove
     ours (matching creation token or live in-memory ownership) — a reused or
     foreign PID is left untouched. A naturally-dead agent is NOT removed until
     killed, so it remains listable and resumable.
