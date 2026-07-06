@@ -587,6 +587,19 @@ class TestWindowsTerminalTabSpawn:
         # Always exit 0 so Windows Terminal closes the tab on completion/kill.
         assert "exit 0" in text
 
+    def test_wrapper_preserves_multiline_prompt_literal(self, tmp_path):
+        manager = process_manager_mod.WindowsProcessManager()
+        wrapper = tmp_path / "w.launch.ps1"
+        sidecar = tmp_path / "w.pid"
+        prompt = "first line\nsecond 'line'\nname: \u00c5sa"
+
+        manager._write_tab_wrapper(
+            wrapper, "C:\\proj", ["claude", "--", prompt], {"K": "v"}, sidecar
+        )
+
+        text = wrapper.read_text(encoding="utf-8-sig")
+        assert "& 'claude' '--' 'first line\nsecond ''line''\nname: \u00c5sa'" in text
+
     def test_wrapper_written_with_utf8_bom(self, tmp_path):
         manager = process_manager_mod.WindowsProcessManager()
         wrapper = tmp_path / "w.launch.ps1"

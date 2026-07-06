@@ -139,6 +139,19 @@ class TestKillCleansArtifacts:
 
         assert not marker.exists()
 
+    def test_unlinks_prompt_sidecar(
+        self, session: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _add_agent(session)
+        prompt_file = server_simple._prompt_file(session, "worker")
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        prompt_file.write_text("prompt", encoding="utf-8")
+        _stub_owns(monkeypatch, owned=True)
+
+        asyncio.run(server_simple.kill_agent("worker"))
+
+        assert not prompt_file.exists()
+
     def test_kill_then_respawn_same_name_does_not_inherit_inbox_or_cursor(
         self, session: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
