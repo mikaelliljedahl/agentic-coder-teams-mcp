@@ -1,5 +1,28 @@
 # Plan: fix Codex spawn creating extra junk WT tabs (+ silent prompt truncation)
 
+## Follow-on: unify codex onto the claude wrapper (fixes lingering `[process exited]` tabs)
+After the `\;` fix landed, a second issue remained: codex tabs stay open showing
+`[process exited with code N] … press Enter to restart` after the agent is killed
+or errors, because codex was launched directly (no wrapper) and WT's default
+`closeOnExit: graceful` keeps a non-zero-exit tab. Claude avoids this via a
+powershell wrapper ending in `exit 0`.
+
+The direct-launch design (commit 8219d25) assumed codex's TUI + state hooks break
+under the powershell wrapper. Two runtime spikes (`scratchpad/spike_codex_wrapper.py`,
+`spike_codex_wrapper_hooks.py`) disproved this on the current code: codex's TUI runs
+**and** its state hooks fire (`state-<agent>.json` written) under the wrapper, and
+killing the codex subtree makes the wrapper hit `exit 0` so WT auto-closes the tab.
+The old constraint was really the since-fixed hook-quoting bug (single-quoted TOML
+literals + `commandWindows` launcher).
+
+**Change:** codex now takes the same wrapper path as claude by default
+(`_spawn_in_terminal_tab`); legacy direct-launch is kept behind
+`WIN_AGENT_TEAMS_CODEX_DIRECT_LAUNCH=1` as a fallback. This also makes the `\;`
+escaping redundant for the default path (prompt is baked into the .ps1, never on
+the wt line) while keeping it correct for the fallback. `_terminate_tab` already
+keys on `wrapper_path`, so kill/auto-close needs no change. Needs a live MCP smoke
+after restart (MCP callback + waiting-marker + kill-auto-close + follow_up).
+
 ## Symptom
 Spawning a **Codex** agent in a Windows Terminal tab opens the intended tab **plus
 several extra "nonsense" tabs** the user must close by hand. Claude agents are fine.

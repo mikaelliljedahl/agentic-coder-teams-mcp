@@ -27,6 +27,12 @@ _ERROR_ACCESS_DENIED = 5
 _KILL_ON_EXIT_ENV = "WIN_AGENT_TEAMS_KILL_ON_EXIT"
 _NO_BREAKAWAY_ENV = "WIN_AGENT_TEAMS_NO_BREAKAWAY"
 _NO_WT_TABS_ENV = "WIN_AGENT_TEAMS_NO_WT_TABS"
+# Opt back in to the legacy direct-launch for codex tabs (codex.exe as the tab's
+# console-root process, no powershell wrapper). Default off: codex now uses the
+# same exit-0 wrapper as claude, which auto-closes the tab on kill/error and
+# keeps the prompt off wt's command line. Kept as a fallback in case a future
+# codex build regresses the (now-verified) wrapper compatibility.
+_CODEX_DIRECT_LAUNCH_ENV = "WIN_AGENT_TEAMS_CODEX_DIRECT_LAUNCH"
 _WT_TAB_PID_TIMEOUT_SECONDS = 12.0
 _WT_TAB_PID_POLL_SECONDS = 0.1
 _LINUX_LAUNCHER_ENV = "WIN_AGENT_TEAMS_LINUX_LAUNCHER"
@@ -799,13 +805,18 @@ class WindowsProcessManager(_PidOwnershipMixin):
         wt_head = [wt, "-w", window_id, "nt", "--title", title,
                    "--suppressApplicationTitle"]
 
-        is_codex = backend_type == "codex"
+        # Legacy direct-launch for codex (codex.exe as the tab's console-root
+        # process) is now opt-in only. By default codex takes the same wrapper
+        # path as claude: a runtime spike confirmed codex's TUI *and* state
+        # hooks work fine under the powershell wrapper (the old "codex must be
+        # console root" constraint was really the since-fixed hook-quoting bug),
+        # and the wrapper's ``exit 0`` auto-closes the tab on kill/error instead
+        # of leaving a lingering ``[process exited]`` tab. Baking the argv into
+        # the .ps1 also keeps the prompt off wt's command line entirely.
+        codex_direct = backend_type == "codex" and _env_flag(_CODEX_DIRECT_LAUNCH_ENV)
         wrapper_path: Path | None = None
-        if is_codex:
-            # Direction A: launch ``codex.exe`` as the tab's direct process.
-            # Codex's interactive TUI + state hooks exit instantly when codex is
-            # not the console root (i.e. parented by our powershell wrapper), so
-            # we drop the wrapper entirely and recover the agent PID afterwards
+        if codex_direct:
+            # ``codex.exe`` launched directly; recover the agent PID afterwards
             # by scanning for the ``codex.exe`` whose argv carries the unique
             # per-agent correlation token. ``-d`` sets the tab's start dir (codex
             # itself also gets ``-C <cwd>`` in build_command).
@@ -815,7 +826,6 @@ class WindowsProcessManager(_PidOwnershipMixin):
             # splits on it *even inside a quoted token*, which truncates a prompt
             # at its first ``;`` and spawns a junk tab per trailing fragment.
             # Escaping ``;`` -> ``\;`` passes a literal ``;`` to codex intact.
-            # The claude branch below is immune (its argv is baked into a .ps1).
             safe = self._escape_wt_passthrough(cmd)
             wt_cmd = [*wt_head, "-d", request.cwd, "--", *safe]
         else:
@@ -858,7 +868,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
             stderr=subprocess.DEVNULL,
             text=True,
         )
-        if is_codex:
+        if codex_direct:
             token = codex_correlation_token(request.agent_id)
             pid = self._await_codex_tab_pid(token)
             if pid is None:
