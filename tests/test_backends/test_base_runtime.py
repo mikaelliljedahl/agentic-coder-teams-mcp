@@ -412,11 +412,19 @@ class TestInteractiveConsoleSpawn:
 
 
 class TestWindowsTerminalTabSpawn:
-    def _prep_manager(self, monkeypatch, tmp_path, *, pid=4242):
+    def _prep_manager(self, monkeypatch, tmp_path, *, pid=4242, codex_direct=False):
         manager = process_manager_mod.WindowsProcessManager()
         monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
         monkeypatch.delenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", raising=False)
         monkeypatch.delenv("WIN_AGENT_TEAMS_NO_WT_TABS", raising=False)
+        # Default: codex takes the wrapper path (like claude). Opt in to the
+        # legacy direct-launch only where a test exercises that fallback.
+        if codex_direct:
+            monkeypatch.setenv(process_manager_mod._CODEX_DIRECT_LAUNCH_ENV, "1")
+        else:
+            monkeypatch.delenv(
+                process_manager_mod._CODEX_DIRECT_LAUNCH_ENV, raising=False
+            )
         # Force the interactive decision on so the branch runs on Linux CI too.
         monkeypatch.setattr(
             manager,
@@ -615,10 +623,44 @@ class TestWindowsTerminalTabSpawn:
         assert raw.startswith(b"\xef\xbb\xbf")
         assert "em—dash" in raw.decode("utf-8-sig")
 
-    def test_codex_tab_launches_codex_directly_without_wrapper(
+    def test_codex_tab_uses_wrapper_by_default(
         self, _make_spawn_request, monkeypatch, tmp_path
     ):
-        manager, popen_mock = self._prep_manager(monkeypatch, tmp_path)
+        # By default codex takes the same powershell exit-0 wrapper as claude
+        # (verified compatible): wrapper .ps1 is written, the wt argv is the
+        # wrapper (no bare codex.exe, no token discovery), and the sidecar PID
+        # is the handle. This is what gives codex tabs auto-close on kill.
+        manager, popen_mock = self._prep_manager(monkeypatch, tmp_path, pid=4242)
+
+        result = manager.spawn_process(
+            _make_spawn_request(),
+            ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:worker@team"],
+            {"PATH": "x"},
+            "codex",
+            is_interactive=True,
+        )
+
+        assert result.process_handle == "4242"
+        cmd = popen_mock.call_args.args[0]
+        assert cmd[0] == "C:\\wt.exe"
+        assert "powershell" in cmd
+        # The bare codex.exe is baked into the wrapper, not on the wt line.
+        assert "C:\\codex.exe" not in cmd
+        wrapper = tmp_path / "team" / "worker.launch.ps1"
+        assert wrapper.exists()
+        assert "codex.exe" in wrapper.read_text(encoding="utf-8-sig")
+        tab = manager._tabs["4242"]
+        assert tab.wrapper_path is not None
+        assert tab.backend == "codex"
+
+    def test_codex_tab_direct_launch_when_flag_set(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        # Fallback: WIN_AGENT_TEAMS_CODEX_DIRECT_LAUNCH=1 restores the legacy
+        # direct codex.exe launch with correlation-token PID discovery.
+        manager, popen_mock = self._prep_manager(
+            monkeypatch, tmp_path, codex_direct=True
+        )
         seen: dict[str, str] = {}
 
         def fake_discover(token: str) -> int:
@@ -653,10 +695,75 @@ class TestWindowsTerminalTabSpawn:
         assert tab.wrapper_path is None
         assert tab.backend == "codex"
 
+    def test_escape_wt_passthrough_escapes_only_semicolons(self):
+        # Pure string logic; wt strips the leading backslash so codex receives a
+        # literal ';'. Other chars (quotes, braces, commas) are left untouched.
+        out = process_manager_mod.WindowsProcessManager._escape_wt_passthrough(
+            ["a;b", "no-semi", "x;y;z", "{k='v'}"]
+        )
+        assert out == [r"a\;b", "no-semi", r"x\;y\;z", "{k='v'}"]
+
+    def test_codex_tab_escapes_semicolons_in_prompt(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        # wt.exe splits its command line on ';' even inside a quoted token, which
+        # truncates the codex prompt at the first ';' and spawns junk tabs. In the
+        # direct-launch fallback the codex passthrough argv must be '\;'-escaped so
+        # the full prompt survives. (The default wrapper path avoids wt entirely.)
+        manager, popen_mock = self._prep_manager(
+            monkeypatch, tmp_path, codex_direct=True
+        )
+        monkeypatch.setattr(manager, "_await_codex_tab_pid", lambda token: 7777)
+
+        prompt = "Implement the parser; run the tests; report back"
+        manager.spawn_process(
+            _make_spawn_request(),
+            ["C:\\codex.exe", "-C", str(tmp_path), prompt],
+            {"PATH": "x"},
+            "codex",
+            is_interactive=True,
+        )
+
+        cmd = popen_mock.call_args.args[0]
+        # The raw ';' must not survive on the wt command line; the escaped form
+        # (with the full prompt intact, not truncated) must.
+        assert prompt not in cmd
+        assert r"Implement the parser\; run the tests\; report back" in cmd
+        # Fixed flags are unaffected (they carry no ';').
+        assert "-C" in cmd
+        assert "C:\\codex.exe" in cmd
+
+    def test_claude_tab_does_not_escape_semicolons(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        # The claude launch bakes its argv into a .ps1 wrapper, so the wt command
+        # line only carries 'powershell -File <wrapper>' -- no argv reaches wt and
+        # no escaping must be applied (a stray backslash would corrupt the prompt).
+        manager, popen_mock = self._prep_manager(monkeypatch, tmp_path)
+
+        prompt = "step one; step two"
+        manager.spawn_process(
+            _make_spawn_request(),
+            ["claude", "--", prompt],
+            {"K": "v"},
+            "claude-code",
+            is_interactive=True,
+        )
+
+        cmd = popen_mock.call_args.args[0]
+        # No '\;' escaping on the wt line; the wt argv is the powershell wrapper.
+        assert not any("\\;" in tok for tok in cmd)
+        assert "powershell" in cmd
+        wrapper = tmp_path / "team" / "worker.launch.ps1"
+        # The wrapper preserves the raw ';' (single-quoted literal), unescaped.
+        assert "step one; step two" in wrapper.read_text(encoding="utf-8-sig")
+
     def test_codex_tab_terminate_taskkills_codex_pid(
         self, _make_spawn_request, monkeypatch, tmp_path
     ):
-        manager, _ = self._prep_manager(monkeypatch, tmp_path)
+        # Direct-launch fallback: the handle IS the codex PID (no wrapper shell),
+        # so terminate taskkills that PID's subtree directly.
+        manager, _ = self._prep_manager(monkeypatch, tmp_path, codex_direct=True)
         monkeypatch.setattr(manager, "_await_codex_tab_pid", lambda token: 7777)
         manager.spawn_process(
             _make_spawn_request(),
@@ -693,7 +800,8 @@ class TestWindowsTerminalTabSpawn:
     def test_codex_tab_raises_when_pid_never_found(
         self, _make_spawn_request, monkeypatch, tmp_path
     ):
-        manager, _ = self._prep_manager(monkeypatch, tmp_path)
+        # Direct-launch fallback: token-based PID discovery timing out raises.
+        manager, _ = self._prep_manager(monkeypatch, tmp_path, codex_direct=True)
         monkeypatch.setattr(manager, "_await_codex_tab_pid", lambda token: None)
 
         with pytest.raises(process_manager_mod.WindowsTerminalTabSpawnError):

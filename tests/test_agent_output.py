@@ -813,6 +813,43 @@ async def test_send_message_orchestrator_alias_routes_to_lead_silently(
 
 
 @pytest.mark.asyncio
+async def test_send_message_team_lead_alias_routes_to_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_base = tmp_path / "sessions"
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
+    monkeypatch.setattr(server_simple, "_session_id", "session-id")
+    monkeypatch.setattr(server_simple, "IDENTITY", "child")
+    monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "parent")
+    (session_base / "session-id").mkdir(parents=True)
+
+    # Claude Code's native teams convention: a subagent addresses "team-lead".
+    result = await server_simple.send_message(to="team-lead", text="hello parent")
+
+    assert result == {"success": True, "to": "parent"}
+
+
+@pytest.mark.asyncio
+async def test_root_lead_identity_defaults_to_team_lead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_base = tmp_path / "sessions"
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
+    monkeypatch.setattr(server_simple, "_session_id", "session-id")
+    # Root lead: IDENTITY is the root name, no parent above it.
+    monkeypatch.setattr(server_simple, "IDENTITY", server_simple.ROOT_LEAD_NAME)
+    monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "")
+    (session_base / "session-id").mkdir(parents=True)
+
+    assert server_simple.ROOT_LEAD_NAME == "team-lead"
+    # The root lead's aliases resolve to its own inbox (team-lead), not a parent.
+    result = await server_simple.send_message(to="lead", text="note to self")
+
+    assert result == {"success": True, "to": "team-lead"}
+    assert (session_base / "session-id" / "inbox-team-lead.jsonl").exists()
+
+
+@pytest.mark.asyncio
 async def test_list_agents_recovers_lead_session_after_mcp_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

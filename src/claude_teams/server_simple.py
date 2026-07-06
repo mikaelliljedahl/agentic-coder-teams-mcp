@@ -39,13 +39,29 @@ from claude_teams.backends.registry import registry
 _AGENT_NAME: str = os.environ.get("AGENT_NAME", "").strip()
 _AGENT_SESSION_ID: str = os.environ.get("AGENT_SESSION_ID", "").strip()
 _AGENT_PARENT_NAME: str = os.environ.get("AGENT_PARENT_NAME", "").strip()
-IDENTITY: str = _AGENT_NAME if _AGENT_NAME else "lead"
+
+# The root coordinator's own inbox name. "team-lead" matches Claude Code's
+# native teams convention, so a spawned Claude addressing "team-lead" lands in
+# the right inbox out of the box. ("lead" and friends remain aliases below for
+# backward compatibility.)
+ROOT_LEAD_NAME: str = "team-lead"
+IDENTITY: str = _AGENT_NAME if _AGENT_NAME else ROOT_LEAD_NAME
 
 # Names a subagent might reasonably use to mean "whoever spawned me". All of
 # these resolve to the lead/parent so a message is never lost to a typo'd
 # recipient. Compared case-insensitively.
 _LEAD_ALIASES: frozenset[str] = frozenset(
-    {"", "lead", "orchestrator", "parent", "boss", "manager", "up", "supervisor"}
+    {
+        "",
+        "team-lead",
+        "lead",
+        "orchestrator",
+        "parent",
+        "boss",
+        "manager",
+        "up",
+        "supervisor",
+    }
 )
 
 _SESSION_BASE = Path.home() / ".claude" / "agent-sessions"
@@ -791,9 +807,9 @@ def _message_recipient(to: str, session_id: str) -> tuple[str, str | None]:
 
     Returns ``(recipient, warning)``. Rules:
 
-    * ``"lead"`` (and common aliases like ``"orchestrator"``/``"parent"``)
-      resolve to the agent that spawned this one. For the root lead they stay
-      ``"lead"`` (its own inbox).
+    * ``"team-lead"``/``"lead"`` (and common aliases like
+      ``"orchestrator"``/``"parent"``) resolve to the agent that spawned this
+      one. For the root lead they stay ``ROOT_LEAD_NAME`` (its own inbox).
     * A name that matches a known agent in this session is used verbatim
       (a lead addressing a child, or a sibling).
     * Any other / unknown name is routed to the lead anyway, with a warning,
@@ -801,7 +817,11 @@ def _message_recipient(to: str, session_id: str) -> tuple[str, str | None]:
       reads.
     """
     raw = to.strip()
-    lead_target = (_AGENT_PARENT_NAME or "lead") if IDENTITY != "lead" else "lead"
+    lead_target = (
+        (_AGENT_PARENT_NAME or ROOT_LEAD_NAME)
+        if IDENTITY != ROOT_LEAD_NAME
+        else ROOT_LEAD_NAME
+    )
 
     if raw.lower() in _LEAD_ALIASES:
         return lead_target, None
@@ -812,7 +832,7 @@ def _message_recipient(to: str, session_id: str) -> tuple[str, str | None]:
 
     warning = (
         f"unknown recipient {to!r}; routed to {lead_target!r}. "
-        'Use to="lead" to reach whoever spawned you.'
+        'Use to="team-lead" to reach whoever spawned you.'
     )
     return lead_target, warning
 
@@ -1295,10 +1315,10 @@ async def spawn_agent(
 
 
 @mcp.tool()
-async def send_message(text: str, to: str = "lead") -> dict:
+async def send_message(text: str, to: str = "team-lead") -> dict:
     """Write a message to an inbox for agents that actively poll read_messages.
 
-    ``to`` defaults to ``"lead"``, which reaches the agent that spawned you —
+    ``to`` defaults to ``"team-lead"``, which reaches the agent that spawned you —
     that is almost always what you want from a subagent. A lead can target a
     child by its agent name. Any unknown recipient is routed to the lead with a
     ``warning`` in the result rather than silently written to a dead inbox.
@@ -1584,7 +1604,7 @@ async def follow_up_agent(
     """
     session_id = _active_session_id()
 
-    def _do_follow_up() -> dict:  # noqa: PLR0911 - mirrors explicit refusal reasons.
+    def _do_follow_up() -> dict:  # noqa: PLR0911, PLR0912 - mirrors explicit refusal reasons.
         if not session_id:
             return _follow_up_failure("session_not_found", name)
         with _agents_transaction(session_id) as agents:
@@ -1624,14 +1644,30 @@ async def follow_up_agent(
                     if changed:
                         _save_agents_transaction(session_id, agents)
                     return _follow_up_failure("agent_state_unknown", name, status)
-                if output is not None and output.busy_hint:
-                    if changed:
-                        _save_agents_transaction(session_id, agents)
-                    return _follow_up_failure("agent_busy", name, status)
-                if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
-                    if changed:
-                        _save_agents_transaction(session_id, agents)
-                    return _follow_up_failure("agent_busy", name, status)
+                # A hook-written "waiting" marker is an authoritative idle
+                # signal: the agent has reached a wait/stop hook and is parked
+                # awaiting input, so we can resume it immediately. The busy_hint
+                # and inactivity-timer checks below are heuristics that exist
+                # only for when no reliable marker is available; a "waiting"
+                # marker overrides both, avoiding a needless wait for an agent
+                # we already know is idle.
+                idle_by_marker = (
+                    _resolve_agent_state(
+                        alive=True,
+                        marker=_read_state_marker(session_id, name),
+                        last_activity_at=last_activity_at,
+                    )
+                    == "waiting"
+                )
+                if not idle_by_marker:
+                    if output is not None and output.busy_hint:
+                        if changed:
+                            _save_agents_transaction(session_id, agents)
+                        return _follow_up_failure("agent_busy", name, status)
+                    if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
+                        if changed:
+                            _save_agents_transaction(session_id, agents)
+                        return _follow_up_failure("agent_busy", name, status)
                 if not replace_if_idle:
                     if changed:
                         _save_agents_transaction(session_id, agents)
