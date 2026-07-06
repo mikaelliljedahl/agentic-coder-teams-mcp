@@ -653,6 +653,66 @@ class TestWindowsTerminalTabSpawn:
         assert tab.wrapper_path is None
         assert tab.backend == "codex"
 
+    def test_escape_wt_passthrough_escapes_only_semicolons(self):
+        # Pure string logic; wt strips the leading backslash so codex receives a
+        # literal ';'. Other chars (quotes, braces, commas) are left untouched.
+        out = process_manager_mod.WindowsProcessManager._escape_wt_passthrough(
+            ["a;b", "no-semi", "x;y;z", "{k='v'}"]
+        )
+        assert out == [r"a\;b", "no-semi", r"x\;y\;z", "{k='v'}"]
+
+    def test_codex_tab_escapes_semicolons_in_prompt(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        # wt.exe splits its command line on ';' even inside a quoted token, which
+        # truncates the codex prompt at the first ';' and spawns junk tabs. The
+        # codex passthrough argv must be '\;'-escaped so the full prompt survives.
+        manager, popen_mock = self._prep_manager(monkeypatch, tmp_path)
+        monkeypatch.setattr(manager, "_await_codex_tab_pid", lambda token: 7777)
+
+        prompt = "Implement the parser; run the tests; report back"
+        manager.spawn_process(
+            _make_spawn_request(),
+            ["C:\\codex.exe", "-C", str(tmp_path), prompt],
+            {"PATH": "x"},
+            "codex",
+            is_interactive=True,
+        )
+
+        cmd = popen_mock.call_args.args[0]
+        # The raw ';' must not survive on the wt command line; the escaped form
+        # (with the full prompt intact, not truncated) must.
+        assert prompt not in cmd
+        assert r"Implement the parser\; run the tests\; report back" in cmd
+        # Fixed flags are unaffected (they carry no ';').
+        assert "-C" in cmd
+        assert "C:\\codex.exe" in cmd
+
+    def test_claude_tab_does_not_escape_semicolons(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        # The claude launch bakes its argv into a .ps1 wrapper, so the wt command
+        # line only carries 'powershell -File <wrapper>' -- no argv reaches wt and
+        # no escaping must be applied (a stray backslash would corrupt the prompt).
+        manager, popen_mock = self._prep_manager(monkeypatch, tmp_path)
+
+        prompt = "step one; step two"
+        manager.spawn_process(
+            _make_spawn_request(),
+            ["claude", "--", prompt],
+            {"K": "v"},
+            "claude-code",
+            is_interactive=True,
+        )
+
+        cmd = popen_mock.call_args.args[0]
+        # No '\;' escaping on the wt line; the wt argv is the powershell wrapper.
+        assert not any("\\;" in tok for tok in cmd)
+        assert "powershell" in cmd
+        wrapper = tmp_path / "team" / "worker.launch.ps1"
+        # The wrapper preserves the raw ';' (single-quoted literal), unescaped.
+        assert "step one; step two" in wrapper.read_text(encoding="utf-8-sig")
+
     def test_codex_tab_terminate_taskkills_codex_pid(
         self, _make_spawn_request, monkeypatch, tmp_path
     ):

@@ -809,7 +809,15 @@ class WindowsProcessManager(_PidOwnershipMixin):
             # by scanning for the ``codex.exe`` whose argv carries the unique
             # per-agent correlation token. ``-d`` sets the tab's start dir (codex
             # itself also gets ``-C <cwd>`` in build_command).
-            wt_cmd = [*wt_head, "-d", request.cwd, "--", *cmd]
+            #
+            # The codex argv sits directly on the wt command line, so wt's own
+            # parser sees it. wt treats ``;`` as a sub-command delimiter and
+            # splits on it *even inside a quoted token*, which truncates a prompt
+            # at its first ``;`` and spawns a junk tab per trailing fragment.
+            # Escaping ``;`` -> ``\;`` passes a literal ``;`` to codex intact.
+            # The claude branch below is immune (its argv is baked into a .ps1).
+            safe = self._escape_wt_passthrough(cmd)
+            wt_cmd = [*wt_head, "-d", request.cwd, "--", *safe]
         else:
             if backend_type == "claude-code":
                 cmd = self._with_debug_file(cmd, log_path)
@@ -878,6 +886,21 @@ class WindowsProcessManager(_PidOwnershipMixin):
             started_at=time.time(),
         )
         return SpawnResult(process_handle=handle, backend_type=backend_type)
+
+    @staticmethod
+    def _escape_wt_passthrough(cmd: list[str]) -> list[str]:
+        r"""Escape wt.exe's ``;`` command-delimiter in a passthrough argv.
+
+        ``wt … -- <argv>`` puts ``<argv>`` on wt's own command line, where ``;``
+        starts a new sub-command (a new tab) -- and wt splits on it even inside
+        the double-quoted token ``subprocess`` produces. For a codex agent whose
+        prompt contains ``;`` this truncates the prompt at the first ``;`` and
+        opens a junk tab for each trailing fragment. wt strips a leading
+        backslash, so ``\;`` reaches the child as a literal ``;`` without
+        splitting. Applied only to the direct codex launch; the claude launch
+        bakes its argv into a ``.ps1`` wrapper and never exposes it to wt.
+        """
+        return [token.replace(";", r"\;") for token in cmd]
 
     def _write_tab_wrapper(
         self,
