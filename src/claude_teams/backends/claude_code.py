@@ -234,7 +234,7 @@ class ClaudeCodeBackend(BaseBackend):
         queue, so an ``AskUserQuestion`` call hangs forever on "Waiting for team
         lead approval". These workers are autonomous with no interactive user,
         so the tool is disabled outright -- a decision that needs the lead is
-        escalated via ``send_message`` to ``lead`` instead.
+        escalated via ``send_message`` to ``team-lead`` instead.
         """
         return ["--disallowed-tools", "AskUserQuestion"]
 
