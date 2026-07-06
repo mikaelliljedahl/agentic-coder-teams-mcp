@@ -160,6 +160,74 @@ def test_agent_alive_prefers_resolved_agent_pid(
     assert seen["handle"] == "200"  # the real agent PID, not launcher 100
 
 
+def _busy_by_timer_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Alive with RECENT activity (10s ago < _FOLLOW_UP_IDLE_SECONDS): the
+    # inactivity timer alone would classify this agent as busy.
+    monkeypatch.setattr(ss.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(
+        ss,
+        "read_codex_output",
+        lambda spawned_at, cwd, **kwargs: SimpleNamespace(
+            last_activity_at=990.0,
+            last_message="done",
+            backend_session_id="backend-session-id",
+            busy_hint=False,
+        ),
+    )
+
+
+def _write_state_marker(state: str) -> None:
+    path = ss._state_marker_file("session-id", "worker")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'{{"state": "{state}", "event": "Stop", "ts": 990.0}}', encoding="utf-8"
+    )
+
+
+def test_waiting_marker_allows_immediate_follow_up(
+    follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A "waiting" state marker is authoritative: even though activity is recent
+    # (the inactivity timer would say busy), the agent is parked at a wait hook
+    # and must be resumable immediately.
+    _write_agent(follow_up.tmp_path, create_token="tok")  # noqa: S106
+    monkeypatch.setattr(
+        ss.process_manager,
+        "health_check",
+        lambda h, expected_token=None: (True, "alive"),
+    )
+    monkeypatch.setattr(ss.process_manager, "owns_process", lambda h, token: True)
+    _busy_by_timer_output(monkeypatch)
+    _no_shutdown(monkeypatch)
+    _write_state_marker("waiting")
+
+    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+
+    assert result["success"] is True
+    assert follow_up.backend.resume_calls[0][1] == "backend-session-id"
+
+
+def test_recent_activity_without_waiting_marker_is_busy(
+    follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No "waiting" marker: the inactivity timer still guards a genuinely busy
+    # agent (recent activity, running marker) from being torn down.
+    _write_agent(follow_up.tmp_path, create_token="tok")  # noqa: S106
+    monkeypatch.setattr(
+        ss.process_manager,
+        "health_check",
+        lambda h, expected_token=None: (True, "alive"),
+    )
+    _busy_by_timer_output(monkeypatch)
+    _write_state_marker("running")
+
+    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+
+    assert result["success"] is False
+    assert result["reason"] == "agent_busy"
+    assert follow_up.backend.resume_calls == []
+
+
 def test_follow_up_resume_persists_new_create_token(
     follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

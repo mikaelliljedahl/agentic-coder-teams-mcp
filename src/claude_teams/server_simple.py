@@ -1584,7 +1584,7 @@ async def follow_up_agent(
     """
     session_id = _active_session_id()
 
-    def _do_follow_up() -> dict:  # noqa: PLR0911 - mirrors explicit refusal reasons.
+    def _do_follow_up() -> dict:  # noqa: PLR0911, PLR0912 - mirrors explicit refusal reasons.
         if not session_id:
             return _follow_up_failure("session_not_found", name)
         with _agents_transaction(session_id) as agents:
@@ -1624,14 +1624,30 @@ async def follow_up_agent(
                     if changed:
                         _save_agents_transaction(session_id, agents)
                     return _follow_up_failure("agent_state_unknown", name, status)
-                if output is not None and output.busy_hint:
-                    if changed:
-                        _save_agents_transaction(session_id, agents)
-                    return _follow_up_failure("agent_busy", name, status)
-                if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
-                    if changed:
-                        _save_agents_transaction(session_id, agents)
-                    return _follow_up_failure("agent_busy", name, status)
+                # A hook-written "waiting" marker is an authoritative idle
+                # signal: the agent has reached a wait/stop hook and is parked
+                # awaiting input, so we can resume it immediately. The busy_hint
+                # and inactivity-timer checks below are heuristics that exist
+                # only for when no reliable marker is available; a "waiting"
+                # marker overrides both, avoiding a needless wait for an agent
+                # we already know is idle.
+                idle_by_marker = (
+                    _resolve_agent_state(
+                        alive=True,
+                        marker=_read_state_marker(session_id, name),
+                        last_activity_at=last_activity_at,
+                    )
+                    == "waiting"
+                )
+                if not idle_by_marker:
+                    if output is not None and output.busy_hint:
+                        if changed:
+                            _save_agents_transaction(session_id, agents)
+                        return _follow_up_failure("agent_busy", name, status)
+                    if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
+                        if changed:
+                            _save_agents_transaction(session_id, agents)
+                        return _follow_up_failure("agent_busy", name, status)
                 if not replace_if_idle:
                     if changed:
                         _save_agents_transaction(session_id, agents)
