@@ -17,6 +17,7 @@ from claude_teams.backends.base import (
     SpawnRequest,
 )
 from claude_teams.backends.contracts import BackendBinaryNotFoundError
+from claude_teams.backends.process_manager import process_manager
 
 _LOCAL_PATH_CLS = type(Path.cwd())
 
@@ -185,8 +186,31 @@ class CodexBackend(BaseBackend):
                     return str(exe), str(arch_root)
         return None
 
+    def _headless(self) -> bool:
+        """Return whether Codex must run its head-less ``exec`` entrypoint.
+
+        The interactive TUI is strongly preferred (visible session the user
+        can watch and type into), but as of codex-cli 0.142.5 it aborts
+        immediately with ``Error: stdin is not a terminal`` when the spawned
+        process has no real TTY — it then dies before any state hook fires
+        and no marker is written. That only happens on the process manager's
+        non-console spawn path (e.g. ``WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE=0``
+        on Windows); Windows Terminal tabs, ``CREATE_NEW_CONSOLE``, tmux panes
+        and Linux terminal windows all provide a real TTY where the TUI works
+        (verified live in PR #14/#18). ``codex exec`` still starts configured
+        MCP servers and runs injected state hooks, and accepts all the flags
+        we pass — it just has no interactive UI.
+        """
+        return not process_manager.provides_tty(
+            self._name, is_interactive=self.is_interactive
+        )
+
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the Codex CLI command.
+
+        Uses the interactive TUI (``codex [OPTIONS] [PROMPT]``) when the
+        agent will be attached to a real TTY, and the non-interactive
+        ``codex exec`` entrypoint otherwise — see :meth:`_headless`.
 
         Args:
             request: Backend-agnostic spawn parameters.
@@ -199,6 +223,7 @@ class CodexBackend(BaseBackend):
         via_cmd_shim = self._launches_via_cmd_shim(binary)
         cmd = [
             binary,
+            *(["exec"] if self._headless() else []),
             *self.permission_args(request),
             "-C",
             request.cwd,
@@ -221,11 +246,19 @@ class CodexBackend(BaseBackend):
     def build_resume_command(
         self, request: SpawnRequest, backend_session_id: str
     ) -> list[str]:
-        """Build the Codex CLI command for a native session resume."""
+        """Build the Codex CLI command for a native session resume.
+
+        Uses the interactive ``codex [OPTIONS] resume <session-id> <prompt>``
+        form when the agent gets a real TTY, and the non-interactive
+        ``codex exec resume <session-id> [OPTIONS] <prompt>`` entrypoint
+        otherwise — see :meth:`_headless`.
+        """
         binary = self.discover_binary()
         via_cmd_shim = self._launches_via_cmd_shim(binary)
+        headless = self._headless()
         cmd = [
             binary,
+            *(["exec", "resume", backend_session_id] if headless else []),
             *self.permission_args(request),
             "-C",
             request.cwd,
@@ -237,13 +270,9 @@ class CodexBackend(BaseBackend):
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
 
         cmd.extend(self._agent_args(request))
-        cmd.extend(
-            [
-                "resume",
-                backend_session_id,
-                self._prompt_arg(request, via_cmd_shim=via_cmd_shim),
-            ]
-        )
+        if not headless:
+            cmd.extend(["resume", backend_session_id])
+        cmd.append(self._prompt_arg(request, via_cmd_shim=via_cmd_shim))
         return cmd
 
     @staticmethod

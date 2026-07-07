@@ -194,6 +194,21 @@ class _PidOwnershipMixin:
         """Return the live creation token for ``handle`` (module-level compute)."""
         return creation_token(handle)
 
+    def provides_tty(self, backend_type: str, *, is_interactive: bool = False) -> bool:
+        """Return whether a spawned agent will run attached to a real TTY.
+
+        Backends whose CLI has both an interactive TUI and a head-less
+        entrypoint (Codex: ``codex`` vs ``codex exec``) call this BEFORE
+        building the command, so they can pick the TUI when the agent gets a
+        real console and fall back to head-less mode when it does not.
+
+        The tmux and Linux-terminal managers always run agents inside a real
+        terminal, so the default is True; the Windows manager overrides this
+        to mirror its interactive-console decision.
+        """
+        _ = backend_type, is_interactive
+        return True
+
     def resolve_agent_pid(
         self,
         handle: str,
@@ -718,6 +733,18 @@ class WindowsProcessManager(_PidOwnershipMixin):
         if info.log_handle is not None and not info.log_handle.closed:
             info.log_handle.flush()
             info.log_handle.close()
+
+    def provides_tty(self, backend_type: str, *, is_interactive: bool = False) -> bool:
+        """Return whether a spawned agent will get a real Windows console.
+
+        Both interactive-console paths give the agent a real console TTY: a
+        Windows Terminal tab (wrapper ``.ps1`` inside the tab) and the
+        ``CREATE_NEW_CONSOLE`` fallback. Only the non-interactive path (stdin
+        pipe + log-file stdout) is TTY-less.
+        """
+        return self._should_use_interactive_console(
+            backend_type, is_interactive=is_interactive
+        )
 
     def _should_use_interactive_console(
         self, backend_type: str, *, is_interactive: bool = False

@@ -17,6 +17,7 @@ from claude_teams.agent_output import (
     read_claude_output,
     read_codex_output,
 )
+from claude_teams.backends import codex as codex_module
 from claude_teams.backends import process_base
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.backends.codex import CodexBackend
@@ -582,6 +583,11 @@ def test_codex_resume_command_preserves_permissions_and_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(process_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        codex_module.process_manager,
+        "provides_tty",
+        lambda backend_type, *, is_interactive=False: True,
+    )
     backend = CodexBackend()
     request = _make_request(
         tmp_path,
@@ -597,12 +603,37 @@ def test_codex_resume_command_preserves_permissions_and_prompt(
     assert cmd[cmd.index("-C") + 1] == str(tmp_path)
     assert "model_reasoning_effort=high" in cmd
     assert any(arg.startswith("mcp_servers.win-agent-teams.env=") for arg in cmd)
+    # Interactive (TTY) resume keeps the visible TUI session.
+    assert "exec" not in cmd
     assert cmd[-3] == "resume"
     assert cmd[-2] == "codex-session-id"
     # /usr/bin/codex is the native binary (not the cmd.exe shim), so the
     # multi-line prompt passes verbatim; the JSON-wrap fallback only applies
     # when launching through the npm codex.cmd shim.
     assert cmd[-1] == "first line\nsecond line"
+
+
+def test_codex_resume_command_uses_exec_resume_without_tty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(process_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        codex_module.process_manager,
+        "provides_tty",
+        lambda backend_type, *, is_interactive=False: False,
+    )
+    backend = CodexBackend()
+    request = _make_request(tmp_path, prompt="follow up")
+
+    cmd = backend.build_resume_command(request, "codex-session-id")
+
+    # Non-interactive resume entrypoint: ``codex exec resume <session-id>``
+    # (the TUI aborts with "stdin is not a terminal" without a real TTY).
+    assert cmd[0] == "/usr/bin/codex"
+    assert cmd[1] == "exec"
+    assert cmd[2] == "resume"
+    assert cmd[3] == "codex-session-id"
+    assert cmd[-1] == "follow up"
 
 
 def test_claude_resume_command_preserves_permissions_and_mcp_config(
