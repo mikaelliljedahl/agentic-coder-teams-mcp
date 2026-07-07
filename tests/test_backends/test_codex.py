@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from claude_teams.agent_output import codex_correlation_token
+from claude_teams.backends import codex as codex_module
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.codex import CodexBackend
 
@@ -93,7 +94,14 @@ class TestCodexResolveModel:
 
 
 class TestCodexBuildCommand:
-    def test_produces_interactive_command(self, _make_request):
+    def test_produces_interactive_command_when_tty(self, _make_request, monkeypatch):
+        # With a real TTY (WT tab / new console / tmux / terminal window) the
+        # interactive TUI is used so the session stays visible to the user.
+        monkeypatch.setattr(
+            codex_module.process_manager,
+            "provides_tty",
+            lambda backend_type, *, is_interactive=False: True,
+        )
         backend = CodexBackend()
         request = _make_request()
 
@@ -102,6 +110,26 @@ class TestCodexBuildCommand:
         assert cmd[0] == "/usr/bin/codex"
         assert "exec" not in cmd
         assert "--model" not in cmd
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        assert "-C" in cmd
+
+    def test_produces_exec_command_when_no_tty(self, _make_request, monkeypatch):
+        # codex-cli 0.142.5's interactive TUI aborts with "stdin is not a
+        # terminal" when spawned without a TTY, so the backend falls back to
+        # the non-interactive ``codex exec`` entrypoint (which still runs
+        # hooks and MCP servers).
+        monkeypatch.setattr(
+            codex_module.process_manager,
+            "provides_tty",
+            lambda backend_type, *, is_interactive=False: False,
+        )
+        backend = CodexBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert cmd[0] == "/usr/bin/codex"
+        assert cmd[1] == "exec"
         assert "--dangerously-bypass-approvals-and-sandbox" in cmd
         assert "-C" in cmd
 
