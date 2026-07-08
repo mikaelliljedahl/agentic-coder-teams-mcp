@@ -417,6 +417,11 @@ class TestWindowsTerminalTabSpawn:
         monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
         monkeypatch.delenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", raising=False)
         monkeypatch.delenv("WIN_AGENT_TEAMS_NO_WT_TABS", raising=False)
+        # Disable the post-launch settle check: these tests use a synthetic PID
+        # that is not a live OS process, so the real liveness poll would treat
+        # every spawn as an immediate abort. The settle/fallback behavior is
+        # covered separately in test_process_manager_windows.py.
+        monkeypatch.setenv("WIN_AGENT_TEAMS_WT_TAB_SETTLE_SECONDS", "0")
         # Default: codex takes the wrapper path (like claude). Opt in to the
         # legacy direct-launch only where a test exercises that fallback.
         if codex_direct:
