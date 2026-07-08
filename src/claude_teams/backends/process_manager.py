@@ -957,12 +957,17 @@ class WindowsProcessManager(_PidOwnershipMixin):
             if pid is None:
                 raise WindowsTerminalTabSpawnError(title)
         handle = str(pid)
-        if not self._tab_survived_settle(handle):
+        # Capture the creation token BEFORE the settle poll so liveness is
+        # PID-reuse-safe across the window: if the tab's PID is recycled by a
+        # foreign process mid-settle, the token diverges and the start is
+        # correctly treated as an abort rather than a false survival.
+        token = creation_token(handle)
+        if not self._tab_survived_settle(handle, token):
             self._reap_failed_tab(handle, sidecar_path, wrapper_path)
             raise WindowsTerminalTabImmediateExitError(title)
         self._tabs[handle] = WindowsTerminalTabInfo(
             pid=pid,
-            token=creation_token(handle),
+            token=token,
             name=request.name,
             agent_id=request.agent_id,
             team_name=request.team_name,
@@ -1059,26 +1064,32 @@ class WindowsProcessManager(_PidOwnershipMixin):
         except ValueError:
             return None
 
-    def _tab_survived_settle(self, handle: str) -> bool:
+    def _tab_survived_settle(
+        self, handle: str, expected_token: str | None = None
+    ) -> bool:
         """Return whether a freshly-launched tab agent stays alive past settle.
 
         A degraded WT window opens the tab and runs the wrapper (so its PID is
         recorded) but hands it no usable console, so codex's TUI aborts within
-        ~1s and the wrapper shell exits. Poll briefly: a still-live PID at the
+        ~1s and the wrapper shell exits. Poll briefly: a PID still live at the
         deadline means a healthy start; an early death means an immediate abort
-        the caller should retry in a fresh console. The settle time is
-        env-tunable (``WIN_AGENT_TEAMS_WT_TAB_SETTLE_SECONDS``); ``0`` disables
-        the check and always reports the start as healthy.
+        the caller should retry in a fresh console. ``expected_token`` (the
+        PID's creation token captured before the poll) makes this PID-reuse-safe
+        — a recycled PID whose token diverges is reported dead. The settle time
+        is env-tunable (``WIN_AGENT_TEAMS_WT_TAB_SETTLE_SECONDS``); ``0``
+        disables the check and always reports the start as healthy.
         """
         settle = self._tab_settle_seconds()
         if settle <= 0:
             return True
         deadline = time.monotonic() + settle
         while time.monotonic() < deadline:
-            if not self._pid_alive(handle):
+            alive, _ = self._pid_health_with_token(handle, expected_token)
+            if not alive:
                 return False
             time.sleep(_WT_TAB_PID_POLL_SECONDS)
-        return self._pid_alive(handle)
+        alive, _ = self._pid_health_with_token(handle, expected_token)
+        return alive
 
     @staticmethod
     def _tab_settle_seconds() -> float:

@@ -224,6 +224,16 @@ class TestTabSettle:
         monkeypatch.setattr(_manager, "_pid_alive", lambda handle: False)
         assert _manager._tab_survived_settle("4321") is True
 
+    def test_pid_reuse_during_settle_is_detected(self, _manager, monkeypatch):
+        # The PID stays "alive" but its creation token diverges from the one
+        # captured at launch: a foreign process recycled the PID, so the tab is
+        # correctly treated as an abort rather than a false survival.
+        monkeypatch.setenv("WIN_AGENT_TEAMS_WT_TAB_SETTLE_SECONDS", "0.2")
+        monkeypatch.setattr(
+            process_manager_mod, "creation_token", lambda handle: "tok-NEW"
+        )
+        assert _manager._tab_survived_settle("4321", "tok-ORIG") is False
+
 
 class TestNewConsoleFallback:
     """A failed WT tab spawn falls back to a CREATE_NEW_CONSOLE launch."""
