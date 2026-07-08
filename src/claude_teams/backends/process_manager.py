@@ -35,6 +35,14 @@ _NO_WT_TABS_ENV = "WIN_AGENT_TEAMS_NO_WT_TABS"
 _CODEX_DIRECT_LAUNCH_ENV = "WIN_AGENT_TEAMS_CODEX_DIRECT_LAUNCH"
 _WT_TAB_PID_TIMEOUT_SECONDS = 12.0
 _WT_TAB_PID_POLL_SECONDS = 0.1
+# How long a freshly-launched WT tab agent must stay alive to be considered a
+# healthy start. A degraded WT window opens the tab and runs the wrapper (so its
+# PID is recorded) but hands it no usable console, so codex's TUI aborts within
+# ~1s ("stdin is not a terminal") and the wrapper shell exits. A PID that dies
+# inside this window is treated as an immediate abort and retried in a fresh
+# console. Env-tunable; 0 disables the check.
+_WT_TAB_SETTLE_SECONDS = 2.0
+_WT_TAB_SETTLE_ENV = "WIN_AGENT_TEAMS_WT_TAB_SETTLE_SECONDS"
 _LINUX_LAUNCHER_ENV = "WIN_AGENT_TEAMS_LINUX_LAUNCHER"
 _LINUX_TERMINAL_ENV = "WIN_AGENT_TEAMS_LINUX_TERMINAL"
 _TERMINAL_LAUNCHER_VALUE = "terminal"
@@ -333,6 +341,26 @@ class WindowsTerminalTabSpawnError(RuntimeError):
         )
 
 
+class WindowsTerminalTabImmediateExitError(WindowsTerminalTabSpawnError):
+    """Raised when a WT tab agent starts but exits within the settle window.
+
+    The tab opened and the wrapper recorded its PID, but the agent process died
+    almost immediately — the signature of a degraded WT window that hands the
+    tab no usable console, so codex's TUI aborts with "stdin is not a terminal".
+    Subclasses :class:`WindowsTerminalTabSpawnError` so a single ``except``
+    covers both tab failure modes; the caller falls back to a new console
+    window (which always allocates a real TTY).
+    """
+
+    def __init__(self, title: str) -> None:
+        """Record which tab agent exited immediately after launch."""
+        RuntimeError.__init__(
+            self,
+            f"Windows Terminal tab {title!r} agent exited within "
+            f"{_WT_TAB_SETTLE_SECONDS:.1f}s of launch (no usable console)",
+        )
+
+
 @dataclass
 class TmuxProcessInfo:
     """Runtime information for a spawned tmux pane/window."""
@@ -450,16 +478,36 @@ class WindowsProcessManager(_PidOwnershipMixin):
         if interactive_console and not _env_flag(_NO_WT_TABS_ENV):
             wt = shutil.which("wt.exe")
             if wt is not None:
-                return self._spawn_in_terminal_tab(
-                    request,
-                    cmd,
-                    env,
-                    backend_type,
-                    log_path,
-                    log_handle,
-                    wt=wt,
-                    creationflags=creationflags,
-                )
+                try:
+                    return self._spawn_in_terminal_tab(
+                        request,
+                        cmd,
+                        env,
+                        backend_type,
+                        log_path,
+                        log_handle,
+                        wt=wt,
+                        creationflags=creationflags,
+                    )
+                except WindowsTerminalTabImmediateExitError as err:
+                    # The tab opened and ran the wrapper but the agent exited
+                    # within the settle window — a degraded WT window that gives
+                    # the tab no usable console, so codex's TUI aborts at once.
+                    # The process is confirmed dead, so a retry cannot
+                    # double-run it: fall back to a dedicated new console
+                    # window, which always allocates a real TTY. Reopen the log
+                    # the tab helper closed so the console path below can keep
+                    # writing to it. (The ambiguous "PID never reported" case
+                    # still propagates: the tab may be alive but slow, and a
+                    # blind retry there could run the agent twice.)
+                    with contextlib.suppress(ValueError, OSError):
+                        log_handle.close()
+                    log_handle = log_path.open("a", encoding="utf-8")
+                    log_handle.write(
+                        f"[wt tab spawn failed] {err}\n"
+                        "[fallback] launching agent in a new console window\n"
+                    )
+                    log_handle.flush()
         popen_log_handle: IO[str] | None = log_handle
         if interactive_console:
             if backend_type == "claude-code":
@@ -909,9 +957,17 @@ class WindowsProcessManager(_PidOwnershipMixin):
             if pid is None:
                 raise WindowsTerminalTabSpawnError(title)
         handle = str(pid)
+        # Capture the creation token BEFORE the settle poll so liveness is
+        # PID-reuse-safe across the window: if the tab's PID is recycled by a
+        # foreign process mid-settle, the token diverges and the start is
+        # correctly treated as an abort rather than a false survival.
+        token = creation_token(handle)
+        if not self._tab_survived_settle(handle, token):
+            self._reap_failed_tab(handle, sidecar_path, wrapper_path)
+            raise WindowsTerminalTabImmediateExitError(title)
         self._tabs[handle] = WindowsTerminalTabInfo(
             pid=pid,
-            token=creation_token(handle),
+            token=token,
             name=request.name,
             agent_id=request.agent_id,
             team_name=request.team_name,
@@ -1007,6 +1063,63 @@ class WindowsProcessManager(_PidOwnershipMixin):
             return int(pid_text)
         except ValueError:
             return None
+
+    def _tab_survived_settle(
+        self, handle: str, expected_token: str | None = None
+    ) -> bool:
+        """Return whether a freshly-launched tab agent stays alive past settle.
+
+        A degraded WT window opens the tab and runs the wrapper (so its PID is
+        recorded) but hands it no usable console, so codex's TUI aborts within
+        ~1s and the wrapper shell exits. Poll briefly: a PID still live at the
+        deadline means a healthy start; an early death means an immediate abort
+        the caller should retry in a fresh console. ``expected_token`` (the
+        PID's creation token captured before the poll) makes this PID-reuse-safe
+        — a recycled PID whose token diverges is reported dead. The settle time
+        is env-tunable (``WIN_AGENT_TEAMS_WT_TAB_SETTLE_SECONDS``); ``0``
+        disables the check and always reports the start as healthy.
+        """
+        settle = self._tab_settle_seconds()
+        if settle <= 0:
+            return True
+        deadline = time.monotonic() + settle
+        while time.monotonic() < deadline:
+            alive, _ = self._pid_health_with_token(handle, expected_token)
+            if not alive:
+                return False
+            time.sleep(_WT_TAB_PID_POLL_SECONDS)
+        alive, _ = self._pid_health_with_token(handle, expected_token)
+        return alive
+
+    @staticmethod
+    def _tab_settle_seconds() -> float:
+        """Return the tab settle window in seconds (env-overridable, >= 0)."""
+        raw = os.environ.get(_WT_TAB_SETTLE_ENV)
+        if raw is None:
+            return _WT_TAB_SETTLE_SECONDS
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return _WT_TAB_SETTLE_SECONDS
+
+    def _reap_failed_tab(
+        self, handle: str, sidecar_path: Path, wrapper_path: Path | None
+    ) -> None:
+        """Kill any lingering tab subtree and remove its wrapper/sidecar files.
+
+        Called when a tab agent aborts immediately so the failed attempt leaves
+        nothing behind before the caller retries in a new console window. The
+        tab was never registered in ``self._tabs``, so only the OS process and
+        the on-disk sidecar/wrapper need cleaning up.
+        """
+        with contextlib.suppress(OSError, ValueError):
+            if self._pid_alive(handle):
+                self._kill_pid(handle)
+        for path in (sidecar_path, wrapper_path):
+            if path is None:
+                continue
+            with contextlib.suppress(OSError):
+                path.unlink()
 
     def _await_codex_tab_pid(self, token: str) -> int | None:
         """Discover the codex.exe PID whose argv carries ``token``.

@@ -417,6 +417,11 @@ class TestWindowsTerminalTabSpawn:
         monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
         monkeypatch.delenv("WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE", raising=False)
         monkeypatch.delenv("WIN_AGENT_TEAMS_NO_WT_TABS", raising=False)
+        # Disable the post-launch settle check: these tests use a synthetic PID
+        # that is not a live OS process, so the real liveness poll would treat
+        # every spawn as an immediate abort. The settle/fallback behavior is
+        # covered separately in test_process_manager_windows.py.
+        monkeypatch.setenv("WIN_AGENT_TEAMS_WT_TAB_SETTLE_SECONDS", "0")
         # Default: codex takes the wrapper path (like claude). Opt in to the
         # legacy direct-launch only where a test exercises that fallback.
         if codex_direct:
@@ -555,6 +560,43 @@ class TestWindowsTerminalTabSpawn:
                 "claude-code",
                 is_interactive=True,
             )
+
+    def test_immediate_exit_reaps_tab_and_raises(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        # A tab agent that dies inside the settle window must be reaped (wrapper
+        # + sidecar removed, nothing registered) and surface the immediate-exit
+        # error so spawn_process can fall back to a new console. Exercises
+        # _spawn_in_terminal_tab directly (spawn_process would catch the error).
+        manager, _ = self._prep_manager(monkeypatch, tmp_path)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_WT_TAB_SETTLE_SECONDS", "0.2")
+        # The wrapper PID looks dead throughout the settle poll.
+        monkeypatch.setattr(
+            manager, "_pid_health_with_token", lambda handle, token: (False, "dead")
+        )
+        monkeypatch.setattr(manager, "_pid_alive", lambda handle: False)
+
+        request = _make_spawn_request()
+        log_path = manager.log_path(request.team_name, request.name)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_path.open("a", encoding="utf-8")
+
+        with pytest.raises(process_manager_mod.WindowsTerminalTabImmediateExitError):
+            manager._spawn_in_terminal_tab(
+                request,
+                ["claude", "--", "do stuff"],
+                {},
+                "claude-code",
+                log_path,
+                log_handle,
+                wt="C:\\wt.exe",
+                creationflags=0,
+            )
+
+        # Nothing registered, and the wrapper the tab wrote was cleaned up.
+        assert manager._tabs == {}
+        assert not (tmp_path / "team" / "worker.launch.ps1").exists()
+        assert not (tmp_path / "team" / "worker.pid").exists()
 
     def test_no_wt_tabs_env_forces_classic_console(
         self, _make_spawn_request, monkeypatch, tmp_path
