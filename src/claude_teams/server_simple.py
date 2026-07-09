@@ -1210,8 +1210,21 @@ async def spawn_agent(
 ) -> dict:
     """Spawn a new agent process.
 
-    reasoning_effort: low/medium/high/xhigh for codex,
-    low/medium/high/xhigh/max for claude-code.
+    model: pick by the kind of work rather than a raw model name. For codex,
+    semantic tiers map to a GPT-5.6 model plus the reasoning effort that suits
+    that work:
+      - ``fast``     -> Terra @ medium  (quick, low-stakes tasks)
+      - ``balanced`` -> Terra @ high    (general default)
+      - ``powerful`` -> Terra @ xhigh   (backend development, code review)
+      - ``frontier`` -> Sol @ high, or Terra @ ultra when Sol is unavailable
+                        (reserve for genuinely hard problems)
+    Leave ``model`` blank to use codex's own configured default. Raw slugs
+    (e.g. ``gpt-5.6-terra``) and short aliases (``terra``/``luna``/``sol``)
+    also work as passthrough. For claude-code, ``model`` is haiku/sonnet/opus.
+
+    reasoning_effort: overrides a tier's bundled effort when set. Codex accepts
+    low/medium/high/xhigh, plus max (Terra/Luna) and ultra (Terra); claude-code
+    accepts low/medium/high/xhigh/max.
 
     expected_outputs (optional): the exact file paths you are instructing the
     agent to create. Echoed back verbatim in the result so you can watch
@@ -1243,15 +1256,15 @@ async def spawn_agent(
             backend_name = backend.strip() or registry.default_backend()
             b = registry.get(backend_name)
 
-            resolved_model = (
-                b.resolve_model(model) if model.strip() else b.default_model()
-            )
+            effort = reasoning_effort.strip() or None
+            # A backend may bundle a reasoning effort into a model tier (e.g.
+            # Codex ``balanced`` -> Terra @ high), so resolve model and effort
+            # together; an explicit ``reasoning_effort`` still wins.
+            resolved_model, effort = b.resolve_launch(model, effort)
 
             mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
 
             agent_cwd = cwd.strip() or str(Path.cwd())
-
-            effort = reasoning_effort.strip() or None
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",

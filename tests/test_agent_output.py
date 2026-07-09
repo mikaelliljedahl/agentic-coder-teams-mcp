@@ -675,6 +675,13 @@ async def test_spawn_agent_persists_output_lookup_metadata(
         def resolve_model(self, model: str) -> str:
             return model
 
+        def resolve_launch(
+            self, model: str, reasoning_effort: str | None
+        ) -> tuple[str, str | None]:
+            return (
+                model if model.strip() else self.default_model()
+            ), reasoning_effort
+
         def spawn(self, request: object) -> SimpleNamespace:
             return SimpleNamespace(process_handle="456")
 
@@ -729,6 +736,13 @@ async def test_spawn_agent_deduplicates_name_within_session(
 
         def resolve_model(self, model: str) -> str:
             return model
+
+        def resolve_launch(
+            self, model: str, reasoning_effort: str | None
+        ) -> tuple[str, str | None]:
+            return (
+                model if model.strip() else self.default_model()
+            ), reasoning_effort
 
         def spawn(self, request: object) -> SimpleNamespace:
             self.next_pid += 1

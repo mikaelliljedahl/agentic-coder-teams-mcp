@@ -247,6 +247,12 @@ class Backend(Protocol):
         """Resolve a generic model alias to a backend-specific identifier."""
         ...
 
+    def resolve_launch(
+        self, model: str, reasoning_effort: str | None
+    ) -> tuple[str, str | None]:
+        """Resolve caller ``(model, effort)`` inputs into concrete launch values."""
+        ...
+
     def build_command(self, request: SpawnRequest) -> list[str]:
         """Build the backend command line for a spawn request."""
         ...
