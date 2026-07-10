@@ -8,6 +8,7 @@ from claude_teams.agent_output import codex_correlation_token
 from claude_teams.backends import codex as codex_module
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.codex import CodexBackend
+from claude_teams.backends.contracts import BackendModelUnavailableError
 
 
 @pytest.fixture
@@ -44,45 +45,49 @@ class TestCodexProperties:
         assert backend.is_interactive is True
 
 
+@pytest.fixture
+def _stub_discovery(monkeypatch: pytest.MonkeyPatch):
+    """Return a helper that stubs live model discovery with a fixed slug list."""
+
+    def apply(slugs: list[str]) -> None:
+        monkeypatch.setattr(
+            CodexBackend, "discover_binary", lambda self: "/usr/bin/codex"
+        )
+        monkeypatch.setattr(
+            codex_module, "_discover_codex_model_slugs", lambda binary: list(slugs)
+        )
+
+    return apply
+
+
 class TestCodexSupportedModels:
-    def test_returns_expected_models(self):
+    def test_returns_capability_tiers_not_slugs(self):
         backend = CodexBackend()
-        models = backend.supported_models()
-        assert models == [
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
-            "gpt-5.3-codex",
-            "gpt-5.2",
+        assert backend.supported_models() == [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra",
         ]
 
 
 class TestCodexDefaultModel:
-    def test_returns_gpt_5_5(self):
+    def test_returns_medium_tier(self):
         backend = CodexBackend()
-        assert backend.default_model() == "gpt-5.5"
+        assert backend.default_model() == "medium"
 
 
 class TestCodexResolveModel:
-    def test_resolves_fast_to_mini(self):
+    def test_resolves_tier_to_slug(self):
         backend = CodexBackend()
-        assert backend.resolve_model("fast") == "gpt-5.4-mini"
+        assert backend.resolve_model("low") == "gpt-5.6-terra"
+        assert backend.resolve_model("medium") == "gpt-5.6-sol"
+        assert backend.resolve_model("ultra") == "gpt-5.6-sol"
 
-    def test_resolves_balanced_to_codex(self):
+    def test_passes_through_direct_slug(self):
         backend = CodexBackend()
-        assert backend.resolve_model("balanced") == "gpt-5.4"
-
-    def test_resolves_powerful_to_max(self):
-        backend = CodexBackend()
-        assert backend.resolve_model("powerful") == "gpt-5.5"
-
-    def test_resolves_gpt_5_4_mini_direct(self):
-        backend = CodexBackend()
-        assert backend.resolve_model("gpt-5.4-mini") == "gpt-5.4-mini"
-
-    def test_resolves_direct_model_name(self):
-        backend = CodexBackend()
-        assert backend.resolve_model("gpt-5.5") == "gpt-5.5"
+        assert backend.resolve_model("gpt-5.6-terra") == "gpt-5.6-terra"
 
     def test_passes_through_unknown_model_name(self):
         backend = CodexBackend()
@@ -91,6 +96,61 @@ class TestCodexResolveModel:
     def test_passes_through_empty_string(self):
         backend = CodexBackend()
         assert backend.resolve_model("") == ""
+
+
+class TestCodexResolveLaunch:
+    def test_tiers_map_to_model_and_effort(self, _stub_discovery):
+        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-sol"])
+        backend = CodexBackend()
+        assert backend.resolve_launch("low", None) == ("gpt-5.6-terra", "medium")
+        assert backend.resolve_launch("medium", None) == ("gpt-5.6-sol", "low")
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
+        assert backend.resolve_launch("ultra", None) == ("gpt-5.6-sol", "xhigh")
+
+    def test_explicit_effort_ignored_for_tier(self, _stub_discovery):
+        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-sol"])
+        backend = CodexBackend()
+        # A tier owns its effort; a caller-supplied reasoning_effort is
+        # silently ignored and the bundled tier effort is used.
+        assert backend.resolve_launch("low", "max") == ("gpt-5.6-terra", "medium")
+        assert backend.resolve_launch("high", "xhigh") == ("gpt-5.6-sol", "medium")
+
+    def test_blank_model_defers_to_codex_config(self):
+        backend = CodexBackend()
+        assert backend.resolve_launch("", None) == ("", None)
+        # an explicit effort still applies to codex's own default model
+        assert backend.resolve_launch("", "high") == ("", "high")
+
+    def test_raw_slug_passthrough_when_available(self, _stub_discovery):
+        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-sol"])
+        backend = CodexBackend()
+        assert backend.resolve_launch("gpt-5.6-terra", "xhigh") == (
+            "gpt-5.6-terra",
+            "xhigh",
+        )
+
+    def test_errors_when_sol_tier_unavailable(self, _stub_discovery):
+        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-luna"])  # no Sol
+        backend = CodexBackend()
+        with pytest.raises(BackendModelUnavailableError):
+            backend.resolve_launch("high", None)
+
+    def test_low_tier_ok_without_sol(self, _stub_discovery):
+        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-luna"])  # Terra present
+        backend = CodexBackend()
+        assert backend.resolve_launch("low", None) == ("gpt-5.6-terra", "medium")
+
+    def test_errors_when_no_5_6_at_all(self, _stub_discovery):
+        _stub_discovery(["gpt-5.5"])  # neither Terra nor Sol
+        backend = CodexBackend()
+        with pytest.raises(BackendModelUnavailableError):
+            backend.resolve_launch("low", None)
+
+    def test_skips_validation_when_discovery_unavailable(self, _stub_discovery):
+        _stub_discovery([])  # cannot determine -> no false error
+        backend = CodexBackend()
+        assert backend.resolve_launch("ultra", None) == ("gpt-5.6-sol", "xhigh")
 
 
 class TestCodexBuildCommand:
@@ -189,6 +249,35 @@ class TestCodexBuildCommand:
         assert "--output-last-message" not in cmd
 
 
+class TestCodexModelArg:
+    def test_build_command_emits_c_model_override_when_set(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(model="gpt-5.6-terra")
+
+        cmd = backend.build_command(request)
+
+        assert "model='gpt-5.6-terra'" in cmd
+        # rendered right after its own -c flag
+        idx = cmd.index("model='gpt-5.6-terra'")
+        assert cmd[idx - 1] == "-c"
+
+    def test_build_command_omits_c_model_override_when_blank(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(model="")
+
+        cmd = backend.build_command(request)
+
+        assert not any(arg.startswith("model=") for arg in cmd)
+
+    def test_build_resume_command_emits_c_model_override_when_set(self, _make_request):
+        backend = CodexBackend()
+        request = _make_request(model="gpt-5.6-luna")
+
+        cmd = backend.build_resume_command(request, "codex-session-123")
+
+        assert "model='gpt-5.6-luna'" in cmd
+
+
 class TestCodexBuildEnv:
     def test_passes_agent_identity(self, _make_request):
         backend = CodexBackend()
@@ -216,7 +305,9 @@ class TestCodexReasoningEffort:
         assert spec is not None
         assert spec.flag == "-c"
         assert spec.value_template == "model_reasoning_effort={value}"
-        assert spec.options == frozenset({"low", "medium", "high", "xhigh"})
+        assert spec.options == frozenset(
+            {"low", "medium", "high", "xhigh", "max", "ultra"}
+        )
 
     def test_build_command_appends_c_override_when_set(self, _make_request):
         backend = CodexBackend()

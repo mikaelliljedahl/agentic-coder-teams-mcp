@@ -235,3 +235,17 @@ class BaseBackend:
     def resolve_model(self, generic_name: str) -> str:
         """Resolve a generic model name to a backend-specific identifier."""
         raise NotImplementedError
+
+    def resolve_launch(
+        self, model: str, reasoning_effort: str | None
+    ) -> tuple[str, str | None]:
+        """Resolve caller ``(model, effort)`` inputs into concrete launch values.
+
+        Returns the ``(model, reasoning_effort)`` pair the spawn should use.
+        The default mirrors the historical server behavior: resolve the model
+        alias (falling back to the backend default when blank) and pass the
+        effort through unchanged. Backends whose model tiers imply a reasoning
+        effort (e.g. Codex) override this to return the bundled pair.
+        """
+        resolved = self.resolve_model(model) if model.strip() else self.default_model()
+        return resolved, reasoning_effort

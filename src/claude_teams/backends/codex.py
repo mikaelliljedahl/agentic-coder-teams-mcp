@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 from pathlib import Path
 from typing import ClassVar
 
@@ -16,7 +17,10 @@ from claude_teams.backends.base import (
     ReasoningEffortSpec,
     SpawnRequest,
 )
-from claude_teams.backends.contracts import BackendBinaryNotFoundError
+from claude_teams.backends.contracts import (
+    BackendBinaryNotFoundError,
+    BackendModelUnavailableError,
+)
 from claude_teams.backends.process_manager import process_manager
 
 _LOCAL_PATH_CLS = type(Path.cwd())
@@ -28,6 +32,55 @@ _WINDOWS_NATIVE_TARGET: dict[str, tuple[str, str]] = {
     "AMD64": ("x64", "x86_64-pc-windows-msvc"),
     "ARM64": ("arm64", "aarch64-pc-windows-msvc"),
 }
+
+# Seconds to wait for ``codex debug models`` before giving up on live model
+# discovery and using the static fallback list.
+_MODEL_DISCOVERY_TIMEOUT_S = 20.0
+
+# Process-lifetime cache of discovered model slugs, keyed by the resolved codex
+# binary path. Populated lazily on first ``supported_models``/tier resolution so
+# a spawn pays at most one ``codex debug models`` subprocess per process.
+_MODEL_SLUG_CACHE: dict[str, list[str]] = {}
+
+
+def _discover_codex_model_slugs(binary: str) -> list[str]:
+    """Return the API-usable, list-visible model slugs from ``codex debug models``.
+
+    Runs the codex CLI's own model registry dump and keeps only models that are
+    both ``supported_in_api`` and ``visibility == "list"`` (hidden helpers like
+    ``codex-auto-review`` are dropped). Cached per binary for the process
+    lifetime. Any failure (binary missing, timeout, non-JSON, schema drift)
+    yields ``[]`` so callers fall back to the static list rather than crash.
+    """
+    if binary in _MODEL_SLUG_CACHE:
+        return _MODEL_SLUG_CACHE[binary]
+    slugs: list[str] = []
+    try:
+        proc = subprocess.run(  # noqa: S603 - binary resolved from PATH, fixed argv.
+            [binary, "debug", "models"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_MODEL_DISCOVERY_TIMEOUT_S,
+            check=False,
+        )
+        data = json.loads(proc.stdout)
+        for model in data.get("models", []):
+            if not isinstance(model, dict):
+                continue
+            slug = model.get("slug")
+            if (
+                model.get("supported_in_api")
+                and model.get("visibility") == "list"
+                and isinstance(slug, str)
+                and slug
+            ):
+                slugs.append(slug)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        slugs = []
+    _MODEL_SLUG_CACHE[binary] = slugs
+    return slugs
 
 
 class CodexBackend(BaseBackend):
@@ -47,24 +100,34 @@ class CodexBackend(BaseBackend):
         """
         return True
 
-    # Verified against `codex debug models` (Codex CLI 0.130.0). Only
-    # API-usable, listed slugs are mapped; `gpt-5.3-codex-spark`
-    # (supported_in_api=false) and hidden `codex-auto-review` are excluded.
-    _MODEL_MAP: ClassVar[dict[str, str]] = {
-        "fast": "gpt-5.4-mini",
-        "balanced": "gpt-5.4",
-        "powerful": "gpt-5.5",
-        "gpt-5.5": "gpt-5.5",
-        "gpt-5.4": "gpt-5.4",
-        "gpt-5.4-mini": "gpt-5.4-mini",
-        "gpt-5.3-codex": "gpt-5.3-codex",
-        "gpt-5.2": "gpt-5.2",
+    # The ONLY model interface exposed to the MCP caller: five capability
+    # tiers, each bundling a concrete GPT-5.6 model with a reasoning effort,
+    # as an ascending cost/quality ladder. Names mirror the effort words the
+    # caller already reasons in (low..ultra) rather than raw model slugs, which
+    # the caller has no basis to choose between. All targets are GPT-5.6; if the
+    # target model is not available on this codex install the spawn errors (no
+    # silent downgrade). A tier fully determines model + effort; a caller-
+    # supplied ``reasoning_effort`` is silently ignored for tiers.
+    #   low    -> Terra @ medium   (dirt cheap, quick/low-stakes)
+    #   medium -> Sol   @ low      (token-efficient general default)
+    #   high   -> Sol   @ medium   (backend dev, code review)
+    #   xhigh  -> Sol   @ high     (genuinely hard problems)
+    #   ultra  -> Sol   @ xhigh    (top; higher still is diminishing returns)
+    _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
+        "low": ("gpt-5.6-terra", "medium"),
+        "medium": ("gpt-5.6-sol", "low"),
+        "high": ("gpt-5.6-sol", "medium"),
+        "xhigh": ("gpt-5.6-sol", "high"),
+        "ultra": ("gpt-5.6-sol", "xhigh"),
     }
 
     _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
         flag="-c",
         value_template="model_reasoning_effort={value}",
-        options=frozenset({"low", "medium", "high", "xhigh"}),
+        # Union across models; Terra adds ``max``/``ultra`` and Luna adds
+        # ``max`` over the older 4-level set. Codex validates the actual
+        # model+effort combination at launch, so this stays a superset.
+        options=frozenset({"low", "medium", "high", "xhigh", "max", "ultra"}),
     )
 
     _AGENT_SELECT_SPEC: ClassVar[AgentSelectSpec] = AgentSelectSpec(
@@ -85,38 +148,102 @@ class CodexBackend(BaseBackend):
         return discover_codex_style_agents(cwd, "codex")
 
     def supported_models(self) -> list[str]:
-        """Return supported Codex model names.
+        """Return the capability tiers the MCP caller may choose from.
+
+        Deliberately the tier names (``low``..``ultra``), not raw model slugs:
+        the caller reasons about how much capability a task needs, not about
+        GPT-5.6 model identities. Each tier maps to a concrete model+effort in
+        :attr:`_TIER_LAUNCH`.
 
         Returns:
-            list[str]: Curated list of supported model identifiers.
+            list[str]: Selectable tier names, cheapest first.
 
         """
-        return ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"]
+        return list(self._TIER_LAUNCH)
 
     def default_model(self) -> str:
-        """Return the default Codex model.
+        """Return the default capability tier.
+
+        ``medium`` (Sol @ low) is the token-efficient general-purpose default.
 
         Returns:
-            str: Default model identifier for this backend.
+            str: Default tier name.
 
         """
-        return "gpt-5.5"
+        return "medium"
 
     def resolve_model(self, generic_name: str) -> str:
-        """Map a generic or direct model name to a Codex model.
+        """Map a tier or raw slug to a Codex model slug (no availability check).
 
-        Allows pass-through for unrecognized model names.
+        A tier name resolves to its bundled model slug; a blank string stays
+        blank (defer to codex config); any other value passes through
+        unchanged. Effort is not considered here, and availability is not
+        validated — use :meth:`resolve_launch` for the launch-time pair.
 
         Args:
-            generic_name: Generic tier or direct model name.
+            generic_name: Tier name or direct model slug.
 
         Returns:
-            Codex model identifier.
+            Codex model slug (possibly empty for blank input).
 
         """
-        if generic_name in self._MODEL_MAP:
-            return self._MODEL_MAP[generic_name]
-        return generic_name
+        key = generic_name.strip()
+        if not key:
+            return ""
+        tier = self._TIER_LAUNCH.get(key.lower())
+        return tier[0] if tier else key
+
+    def resolve_launch(
+        self, model: str, reasoning_effort: str | None
+    ) -> tuple[str, str | None]:
+        """Resolve caller ``(model, effort)`` into a concrete Codex launch pair.
+
+        - Blank ``model`` -> ``("", effort)``: no ``-c model`` override is
+          emitted and codex uses its own ``config.toml`` default (escape hatch).
+        - A capability tier (``low``/``medium``/``high``/``xhigh``/``ultra``)
+          resolves to its bundled ``(GPT-5.6 slug, effort)``; a caller-supplied
+          ``reasoning_effort`` is silently ignored (the tier owns the effort).
+        - Any other value is treated as a raw model slug and passes through
+          (``reasoning_effort`` still applies here and to blank models).
+
+        The resolved model is validated against the models this codex install
+        actually exposes; an unavailable GPT-5.6 model raises
+        :class:`BackendModelUnavailableError` rather than downgrading silently.
+        """
+        key = model.strip()
+        if not key:
+            return "", reasoning_effort
+        tier = self._TIER_LAUNCH.get(key.lower())
+        if tier is not None:
+            slug, tier_effort = tier
+            self._require_available(slug)
+            return slug, tier_effort
+        self._require_available(key)
+        return key, reasoning_effort
+
+    def _available_model_slugs(self) -> list[str]:
+        """Return the model slugs this codex install exposes (empty if unknown).
+
+        Sourced from live ``codex debug models`` discovery (cached per process).
+        Empty when the binary or its model dump cannot be read — callers treat
+        empty as "cannot determine" and skip validation rather than false-error.
+        """
+        try:
+            binary = self.discover_binary()
+        except BackendBinaryNotFoundError:
+            return []
+        return _discover_codex_model_slugs(binary)
+
+    def _require_available(self, slug: str) -> None:
+        """Raise if ``slug`` is known to be unavailable on this codex install.
+
+        Validation is skipped when discovery yields nothing (cannot determine),
+        so a discovery hiccup never blocks a spawn; codex itself would then
+        reject an genuinely-missing model at launch.
+        """
+        available = self._available_model_slugs()
+        if available and slug not in available:
+            raise BackendModelUnavailableError(slug, self._name, available)
 
     def default_permission_args(self) -> list[str]:
         """Return default permission-bypass arguments for Codex."""
@@ -227,6 +354,7 @@ class CodexBackend(BaseBackend):
             *self.permission_args(request),
             "-C",
             request.cwd,
+            *self._model_args(request),
             *self._mcp_identity_args(request),
             *self._hook_override_args(request),
         ]
@@ -262,6 +390,7 @@ class CodexBackend(BaseBackend):
             *self.permission_args(request),
             "-C",
             request.cwd,
+            *self._model_args(request),
             *self._mcp_identity_args(request),
             *self._hook_override_args(request),
         ]
@@ -318,6 +447,20 @@ class CodexBackend(BaseBackend):
         if os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS", "1").strip() == "0":
             return False
         return os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "1").strip() != "0"
+
+    def _model_args(self, request: SpawnRequest) -> list[str]:
+        """Build the ``-c model=<slug>`` override, if a model was selected.
+
+        A blank ``request.model`` emits nothing so codex falls back to its own
+        ``config.toml`` default. The slug is rendered as a TOML single-quoted
+        literal (via :meth:`_toml_literal`) because slugs contain ``.``/``-``
+        and would not be valid bare TOML values, and single quotes avoid
+        Windows ``CreateProcess`` double-quote escaping for the argv token.
+        """
+        model = request.model.strip() if request.model else ""
+        if not model:
+            return []
+        return ["-c", f"model={self._toml_literal(model)}"]
 
     def _mcp_identity_args(self, request: SpawnRequest) -> list[str]:
         """Build a per-spawn ``-c`` override carrying this agent's identity.

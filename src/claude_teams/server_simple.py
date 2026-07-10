@@ -1210,8 +1210,22 @@ async def spawn_agent(
 ) -> dict:
     """Spawn a new agent process.
 
-    reasoning_effort: low/medium/high/xhigh for codex,
-    low/medium/high/xhigh/max for claude-code.
+    model: pick by how much capability the task needs, not by a model name.
+    For codex, choose one capability tier (each maps to a GPT-5.6 model at a
+    fixed reasoning effort), cheapest first:
+      - ``low``    -> quick, low-stakes tasks
+      - ``medium`` -> token-efficient general default
+      - ``high``   -> backend development, code review
+      - ``xhigh``  -> genuinely hard problems
+      - ``ultra``  -> the hardest problems (top tier)
+    Spawning errors if the required GPT-5.6 model is not available on this
+    machine (upgrade codex / check account access) — there is no silent
+    downgrade. For claude-code, ``model`` is haiku/sonnet/opus.
+
+    reasoning_effort: for claude-code, sets the effort (low/medium/high/xhigh/
+    max). For codex it is silently ignored when ``model`` is a capability tier
+    (the tier owns the effort); it still applies to a blank/raw-slug codex
+    model. Codex accepts low/medium/high/xhigh, plus max/ultra.
 
     expected_outputs (optional): the exact file paths you are instructing the
     agent to create. Echoed back verbatim in the result so you can watch
@@ -1243,15 +1257,16 @@ async def spawn_agent(
             backend_name = backend.strip() or registry.default_backend()
             b = registry.get(backend_name)
 
-            resolved_model = (
-                b.resolve_model(model) if model.strip() else b.default_model()
-            )
+            effort = reasoning_effort.strip() or None
+            # A backend may bundle a reasoning effort into a model tier (e.g.
+            # Codex ``high`` -> Sol @ medium), so resolve model and effort
+            # together. For codex tiers the bundled effort wins and any caller
+            # ``reasoning_effort`` is ignored; other backends still honor it.
+            resolved_model, effort = b.resolve_launch(model, effort)
 
             mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
 
             agent_cwd = cwd.strip() or str(Path.cwd())
-
-            effort = reasoning_effort.strip() or None
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
@@ -1687,7 +1702,17 @@ async def follow_up_agent(
             agent_cwd = str(agent.get("cwd") or Path.cwd())
             mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
 
-            model = str(agent.get("model") or backend.default_model())
+            # Reuse the concrete model resolved at spawn. Preserve a stored
+            # blank verbatim (blank means "defer to codex config"); only a
+            # genuinely absent key falls back to the backend default. Do NOT
+            # coerce blank via ``or`` — default_model() may be a capability
+            # tier name (e.g. "medium"), which must never reach ``-c model``.
+            stored_model = agent.get("model")
+            model = (
+                stored_model
+                if isinstance(stored_model, str)
+                else backend.default_model()
+            )
             permission_mode = str(agent.get("permission_mode") or "bypass")
             effort_value = agent.get("reasoning_effort")
             effort = effort_value if isinstance(effort_value, str) else None

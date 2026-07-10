@@ -22,6 +22,11 @@ class _FakeClaudeBackend:
     def resolve_model(self, model: str) -> str:
         return model
 
+    def resolve_launch(
+        self, model: str, reasoning_effort: str | None
+    ) -> tuple[str, str | None]:
+        return (model if model.strip() else self.default_model()), reasoning_effort
+
     def spawn(self, request: object) -> SimpleNamespace:
         self.last_request = request
         return SimpleNamespace(process_handle="789")
