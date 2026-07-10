@@ -1210,22 +1210,21 @@ async def spawn_agent(
 ) -> dict:
     """Spawn a new agent process.
 
-    model: pick by the kind of work rather than a raw model name. For codex,
-    semantic tiers map to a GPT-5.6 model plus the reasoning effort that suits
-    that work:
-      - ``fast``     -> Terra @ medium  (quick, low-stakes tasks)
-      - ``balanced`` -> Terra @ high    (general default)
-      - ``powerful`` -> Sol @ medium, or Terra @ xhigh when Sol is unavailable
-                        (backend development, code review)
-      - ``frontier`` -> Sol @ high, or Terra @ ultra when Sol is unavailable
-                        (reserve for genuinely hard problems)
-    Leave ``model`` blank to use codex's own configured default. Raw slugs
-    (e.g. ``gpt-5.6-terra``) and short aliases (``terra``/``luna``/``sol``)
-    also work as passthrough. For claude-code, ``model`` is haiku/sonnet/opus.
+    model: pick by how much capability the task needs, not by a model name.
+    For codex, choose one capability tier (each maps to a GPT-5.6 model at a
+    fixed reasoning effort), cheapest first:
+      - ``low``    -> quick, low-stakes tasks
+      - ``medium`` -> token-efficient general default
+      - ``high``   -> backend development, code review
+      - ``xhigh``  -> genuinely hard problems
+      - ``ultra``  -> the hardest problems (top tier)
+    Spawning errors if the required GPT-5.6 model is not available on this
+    machine (upgrade codex / check account access) — there is no silent
+    downgrade. For claude-code, ``model`` is haiku/sonnet/opus.
 
     reasoning_effort: overrides a tier's bundled effort when set. Codex accepts
-    low/medium/high/xhigh, plus max (Terra/Luna) and ultra (Terra); claude-code
-    accepts low/medium/high/xhigh/max.
+    low/medium/high/xhigh, plus max/ultra; claude-code accepts
+    low/medium/high/xhigh/max.
 
     expected_outputs (optional): the exact file paths you are instructing the
     agent to create. Echoed back verbatim in the result so you can watch
@@ -1701,7 +1700,17 @@ async def follow_up_agent(
             agent_cwd = str(agent.get("cwd") or Path.cwd())
             mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
 
-            model = str(agent.get("model") or backend.default_model())
+            # Reuse the concrete model resolved at spawn. Preserve a stored
+            # blank verbatim (blank means "defer to codex config"); only a
+            # genuinely absent key falls back to the backend default. Do NOT
+            # coerce blank via ``or`` — default_model() may be a capability
+            # tier name (e.g. "medium"), which must never reach ``-c model``.
+            stored_model = agent.get("model")
+            model = (
+                stored_model
+                if isinstance(stored_model, str)
+                else backend.default_model()
+            )
             permission_mode = str(agent.get("permission_mode") or "bypass")
             effort_value = agent.get("reasoning_effort")
             effort = effort_value if isinstance(effort_value, str) else None

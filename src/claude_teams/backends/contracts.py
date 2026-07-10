@@ -64,6 +64,25 @@ class UnsupportedBackendModelError(ValueError):
         )
 
 
+class BackendModelUnavailableError(RuntimeError):
+    """Raised when a resolved model is not available on this backend install.
+
+    Distinct from :class:`UnsupportedBackendModelError` (an unknown name):
+    the name resolved fine, but the underlying model is not exposed by the
+    installed CLI (e.g. a GPT-5.6 model requiring a newer codex or account).
+    """
+
+    def __init__(
+        self, model: str, backend_name: str, available: Iterable[str]
+    ) -> None:
+        """Build the message from the model, backend, and available models."""
+        super().__init__(
+            f"Model {model!r} is not available for {backend_name} on this "
+            f"machine. Available: {', '.join(available) or '(none)'}. "
+            "Upgrade the CLI or check account access."
+        )
+
+
 class CaptureResult(TypedDict):
     """Result of executing a command in a tmux pane."""
 
