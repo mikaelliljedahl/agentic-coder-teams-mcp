@@ -82,7 +82,7 @@ class TestCodexResolveModel:
     def test_resolves_tier_to_slug(self):
         backend = CodexBackend()
         assert backend.resolve_model("low") == "gpt-5.6-terra"
-        assert backend.resolve_model("medium") == "gpt-5.6-sol"
+        assert backend.resolve_model("medium") == "gpt-5.6-terra"
         assert backend.resolve_model("ultra") == "gpt-5.6-sol"
 
     def test_passes_through_direct_slug(self):
@@ -103,7 +103,7 @@ class TestCodexResolveLaunch:
         _stub_discovery(["gpt-5.6-terra", "gpt-5.6-sol"])
         backend = CodexBackend()
         assert backend.resolve_launch("low", None) == ("gpt-5.6-terra", "medium")
-        assert backend.resolve_launch("medium", None) == ("gpt-5.6-sol", "low")
+        assert backend.resolve_launch("medium", None) == ("gpt-5.6-terra", "high")
         assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
         assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
         assert backend.resolve_launch("ultra", None) == ("gpt-5.6-sol", "xhigh")
