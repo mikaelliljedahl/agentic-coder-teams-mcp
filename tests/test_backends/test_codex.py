@@ -108,7 +108,6 @@ class TestCodexResolveModel:
         backend = CodexBackend()
         assert backend.resolve_model("fast") == "gpt-5.6-terra"
         assert backend.resolve_model("balanced") == "gpt-5.6-terra"
-        assert backend.resolve_model("powerful") == "gpt-5.6-terra"
 
     def test_resolves_alias(self):
         backend = CodexBackend()
@@ -130,10 +129,19 @@ class TestCodexResolveModel:
 
 
 class TestCodexResolveLaunch:
-    def test_tier_bundles_effort(self):
+    def test_terra_tier_bundles_effort(self):
         backend = CodexBackend()
         assert backend.resolve_launch("fast", None) == ("gpt-5.6-terra", "medium")
         assert backend.resolve_launch("balanced", None) == ("gpt-5.6-terra", "high")
+
+    def test_powerful_prefers_sol_medium_when_available(self, _stub_discovery):
+        _stub_discovery(["gpt-5.6-sol", "gpt-5.6-terra"])
+        backend = CodexBackend()
+        assert backend.resolve_launch("powerful", None) == ("gpt-5.6-sol", "medium")
+
+    def test_powerful_falls_back_to_terra_xhigh_without_sol(self, _stub_discovery):
+        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-luna"])
+        backend = CodexBackend()
         assert backend.resolve_launch("powerful", None) == ("gpt-5.6-terra", "xhigh")
 
     def test_explicit_effort_overrides_tier(self):

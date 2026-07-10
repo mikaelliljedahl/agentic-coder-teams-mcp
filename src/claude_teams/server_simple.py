@@ -1215,7 +1215,8 @@ async def spawn_agent(
     that work:
       - ``fast``     -> Terra @ medium  (quick, low-stakes tasks)
       - ``balanced`` -> Terra @ high    (general default)
-      - ``powerful`` -> Terra @ xhigh   (backend development, code review)
+      - ``powerful`` -> Sol @ medium, or Terra @ xhigh when Sol is unavailable
+                        (backend development, code review)
       - ``frontier`` -> Sol @ high, or Terra @ ultra when Sol is unavailable
                         (reserve for genuinely hard problems)
     Leave ``model`` blank to use codex's own configured default. Raw slugs

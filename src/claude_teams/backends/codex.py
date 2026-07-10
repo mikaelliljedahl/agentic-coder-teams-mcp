@@ -100,15 +100,23 @@ class CodexBackend(BaseBackend):
     # Semantic capability tiers, each bundling a concrete model with the
     # reasoning effort that makes it the right tool for that class of work.
     # The caller passes a tier (or a raw slug); an explicit ``reasoning_effort``
-    # always overrides the tier's bundled effort. ``frontier`` is resolved
-    # dynamically (see :meth:`_frontier_launch`) because GPT-5.6-Sol is only
-    # available to some accounts. Rationale: Terra @ xhigh lands where Sol @
-    # medium would, so Terra covers backend dev and code review; Sol is held
-    # for genuinely hard problems.
+    # always overrides the tier's bundled effort. ``fast``/``balanced`` ride
+    # Terra; ``powerful``/``frontier`` prefer Sol and are resolved dynamically
+    # (see :attr:`_SOL_TIER_LAUNCH` / :meth:`_sol_or_terra`) because GPT-5.6-Sol
+    # is only exposed on some accounts.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
         "fast": ("gpt-5.6-terra", "medium"),
         "balanced": ("gpt-5.6-terra", "high"),
-        "powerful": ("gpt-5.6-terra", "xhigh"),
+    }
+
+    # Sol-preferring tiers -> (Sol effort, Terra fallback effort when Sol is
+    # unavailable on this account). Terra @ xhigh lands where Sol @ medium
+    # would, so ``powerful`` degrades to Terra @ xhigh for backend dev and
+    # code review; ``frontier`` (held for genuinely hard problems) degrades to
+    # Terra @ ultra.
+    _SOL_TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
+        "powerful": ("medium", "xhigh"),
+        "frontier": ("high", "ultra"),
     }
 
     # Short, human-friendly aliases for raw model slugs. Unlike tiers these
@@ -214,7 +222,8 @@ class CodexBackend(BaseBackend):
         - Blank ``model`` -> ``("", effort)``: no ``-c model`` override is
           emitted and codex uses its own ``config.toml`` default.
         - A semantic tier (``fast``/``balanced``/``powerful``/``frontier``)
-          resolves to its bundled ``(slug, effort)``; an explicit
+          resolves to its bundled ``(slug, effort)``; ``powerful``/``frontier``
+          prefer Sol and fall back to Terra when Sol is unavailable. An explicit
           ``reasoning_effort`` overrides the tier's bundled effort.
         - A short alias (``terra``/``luna``/``sol``) or a raw slug passes
           through as the model, with effort left as the caller gave it.
@@ -223,8 +232,9 @@ class CodexBackend(BaseBackend):
         if not key:
             return "", reasoning_effort
         low = key.lower()
-        if low == "frontier":
-            slug, tier_effort = self._frontier_launch()
+        if low in self._SOL_TIER_LAUNCH:
+            sol_effort, terra_effort = self._SOL_TIER_LAUNCH[low]
+            slug, tier_effort = self._sol_or_terra(sol_effort, terra_effort)
             return slug, reasoning_effort or tier_effort
         if low in self._TIER_LAUNCH:
             slug, tier_effort = self._TIER_LAUNCH[low]
@@ -233,16 +243,16 @@ class CodexBackend(BaseBackend):
             return self._MODEL_ALIASES[low], reasoning_effort
         return key, reasoning_effort
 
-    def _frontier_launch(self) -> tuple[str, str]:
-        """Resolve the ``frontier`` tier, preferring Sol when it is available.
+    def _sol_or_terra(self, sol_effort: str, terra_effort: str) -> tuple[str, str]:
+        """Resolve a Sol-preferring tier, degrading to Terra when Sol is absent.
 
         GPT-5.6-Sol is only exposed to some accounts, so probe the discovered
-        model list: use Sol @ high when present, otherwise fall back to
-        Terra @ ultra (Terra's top effort) so the tier degrades gracefully.
+        model list: use ``(Sol, sol_effort)`` when present, otherwise fall back
+        to ``(Terra, terra_effort)`` so the tier degrades gracefully.
         """
         if "gpt-5.6-sol" in self.supported_models():
-            return "gpt-5.6-sol", "high"
-        return "gpt-5.6-terra", "ultra"
+            return "gpt-5.6-sol", sol_effort
+        return "gpt-5.6-terra", terra_effort
 
     def default_permission_args(self) -> list[str]:
         """Return default permission-bypass arguments for Codex."""
