@@ -108,10 +108,13 @@ class TestCodexResolveLaunch:
         assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
         assert backend.resolve_launch("ultra", None) == ("gpt-5.6-sol", "xhigh")
 
-    def test_explicit_effort_overrides_tier(self, _stub_discovery):
+    def test_explicit_effort_ignored_for_tier(self, _stub_discovery):
         _stub_discovery(["gpt-5.6-terra", "gpt-5.6-sol"])
         backend = CodexBackend()
-        assert backend.resolve_launch("low", "max") == ("gpt-5.6-terra", "max")
+        # A tier owns its effort; a caller-supplied reasoning_effort is
+        # silently ignored and the bundled tier effort is used.
+        assert backend.resolve_launch("low", "max") == ("gpt-5.6-terra", "medium")
+        assert backend.resolve_launch("high", "xhigh") == ("gpt-5.6-sol", "medium")
 
     def test_blank_model_defers_to_codex_config(self):
         backend = CodexBackend()

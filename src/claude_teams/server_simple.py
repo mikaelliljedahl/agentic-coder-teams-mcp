@@ -1222,9 +1222,10 @@ async def spawn_agent(
     machine (upgrade codex / check account access) — there is no silent
     downgrade. For claude-code, ``model`` is haiku/sonnet/opus.
 
-    reasoning_effort: overrides a tier's bundled effort when set. Codex accepts
-    low/medium/high/xhigh, plus max/ultra; claude-code accepts
-    low/medium/high/xhigh/max.
+    reasoning_effort: for claude-code, sets the effort (low/medium/high/xhigh/
+    max). For codex it is silently ignored when ``model`` is a capability tier
+    (the tier owns the effort); it still applies to a blank/raw-slug codex
+    model. Codex accepts low/medium/high/xhigh, plus max/ultra.
 
     expected_outputs (optional): the exact file paths you are instructing the
     agent to create. Echoed back verbatim in the result so you can watch
@@ -1258,8 +1259,9 @@ async def spawn_agent(
 
             effort = reasoning_effort.strip() or None
             # A backend may bundle a reasoning effort into a model tier (e.g.
-            # Codex ``balanced`` -> Terra @ high), so resolve model and effort
-            # together; an explicit ``reasoning_effort`` still wins.
+            # Codex ``high`` -> Sol @ medium), so resolve model and effort
+            # together. For codex tiers the bundled effort wins and any caller
+            # ``reasoning_effort`` is ignored; other backends still honor it.
             resolved_model, effort = b.resolve_launch(model, effort)
 
             mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)

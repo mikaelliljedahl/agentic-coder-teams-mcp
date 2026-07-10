@@ -106,8 +106,8 @@ class CodexBackend(BaseBackend):
     # caller already reasons in (low..ultra) rather than raw model slugs, which
     # the caller has no basis to choose between. All targets are GPT-5.6; if the
     # target model is not available on this codex install the spawn errors (no
-    # silent downgrade). An explicit ``reasoning_effort`` overrides the tier's
-    # bundled effort.
+    # silent downgrade). A tier fully determines model + effort; a caller-
+    # supplied ``reasoning_effort`` is silently ignored for tiers.
     #   low    -> Terra @ medium   (dirt cheap, quick/low-stakes)
     #   medium -> Sol   @ low      (token-efficient general default)
     #   high   -> Sol   @ medium   (backend dev, code review)
@@ -201,9 +201,10 @@ class CodexBackend(BaseBackend):
         - Blank ``model`` -> ``("", effort)``: no ``-c model`` override is
           emitted and codex uses its own ``config.toml`` default (escape hatch).
         - A capability tier (``low``/``medium``/``high``/``xhigh``/``ultra``)
-          resolves to its bundled ``(GPT-5.6 slug, effort)``; an explicit
-          ``reasoning_effort`` overrides the tier's bundled effort.
-        - Any other value is treated as a raw model slug and passes through.
+          resolves to its bundled ``(GPT-5.6 slug, effort)``; a caller-supplied
+          ``reasoning_effort`` is silently ignored (the tier owns the effort).
+        - Any other value is treated as a raw model slug and passes through
+          (``reasoning_effort`` still applies here and to blank models).
 
         The resolved model is validated against the models this codex install
         actually exposes; an unavailable GPT-5.6 model raises
@@ -216,7 +217,7 @@ class CodexBackend(BaseBackend):
         if tier is not None:
             slug, tier_effort = tier
             self._require_available(slug)
-            return slug, reasoning_effort or tier_effort
+            return slug, tier_effort
         self._require_available(key)
         return key, reasoning_effort
 
