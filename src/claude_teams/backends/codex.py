@@ -109,15 +109,13 @@ class CodexBackend(BaseBackend):
     # silent downgrade). A tier fully determines model + effort; a caller-
     # supplied ``reasoning_effort`` is silently ignored for tiers.
     #   low    -> Terra @ medium   (dirt cheap, quick/low-stakes)
-    #   medium -> Terra @ high     (token-efficient general default; more
-    #             cost-effective than Sol @ low and on par with the old 5.5
-    #             @ medium)
+    #   medium -> Sol   @ low       (token-efficient general default)
     #   high   -> Sol   @ medium   (backend dev, code review)
     #   xhigh  -> Sol   @ high     (genuinely hard problems)
     #   ultra  -> Sol   @ xhigh    (top; higher still is diminishing returns)
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
         "low": ("gpt-5.6-terra", "medium"),
-        "medium": ("gpt-5.6-terra", "high"),
+        "medium": ("gpt-5.6-sol", "low"),
         "high": ("gpt-5.6-sol", "medium"),
         "xhigh": ("gpt-5.6-sol", "high"),
         "ultra": ("gpt-5.6-sol", "xhigh"),
