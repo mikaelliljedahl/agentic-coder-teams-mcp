@@ -118,6 +118,89 @@ def read_claude_output(
     )
 
 
+def read_pi_output(
+    pi_session_dir: str,
+    max_bytes: int = _LAST_MESSAGE_BUDGET,
+    *,
+    expected_session_id: str | None = None,
+) -> AgentOutput | None:
+    """Read the latest pi assistant output from a per-agent session dir.
+
+    Unlike Codex/Claude, the pi backend controls the storage location
+    (``--session-dir <session>/pi-sessions/<agent>``) and the session id
+    (``--session-id <agent>``), so binding is deterministic: glob the one
+    ``*.jsonl`` there, read the header ``id`` as the backend session id, and
+    scan backward for the last ``assistant`` message's text.
+
+    Args:
+        pi_session_dir: The agent's dedicated pi session directory.
+        max_bytes: Character budget for the returned ``last_message``.
+        expected_session_id: When set, prefer the file whose header ``id``
+            matches; otherwise the most-recently-modified file wins.
+
+    Returns:
+        The latest :class:`AgentOutput`, or ``None`` when nothing is found.
+    """
+    directory = Path(pi_session_dir).expanduser()
+    if not directory.exists():
+        return None
+
+    candidates: list[tuple[float, Path, str | None]] = []
+    with contextlib.suppress(OSError):
+        for path in directory.glob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            candidates.append((mtime, path, _pi_session_id(path)))
+    if not candidates:
+        return None
+
+    matched = [
+        c
+        for c in candidates
+        if expected_session_id and c[2] == expected_session_id
+    ]
+    mtime, path, session_id = max(matched or candidates, key=lambda item: item[0])
+    message = _last_pi_message(path)
+    if message is None and session_id is None:
+        return None
+    return AgentOutput(
+        last_activity_at=mtime,
+        last_message=_truncate_tail(message, max_bytes) if message else None,
+        rollout_path=str(path),
+        backend_session_id=session_id,
+    )
+
+
+def _pi_session_id(path: Path) -> str | None:
+    """Return the ``id`` from a pi session file's header line."""
+    header = _first_json_object(path)
+    if isinstance(header, dict) and header.get("type") == "session":
+        session_id = header.get("id")
+        if isinstance(session_id, str) and session_id:
+            return session_id
+    return None
+
+
+def _last_pi_message(path: Path) -> str | None:
+    """Return the text of the last ``assistant`` message in a pi session file."""
+    for line in _iter_lines_reverse(path):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        message = item.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        text = _content_text(message.get("content"), "text", allow_string=True)
+        if text is not None:
+            return text
+    return None
+
+
 def _matching_codex_rollouts(
     spawned_at: float,
     normalized_cwd: str,

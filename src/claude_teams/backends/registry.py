@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 _BUILTIN_BACKENDS: dict[str, str] = {
     "claude-code": "claude_teams.backends.claude_code.ClaudeCodeBackend",
     "codex": "claude_teams.backends.codex.CodexBackend",
+    "pi": "claude_teams.backends.pi.PiBackend",
 }
 
 
