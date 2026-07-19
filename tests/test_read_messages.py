@@ -340,6 +340,32 @@ def test_limit_zero_has_more_false_when_nothing_pending(inbox: Path) -> None:
     assert result["has_more"] is False
 
 
+def test_limit_zero_reports_true_unread_count(inbox: Path) -> None:
+    _append(inbox, "A", "a1")
+    _append(inbox, "A", "a2")
+
+    result = _read(from_agent="A", limit=0)
+
+    # A non-consuming peek must report the real backlog, not the empty batch:
+    # a coordinator uses this to decide whether to act.
+    assert result["messages"] == []
+    assert result["has_more"] is True
+    assert result["unread_count"] == 2
+
+
+def test_clipped_batch_reports_total_unread_not_batch_size(inbox: Path) -> None:
+    _append(inbox, "A", "a1")
+    _append(inbox, "A", "a2")
+    _append(inbox, "A", "a3")
+
+    result = _read(limit=1)
+
+    assert _texts(result) == ["a1"]
+    assert result["has_more"] is True
+    # unread_count is the pending backlog, not the size of this clipped batch.
+    assert result["unread_count"] == 3
+
+
 def test_max_chars_none_does_not_add_truncation_fields(inbox: Path) -> None:
     _append(inbox, "A", "hello")
 

@@ -842,9 +842,13 @@ and auto-restarts the server if it had died from host idle timeout. Do not
 tight-poll this tool — use the watch recipe below instead.
 
 Recommended low-token loop: run `win-agent-teams watch <session-dir>`.
-The watcher ignores `running` hook churn and emits one JSON wake record:
-`reason="message"` for unread inbox data, `reason="waiting"` for a changed
-waiting marker, or `reason="output"` for a selected output. On a message,
+The watcher ignores non-actionable churn — `running` hook transitions and
+`SubagentStop` (a worker's own internal Task subagent finishing) — and emits
+one JSON wake record: `reason="message"` for unread inbox data,
+`reason="waiting"` for a marker that settles as waiting, or `reason="output"`
+for a selected output. A waiting marker must persist for a short settle window
+(`WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`, default 1.5s) before it wakes; one that
+resumes `running` within the window is suppressed as a brief park. On a message,
 call `read_messages`; on waiting, call this tool for the status delta.
 
 - Claude Code coordinator: run the watch as a BACKGROUND command. Its
@@ -856,9 +860,10 @@ call `read_messages`; on waiting, call this tool for the status delta.
   A marker read is useful for `reason="waiting"`; `reason="message"` requires
   `read_messages` because no state marker need have changed.
 
-Timeout exit 2 means no new edge arrived; re-check status before
+Timeout exit 2 means no actionable edge settled; re-check status before
 starting the next watch because an agent may already be waiting due to the
-small status-check/watch-baseline race.
+small status-check/watch-baseline race, or a genuine waiting edge may have
+arrived inside the final unfinished settle window.
 """.strip()
 
 
@@ -1207,11 +1212,14 @@ async def spawn_agent(
 
     Recommended coordination pattern: do NOT tight-poll. Run
     ``win-agent-teams watch session_dir`` in the background for a Claude Code
-    coordinator (bounded foreground for Codex). It ignores ``running`` hook
-    churn and wakes on unread inbox data, a changed ``waiting`` marker, or a
-    selected output. Branch on its JSON ``reason``: call ``read_messages`` for
-    ``message`` and ``agent_status``/``check_agent`` for ``waiting``. Re-check
-    status after timeout exit 2 before mounting the next watch.
+    coordinator (bounded foreground for Codex). It ignores non-actionable churn
+    (``running`` transitions and ``SubagentStop``) and wakes on unread inbox
+    data, a selected output, or a ``waiting`` marker that persists past a short
+    settle window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 1.5s) — a
+    marker resuming ``running`` within the window is suppressed. Branch on its
+    JSON ``reason``: call ``read_messages`` for ``message`` and
+    ``agent_status``/``check_agent`` for ``waiting``. Re-check status after
+    timeout exit 2 before mounting the next watch.
     """
 
     def _do_spawn() -> dict:
@@ -1438,6 +1446,10 @@ async def read_messages(
                 for position, index, msg in per_sender_batches[sender]
             ]
             selected.sort(key=lambda item: item[2])  # global file order
+            # The pending backlog is measured before any limit clipping so a
+            # non-consuming peek (limit=0) or a clipped batch still reports the
+            # true unread count instead of just the returned batch size.
+            total_unread = len(selected)
             has_more = False
             if effective_limit is not None and len(selected) > effective_limit:
                 selected = selected[:effective_limit]
@@ -1478,7 +1490,7 @@ async def read_messages(
 
             result: dict = {
                 "messages": messages,
-                "unread_count": len(messages),
+                "unread_count": total_unread,
                 "has_more": has_more,
             }
             if from_agent:
@@ -2040,8 +2052,10 @@ async def agent_watch_paths(names: list[str] | None = None) -> list[dict]:
 
     Canonical watch recipe: background-watch (or, for a Codex coordinator,
     bounded-foreground-watch) via ``win-agent-teams watch <session-dir>``.
-    It ignores ``running`` transitions and emits ``reason=message`` for unread
-    inbox data or ``reason=waiting`` for a changed waiting marker. Call
+    It ignores non-actionable churn (``running`` transitions and
+    ``SubagentStop``) and emits ``reason=message`` for unread inbox data or
+    ``reason=waiting`` for a waiting marker that persists past a short settle
+    window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 1.5s). Call
     ``read_messages`` for message and ``agent_status``/``check_agent`` for
     waiting. Re-check status after timeout exit 2 before watching again.
     """

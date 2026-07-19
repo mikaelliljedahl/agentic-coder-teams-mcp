@@ -2,6 +2,7 @@
 
 import fnmatch
 import json
+import math
 import os
 import signal
 import time
@@ -17,6 +18,42 @@ from claude_teams.server_simple import mcp
 
 _WATCH_POLL_SECONDS = 0.5
 _WATCH_DEFAULT_PATTERN = "state-*.json"
+
+# Waiting markers written by these hook events are NOT coordinator-actionable:
+# ``SubagentStop`` fires when one of an agent's OWN built-in Task subagents
+# finishes, while the agent itself is still mid-task and will resume on its
+# next tool call. Waking a coordinator for it is a false positive.
+_NON_ACTIONABLE_WAITING_EVENTS: frozenset[str] = frozenset({"SubagentStop"})
+
+_WATCH_SETTLE_DEFAULT_SECONDS = 1.5
+
+
+def _settle_seconds_from_env() -> float:
+    """Return the settle window from the environment, falling back to the default.
+
+    A malformed override (non-numeric, ``NaN``, infinite, or negative) falls
+    back to :data:`_WATCH_SETTLE_DEFAULT_SECONDS` rather than breaking the CLI or
+    — in the ``NaN`` case — silently making ``now - since >= settle`` never true,
+    which would suppress every genuine wake. ``0`` is a valid override (settle
+    disabled).
+    """
+    raw = os.environ.get("WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS")
+    if raw is None:
+        return _WATCH_SETTLE_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _WATCH_SETTLE_DEFAULT_SECONDS
+    if not math.isfinite(value) or value < 0:
+        return _WATCH_SETTLE_DEFAULT_SECONDS
+    return value
+
+
+# Seconds an actionable ``waiting`` marker must persist before it wakes the
+# coordinator. An agent that merely parks between operations (e.g. a
+# backgrounded bash or a brief yield) flips waiting->running again within this
+# window; requiring the marker to settle suppresses that churn. Env-overridable.
+_WATCH_SETTLE_SECONDS = _settle_seconds_from_env()
 
 app = typer.Typer(
     name="win-agent-teams",
@@ -111,7 +148,15 @@ def _path_identity(path: Path) -> tuple[int, int] | None:
 
 
 def _waiting_agent(path: Path) -> str | None:
-    """Return the agent name when ``path`` is a valid waiting-state marker."""
+    """Return the agent name for a coordinator-actionable waiting marker.
+
+    Returns ``None`` when ``path`` is not such a marker. A marker is actionable
+    only when its state is ``waiting`` AND the hook event
+    that produced it is not in :data:`_NON_ACTIONABLE_WAITING_EVENTS`. This
+    filters out ``SubagentStop`` churn (an agent's own Task subagent finishing)
+    the same way the caller already ignores ``running`` transitions. Markers with
+    no recorded ``event`` are treated as actionable for backward compatibility.
+    """
     if not (path.name.startswith("state-") and path.suffix == ".json"):
         return None
     try:
@@ -119,6 +164,12 @@ def _waiting_agent(path: Path) -> str | None:
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(marker, dict) or marker.get("state") != "waiting":
+        return None
+    event = marker.get("event")
+    # ``event`` may be any JSON value; guard the membership test so a non-string
+    # (unhashable list/dict) does not raise and regress marker tolerance. A
+    # missing or non-string event is treated as actionable.
+    if isinstance(event, str) and event in _NON_ACTIONABLE_WAITING_EVENTS:
         return None
     return path.stem.removeprefix("state-")
 
@@ -148,16 +199,21 @@ def watch(
 ) -> None:
     """Block until an agent is waiting, an inbox is unread, or output changes.
 
-    State-marker changes are semantic: ``running`` lifecycle transitions are
-    ignored, while a changed marker whose state is ``waiting`` exits 0. Other
-    files selected by PATTERN wake on any creation/change. Unless
-    ``--no-inbox`` is passed, unread messages for ``AGENT_NAME`` (or the root
-    ``team-lead`` identity) also exit 0 without consuming them.
+    State-marker changes are semantic: ``running`` lifecycle transitions and
+    ``SubagentStop`` (a worker's own Task subagent finishing) are ignored, and a
+    marker whose state is ``waiting`` exits 0 only after it *persists* as waiting
+    for a short settle window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default
+    1.5s) — a marker that resumes ``running`` inside the window is suppressed as
+    a brief park. Other files selected by PATTERN wake on any creation/change.
+    Unless ``--no-inbox`` is passed, unread messages for ``AGENT_NAME`` (or the
+    root ``team-lead`` identity) also exit 0 without consuming them. When several
+    signals are ready in one poll the priority is message > output > waiting.
 
     Success prints one JSON object with ``reason`` equal to ``message``,
     ``waiting``, or ``output``. Timeout prints nothing and exits 2; re-check
     status after exit 2 because a waiting transition may precede the initial
-    marker snapshot.
+    marker snapshot, or a genuine waiting edge may still be inside its settle
+    window at the deadline.
     """
     directory = Path(session_dir)
     deadline = time.monotonic() + timeout
@@ -180,7 +236,15 @@ def watch(
             )
             raise typer.Exit(code=0)
 
+    # A waiting marker only wakes the coordinator once it has stayed waiting for
+    # _WATCH_SETTLE_SECONDS. Every actionable candidate is tracked by its marker
+    # path — a coordinator watches ALL agents' markers, so overlapping waits must
+    # each settle independently; a single slot would drop one when another arrives
+    # or resumes. Value is the first-seen monotonic time.
+    pending_waits: dict[str, float] = {}
+
     while True:
+        now = time.monotonic()
         after = _snapshot_mtimes(directory, pattern)
         changed = _changed_paths(before, after)
         inbox_after = _path_identity(inbox_path)
@@ -215,13 +279,31 @@ def watch(
         # so one non-ready write cannot be rediscovered forever.
         before = after
 
-        if waiting:
-            agent, path = waiting[0]
-            _emit_wake({"reason": "waiting", "agent": agent, "path": path})
-            raise typer.Exit(code=0)
+        # Register every actionable waiting edge seen this tick, keeping the
+        # earliest first-seen time while a marker stays a candidate.
+        for _agent, wpath in waiting:
+            pending_waits.setdefault(wpath, now)
+
+        # Emit outputs BEFORE any settled wait. A wait settles over several
+        # polls, so an output edge can land in the same poll a wait matures;
+        # since `before = after` has already consumed that output edge, waking
+        # on the wait first would drop the output for good. Priority is
+        # message > output > waiting (message is handled at the top of the loop).
         if outputs:
             _emit_wake({"reason": "output", "path": outputs[0]})
             raise typer.Exit(code=0)
+
+        # Settle each candidate against its CURRENT state: drop any that flipped
+        # back to running (or to a non-actionable SubagentStop) within the
+        # window, and wake on the first that has stayed waiting long enough.
+        # Iterate in insertion order so the earliest-seen settled wait wins.
+        for wpath in list(pending_waits):
+            current = _waiting_agent(Path(wpath))
+            if current is None:
+                del pending_waits[wpath]
+            elif now - pending_waits[wpath] >= _WATCH_SETTLE_SECONDS:
+                _emit_wake({"reason": "waiting", "agent": current, "path": wpath})
+                raise typer.Exit(code=0)
         if time.monotonic() >= deadline:
             raise typer.Exit(code=2)
         time.sleep(_WATCH_POLL_SECONDS)
