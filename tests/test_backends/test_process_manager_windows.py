@@ -118,7 +118,10 @@ class TestBreakawayFallback:
             calls.append(creationflags)
             if len(calls) == 1:
                 err = OSError("access denied")
-                err.winerror = 5
+                # ``winerror`` is a Windows-only OSError attribute; ty checks
+                # against the Linux stdlib where it is absent. The test
+                # deliberately simulates the Windows exception shape.
+                err.winerror = 5  # ty: ignore[unresolved-attribute]
                 raise err
             return _fake_process()
 
@@ -139,7 +142,8 @@ class TestBreakawayFallback:
         def fake_popen(cmd, creationflags=0, **kwargs):
             calls.append(creationflags)
             err = OSError("file not found")
-            err.winerror = 2
+            # Windows-only OSError attribute; see note above.
+            err.winerror = 2  # ty: ignore[unresolved-attribute]
             raise err
 
         monkeypatch.setattr(process_manager_mod.subprocess, "Popen", fake_popen)

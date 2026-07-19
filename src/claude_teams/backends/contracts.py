@@ -307,6 +307,14 @@ class Backend(Protocol):
         """Spawn a backend worker and return its process handle."""
         ...
 
+    def resume(self, request: SpawnRequest, backend_session_id: str) -> SpawnResult:
+        """Resume a backend-native conversation as a new process.
+
+        Backends that cannot resume natively still provide this member (see
+        ``supports_resume``); callers gate on ``supports_resume`` before use.
+        """
+        ...
+
     def health_check(self, handle: str) -> HealthStatus:
         """Check whether the backend worker identified by ``handle`` is alive."""
         ...

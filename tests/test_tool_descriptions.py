@@ -63,6 +63,7 @@ async def _registered_description(tool_name: str) -> str:
     schema.
     """
     tool = await server_simple.mcp.get_tool(tool_name)
+    assert tool is not None
     return tool.description or ""
 
 
