@@ -91,6 +91,25 @@ an injected clock and poll interval for exactly this reason.
    numbers are indicative.** 112 of 113 `server_simple.py` line citations had
    drifted within a few PRs while every named value stayed correct. Converting
    the whole document to symbol-based references is an open, offered follow-up.
+5. **Never edit `server_simple.py` with a scripted whole-file operation.** Two
+   separate agents damaged it two steps running. Once, a slice-replacement
+   anchored on `mcp_config_path = _write_mcp_config(...)` — a line that occurs
+   in **both** `_do_spawn` and `_prepare` — matched the wrong one and silently
+   deleted ~600 lines spanning `send_message`, `read_messages` and
+   `check_agent`. Once, a `git checkout src/claude_teams/server_simple.py`
+   meant to revert a single mutation reverted the whole file and wiped a
+   finished implementation. Both were recovered, but only because the author
+   noticed. The file is ~2700 lines with repeated idioms, so anchors that look
+   unique usually are not.
+
+   Rules: prefer targeted edits; if you must script one, assert the anchor
+   matches exactly once *before* writing; to revert a mutation, restore from a
+   copy taken beforehand, never `git checkout` a file with uncommitted work.
+   Afterwards verify with a symbol-set diff against `HEAD` **and** body hashes
+   of the functions outside your intended scope — a green suite alone does not
+   prove nothing was lost, because a deleted `@mcp.tool()` docstring changes
+   the contract calling agents read (`_with_disk_note` appends to the
+   *registered* description) while every test still passes.
 
 ## Decisions already taken — do not silently revisit
 
