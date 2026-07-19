@@ -122,7 +122,11 @@ Every tool body runs on a worker thread via `run_blocking`
    (`src/claude_teams/server_simple.py:1273`) and appends the registry record.
 
 **Returns** `{name, pid, backend, session_id, state_marker_path, session_dir,
-expected_outputs}` (`src/claude_teams/server_simple.py:1292-1300`).
+watch_argv, watch_command_bash, watch_command_powershell, expected_outputs}`
+(`src/claude_teams/server_simple.py:1338-1349`). The three `watch_*` fields are
+ready-to-run renderings of the watcher invocation for this session, so a
+coordinator does not have to assemble the command itself.
+
 `expected_outputs` is echoed back verbatim and is **not** validated, watched, or
 acted upon anywhere.
 
@@ -305,10 +309,12 @@ skipped (`src/claude_teams/server_simple.py:2036-2038`).
 
 ### `agent_watch_paths(names=None)`
 
-Returns `[{name, state_marker_path}]`
-(`src/claude_teams/server_simple.py:2071-2079`). Pure path computation — it does
-not check that the file exists. Use it to rediscover what to watch when a
-`spawn_agent` return was not retained.
+Returns `{has_session, session_dir, watch_argv, watch_command_bash,
+watch_command_powershell, agents: [{name, state_marker_path}]}`
+(`src/claude_teams/server_simple.py:2121-2135`) — no longer a bare list. Pure
+path computation: it does not check that any file exists. Use it to rediscover
+what to watch when a `spawn_agent` return was not retained; the `watch_*` fields
+give the same ready-to-run command `spawn_agent` returns.
 
 ### `list_backends()`
 
