@@ -39,7 +39,6 @@ class AgentOutput:
     last_message: str | None
     rollout_path: str
     backend_session_id: str | None = None
-    busy_hint: bool = False
 
 
 def read_codex_output(

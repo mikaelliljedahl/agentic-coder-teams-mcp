@@ -104,7 +104,6 @@ class TestCheckAgentCompactShape:
                 last_activity_at=1000.0,
                 last_message=long_message,
                 backend_session_id=None,
-                busy_hint=False,
             ),
         )
 
@@ -132,7 +131,6 @@ class TestCheckAgentCompactShape:
                 last_activity_at=1000.0,
                 last_message="short line",
                 backend_session_id=None,
-                busy_hint=False,
             ),
         )
 
@@ -159,7 +157,6 @@ class TestCheckAgentCompactShape:
                 last_activity_at=1000.0,
                 last_message="hello world",
                 backend_session_id="backend-sess",
-                busy_hint=False,
             ),
         )
 
@@ -216,7 +213,6 @@ class TestFollowUpAgentInternalDict:
                 last_activity_at=server_simple.time.time(),
                 last_message="working...",
                 backend_session_id="backend-sess",
-                busy_hint=False,
             ),
         )
 
@@ -329,7 +325,6 @@ class TestListAgentsCompactRows:
                 last_activity_at=1000.0,
                 last_message="line one\nline two",
                 backend_session_id=None,
-                busy_hint=False,
             ),
         )
 
@@ -360,7 +355,6 @@ class TestListAgentsCompactRows:
                 last_activity_at=1000.0,
                 last_message=long_line,
                 backend_session_id=None,
-                busy_hint=False,
             ),
         )
 

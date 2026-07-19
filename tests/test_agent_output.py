@@ -1063,7 +1063,6 @@ async def test_check_agent_persists_backend_session_id_from_rollout(
             last_activity_at=10.0,
             last_message="done",
             backend_session_id="backend-session-id",
-            busy_hint=False,
         ),
     )
 
@@ -1196,7 +1195,6 @@ async def test_follow_up_agent_refuses_idle_live_agent_without_replace(
             last_activity_at=900.0,
             last_message="done",
             backend_session_id="backend-session-id",
-            busy_hint=False,
         ),
     )
 
@@ -1229,7 +1227,6 @@ async def test_follow_up_agent_replaces_idle_live_agent_when_allowed(
             last_activity_at=900.0,
             last_message="done",
             backend_session_id="backend-session-id",
-            busy_hint=False,
         ),
     )
     # The idle-but-alive agent is genuinely ours, so ownership holds and the

@@ -93,7 +93,6 @@ def _idle_output(monkeypatch: pytest.MonkeyPatch) -> None:
             last_activity_at=900.0,
             last_message="done",
             backend_session_id="backend-session-id",
-            busy_hint=False,
         ),
     )
 
@@ -171,7 +170,6 @@ def _busy_by_timer_output(monkeypatch: pytest.MonkeyPatch) -> None:
             last_activity_at=990.0,
             last_message="done",
             backend_session_id="backend-session-id",
-            busy_hint=False,
         ),
     )
 
