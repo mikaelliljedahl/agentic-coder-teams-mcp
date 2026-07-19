@@ -28,6 +28,7 @@ from claude_teams.agent_output import (
     _rollout_contains_token,
     _started_after,
     _truncate_tail,
+    claude_correlation_token,
     codex_correlation_token,
     read_claude_output,
     read_codex_output,
@@ -592,6 +593,185 @@ def test_read_claude_output_can_match_known_session_started_before_resume(
     assert output is not None
     assert output.backend_session_id == "known-session"
     assert output.last_message == "follow-up answer"
+
+
+def _claude_user_prompt(text: str, *, session_id: str, timestamp: str) -> dict:
+    return {
+        "type": "user",
+        "timestamp": timestamp,
+        "sessionId": session_id,
+        "message": {"role": "user", "content": text},
+    }
+
+
+def test_read_claude_output_disambiguates_concurrent_agents_by_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    project_dir = _claude_project_dir(tmp_path, cwd)
+    token_a = claude_correlation_token("worker-a@sess")
+    token_b = claude_correlation_token("worker-b@sess")
+
+    # Both agents spawned in the same cwd at ~the same time. transcript-b has
+    # the newer mtime, so plain max(mtime) would wrongly bind agent-a to
+    # session-b. The correlation token makes the binding deterministic.
+    _write_jsonl(
+        project_dir / "transcript-a.jsonl",
+        [
+            _claude_user_prompt(
+                f"do work\n\n{token_a}",
+                session_id="session-a",
+                timestamp=_timestamp_at(spawned_at),
+            ),
+            _claude_message(
+                [{"type": "text", "text": "from a"}], session_id="session-a"
+            ),
+        ],
+        spawned_at + 10,
+    )
+    _write_jsonl(
+        project_dir / "transcript-b.jsonl",
+        [
+            _claude_user_prompt(
+                f"do work\n\n{token_b}",
+                session_id="session-b",
+                timestamp=_timestamp_at(spawned_at),
+            ),
+            _claude_message(
+                [{"type": "text", "text": "from b"}], session_id="session-b"
+            ),
+        ],
+        spawned_at + 30,
+    )
+
+    output = read_claude_output(spawned_at, str(cwd), correlation_token=token_a)
+
+    assert output is not None
+    assert output.backend_session_id == "session-a"
+    assert output.last_message == "from a"
+    assert output.rollout_path.endswith("transcript-a.jsonl")
+
+
+def test_read_claude_output_falls_back_when_token_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    project_dir = _claude_project_dir(tmp_path, cwd)
+
+    # No transcript carries the token (e.g. Claude has not flushed the prompt
+    # yet, or the agent was spawned before this marker existed) -> newest mtime.
+    _write_jsonl(
+        project_dir / "older.jsonl",
+        [_claude_message([{"type": "text", "text": "older"}], session_id="session-x")],
+        spawned_at + 10,
+    )
+    _write_jsonl(
+        project_dir / "latest.jsonl",
+        [_claude_message([{"type": "text", "text": "latest"}], session_id="session-y")],
+        spawned_at + 20,
+    )
+
+    output = read_claude_output(
+        spawned_at,
+        str(cwd),
+        correlation_token=claude_correlation_token("ghost@sess"),
+    )
+
+    assert output is not None
+    assert output.backend_session_id == "session-y"
+    assert output.last_message == "latest"
+
+
+def test_read_claude_output_ignores_token_when_session_id_known(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    project_dir = _claude_project_dir(tmp_path, cwd)
+    other_token = claude_correlation_token("worker-other@sess")
+
+    # A newer transcript carries a *different* agent's token, but the exact
+    # backend_session_id is known -> match by session id, ignore the token.
+    _write_jsonl(
+        project_dir / "known.jsonl",
+        [
+            _claude_message(
+                [{"type": "text", "text": "known answer"}],
+                session_id="known-session",
+            )
+        ],
+        spawned_at + 10,
+    )
+    _write_jsonl(
+        project_dir / "decoy.jsonl",
+        [
+            _claude_user_prompt(
+                f"do work\n\n{other_token}",
+                session_id="decoy-session",
+                timestamp=_timestamp_at(spawned_at),
+            ),
+            _claude_message(
+                [{"type": "text", "text": "decoy"}], session_id="decoy-session"
+            ),
+        ],
+        spawned_at + 30,
+    )
+
+    output = read_claude_output(
+        spawned_at,
+        str(cwd),
+        backend_session_id="known-session",
+        correlation_token=other_token,
+    )
+
+    assert output is not None
+    assert output.backend_session_id == "known-session"
+    assert output.last_message == "known answer"
+
+
+def test_claude_build_command_embeds_correlation_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(process_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    backend = ClaudeCodeBackend()
+    request = _make_request(
+        tmp_path, agent_id="worker@sess-uuid", prompt="single line task"
+    )
+
+    cmd = backend.build_command(request)
+
+    assert cmd[-1].startswith("single line task")
+    assert claude_correlation_token("worker@sess-uuid") in cmd[-1]
+
+    # Resume already knows the backend session id, so it must NOT inject the
+    # marker (it would pollute the resumed transcript on every follow-up).
+    resume_cmd = backend.build_resume_command(request, "claude-session-id")
+    assert claude_correlation_token("worker@sess-uuid") not in resume_cmd[-1]
+
+
+def test_claude_build_command_embeds_token_with_prompt_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(process_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    backend = ClaudeCodeBackend()
+    request = _make_request(
+        tmp_path,
+        agent_id="worker@sess-uuid",
+        prompt="ignored when a prompt file is used",
+        extra={"prompt_file_path": "C:\\tmp\\worker.prompt.txt"},
+    )
+
+    cmd = backend.build_command(request)
+
+    # Even when the real prompt travels via a file, the marker must land in the
+    # file-read instruction so it reaches the first recorded user message.
+    assert "C:\\tmp\\worker.prompt.txt" in cmd[-1]
+    assert claude_correlation_token("worker@sess-uuid") in cmd[-1]
 
 
 def test_codex_resume_command_preserves_permissions_and_prompt(

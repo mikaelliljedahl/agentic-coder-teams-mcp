@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_teams.agent_output import claude_correlation_token
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 
@@ -157,7 +158,10 @@ class TestClaudeCodeBuildCommand:
         assert cmd[idx + 1] == "worker"
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "sonnet"
-        assert cmd[-1] == "do stuff"
+        # The prompt carries a trailing per-agent correlation marker so the
+        # transcript can be bound deterministically at read time.
+        assert cmd[-1].startswith("do stuff")
+        assert claude_correlation_token("worker@team") in cmd[-1]
 
     def test_includes_plan_mode_required_when_set(self, _make_request):
         backend = ClaudeCodeBackend()
@@ -201,7 +205,8 @@ class TestClaudeCodeBuildCommand:
         idx = cmd.index("--mcp-config")
         assert cmd[idx + 1] == "C:\\tmp\\worker.mcp.json"
         assert cmd[-2] == "--"
-        assert cmd[-1] == "do stuff"
+        assert cmd[-1].startswith("do stuff")
+        assert claude_correlation_token("worker@team") in cmd[-1]
 
     def test_terminates_options_before_prompt(self, _make_request):
         backend = ClaudeCodeBackend()
@@ -209,7 +214,8 @@ class TestClaudeCodeBuildCommand:
 
         cmd = backend.build_command(request)
 
-        assert cmd[-2:] == ["--", "do stuff"]
+        assert cmd[-2] == "--"
+        assert cmd[-1].startswith("do stuff")
 
     def test_preserves_multiline_prompt_as_single_arg(self, _make_request):
         backend = ClaudeCodeBackend()
@@ -218,7 +224,7 @@ class TestClaudeCodeBuildCommand:
 
         cmd = backend.build_command(request)
 
-        assert cmd[-1] == prompt
+        assert cmd[-1].startswith(prompt)
         assert "Decode this JSON string" not in cmd[-1]
 
     def test_uses_prompt_file_instruction_when_provided(self, _make_request):
@@ -231,10 +237,14 @@ class TestClaudeCodeBuildCommand:
 
         cmd = backend.build_command(request)
 
-        assert cmd[-1] == (
+        assert cmd[-1].startswith(
             "Read your complete task prompt from UTF-8 file path "
             "C:\\sessions\\worker.prompt.txt then follow the file contents exactly."
         )
+        # The correlation marker rides on the file-read instruction so it still
+        # lands in the first recorded user message even when a prompt file is
+        # used; the real prompt never reaches argv.
+        assert claude_correlation_token("worker@team") in cmd[-1]
         assert prompt not in cmd[-1]
         assert "'" not in cmd[-1]
         assert '"' not in cmd[-1]
