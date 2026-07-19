@@ -74,6 +74,11 @@ def _write_agent(tmp_path: Path, **overrides: object) -> None:
         "model": "model",
         "permission_mode": "bypass",
         "reasoning_effort": None,
+        # R2: follow-up is downstream-only, and the default test IDENTITY is
+        # the root lead. The direction guard itself is covered in
+        # tests/test_direction_guard.py.
+        "spawned_by": "team-lead",
+        "spawned_by_source": "spawn",
     }
     record.update(overrides)
     ss._save_agents("session-id", [record])

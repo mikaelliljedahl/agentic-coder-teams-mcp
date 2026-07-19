@@ -743,6 +743,8 @@ async def test_spawn_agent_persists_output_lookup_metadata(
             "reasoning_effort": None,
             "create_token": None,
             "prompt_transport": "argv",
+            "spawned_by": "team-lead",
+            "spawned_by_source": "spawn",
         }
     ]
 
@@ -1129,6 +1131,11 @@ def _default_follow_up_record(tmp_path: Path, **overrides: object) -> dict:
         "permission_mode": "bypass",
         "reasoning_effort": None,
         "correlation_id": "corr-followup",
+        # R2: follow-up is downstream-only, and the default test IDENTITY is
+        # the root lead. The direction guard itself is covered in
+        # tests/test_direction_guard.py.
+        "spawned_by": "team-lead",
+        "spawned_by_source": "spawn",
     }
     record.update(overrides)
     return record
@@ -1475,6 +1482,8 @@ async def test_follow_up_agent_recovers_session_after_mcp_restart(
                 "permission_mode": "bypass",
                 "reasoning_effort": None,
                 "correlation_id": "corr-restart",
+                "spawned_by": "team-lead",
+                "spawned_by_source": "spawn",
             }
         ],
     )

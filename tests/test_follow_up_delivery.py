@@ -142,6 +142,11 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         "permission_mode": "bypass",
         "reasoning_effort": None,
         "correlation_id": "corr-delivery",
+        # R2: follow-up is downstream-only, and the default test IDENTITY is
+        # the root lead. The direction guard itself is covered in
+        # tests/test_direction_guard.py.
+        "spawned_by": "team-lead",
+        "spawned_by_source": "spawn",
     }
     server_simple._save_agents(SESSION, [record])
     server_simple._persist_session_binding(SESSION)

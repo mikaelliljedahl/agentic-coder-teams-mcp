@@ -31,11 +31,17 @@ Living handoff document. Update it as work lands; it is the source of truth for
 | `feat:` | **A2 + A6** — the validation ladder and all five consumer decisions. |
 | `test:` | the three coverage gaps the A1 review flagged (persisted-malformed-id restart path, legacy refusal wording, Codex direct-launch fail-loud). |
 | `feat:` | **A3 + A4 + A4b + A5** — `delivery.py` (nonce confirmation, rotation-aware receipt scanner), `leases.py` (per-target operation lease), the three-phase `follow_up_agent`, kill refusal + CLI operator escape, unique prompt files. |
+| `feat:` | **C1 + C2** — `spawned_by`/`spawned_by_source` on the record, the downstream-only direction guard ahead of every side effect, and `win-agent-teams adopt` (CLI-only, token + generation gated). |
 
 ## Next, in dependency order
 
-**Phase A is complete.** Next: C1+C2 (direction guard — deliberately ahead of
-Phase B), then Phase B, then C3+C4.
+**Phase A and C1+C2 are complete.** Next: Phase B, then C3+C4.
+
+C1+C2 note for whoever picks up Phase B: **every agent record now needs
+`spawned_by`**, and a test fixture that omits it gets `parent_unknown` rather
+than reaching the code under test. Five existing fixtures were updated for
+this; new ones should set `"spawned_by": "team-lead"` (the default test
+`IDENTITY`) unless the test is about the guard itself.
 
 Phase B builds directly on two things A3–A5 established and should reuse rather
 than re-derive:

@@ -36,6 +36,19 @@ CORRELATION_UNVERIFIED = "unverified"
 
 CORRELATION_FIELD = "correlation_id"
 
+#: R2/C1 — the agent-record field naming who spawned this agent. Written at
+#: spawn from the spawning server's ``IDENTITY`` and preserved verbatim across
+#: every resume. Its absence is meaningful: a record written before C1 shipped
+#: cannot be backfilled and must be refused rather than silently allowed.
+SPAWNED_BY_FIELD = "spawned_by"
+#: How the parentage in :data:`SPAWNED_BY_FIELD` was established.
+SPAWNED_BY_SOURCE_FIELD = "spawned_by_source"
+#: Derived from the spawning call itself — the normal case.
+SPAWNED_BY_SOURCE_SPAWN = "spawn"
+#: Asserted by an operator through the CLI recovery path, not observed at
+#: spawn. Recorded distinctly so a later reader can tell the two apart.
+SPAWNED_BY_SOURCE_OPERATOR = "operator_asserted"
+
 
 def new_correlation_id() -> str:
     """Return a fresh per-spawn correlation id.

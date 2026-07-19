@@ -37,6 +37,9 @@ from claude_teams.agent_output import (
     CORRELATION_FIELD,
     PROMPT_TRANSPORT_FIELD,
     PROMPT_TRANSPORT_SIDECAR,
+    SPAWNED_BY_FIELD,
+    SPAWNED_BY_SOURCE_FIELD,
+    SPAWNED_BY_SOURCE_SPAWN,
     BindingResult,
     _make_binder,
     classify_correlation,
@@ -1236,6 +1239,48 @@ def _follow_up_failure(
     return payload
 
 
+def _direction_refusal(agent: dict, name: str) -> dict | None:
+    """Return a refusal payload unless this caller spawned ``agent``.
+
+    ``None`` means the follow-up may proceed. See the call site in
+    ``follow_up_agent._prepare`` for why this is an accident guard rather than
+    an authorization check, and why it must run before any side effect.
+    """
+    spawner = agent.get(SPAWNED_BY_FIELD)
+    if not isinstance(spawner, str) or not spawner:
+        # Deliberately NOT a silent allow. Records written before this field
+        # existed cannot be backfilled from anything trustworthy, and allowing
+        # them would disable the guard during precisely the upgrade window in
+        # which stale, unowned records are most likely to be around.
+        return _follow_up_failure(
+            "parent_unknown",
+            name,
+            detail=(
+                f"The record for {name!r} does not say who spawned it, so the "
+                "downstream-only rule cannot be evaluated. It predates spawner "
+                "tracking and cannot be backfilled automatically. Either kill "
+                "and respawn it, or have an operator run "
+                "`win-agent-teams adopt` (CLI-only, requires the session "
+                "recovery token)."
+            ),
+        )
+    if spawner != IDENTITY:
+        return _follow_up_failure(
+            "not_spawner",
+            name,
+            detail=(
+                f"follow_up_agent is downstream-only: it may only be called by "
+                f"the agent that spawned the target. {name!r} was spawned by "
+                f"{spawner!r}, not by {IDENTITY!r}. A follow-up is "
+                "kill-and-respawn, so allowing this would restart the target's "
+                "process and destroy its context. To reach an agent you did "
+                "not spawn, use send_message; it appends to that agent's inbox "
+                "and wakes its watcher without disturbing its process."
+            ),
+        )
+    return None
+
+
 #: Why each non-``bound`` binding outcome blocks a follow-up, and what the
 #: caller should do about it. ``legacy`` names kill-and-respawn because R8
 #: allows no compatibility exception: a legacy stored id may be exactly the
@@ -1292,6 +1337,8 @@ class _FollowUpPlan:
     effort: str | None
     correlation_id: str | None
     agent_cwd: str
+    spawned_by: str
+    spawned_by_source: str
 
 
 @dataclass(frozen=True)
@@ -1736,6 +1783,11 @@ async def spawn_agent(
                     "create_token": create_token,
                     CORRELATION_FIELD: correlation_id,
                     PROMPT_TRANSPORT_FIELD: _prompt_transport(prompt_extra),
+                    # C1/R2 — who spawned this agent, captured here because
+                    # this is the only moment it is observed rather than
+                    # asserted. ``follow_up_agent`` refuses any other caller.
+                    SPAWNED_BY_FIELD: IDENTITY,
+                    SPAWNED_BY_SOURCE_FIELD: SPAWNED_BY_SOURCE_SPAWN,
                 }
             )
             _save_agents_transaction(session_id, agents)
@@ -2155,6 +2207,12 @@ def _finalize_follow_up(
                 # Explicit even though ``update`` would preserve it: the id
                 # surviving resume is the property R8 depends on.
                 **_correlation_extra(plan.correlation_id),
+                # Explicit for the same reason as the correlation id: a resume
+                # must never launder away who spawned the agent, or the next
+                # follow-up would see ``parent_unknown``. ``update`` would
+                # preserve it anyway — stating it makes the invariant local.
+                SPAWNED_BY_FIELD: plan.spawned_by,
+                SPAWNED_BY_SOURCE_FIELD: plan.spawned_by_source,
                 # The resume prompt may take a different transport than the
                 # spawn prompt did, and gate 0's grace period restarts from
                 # this attempt.
@@ -2243,6 +2301,24 @@ async def follow_up_agent(
                 return _FollowUpPrep(
                     refusal=_follow_up_failure("agent_not_found", name)
                 )
+
+            # R2/C2 — session resume is downstream-only.
+            #
+            # THIS IS AN ACCIDENT GUARD, NOT A SECURITY BOUNDARY. ``IDENTITY``
+            # is read from an env var at import time by the caller's own
+            # process, and the server evaluating this check IS that process, so
+            # the identity is self-asserted and trivially forgeable. It exists
+            # because a follow-up is kill-and-respawn: a worker calling this on
+            # its own coordinator restarts that coordinator's process, losing
+            # its context mid-task. Do not treat it as authorization.
+            #
+            # Placed ahead of every side effect on purpose — before the binding
+            # resolve, before any record write, and in particular before the
+            # A4b lease is reserved or the generation is bumped. A refusal must
+            # leave the session byte-identical.
+            refusal = _direction_refusal(agent, name)
+            if refusal is not None:
+                return _FollowUpPrep(refusal=refusal)
 
             backend_name = str(agent.get("backend") or "")
             try:
@@ -2435,6 +2511,10 @@ async def follow_up_agent(
                     effort=effort,
                     correlation_id=correlation_id,
                     agent_cwd=agent_cwd,
+                    spawned_by=str(agent.get(SPAWNED_BY_FIELD) or ""),
+                    spawned_by_source=str(
+                        agent.get(SPAWNED_BY_SOURCE_FIELD) or SPAWNED_BY_SOURCE_SPAWN
+                    ),
                 ),
                 ticket=reservation.ticket,
             )

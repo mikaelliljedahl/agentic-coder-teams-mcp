@@ -71,18 +71,29 @@ process environment to its MCP servers.
 `AGENT_PARENT_NAME` is set from `request.lead_session_id`, which `spawn_agent`
 fills with the spawner's `IDENTITY` (`src/claude_teams/server_simple.py:1261`).
 
-### Parentage is recorded only as a routing hint, not as a tree
+### Parentage is a flat field, not a tree
 
-`agents.json` records no parent field. A spawned agent's record is
+A spawned agent's record is
 `{name, pid, backend, session_id, status, spawned_at, cwd, model,
 permission_mode, reasoning_effort, create_token, correlation_id,
-prompt_transport}` (`spawn_agent._do_spawn`), plus two fields written only by
-`follow_up_agent`: `generation` (int, the CAS counter — absent counts as 0) and
-`pending_delivery` (present only while an attempt is unconfirmed, see
-[section 4a](#4a-delivery-confirmation)). The only parent information
-that exists is the `AGENT_PARENT_NAME` env var inside the child process, used to
-resolve the `"team-lead"` alias when that child sends a message
-(`src/claude_teams/server_simple.py:792-796`).
+prompt_transport, spawned_by, spawned_by_source}` (`spawn_agent._do_spawn`),
+plus two fields written only by `follow_up_agent`: `generation` (int, the CAS
+counter — absent counts as 0) and `pending_delivery` (present only while an
+attempt is unconfirmed, see [section 4a](#4a-delivery-confirmation)).
+
+`spawned_by` holds the spawning server's `IDENTITY` at the moment of the spawn,
+and `spawned_by_source` records how that parentage was established: `spawn`
+(observed at spawn, the normal case) or `operator_asserted` (written by the CLI
+recovery path described in
+[gates 2a/2b](#gates-2a2b--the-direction-guard-not-a-security-boundary)).
+Both are preserved verbatim through every resume. `spawned_by` is what the
+`follow_up_agent` direction guard reads; a record without it is refused with
+`reason="parent_unknown"` rather than allowed.
+
+This is a single field per record, not a tree: it names one parent and supports
+no ancestry query. It is also **not** the mechanism that resolves the
+`"team-lead"` alias — that still comes from the `AGENT_PARENT_NAME` env var
+inside the child process (`_message_recipient`).
 
 `correlation_id` is **required and load-bearing**: a non-empty string, written
 at spawn and preserved through resume. Constructing or migrating a record
@@ -153,7 +164,9 @@ sit below the `@mcp.tool()` decorator to take effect.
 6. Calls `backend.spawn(request)`, which builds argv and starts **a new OS
    process** (`src/claude_teams/backends/process_base.py:82-105`).
 7. Captures a PID creation token from the just-live child and appends the
-   registry record, including `correlation_id`.
+   registry record, including `correlation_id` and `spawned_by` (the spawning
+   server's `IDENTITY`, with `spawned_by_source: "spawn"`). This is the only
+   point at which parentage is *observed* rather than asserted.
 
 **Returns** `{name, pid, backend, session_id, state_marker_path, session_dir,
 watch_argv, watch_command_bash, watch_command_powershell, expected_outputs}`
@@ -537,6 +550,8 @@ Evaluated in this order, in `_do_follow_up`:
 |-------|-----------|----------------|
 | 1 | No session resolved | `session_not_found` |
 | 2 | `name` not in `agents.json` | `agent_not_found` |
+| 2a | Record has no `spawned_by` | `parent_unknown` |
+| 2b | Caller's `IDENTITY` is not the record's `spawned_by` | `not_spawner` |
 | 3 | Backend not loadable, or `supports_resume()` false | `backend_not_supported` |
 | 3a | Binding outcome is not `bound` | `binding_<outcome>` |
 | 4 | No `backend_session_id` known | `backend_session_missing` |
@@ -551,8 +566,55 @@ Evaluated in this order, in `_do_follow_up`:
 | 11 | Resumed child died with no receipt | `not_delivered` |
 | 12 | Scan bound expired, child still alive | *not a refusal* — `queued(phase="unconfirmed")` |
 
-Gate 3a is evaluated before the lease is reserved; gates 10-12 happen **after**
-the registry lock has been released (see [4a](#4a-delivery-confirmation)).
+Gates 2a/2b are evaluated first of all, before the binding resolve and before
+any write; gate 3a is evaluated before the lease is reserved; gates 10-12 happen
+**after** the registry lock has been released (see
+[4a](#4a-delivery-confirmation)).
+
+#### Gates 2a/2b — the direction guard (NOT a security boundary)
+
+`follow_up_agent` is downstream-only: only the agent recorded in the target's
+`spawned_by` may call it. A sibling, an unrelated agent, and — the case this
+exists for — a worker targeting its own coordinator are all refused with
+`reason="not_spawner"`, and the `detail` names the rule and points at
+`send_message` as the upstream path. The reason it matters is that a follow-up
+is kill-and-respawn: letting a worker follow up its lead would restart the
+coordinator's process mid-task.
+
+**This is an accident guard, not an authorization check, and must never be
+described as one.** `IDENTITY` is read from an env var at import time by the
+caller's own process (see
+[Identity is process-global and read once at import](#identity-is-process-global-and-read-once-at-import)),
+and the MCP server evaluating the guard *is* that process. A caller can assert
+any identity it likes, and anything with filesystem access can edit
+`agents.json` directly. Resisting a deliberate bypass would need a shared
+broker, minted credentials and worker-unwritable state — an explicit non-goal.
+The guard stops mistakes; it stops nothing else.
+
+A record with no `spawned_by` refuses with `reason="parent_unknown"` rather
+than being silently allowed: records written before the field existed cannot be
+backfilled from anything trustworthy, and allowing them would disable the guard
+during exactly the upgrade window in which unowned records exist. Recovery is
+`kill_agent` + `spawn_agent`, or the operator CLI:
+
+```
+win-agent-teams adopt <session-id> <agent> <parent> \
+    --token <session recovery token> --expect-generation <n>
+```
+
+Adoption is deliberately **not** reachable over MCP. An agent-callable version
+would reintroduce the hole the guard closes: "callable only by a caller claiming
+parentage" is tautological, because the operation itself writes the caller as
+the spawner and identity is self-asserted — a confused worker could adopt its
+own coordinator and then legitimately follow it up. The CLI form is gated on the
+session recovery token *and* the record generation the operator observed (so an
+adoption cannot be replayed against a record that moved underneath it), and it
+records `spawned_by_source: "operator_asserted"` so a later reader can tell an
+asserted parentage from an observed one.
+
+A refusal at 2a/2b **changes nothing**: no PID, no regenerated MCP config, no
+prompt sidecar, no lease acquired and no generation bump. That is why the check
+sits ahead of every side effect rather than alongside the other gates.
 
 Checks 5–7 all sit **behind** the marker resolution. An earlier revision of this
 document listed 5 and 6 as unconditional on `alive`, and carried an extra row for
@@ -609,7 +671,7 @@ only recovery is `kill_agent` followed by a fresh `spawn_agent`; the refusal's
 `agent_status`) keep working against legacy records unchanged.
 
 Failure payloads carry `{success: false, name, reason, retriable}`, a `detail`
-string for the binding refusals, plus `alive`, `backend_session_id`,
+string for the binding and direction refusals, plus `alive`, `backend_session_id`,
 `last_activity_at`, `binding`, and the unbounded `last_message` when a status
 was computed.
 
@@ -1085,15 +1147,23 @@ put its workers in Claude Code's native team-messaging mode
 worker's inbox therefore accumulate unread unless the caller's own prompt text
 instructs the agent to poll.
 
-### `follow_up_agent` has no caller-identity check
+### `kill_agent` still has no caller-identity check
 
-The tool looks the target up by name in the session-wide `agents.json`
-(`src/claude_teams/server_simple.py:1586`) and never compares the target against
-`IDENTITY` or `_AGENT_PARENT_NAME`. Because all descendants share one flat
-registry (section 1), **any agent can kill-and-respawn any other agent in the
-session, including its own lead**, provided that lead is itself a spawned agent
-record. The same holds for `kill_agent`, which performs no caller check either
-(`src/claude_teams/server_simple.py:1786`).
+`follow_up_agent` now compares the caller's `IDENTITY` against the target's
+`spawned_by` (`_direction_refusal`, gates 2a/2b above), so the flat registry no
+longer means any agent can kill-and-respawn any other one through that tool.
+
+`kill_agent` has no equivalent check: it looks the target up by name in the
+session-wide `agents.json` and never consults the caller's identity. Because all
+descendants share one flat registry (section 1), **any agent can kill any other
+agent in the session, including its own lead**, provided that lead is itself a
+spawned agent record. This is the same hazard class as the one gates 2a/2b
+close, but it is lifecycle control rather than message delivery and is tracked
+as a separate follow-up.
+
+Note that closing it would have the same character as the direction guard —
+an accident guard, not authorization — for the same reason: identity is
+self-asserted (see [gates 2a/2b](#gates-2a2b--the-direction-guard-not-a-security-boundary)).
 
 ### `before = after` is load-bearing and ordering-sensitive
 

@@ -46,6 +46,11 @@ def _add_agent(session_id: str, **overrides: object) -> dict:
         "status": "running",
         "spawned_at": 1000.0,
         "cwd": "C:\\project",
+        # R2: follow-up is downstream-only, and the default test IDENTITY is
+        # the root lead. The direction guard itself is covered in
+        # tests/test_direction_guard.py.
+        "spawned_by": "team-lead",
+        "spawned_by_source": "spawn",
     }
     agent.update(overrides)
     server_simple._save_agents(session_id, [agent])

@@ -13,6 +13,11 @@ from rich.console import Console
 from rich.table import Table
 
 from claude_teams import leases, server_simple
+from claude_teams.agent_output import (
+    SPAWNED_BY_FIELD,
+    SPAWNED_BY_SOURCE_FIELD,
+    SPAWNED_BY_SOURCE_OPERATOR,
+)
 from claude_teams.backends.registry import registry
 from claude_teams.messaging import unread_sender_counts
 from claude_teams.server_simple import mcp
@@ -239,6 +244,66 @@ def lease_force(
                 "fenced_generation": fenced_generation,
                 "attempt_nonce": lease.nonce,
                 "child_terminated": terminated,
+            }
+        )
+    )
+
+
+@app.command("adopt")
+def adopt(
+    session_id: str = typer.Argument(..., help="Session id holding the agent."),
+    agent: str = typer.Argument(..., help="Agent name to adopt."),
+    parent: str = typer.Argument(..., help="Agent name to record as the spawner."),
+    token: str = typer.Option(..., "--token", help="Session recovery token."),
+    expect_generation: int = typer.Option(
+        ...,
+        "--expect-generation",
+        help="Record generation you observed; the write is refused if it moved.",
+    ),
+) -> None:
+    """Record who spawned an agent whose ``spawned_by`` field is missing.
+
+    Deliberately CLI-only and operator-driven. An MCP-callable equivalent would
+    reintroduce exactly the hole the direction guard closes: "callable only by
+    a caller claiming parentage" is tautological, because the operation itself
+    writes the caller as the spawner and an agent's identity is self-asserted.
+    A confused worker could adopt its own coordinator and then legitimately
+    follow it up, turning a one-call mistake into a two-call one.
+
+    Gated on the session recovery token *and* the generation you read, so an
+    adoption cannot be replayed against a record that changed underneath it.
+    The parentage is stored as operator-asserted rather than spawn-derived,
+    because it was asserted by a human and not observed at spawn.
+
+    A worker with filesystem access can still edit ``agents.json`` directly.
+    That is an accepted non-goal: the guard prevents accidents, not bypasses.
+    """
+    _authorize(session_id, token)
+    with server_simple._agents_transaction(session_id) as agents:
+        record = next((a for a in agents if a.get("name") == agent), None)
+        if record is None:
+            console.print(f"[red]No agent named {agent!r} in {session_id!r}.[/red]")
+            raise typer.Exit(code=1)
+        actual = server_simple._record_generation(record)
+        if actual != expect_generation:
+            console.print(
+                f"[red]Record generation is {actual}, not the expected "
+                f"{expect_generation}; refusing to adopt a record that moved."
+                "[/red]"
+            )
+            raise typer.Exit(code=3)
+        record[SPAWNED_BY_FIELD] = parent
+        record[SPAWNED_BY_SOURCE_FIELD] = SPAWNED_BY_SOURCE_OPERATOR
+        generation = server_simple._bump_generation(record)
+        server_simple._save_agents_transaction(session_id, agents)
+    console.print_json(
+        json.dumps(
+            {
+                "adopted": True,
+                "agent": agent,
+                "spawned_by": parent,
+                "spawned_by_source": SPAWNED_BY_SOURCE_OPERATOR,
+                "generation": generation,
             }
         )
     )

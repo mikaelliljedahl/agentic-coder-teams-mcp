@@ -484,7 +484,18 @@ def test_follow_up_agent_unsupported_backend(isolated, monkeypatch):
     _make_session(
         isolated.base,
         "s1",
-        json.dumps([{"name": "worker", "pid": 1, "backend": "totally-bogus"}]),
+        json.dumps(
+            [
+                {
+                    "name": "worker",
+                    "pid": 1,
+                    "backend": "totally-bogus",
+                    # R2: the caller must be the recorded spawner, and the
+                    # default IDENTITY in tests is the root lead.
+                    "spawned_by": "team-lead",
+                }
+            ]
+        ),
     )
     monkeypatch.setattr(ss, "_active_session_id", lambda **kwargs: "s1")
     result = asyncio.run(ss.follow_up_agent("worker", "next"))
