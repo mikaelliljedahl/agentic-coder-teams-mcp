@@ -29,19 +29,23 @@ Living handoff document. Update it as work lands; it is the source of truth for
 | `feat:` | **A1b/A1** — per-spawn correlation id, server-owned prompt materialization. |
 | `refactor:` | shared Windows-aware force-kill helper (clears the old `ty` red). |
 | `feat:` | **A2 + A6** — the validation ladder and all five consumer decisions. |
+| `test:` | the three coverage gaps the A1 review flagged (persisted-malformed-id restart path, legacy refusal wording, Codex direct-launch fail-loud). |
+| `feat:` | **A3 + A4 + A4b + A5** — `delivery.py` (nonce confirmation, rotation-aware receipt scanner), `leases.py` (per-target operation lease), the three-phase `follow_up_agent`, kill refusal + CLI operator escape, unique prompt files. |
 
 ## Next, in dependency order
 
-**Phase A (remaining).** Everything reads the correlation id, so A1b is first.
+**Phase A is complete.** Next: C1+C2 (direction guard — deliberately ahead of
+Phase B), then Phase B, then C3+C4.
 
-1. **A3 / A4 / A4b** — child liveness as early-failure only; nonce confirmation
-   against named receipt records; per-target operation lease with
-   `holder_create_token` fencing, atomic temp+replace storage, refuse-on-kill
-   with a CLI operator escape.
-2. **A5** — unique prompt files with lifecycle rules.
+Phase B builds directly on two things A3–A5 established and should reuse rather
+than re-derive:
 
-**Then** C1+C2 (direction guard — deliberately ahead of Phase B), then Phase B,
-then C3+C4.
+- `pending_delivery` on the agent record already is the "unconfirmed attempt"
+  state B1's status store needs, and `_reconcile_pending_delivery` already
+  implements "a retry reconciles before re-sending".
+- `_LEASE_QUEUE_WAIT_SECONDS` is the bounded in-call wait R1 describes. B1's
+  `queued(phase=pending)` tail is the same return shape `follow_up_agent`
+  already produces when that budget expires.
 
 ## Quality gates — all four, whole repo
 
@@ -54,8 +58,13 @@ uv run pytest
 
 There is no `.venv` in a fresh worktree; `uv sync` first.
 
-All four gates are **green** as of the A2/A6 commit (691 passed, 1 skipped). The
-old `signal.SIGKILL` `ty` red was fixed by the shared force-kill helper.
+All four gates are **green** as of the A3-A5 commit (778 passed, 1 skipped).
+
+Known intermittent, pre-existing and NOT caused by this work:
+`tests/test_cli_watch.py::test_watch_settle_wakes_persistent_waiting` fails
+roughly 1 run in 3 on a wall-clock settle race. Re-run to confirm before
+treating it as a real failure. Every new timing test added for A3/A4/A4b takes
+an injected clock and poll interval for exactly this reason.
 
 ## Working rules learned the hard way
 
