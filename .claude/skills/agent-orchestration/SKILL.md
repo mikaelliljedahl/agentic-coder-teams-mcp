@@ -45,8 +45,8 @@ Your caller (a workflow, a command, or the user) gives you:
 list_backends            # pre-flight: confirm the worker backend exists
 spawn_agent(...)         # launch the worker; KEEP the returned handles
 ── wait ──────────────── # watch the state marker, don't tight-poll
-  Claude coordinator:  background  win-agent-teams watch <session_dir> ...
-  Codex   coordinator:  foreground win-agent-teams watch <session_dir> ...  (looped, this turn)
+  Claude coordinator:  background  returned watch_command_<shell> (or spawn watch_argv)
+  Codex   coordinator:  foreground returned watch_command_<shell> (or spawn watch_argv; looped)
 ── on change ──────────
 agent_status / check_agent          # coarse state (cheap; no bodies)
 read_messages(from_agent=<name>)    # delta; the DONE/FAILED line lands here
@@ -90,21 +90,21 @@ Call `mcp__win-agent-teams__spawn_agent` with:
 Notes:
 - The prompt is a structured MCP argument, **not** a shell string — no HEREDOC or quoting concerns; non-ASCII text is safe inline.
 - **Always use an absolute path** in the write instruction. A worker's working directory is unreliable; relative paths land in surprising places.
-- Spawning is **non-blocking** — the call returns once the process launches, not when the worker finishes. **Keep the returned `state_marker_path`, `session_dir`, `session_id`, and `lead_token`**: the first two drive the watch step; the latter two are your restart-recovery handles.
+- Spawning is **non-blocking** — the call returns once the process launches, not when the worker finishes. **Keep the returned `state_marker_path`, `session_dir`, `watch_argv`, `watch_command_bash`, `watch_command_powershell`, `session_id`, and `lead_token`**: the watch fields drive the wait step; the latter two are your restart-recovery handles. There is intentionally no plain `watch_command` field.
 
 ## 3. Wait — watch, don't tight-poll
 
-Do **not** spin on `check_agent`/`list_agents`. Each worker writes a `state-<agent>.json` marker under its `session_dir` on every lifecycle transition (`{ "state": "running" | "waiting" | ..., "event", "ts" }`); `agent_watch_paths()` rediscovers the paths if you lose them. Block on the marker with the CLI:
+Do **not** spin on `check_agent`/`list_agents`. Each worker writes a `state-<agent>.json` marker under its `session_dir` on every lifecycle transition (`{ "state": "running" | "waiting" | ..., "event", "ts" }`). `agent_watch_paths()` rediscovers an envelope containing the same session-wide watch metadata and minimal `{name, state_marker_path}` rows; use `has_session`, not an empty `agents` list, to distinguish no session from a live zero-agent session.
 
-```
-win-agent-teams watch <session_dir> --timeout 60 --pattern "state-*.json"
-```
+Execute the returned shell-neutral `watch_argv` directly. The `win-agent-teams` console script may not be on PATH. For pasted commands, use `watch_command_bash` in Bash and `watch_command_powershell` in PowerShell; for cmd.exe use `watch_argv`. The returned command uses the CLI's default 60-second timeout; append argv tokens when a different timeout or pattern is required.
 
 - **Claude Code coordinator** → run the watch as a **background** command. Its completion wakes you; then call `agent_status`/`check_agent` for the delta. You spend no tokens while it blocks.
 - **Codex coordinator** (no marker-event idle-wake) → for same-turn coordination, run the watch as a **bounded foreground** command in the **current turn**, looped: exit `0` means an **actionable edge** (see below) and exit `2` means timeout; on each exit, read the marker JSON (and/or call `agent_status`), then read messages and verify the output file before deciding the worker is done. If not done and the worker is still alive, watch again. Longer tasks can take several rounds — that is normal.
 - **Codex thread automation variant** → for long-running work where you do not want to hold the current turn open, create/use a Codex thread automation as a scheduled heartbeat for this same thread. On each wake, rediscover paths if needed (`agent_watch_paths` / retained `session_dir`), inspect marker/messages/output, then either stop/report or schedule/allow the next heartbeat. This is time-based polling, not an event wake from the marker file.
 
-**What counts as an actionable edge** (why the watch exits `0`): the watch is deliberately *not* a raw file-change notifier. It wakes only on an unread inbox message, a matched **output** file change, or a **waiting** marker that is genuinely coordinator-actionable — and it ignores churn: `running` lifecycle transitions, a worker's own `SubagentStop` (an internal Task subagent finishing while the worker keeps going), and a `waiting` marker that flips back to `running` within a short settle window (default 1.5s, env `WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`). So a worker doing multi-step internal work will **not** wake you until it actually parks or reports — a timeout (`exit 2`) with the worker still `running` is normal; just watch again.
+The watch is **one-shot**: it exits on the first actionable signal. Re-arm it after every wake when more work remains.
+
+**What counts as an actionable edge** (why the watch exits `0`): the watch is deliberately *not* a raw file-change notifier. It wakes only on an unread inbox message, a matched **output** file change, or a **waiting** marker that is genuinely coordinator-actionable — and it ignores churn: `running` lifecycle transitions, a worker's own `SubagentStop` (an internal Task subagent finishing while the worker keeps going), and a `waiting` marker that flips back to `running` within a short settle window (default 15s, env `WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`). So a worker doing multi-step internal work will **not** wake you until it actually parks or reports — a timeout (`exit 2`) with the worker still `running` is normal; just watch again.
 
 On a change, check liveness with `agent_status` (or `check_agent` for one, `list_agents` for all). These are **compact by default** — a coarse `state` (`running`/`waiting`/`idle`/`dead`) plus `heartbeat_age_s` and `stalled`, with no transcript bodies. Use `stalled: true` to detect "alive but hung". Pass `full=True` only when you actually need `last_message` / `backend_session_id`.
 
@@ -175,9 +175,9 @@ For implementation tasks, additionally `git diff` and **grep the diff for the ch
 | Tool | Use |
 |------|-----|
 | `list_backends` | Pre-flight: confirm the worker backend exists. |
-| `spawn_agent` | Launch a worker; returns `state_marker_path`, `session_dir`, `session_id`, `lead_token`. |
-| `agent_watch_paths` | Rediscover a worker's marker/session paths. |
-| `win-agent-teams watch <session_dir>` (CLI) | Block until a state marker changes (background for Claude, foreground-looped for Codex). |
+| `spawn_agent` | Launch a worker; returns marker/session data plus canonical `watch_argv` and per-shell renderings. |
+| `agent_watch_paths` | Rediscover the session watch envelope and minimal agent marker rows. |
+| Returned `watch_argv` / shell rendering | One-shot block until an actionable signal (background for Claude, foreground-looped for Codex). |
 | `agent_status` / `check_agent` / `list_agents` | Compact liveness (`state`, `heartbeat_age_s`, `stalled`); `full=True` for bodies. |
 | `read_messages` | Delta inbox read; where `DONE`/`FAILED` lands. Advance via `seq`/`cursors`. |
 | `follow_up_agent` | Resume a dead/idle worker with a new prompt (the reliable way to reach a worker). |
