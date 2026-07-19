@@ -78,6 +78,15 @@ the follow-up gate.
 (`:1661-1699`), rewiring the resumed *process's* parent — but there is no
 registry parent to overwrite.
 
+**Kill purges the killed agent's messages from its reader's inbox.** Added by
+PR #30 after this plan was drafted: `_cleanup_agent_artifacts` calls
+`purge_sender_from_inbox` (`messaging.py:65-101`) and deletes that sender's
+cursor entry, because unread is `total_from_sender - consumed`, so dropping the
+cursor alone would resurface an already-read backlog. Both happen under
+`_inbox_lock(IDENTITY)` — which is a `threading.Lock`, i.e. **in-process only**.
+With one MCP server per agent, a killer in one process is therefore not
+serialized against a reader in another.
+
 **Nothing can execute work from a marker.** Hooks only write marker state
 (`hooks.py:61-89`); the watcher reads files, prints one JSON record and exits
 (`cli.py:183-220`). Markers are also lossy: hooks can be disabled
@@ -559,9 +568,16 @@ with no receipt record — is terminal.
   before concluding**: an in-flight `sent`/`unconfirmed` attempt may already
   have an unread receipt, so cleanup rescans for the nonce first and records
   `delivered` if it landed; only a genuinely receipt-less attempt becomes
-  `failed`. Records are never deleted. Marking a delivered message failed at
-  kill time would reintroduce exactly the false-status problem this feature
-  exists to remove.
+  `failed`. Marking a delivered message failed at kill time would reintroduce
+  exactly the false-status problem this feature exists to remove.
+
+  **Delivery records are never deleted — unlike inbox messages, which kill now
+  purges** (`messaging.py:65-101`). The two stores deliberately differ: the
+  inbox is live actionable state that must not resurface for a same-named
+  successor, whereas the delivery store is the sender's audit trail and its
+  whole value is that a settled outcome stays queryable after the target is
+  gone. An implementer seeing kill delete inbox lines must not extend that to
+  the delivery store.
 - **`delivery_status` is an active reconciler, not a passive lookup.** When the
   phase is `unconfirmed` it performs a bounded reconciliation scan before
   answering. Without this, response-loss recovery could return `unconfirmed`
@@ -619,6 +635,13 @@ this had the sender's server writing the recipient's cursor concurrently with th
 recipient's `read_messages`.
 
 A separate audit store avoids both, needs no cursor changes, and is smaller.
+
+PR #30 adds a third reason that did not exist when this was decided: kill now
+purges a sender's messages from the reader's inbox entirely
+(`messaging.py:65-101`). Guaranteed-path records kept in the inbox would
+therefore be destroyed when the *sender* is killed — losing exactly the audit
+trail R4 requires to survive. The separate store is not merely safer, it is now
+the only option that satisfies R4.
 
 ## C3 + C4
 
@@ -874,3 +897,10 @@ Two of those changed facts this plan depends on:
 - `c6a022e` added substantial coverage to `agent_output` and `server_simple` —
   the files Phase A rewrites. Phase A's tests must be reconciled with those,
   not written as if they are absent.
+- `8e5aa32` made the coordination tools return ready-to-run watch commands, and
+  changed `agent_watch_paths` from a list to a dict. Reference corrected.
+- PR #30 (`4b101af`) added `purge_sender_from_inbox` and cursor-entry deletion
+  to kill cleanup. Consequences folded into B1 (delivery records must survive
+  what inbox lines do not) and B4 (an inbox-resident audit record would now be
+  destroyed by killing the sender). Its in-process `_inbox_lock` also confirms
+  B1's cross-process requirement is real rather than theoretical.
