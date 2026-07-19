@@ -12,8 +12,14 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from claude_teams import server_simple as _ss
 from claude_teams.backends.registry import registry
-from claude_teams.messaging import unread_sender_counts
+from claude_teams.hooks import _SAFE_AGENT_RE
+from claude_teams.messaging import (
+    load_inbox_cursors,
+    read_inbox_by_sender,
+    unread_sender_counts,
+)
 from claude_teams.server_simple import mcp
 
 _WATCH_POLL_SECONDS = 0.5
@@ -179,6 +185,20 @@ def _emit_wake(payload: dict) -> None:
     typer.echo(json.dumps(payload, separators=(",", ":")))
 
 
+def _require_safe_reader(reader: str) -> str:
+    """Return ``reader`` when it is safe to interpolate into inbox filenames.
+
+    Reuses the repo's shared safe-agent-name invariant
+    (``claude_teams.hooks._SAFE_AGENT_RE``) so a reader value can never carry
+    path separators or control characters into ``inbox-<reader>.jsonl`` /
+    ``inbox-<reader>.pos.json`` paths.
+    """
+    if not _SAFE_AGENT_RE.match(reader):
+        msg = f"unsafe reader name: {reader!r}"
+        raise ValueError(msg)
+    return reader
+
+
 @app.command()
 def watch(
     session_dir: str = typer.Argument(..., help="Directory to watch."),
@@ -196,6 +216,14 @@ def watch(
         "--inbox/--no-inbox",
         help="Wake for unread messages to this orchestrator (enabled by default).",
     ),
+    reader: str | None = typer.Option(
+        None,
+        "--reader",
+        help=(
+            "Inbox reader identity to watch. Overrides AGENT_NAME/team-lead; "
+            "omit for the current env-based behavior."
+        ),
+    ),
 ) -> None:
     """Block until an agent is waiting, an inbox is unread, or output changes.
 
@@ -206,7 +234,8 @@ def watch(
     15s) — a marker that resumes ``running`` inside the window is suppressed as
     a brief park. Other files selected by PATTERN wake on any creation/change.
     Unless ``--no-inbox`` is passed, unread messages for ``AGENT_NAME`` (or the
-    root ``team-lead`` identity) also exit 0 without consuming them. When several
+    root ``team-lead`` identity, or an explicit ``--reader NAME``) also exit 0
+    without consuming them. When several
     signals are ready in one poll the priority is message > output > waiting.
 
     Success prints one JSON object with ``reason`` equal to ``message``,
@@ -219,9 +248,17 @@ def watch(
     deadline = time.monotonic() + timeout
     before = _snapshot_mtimes(directory, pattern)
 
-    reader = os.environ.get("AGENT_NAME", "").strip() or "team-lead"
-    inbox_path = directory / f"inbox-{reader}.jsonl"
-    cursor_path = directory / f"inbox-{reader}.pos.json"
+    if reader is not None:
+        try:
+            _require_safe_reader(reader)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        reader_name = reader
+    else:
+        reader_name = os.environ.get("AGENT_NAME", "").strip() or "team-lead"
+    inbox_path = directory / f"inbox-{reader_name}.jsonl"
+    cursor_path = directory / f"inbox-{reader_name}.pos.json"
     inbox_before = _path_identity(inbox_path)
 
     if watch_inbox:
@@ -307,6 +344,76 @@ def watch(
         if time.monotonic() >= deadline:
             raise typer.Exit(code=2)
         time.sleep(_WATCH_POLL_SECONDS)
+
+
+@app.command(name="session-dir")
+def session_dir() -> None:
+    """Print the current workspace session as ``id<TAB>dir<TAB>identity``.
+
+    Discovery-only: resolves the active/recoverable session WITHOUT creating a
+    session directory. On success exits 0 with exactly one tab-separated line on
+    stdout and nothing on stderr. When no session exists it exits 3 with empty
+    stdout. An internal error exits 1 with a message on stderr only.
+    """
+    try:
+        session_id = _ss._active_session_id(create=False)
+        line = (
+            f"{session_id}\t{_ss._session_dir(session_id)}\t{_ss.IDENTITY}"
+            if session_id
+            else None
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    if line is None:
+        raise typer.Exit(code=3)
+    typer.echo(line)
+
+
+@app.command(name="inbox-status")
+def inbox_status(
+    session_dir: str = typer.Argument(..., help="Session directory to probe."),
+    reader: str = typer.Option(
+        "team-lead", "--reader", help="Inbox reader identity to probe."
+    ),
+) -> None:
+    """Emit a non-consuming inbox generation snapshot as one JSON object.
+
+    Prints ``{"schema":"inbox-status/1","reader":...,"senders":{<from>:
+    {"total":N,"cursor":M,"unread":K}}}`` where ``unread = total -
+    min(cursor, total)``; an empty inbox yields ``"senders":{}``. This never
+    writes a cursor. A bad/nonexistent/outside-base ``session_dir`` exits 4 with
+    a message on stderr and no stdout; an internal error exits 1 with stderr
+    only.
+    """
+    try:
+        _require_safe_reader(reader)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+    directory = Path(session_dir)
+    base = _ss._SESSION_BASE.resolve()
+    if not directory.is_dir() or directory.resolve().parent != base:
+        typer.echo(f"session_dir not under session base: {session_dir!r}", err=True)
+        raise typer.Exit(code=4)
+
+    try:
+        inbox_path = directory / f"inbox-{reader}.jsonl"
+        cursor_path = directory / f"inbox-{reader}.pos.json"
+        by_sender = read_inbox_by_sender(inbox_path)
+        cursors = load_inbox_cursors(cursor_path)
+        senders: dict[str, dict[str, int]] = {}
+        for sender, messages in by_sender.items():
+            total = len(messages)
+            cursor = cursors.get(sender, 0)
+            unread = total - min(cursor, total)
+            senders[sender] = {"total": total, "cursor": cursor, "unread": unread}
+        payload = {"schema": "inbox-status/1", "reader": reader, "senders": senders}
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(payload, separators=(",", ":")))
 
 
 if __name__ == "__main__":

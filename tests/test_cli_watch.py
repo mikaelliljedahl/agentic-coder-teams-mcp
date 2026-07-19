@@ -584,3 +584,217 @@ def test_watch_no_inbox_preserves_artifact_only_behavior(
     assert result.exit_code == 0
     wake = json.loads(result.stdout)
     assert wake == {"reason": "output", "path": str(output)}
+
+
+# ---------------------------------------------------------------------------
+# T3b — `watch --reader` overrides the env-based reader.
+# ---------------------------------------------------------------------------
+
+
+def test_watch_reader_flag_overrides_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_NAME", "other")
+    # The env identity's inbox has traffic that must be IGNORED when --reader wins.
+    other_inbox = tmp_path / "inbox-other.jsonl"
+    other_inbox.write_text(json.dumps({"from": "noise", "text": "ignore"}) + "\n")
+    lead_inbox = tmp_path / "inbox-team-lead.jsonl"
+    lead_inbox.write_text(json.dumps({"from": "worker", "text": "wake lead"}) + "\n")
+
+    result = runner.invoke(
+        app, ["watch", str(tmp_path), "--timeout", "1", "--reader", "team-lead"]
+    )
+
+    assert result.exit_code == 0
+    wake = json.loads(result.stdout)
+    assert wake == {
+        "reason": "message",
+        "from": ["worker"],
+        "path": str(lead_inbox),
+    }
+
+
+# ---------------------------------------------------------------------------
+# T2b — `inbox-status` non-consuming generation probe.
+# ---------------------------------------------------------------------------
+
+
+def _session_base(tmp_path: Path, monkeypatch) -> Path:
+    from claude_teams import server_simple as ss
+
+    base = tmp_path / "sessions"
+    base.mkdir()
+    monkeypatch.setattr(ss, "_SESSION_BASE", base)
+    return base
+
+
+def test_inbox_status_reports_schema_per_sender(tmp_path: Path, monkeypatch) -> None:
+    base = _session_base(tmp_path, monkeypatch)
+    sdir = base / "abc"
+    sdir.mkdir()
+    inbox = sdir / "inbox-team-lead.jsonl"
+    inbox.write_text(
+        json.dumps({"from": "worker", "text": "a"})
+        + "\n"
+        + json.dumps({"from": "worker", "text": "b"})
+        + "\n"
+    )
+    (sdir / "inbox-team-lead.pos.json").write_text('{"worker":1}')
+
+    result = runner.invoke(app, ["inbox-status", str(sdir)])
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "schema": "inbox-status/1",
+        "reader": "team-lead",
+        "senders": {"worker": {"total": 2, "cursor": 1, "unread": 1}},
+    }
+
+
+def test_inbox_status_empty_inbox_emits_empty_senders(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base = _session_base(tmp_path, monkeypatch)
+    sdir = base / "def"
+    sdir.mkdir()
+
+    result = runner.invoke(app, ["inbox-status", str(sdir)])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "schema": "inbox-status/1",
+        "reader": "team-lead",
+        "senders": {},
+    }
+
+
+def test_inbox_status_is_non_consuming(tmp_path: Path, monkeypatch) -> None:
+    from claude_teams.messaging import unread_sender_counts
+
+    base = _session_base(tmp_path, monkeypatch)
+    sdir = base / "ghi"
+    sdir.mkdir()
+    inbox = sdir / "inbox-team-lead.jsonl"
+    inbox.write_text(json.dumps({"from": "worker", "text": "a"}) + "\n")
+    cursor = sdir / "inbox-team-lead.pos.json"
+
+    result = runner.invoke(app, ["inbox-status", str(sdir)])
+    assert result.exit_code == 0
+
+    # No cursor was written, and the unread view is unchanged afterwards.
+    assert not cursor.exists()
+    assert unread_sender_counts(inbox, cursor) == {"worker": 1}
+
+
+def test_inbox_status_respects_reader_flag(tmp_path: Path, monkeypatch) -> None:
+    base = _session_base(tmp_path, monkeypatch)
+    sdir = base / "jkl"
+    sdir.mkdir()
+    (sdir / "inbox-team-lead.jsonl").write_text(
+        json.dumps({"from": "noise", "text": "ignore"}) + "\n"
+    )
+    (sdir / "inbox-reviewer.jsonl").write_text(
+        json.dumps({"from": "worker", "text": "x"}) + "\n"
+    )
+
+    result = runner.invoke(app, ["inbox-status", str(sdir), "--reader", "reviewer"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["reader"] == "reviewer"
+    assert payload["senders"] == {"worker": {"total": 1, "cursor": 0, "unread": 1}}
+
+
+def test_inbox_status_outside_base_exits_4(tmp_path: Path, monkeypatch) -> None:
+    _session_base(tmp_path, monkeypatch)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+
+    result = runner.invoke(app, ["inbox-status", str(outside)])
+
+    assert result.exit_code == 4
+    assert result.stdout == ""
+    assert result.stderr != ""
+
+
+def test_inbox_status_nonexistent_dir_exits_4(tmp_path: Path, monkeypatch) -> None:
+    base = _session_base(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["inbox-status", str(base / "missing")])
+
+    assert result.exit_code == 4
+    assert result.stdout == ""
+    assert result.stderr != ""
+
+
+# ---------------------------------------------------------------------------
+# Unsafe --reader validation exits 1 for BOTH inbox-status and watch.
+# ---------------------------------------------------------------------------
+
+
+def test_inbox_status_unsafe_reader_exits_1(tmp_path: Path, monkeypatch) -> None:
+    base = _session_base(tmp_path, monkeypatch)
+    sdir = base / "unsafe"
+    sdir.mkdir()
+
+    result = runner.invoke(app, ["inbox-status", str(sdir), "--reader", "../evil"])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr != ""
+
+
+def test_watch_unsafe_reader_exits_1(tmp_path: Path) -> None:
+    # A reader carrying a path separator must be rejected before any watching,
+    # so it can never interpolate into inbox-<reader>.jsonl / .pos.json paths.
+    result = runner.invoke(
+        app, ["watch", str(tmp_path), "--timeout", "1", "--reader", "../evil"]
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr != ""
+
+
+def test_inbox_status_probe_matches_following_consuming_read_messages(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The non-consuming probe reports exactly what a real read_messages drains.
+
+    Stronger T2b: after the probe, drive the actual consuming
+    ``server_simple.read_messages`` and assert it returns the same messages the
+    probe reported unread, and that only THEN is the generation consumed.
+    """
+    import asyncio
+
+    from claude_teams import server_simple as ss
+
+    base = _session_base(tmp_path, monkeypatch)
+    session_id = "read-through"
+    sdir = base / session_id
+    sdir.mkdir()
+    monkeypatch.setattr(ss, "_session_id", session_id)
+    monkeypatch.setattr(ss, "IDENTITY", "team-lead")
+    monkeypatch.setattr(ss, "_inbox_locks", {})
+
+    inbox = sdir / "inbox-team-lead.jsonl"
+    inbox.write_text(
+        json.dumps({"from": "worker", "text": "a"})
+        + "\n"
+        + json.dumps({"from": "worker", "text": "b"})
+        + "\n"
+    )
+
+    probe = runner.invoke(app, ["inbox-status", str(sdir)])
+    assert probe.exit_code == 0
+    payload = json.loads(probe.stdout)
+    assert payload["senders"] == {"worker": {"total": 2, "cursor": 0, "unread": 2}}
+
+    # A following REAL consuming read returns exactly the probed messages.
+    result = asyncio.run(ss.read_messages())
+    assert [m["text"] for m in result["messages"]] == ["a", "b"]
+
+    # The probe itself did not consume: only the real read advanced the cursor.
+    after = runner.invoke(app, ["inbox-status", str(sdir)])
+    assert json.loads(after.stdout)["senders"]["worker"]["unread"] == 0

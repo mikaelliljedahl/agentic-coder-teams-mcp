@@ -1995,8 +1995,10 @@ async def session_info() -> dict:
     """Report the current session and any recoverable prior sessions.
 
     Call this right after a restart if ``list_agents`` is unexpectedly empty:
-    it returns ``{session_id, identity, cwd, agent_count, lead_token,
-    recoverable_sessions}``. ``recoverable_sessions`` lists prior sessions for
+    it returns ``{session_id, session_dir, identity, cwd, agent_count,
+    lead_token, recoverable_sessions}``. ``session_dir`` is this session's
+    on-disk directory (``""`` when no session exists yet).
+    ``recoverable_sessions`` lists prior sessions for
     this workspace (``{session_id, agent_count, last_activity}``) that still
     hold resumable agents; adopt one with ``resume_session('<session_id>')``.
     ``lead_token`` is this session's stable recovery token.
@@ -2011,6 +2013,7 @@ async def session_info() -> dict:
         if not session_id:
             return {
                 "session_id": "",
+                "session_dir": "",
                 "identity": IDENTITY,
                 "cwd": cwd,
                 "agent_count": 0,
@@ -2023,6 +2026,7 @@ async def session_info() -> dict:
             agents = []
         return {
             "session_id": session_id,
+            "session_dir": str(_session_dir(session_id)),
             "identity": IDENTITY,
             "cwd": cwd,
             "agent_count": len(agents),
