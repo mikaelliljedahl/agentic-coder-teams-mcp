@@ -1221,7 +1221,7 @@ async def test_follow_up_agent_resumes_dead_agent(
     )
     monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent("worker", "next prompt", "k1")
 
     assert result["success"] is True
     assert result["pid"] == 789
@@ -1240,9 +1240,16 @@ async def test_follow_up_agent_resumes_dead_agent(
 
 
 @pytest.mark.asyncio
-async def test_follow_up_agent_refuses_busy_live_agent(
+async def test_follow_up_agent_waits_for_a_busy_live_agent_instead_of_refusing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """B2 — ``agent_busy`` is no longer a refusal; it is a bounded wait.
+
+    Here the budget is zero, so the wait ends immediately in R1's cooperative
+    tail: ``queued(phase=pending)`` with an obligation on the sender. What it
+    must NOT be is the old dead-end refusal, and it must not be ``failed``
+    either — nothing was sent, so nothing definitely failed.
+    """
     backend = _FakeResumeBackend()
     _setup_follow_up_session(tmp_path, monkeypatch, backend)
     _write_agent_for_follow_up(tmp_path)
@@ -1251,11 +1258,14 @@ async def test_follow_up_agent_refuses_busy_live_agent(
         "health_check",
         lambda handle, expected_token=None: (True, "alive"),
     )
+    monkeypatch.setattr(server_simple, "_DELIVERY_CALL_BUDGET_SECONDS", 0.0)
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent("worker", "next prompt", "k2")
 
     assert result["success"] is False
-    assert result["reason"] == "agent_busy"
+    assert result["status"] == "queued"
+    assert result["phase"] == "pending"
+    assert "deliver_pending" in result["sender_obligation"]
     assert backend.resume_calls == []
 
 
@@ -1279,7 +1289,7 @@ async def test_follow_up_agent_refuses_idle_live_agent_without_replace(
     )
 
     result = await server_simple.follow_up_agent(
-        "worker", "next prompt", replace_if_idle=False
+        "worker", "next prompt", "k3", replace_if_idle=False
     )
 
     assert result["success"] is False
@@ -1325,7 +1335,7 @@ async def test_follow_up_agent_waiting_marker_overrides_quiet_transcript(
         last_message=None,
     )
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent("worker", "next prompt", "k4")
 
     assert result["success"] is True, (
         f"waiting marker must override a quiet transcript, got {result}"
@@ -1364,7 +1374,7 @@ async def test_follow_up_agent_replaces_idle_live_agent_when_allowed(
     )
 
     result = await server_simple.follow_up_agent(
-        "worker", "next prompt", replace_if_idle=True
+        "worker", "next prompt", "k5", replace_if_idle=True
     )
 
     assert result["success"] is True
@@ -1381,7 +1391,7 @@ async def test_follow_up_agent_rejects_backend_without_resume(
     _setup_follow_up_session(tmp_path, monkeypatch, backend)
     _write_agent_for_follow_up(tmp_path)
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent("worker", "next prompt", "k6")
 
     assert result["success"] is False
     assert result["reason"] == "backend_not_supported"
@@ -1401,7 +1411,7 @@ async def test_follow_up_agent_preserves_correlation_id(
     )
     monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent("worker", "next prompt", "k7")
 
     assert result["success"] is True
     request, _ = backend.resume_calls[0]
@@ -1435,7 +1445,7 @@ async def test_follow_up_agent_refuses_legacy_record_and_invents_no_id(
     )
     monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent("worker", "next prompt", "k8")
 
     assert result["success"] is False
     assert result["reason"] == "binding_legacy"
@@ -1497,7 +1507,7 @@ async def test_follow_up_agent_recovers_session_after_mcp_restart(
     )
     monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent("worker", "next prompt", "k9")
 
     assert result["success"] is True
     assert result["session_id"] == session_id
@@ -2662,7 +2672,7 @@ async def test_follow_up_refuses_every_non_success_binding(
     _setup_consumer_session(tmp_path, monkeypatch)
     _force_binding(monkeypatch, outcome)
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent("worker", "next prompt", "k10")
 
     assert result["success"] is False
     assert result["reason"] == f"binding_{outcome}"
@@ -2678,7 +2688,7 @@ async def test_follow_up_legacy_refusal_names_kill_and_respawn(
     _setup_consumer_session(tmp_path, monkeypatch)
     _force_binding(monkeypatch, ao.BINDING_LEGACY)
 
-    result = await server_simple.follow_up_agent("worker", "next prompt")
+    result = await server_simple.follow_up_agent("worker", "next prompt", "k11")
 
     assert result["reason"] == "binding_legacy"
     assert result["retriable"] is False

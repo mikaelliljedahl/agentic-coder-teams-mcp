@@ -24,14 +24,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
-if os.name == "nt":
-    import msvcrt
-else:
-    import fcntl
-
 from fastmcp import FastMCP
 
-from claude_teams import delivery, hooks
+from claude_teams import delivery, delivery_store, hooks
 from claude_teams.agent_output import (
     BINDING_LEGACY,
     CORRELATION_FIELD,
@@ -66,6 +61,25 @@ from claude_teams.delivery import (
     remove_prompt_file,
     stale_prompt_files,
 )
+from claude_teams.delivery_store import (
+    DELIVERIES_FILE_NAME,
+    IDEMPOTENCY_CONFLICT,
+    PHASE_PENDING,
+    PHASE_SENT,
+    PHASE_UNCONFIRMED,
+    REASON_NOT_DELIVERED,
+    STATUS_DELIVERED,
+    STATUS_FAILED,
+    STATUS_QUEUED,
+    delivery_transaction,
+    is_terminal,
+    mark_phase,
+    public_view,
+    request_fingerprint,
+    settle,
+    validate_idempotency_key,
+)
+from claude_teams.filelock import FileLockTimeoutError, lock_handle, unlock_handle
 from claude_teams.leases import (
     LEASES_FILE_NAME,
     finalize_lease,
@@ -140,11 +154,22 @@ _CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60.0
 # inject a clock and drive the poll loop deterministically: the repo already
 # carries one flaky wall-clock watcher test and confirmation is far more
 # timing-dense than that.
-_DELIVERY_CONFIRM_BOUND_SECONDS = 20.0
 _DELIVERY_POLL_SECONDS = 0.25
-#: How long a queued caller waits for the per-target FIFO before returning the
-#: cooperative ``queued`` tail. It never gets a refusal (R1).
-_LEASE_QUEUE_WAIT_SECONDS = 30.0
+#: B0 — **the** delivery bound. ONE total budget covering the wait for a busy
+#: target, lease acquisition, the resume, and confirmation. Deliberately not a
+#: per-step timeout: a per-step design lets a caller spend three budgets in one
+#: call and makes "which of the two outcomes did I get" unanswerable.
+#:
+#: It is a documented server-side constant rather than an assumption about the
+#: client's deadline — the server cannot know that — so it is echoed back as
+#: ``call_budget_s`` on every ``follow_up_agent`` result. Keep it below the
+#: smallest realistic MCP client timeout.
+_DELIVERY_CALL_BUDGET_SECONDS = 45.0
+#: How long after a child is proven dead an ``unconfirmed`` attempt waits for a
+#: final transcript flush before it may be settled ``failed``. Buffered writes
+#: routinely land after the process exits, and settling early would report a
+#: delivered message as failed.
+_UNCONFIRMED_FLUSH_GRACE_SECONDS = 30.0
 #: How long a lease is nominally valid. Purely informational: expiry alone
 #: NEVER reclaims a lease — see ``leases.reconcile_lease``.
 _LEASE_TTL_SECONDS = 120.0
@@ -253,8 +278,9 @@ def _resolve_agent_state(
     return "idle"
 
 
-class AgentsFileLockTimeoutError(TimeoutError):
-    """Raised when another MCP process holds the agents registry lock too long."""
+#: Retained under its historical name; the implementation now lives in
+#: :mod:`claude_teams.filelock`, shared with the delivery status store.
+AgentsFileLockTimeoutError = FileLockTimeoutError
 
 
 mcp = FastMCP(
@@ -330,6 +356,17 @@ def _leases_file(session_id: str) -> Path:
     return _session_dir(session_id) / LEASES_FILE_NAME
 
 
+def _deliveries_file(session_id: str) -> Path:
+    """Return the per-session delivery/audit store (B1, R4).
+
+    A third file beside ``agents.json`` and ``operation-leases.json``, and
+    deliberately **not** part of either. Unlike the inbox — which kill purges —
+    nothing ever deletes rows here: the sender's whole reason for querying is
+    that a settled outcome outlives the target.
+    """
+    return _session_dir(session_id) / DELIVERIES_FILE_NAME
+
+
 def _read_state_marker(session_id: str, name: str) -> dict | None:
     """Read an agent's hook-written state marker, tolerating a missing/corrupt file."""
     path = _state_marker_file(session_id, name)
@@ -389,28 +426,16 @@ def _read_json_object(path: Path) -> dict:
 
 
 def _lock_file(handle) -> None:
-    if os.name == "nt":
-        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, _LOCK_SIZE)
-            except OSError as err:
-                if time.monotonic() >= deadline:
-                    raise AgentsFileLockTimeoutError from err
-                time.sleep(_LOCK_RETRY_SECONDS)
-            else:
-                return
-    else:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    """Take the registry's cross-process advisory lock.
+
+    Delegates to :mod:`claude_teams.filelock` so the delivery status store
+    takes the *same* lock model rather than a second, subtly different one.
+    """
+    lock_handle(handle, timeout_s=_LOCK_TIMEOUT_SECONDS)
 
 
 def _unlock_file(handle) -> None:
-    if os.name == "nt":
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, _LOCK_SIZE)
-    else:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    unlock_handle(handle)
 
 
 @contextmanager
@@ -1239,6 +1264,41 @@ def _follow_up_failure(
     return payload
 
 
+#: B3/R7 — what each unreachable target state means and what to do instead.
+_NO_DELIVERY_PATH_DETAIL = {
+    "record_removed": (
+        "There is no record for this agent in the session: it was killed, or "
+        "it never existed under this name. A killed agent is unreachable by "
+        "design — its context is gone — so spawn a new agent rather than "
+        "retrying. Nothing was sent."
+    ),
+    "no_backend_session": (
+        "This agent has no resumable backend session, so there is no channel "
+        "to deliver into. A dead agent WITH a valid backend session is still "
+        "resumable; this one is not. Nothing was sent."
+    ),
+}
+
+
+def _no_delivery_path(name: str, state: str, status: dict | None = None) -> dict:
+    """Build the R7 refusal that names the unreachable state.
+
+    R7 exists because the old behaviour was two tools pointing at each other:
+    one returned a refusal, the other returned success without delivering. A
+    recipient that genuinely cannot be reached must be said so once, plainly,
+    with the state named — never a bare lookup miss.
+    """
+    payload = _follow_up_failure(
+        "no_delivery_path",
+        name,
+        status,
+        retriable=False,
+        detail=_NO_DELIVERY_PATH_DETAIL.get(state, ""),
+    )
+    payload["state"] = state
+    return payload
+
+
 def _direction_refusal(agent: dict, name: str) -> dict | None:
     """Return a refusal payload unless this caller spawned ``agent``.
 
@@ -1343,12 +1403,18 @@ class _FollowUpPlan:
 
 @dataclass(frozen=True)
 class _FollowUpPrep:
-    """Result of phase 1: a refusal, a plan, or a place in the FIFO queue."""
+    """Result of phase 1: a refusal, a plan, a FIFO place, or "wait and retry".
+
+    ``wait_reason`` is B2: a busy target is no longer refused, so phase 1 has
+    to be able to say "nothing is wrong, come back in a moment" without
+    returning either a plan or a refusal.
+    """
 
     refusal: dict | None = None
     plan: _FollowUpPlan | None = None
     ticket: str | None = None
     queue_position: int = 0
+    wait_reason: str = ""
 
 
 #: Sentinel outcome for "the backend never returned a child at all". Distinct
@@ -1500,6 +1566,113 @@ def _reconcile_pending_delivery(
     # because the record it is looking for was written before this call began.
     scanner.rewind()
     return scanner.poll(nonce) == SCAN_FOUND
+
+
+def _scan_for_nonce(session_id: str, agent: dict | None, nonce: str) -> bool:
+    """Search the whole of ``agent``'s bound transcript for ``nonce``.
+
+    ``rewind()``, not ``snapshot()``: the record being looked for was written
+    before this call began, so anchoring at the current tail — which is what a
+    fresh attempt does — would deliberately skip exactly what we came for.
+
+    Takes the agent **record**, never a name, so it can run inside a registry
+    transaction. Re-entering ``_load_agents`` there would try to take the
+    cross-process file lock this process already holds on another handle,
+    which blocks on POSIX and times out on Windows.
+    """
+    if not nonce or agent is None:
+        return False
+    backend_name = str(agent.get("backend") or "")
+    binding = _resolve_agent_binding(agent)
+    output = binding.output
+    backend_session_id = str(
+        _stored_backend_session_id(agent)
+        or (output.backend_session_id if output else "")
+        or ""
+    )
+    if not backend_session_id:
+        return False
+    scanner = _delivery_scanner(
+        agent, backend_name, backend_session_id, binding, session_id
+    )
+    scanner.rewind()
+    return scanner.poll(nonce) == SCAN_FOUND
+
+
+def _find_agent(agents: list[dict], name: str) -> dict | None:
+    """Return the record named ``name``, or ``None``."""
+    return next((a for a in agents if a.get("name") == name), None)
+
+
+def _reconcile_delivery_record(
+    session_id: str, record: dict, agent: dict | None, *, now: float | None = None
+) -> bool:
+    """Actively reconcile one ``unconfirmed`` attempt. Returns whether it moved.
+
+    This is why ``delivery_status`` is a reconciler and not a lookup: without
+    it, response-loss recovery would keep answering ``unconfirmed`` forever
+    after the nonce had actually landed, which is a false status in the other
+    direction.
+
+    The reaping rule is deliberately asymmetric. A **live** child with no
+    receipt stays ``queued(phase=unconfirmed)`` indefinitely — that follows
+    from the no-dispatcher non-goal and is honest rather than silently
+    expired. Only once the child is proven dead, and one flush grace has
+    passed, does a still-absent nonce become terminal.
+    """
+    if is_terminal(record) or record.get("phase") not in {
+        PHASE_SENT,
+        PHASE_UNCONFIRMED,
+    }:
+        return False
+    nonce = str(record.get("nonce") or "")
+    if _scan_for_nonce(session_id, agent, nonce):
+        settle(record, STATUS_DELIVERED, reason="", now=now if now else time.time())
+        remove_prompt_file(_optional_path(record.get("prompt_file")))
+        return True
+    if agent is not None and _agent_alive(agent):
+        # Live uncertainty (R6). Not delivered, and emphatically not failed.
+        mark_phase(record, PHASE_UNCONFIRMED)
+        return record.get("phase") == PHASE_UNCONFIRMED
+    attempted_at = _safe_float(record.get("attempted_at"))
+    current = now if now is not None else time.time()
+    if attempted_at and current - attempted_at < _UNCONFIRMED_FLUSH_GRACE_SECONDS:
+        # The child is gone but its last transcript writes may not have hit
+        # disk yet. Settling here would report a delivered prompt as failed.
+        mark_phase(record, PHASE_UNCONFIRMED)
+        return False
+    settle(record, STATUS_FAILED, reason=REASON_NOT_DELIVERED, now=current)
+    remove_prompt_file(_optional_path(record.get("prompt_file")))
+    return True
+
+
+def _reconcile_deliveries_for_target(
+    session_id: str, agent_name: str, agent: dict | None
+) -> None:
+    """Settle every in-flight attempt against ``agent_name``, receipt first.
+
+    Called from ``kill_agent`` while the registry lock is held. Order is the
+    whole point: an attempt may already have an unread receipt on disk, and
+    marking that message ``failed`` because the target is being killed would
+    reintroduce precisely the false status this feature exists to remove.
+
+    Nothing is deleted. Kill purges inbox lines; the audit trail is what the
+    sender comes back to *after* the target is gone.
+    """
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        for record in list(txn.data.values()):
+            if record.get("to") != agent_name or is_terminal(record):
+                continue
+            if _scan_for_nonce(session_id, agent, str(record.get("nonce") or "")):
+                settle(record, STATUS_DELIVERED, reason="", now=time.time())
+            else:
+                settle(
+                    record,
+                    STATUS_FAILED,
+                    reason=REASON_NOT_DELIVERED,
+                    now=time.time(),
+                )
+            txn.touch()
 
 
 def _create_session() -> str:
@@ -2266,25 +2439,26 @@ def _finalize_follow_up(
     }
 
 
-@mcp.tool()
-async def follow_up_agent(
+def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
+    session_id: str,
     name: str,
     prompt: str,
-    replace_if_idle: bool = True,
+    replace_if_idle: bool,
+    record: dict,
+    deadline: float,
 ) -> dict:
-    """Resume a logical agent with a follow-up prompt through the backend CLI.
+    """B0 — deliver ``prompt`` to ``name`` inside one bounded budget.
 
-    Use this instead of send_message when the target agent is not polling read_messages.
-    send_message only writes to an inbox; follow_up_agent is the mechanism for
-    continuing a spawned agent that would otherwise never read an inbox message.
-    It only runs when the agent is dead or idle; a live busy agent is refused
-    with reason="agent_busy".
+    Shared by ``follow_up_agent`` and ``deliver_pending``: the cooperative tail
+    has to be completed by exactly the same code that would have completed it
+    in the originating call, or the two could disagree about what happened.
 
-    replace_if_idle defaults to True: an idle-but-alive process is gracefully
-    shut down and resumed with the follow-up prompt. Set it to False to instead
-    refuse such an agent with reason="agent_idle_but_alive".
+    ``deadline`` is on the injected ``_delivery_clock`` and is the ONE budget —
+    the wait for a busy target, the FIFO queue, the resume, and confirmation
+    all spend from it. ``record`` is the already-durable store row; this
+    function advances its phase but never creates it, because creation must
+    happen before any waiting for response loss to be recoverable.
     """
-    session_id = _active_session_id()
 
     def _prepare(ticket: str | None) -> _FollowUpPrep:  # noqa: PLR0911
         """Phase 1 — validate, reserve the lease, and build the request.
@@ -2298,9 +2472,10 @@ async def follow_up_agent(
         with _agents_transaction(session_id) as agents:
             agent = next((a for a in agents if a["name"] == name), None)
             if agent is None:
-                return _FollowUpPrep(
-                    refusal=_follow_up_failure("agent_not_found", name)
-                )
+                # B3/R7: name the state rather than returning a bare
+                # "not found" that reads as a lookup miss. A killed agent is
+                # unreachable by design, and saying so is the point.
+                return _FollowUpPrep(refusal=_no_delivery_path(name, "record_removed"))
 
             # R2/C2 — session resume is downstream-only.
             #
@@ -2372,7 +2547,13 @@ async def follow_up_agent(
 
             backend_session_id = status.get("backend_session_id")
             if not backend_session_id:
-                return _refuse("backend_session_missing")
+                # B3/R7 — dead or alive, without a resumable backend session
+                # there is no path at all. Say which state that is.
+                if changed:
+                    _save_agents_transaction(session_id, agents)
+                return _FollowUpPrep(
+                    refusal=_no_delivery_path(name, "no_backend_session", status)
+                )
 
             # R6: a prior attempt that expired with a live child may in fact
             # have landed, because a buffered transcript write can arrive after
@@ -2424,12 +2605,34 @@ async def follow_up_agent(
                     == "waiting"
                 )
                 if not idle_by_marker:
+                    # B2/R1 — a busy target is no longer a dead end. This is
+                    # the defect the whole feature exists to close: the caller
+                    # is the target's own spawner (the direction guard has
+                    # already run), it has something the target needs, and
+                    # refusing left it with no correct tool. So we WAIT,
+                    # bounded, for the target to reach a resumable point.
+                    #
+                    # The wait happens in the caller loop below, never here:
+                    # this body holds the cross-process registry lock, and
+                    # sleeping under it would block every registry reader on
+                    # the machine.
+                    #
+                    # The three-way split below is unchanged from the refusal
+                    # version; only the two "busy" arms became waits.
+                    # ``agent_state_unknown`` stays a refusal: it is not a
+                    # busy agent, it is one we cannot describe at all, and
+                    # waiting for that resolves nothing.
+                    def _wait() -> _FollowUpPrep:
+                        if changed:
+                            _save_agents_transaction(session_id, agents)
+                        return _FollowUpPrep(wait_reason="agent_busy")
+
                     if status.get("last_message") is None:
-                        return _refuse("agent_busy")
+                        return _wait()
                     if last_activity_at is None:
                         return _refuse("agent_state_unknown")
                     if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
-                        return _refuse("agent_busy")
+                        return _wait()
                 if not replace_if_idle:
                     return _refuse("agent_idle_but_alive")
 
@@ -2523,36 +2726,36 @@ async def follow_up_agent(
         if not session_id:
             return _follow_up_failure("session_not_found", name)
         ticket: str | None = None
-        queue_deadline = _delivery_clock() + _LEASE_QUEUE_WAIT_SECONDS
+        waited_for = ""
+        position = 0
         while True:
             prep = _prepare(ticket)
             if prep.refusal is not None:
                 return prep.refusal
             if prep.plan is not None:
                 break
-            # Queued behind per-target FIFO. R1: a valid caller is never handed
-            # a dead end, so this waits rather than refusing, and the honest
-            # cooperative tail only appears once the wait budget is spent.
-            ticket = prep.ticket
-            if _delivery_clock() >= queue_deadline:
-                return {
-                    "success": False,
-                    "name": name,
-                    "status": "queued",
-                    "phase": "pending",
-                    "reason": "operation_in_progress",
-                    "retriable": True,
-                    "queue_position": prep.queue_position,
-                    "session_id": session_id,
-                    "detail": (
-                        "Another delivery to this agent is still in flight. "
-                        "Nothing was sent. Call follow_up_agent again; your "
-                        "place in the per-target queue is preserved."
-                    ),
-                }
+            # Two reasons to be here, and neither is a refusal (R1): the target
+            # is busy (B2), or another valid caller holds the per-target FIFO
+            # (A4b). Both wait; the honest cooperative tail appears only once
+            # the ONE budget is spent.
+            if prep.wait_reason:
+                waited_for = prep.wait_reason
+            else:
+                ticket = prep.ticket
+                waited_for = "operation_in_progress"
+                position = prep.queue_position
+            if _delivery_clock() >= deadline:
+                # B1: a message that was NEVER leased does not expire into
+                # `failed`. There is one timeout — this budget — so the same
+                # instant cannot also mean "definitely never delivered".
+                return _pending_tail(session_id, name, record, waited_for, position)
             _delivery_sleep(_DELIVERY_POLL_SECONDS)
 
         plan = prep.plan
+        # Crash-recovery window "after spawn, before sent": the nonce is
+        # durable BEFORE the resume, so a crash here still leaves a searchable
+        # receipt marker rather than an attempt nobody can attribute.
+        _mark_attempt_sent(session_id, record, plan)
         # Phase 2 — the registry lock is NOT held here. Shutdown, resume and
         # confirmation all take real time, and holding a cross-process lock
         # across them would block every registry reader on the machine.
@@ -2569,8 +2772,13 @@ async def follow_up_agent(
                 result = plan.backend.resume(plan.request, plan.backend_session_id)
             except Exception:
                 logger.debug("Failed resuming backend session", exc_info=True)
-                return _finalize_follow_up(
-                    session_id, plan, _DELIVERY_RESUME_FAILED, None
+                return _record_outcome(
+                    session_id,
+                    record,
+                    _finalize_follow_up(
+                        session_id, plan, _DELIVERY_RESUME_FAILED, None
+                    ),
+                    plan,
                 )
 
             new_pid = int(result.process_handle)
@@ -2578,19 +2786,469 @@ async def follow_up_agent(
                 plan.scanner,
                 plan.nonce,
                 child_alive=lambda: process_manager.health_check(str(new_pid))[0],
-                bound_s=_DELIVERY_CONFIRM_BOUND_SECONDS,
+                # Whatever is LEFT of the one budget, never a fresh timer.
+                # A per-step bound here would let a single call spend the
+                # advertised budget twice over.
+                bound_s=max(0.0, deadline - _delivery_clock()),
                 poll_interval_s=_DELIVERY_POLL_SECONDS,
                 clock=_delivery_clock,
                 sleep=_delivery_sleep,
             )
-            return _finalize_follow_up(session_id, plan, outcome, new_pid)
+            return _record_outcome(
+                session_id,
+                record,
+                _finalize_follow_up(session_id, plan, outcome, new_pid),
+                plan,
+            )
         finally:
             # Belt and braces: a crash between here and ``_finalize`` would
             # otherwise leave the lease held by a process that is no longer
             # working on it. ``release_lease`` is a no-op once finalize won.
+            #
+            # The lease is deliberately NOT held across ``unconfirmed``: it
+            # converts to the durable pending-delivery record, which keeps
+            # serializing this target until reconciliation, so neither a
+            # future delivery nor a kill is blocked by a lease nobody is
+            # progressing.
             release_lease(_leases_file(session_id), plan.agent_name, plan.operation_id)
 
-    return _annotate(await run_blocking(_do_follow_up))
+    return _do_follow_up()
+
+
+def _mark_attempt_sent(session_id: str, record: dict, plan: _FollowUpPlan) -> None:
+    """Move the store row to ``queued(phase=sent)`` BEFORE the resume runs.
+
+    Ordering is the crash-recovery contract. If this process dies between the
+    spawn and the confirmation, the nonce is already on disk, so lease expiry
+    can reconcile the attempt by searching for it. Writing the nonce *after*
+    the resume would leave a delivered prompt no one could attribute.
+    """
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        stored = txn.get(
+            str(record.get("sender") or ""), str(record["idempotency_key"])
+        )
+        target = stored if stored is not None else record
+        target["nonce"] = plan.nonce
+        target["operation_id"] = plan.operation_id
+        target["attempts"] = int(target.get("attempts") or 0) + 1
+        target["attempted_at"] = time.time()
+        target["prompt_file"] = str(plan.prompt_file) if plan.prompt_file else ""
+        mark_phase(target, PHASE_SENT)
+        txn.put(target)
+        record.update(target)
+
+
+def _record_outcome(
+    session_id: str, record: dict, result: dict, plan: _FollowUpPlan
+) -> dict:
+    """Fold one attempt's result into the durable store, then annotate it.
+
+    The mapping is deliberately narrow, because R4 has exactly three public
+    statuses and this is the only place a transport result becomes one of
+    them:
+
+    - ``delivered`` → terminal ``delivered``.
+    - ``queued(phase=unconfirmed)`` → stays non-terminal. A live child with a
+      buffered write is uncertainty, not failure, and settling it here is the
+      contradiction R6 forbids.
+    - a **retriable** failure (superseded, resume refused) → back to
+      ``pending``. Nothing was confirmed and nothing is settled, so the
+      cooperative tail can still complete it.
+    - any other failure → terminal ``failed``. The child is provably gone with
+      no receipt: definite non-delivery.
+    """
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        stored = txn.get(
+            str(record.get("sender") or ""), str(record["idempotency_key"])
+        )
+        target = stored if stored is not None else record
+        if result.get("status") == "delivered":
+            settle(target, STATUS_DELIVERED, reason="", now=time.time())
+        elif result.get("phase") == PHASE_UNCONFIRMED:
+            mark_phase(target, PHASE_UNCONFIRMED, reason="delivery_unconfirmed")
+        elif result.get("retriable"):
+            mark_phase(target, PHASE_PENDING, reason=str(result.get("reason") or ""))
+        else:
+            settle(
+                target,
+                STATUS_FAILED,
+                reason=str(result.get("reason") or REASON_NOT_DELIVERED),
+                now=time.time(),
+            )
+        txn.put(target)
+        record.update(target)
+    _ = plan
+    return _with_public_status(result, record)
+
+
+def _with_delivery_identity(result: dict, record: dict) -> dict:
+    """Attach the identity a sender needs to ask about this message later."""
+    result["message_id"] = record.get("message_id", "")
+    result["idempotency_key"] = record.get("idempotency_key", "")
+    result["call_budget_s"] = _DELIVERY_CALL_BUDGET_SECONDS
+    return result
+
+
+def _with_public_status(result: dict, record: dict) -> dict:
+    """Make the returned status and phase agree with what was durably stored.
+
+    Not cosmetic. A caller must be able to compare this response with a later
+    ``delivery_status`` answer and see the same thing; a transport-shaped
+    payload that omits ``status`` would leave "which of R4's three did I get?"
+    to be inferred from ``success``, which is exactly the ambiguity this
+    feature removes.
+    """
+    result["status"] = record.get("status", STATUS_QUEUED)
+    result["phase"] = record.get("phase", PHASE_PENDING)
+    return _with_delivery_identity(result, record)
+
+
+#: The obligation attached to the cooperative tail. R1 requires the sender be
+#: told plainly that the tail is cooperative — there is no dispatcher, so
+#: nothing completes it unless the sender comes back.
+_TAIL_OBLIGATION = (
+    "SENDER OBLIGATION: this message was NOT delivered and nothing will "
+    "deliver it on your behalf — there is no background dispatcher. Call "
+    "deliver_pending() (or follow_up_agent again with this same "
+    "idempotency_key) to finish it. The message stays durably queryable via "
+    "delivery_status(idempotency_key) until it settles."
+)
+
+
+def _pending_tail(
+    session_id: str, name: str, record: dict, waited_for: str, position: int
+) -> dict:
+    """Return R1's cooperative tail: ``queued(phase=pending)``, never failed.
+
+    Nothing was sent, so the record stays exactly where it was — not settled,
+    not expired. An earlier draft had ``failed(reason="expired")`` here, which
+    contradicted R1 outright: the budget expiring is precisely the case the
+    requirement says returns ``queued`` with an obligation on the sender.
+    """
+    return _with_delivery_identity(
+        {
+            "success": False,
+            "name": name,
+            "status": STATUS_QUEUED,
+            "phase": PHASE_PENDING,
+            "reason": waited_for or "call_budget_expired",
+            "retriable": True,
+            "queue_position": position,
+            "session_id": session_id,
+            "sender_obligation": _TAIL_OBLIGATION,
+            "detail": (
+                f"The target did not become deliverable within the "
+                f"{_DELIVERY_CALL_BUDGET_SECONDS:g}s call budget "
+                f"(waited on: {waited_for or 'target'}). Nothing was sent and "
+                "nothing was lost."
+            ),
+        },
+        record,
+    )
+
+
+def _open_delivery_record(
+    session_id: str, name: str, prompt: str, idempotency_key: str, options: dict
+) -> tuple[dict | None, dict | None]:
+    """Create or reuse this sender's durable record. Returns ``(record, refusal)``.
+
+    Runs **before any waiting**, under the store's cross-process lock, so the
+    check-then-create sequence is atomic against another MCP server doing the
+    same thing with the same key.
+
+    Three outcomes, and the middle one is the whole reason the key exists:
+
+    - no record → create one now. Creating it before the wait is what makes
+      response loss survivable: a client timeout, a cancellation, or a crash
+      after this point still leaves something ``delivery_status(key)`` can
+      answer from.
+    - a record with the SAME fingerprint → reuse it. Never a second attempt.
+    - a record with ANY differing field → ``idempotency_conflict``, and
+      nothing is mutated. Silently delivering the new text under the old key
+      would make the audit trail lie about what was sent.
+    """
+    fingerprint = request_fingerprint(to=name, prompt=prompt, options=options)
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        existing = txn.get(IDENTITY, idempotency_key)
+        if existing is not None:
+            if existing.get("fingerprint") != fingerprint:
+                return None, _with_delivery_identity(
+                    {
+                        "success": False,
+                        "name": name,
+                        "reason": IDEMPOTENCY_CONFLICT,
+                        "retriable": False,
+                        "detail": (
+                            f"idempotency_key {idempotency_key!r} was already "
+                            f"used for a different message (recipient, prompt "
+                            "or options differ). Nothing was sent and nothing "
+                            "was changed. Use a new key, or repeat the "
+                            "original request byte-for-byte."
+                        ),
+                    },
+                    existing,
+                )
+            return dict(existing), None
+        record = delivery_store.new_record(
+            sender=IDENTITY,
+            idempotency_key=idempotency_key,
+            to=name,
+            fingerprint=fingerprint,
+            created_at=time.time(),
+        )
+        record["prompt"] = prompt
+        record["options"] = options
+        txn.put(record)
+        return dict(record), None
+
+
+def _preflight_refusal(session_id: str, name: str) -> dict | None:
+    """Refusals that must leave the session byte-identical (read-only).
+
+    Only the two that carry that promise live here: an absent record, and the
+    R2/C2 downstream-only direction guard. Everything else is decided under
+    the registry lock in ``_prepare``, where it belongs.
+    """
+    agent = _find_agent(_load_agents(session_id), name)
+    if agent is None:
+        return _no_delivery_path(name, "record_removed")
+    return _direction_refusal(agent, name)
+
+
+def _settled_result(session_id: str, name: str, record: dict) -> dict:
+    """Return the already-known outcome for a terminal same-key retry."""
+    delivered = record.get("status") == STATUS_DELIVERED
+    return _with_delivery_identity(
+        {
+            "success": delivered,
+            "name": name,
+            "status": record.get("status"),
+            "phase": record.get("phase"),
+            "reason": record.get("reason", ""),
+            "retriable": False,
+            "session_id": session_id,
+            "detail": (
+                "This idempotency key has already settled; the message was "
+                "not sent again."
+            ),
+        },
+        record,
+    )
+
+
+@mcp.tool()
+async def follow_up_agent(
+    name: str,
+    prompt: str,
+    idempotency_key: str = "",
+    replace_if_idle: bool = True,
+) -> dict:
+    """Deliver a follow-up prompt to an agent you spawned, and confirm it landed.
+
+    Use this instead of send_message when the target agent is not polling read_messages.
+    send_message only writes to an inbox; follow_up_agent is the
+    mechanism for continuing a spawned agent that would otherwise never read an
+    inbox message. A busy agent is NOT refused: the call waits, bounded, for it
+    to reach a resumable point, then resumes and confirms.
+
+    idempotency_key is REQUIRED and is chosen by you before the call. It is how
+    you recover the outcome if you lose this response (client timeout,
+    cancellation, crash): call delivery_status(idempotency_key). Reusing a key
+    with a byte-identical request returns the same attempt and never sends
+    twice; reusing it with any changed field returns idempotency_conflict and
+    changes nothing.
+
+    Returns exactly three statuses. "delivered" means the prompt was observed
+    in the target's context — a returned PID never means that. "failed" means
+    definite non-delivery (child dead, no receipt). "queued" means still in
+    flight, with a phase beneath it: "pending" (nothing was sent — the call
+    budget expired, and completing it is YOUR obligation via deliver_pending)
+    or "unconfirmed" (it was sent and the child is alive, but the receipt has
+    not appeared yet; retrying reconciles rather than resending).
+
+    Guaranteed-path messages do NOT enter the recipient's inbox, so they cannot
+    be read a second time via read_messages; they are recorded in the sender's
+    delivery store instead.
+
+    replace_if_idle defaults to True: an idle-but-alive process is gracefully
+    shut down and resumed with the follow-up prompt. Set it to False to instead
+    refuse such an agent with reason="agent_idle_but_alive".
+    """
+    session_id = _active_session_id()
+
+    def _run() -> dict:
+        # Validation FIRST, before the record exists and before any waiting:
+        # a caller that got the key wrong must learn now, not a budget later.
+        invalid = validate_idempotency_key(idempotency_key)
+        if invalid is not None:
+            return {
+                "success": False,
+                "name": name,
+                "reason": invalid,
+                "retriable": False,
+                "detail": (
+                    "follow_up_agent requires an idempotency_key you choose "
+                    "before the call: 1-"
+                    f"{delivery_store.MAX_IDEMPOTENCY_KEY_LENGTH} characters "
+                    "from [A-Za-z0-9._:@=+-], starting alphanumeric. It is "
+                    "what lets you recover the outcome if this response is "
+                    "lost. Nothing was sent."
+                ),
+            }
+        if not session_id:
+            return _follow_up_failure("session_not_found", name)
+
+        # C2's invariant survives Phase B: a refused upstream follow-up must
+        # leave the session byte-identical, and creating the durable record
+        # first would have written a file. So the guard is re-run here, ahead
+        # of the store, as a read-only pre-flight. ``_prepare`` still checks it
+        # again under the registry lock — that one is authoritative; this one
+        # only decides whether we may touch disk at all.
+        preflight = _preflight_refusal(session_id, name)
+        if preflight is not None:
+            return preflight
+
+        options = {"replace_if_idle": replace_if_idle}
+        record, refusal = _open_delivery_record(
+            session_id, name, prompt, idempotency_key, options
+        )
+        if refusal is not None or record is None:
+            return refusal or _follow_up_failure("session_not_found", name)
+        if is_terminal(record):
+            return _settled_result(session_id, name, record)
+
+        deadline = _delivery_clock() + _DELIVERY_CALL_BUDGET_SECONDS
+        return _guaranteed_delivery(
+            session_id, name, prompt, replace_if_idle, record, deadline
+        )
+
+    return _annotate(await run_blocking(_run))
+
+
+@mcp.tool()
+async def delivery_status(idempotency_key: str = "", to: str = "") -> dict:
+    """Ask what happened to a guaranteed-path message you sent (R4).
+
+    Pass the idempotency_key you chose for that message. This works even if you
+    never received the original response — that is the point of the key.
+
+    This is an ACTIVE reconciler, not a passive lookup: an attempt sitting at
+    phase="unconfirmed" is rescanned for its receipt before this answers, so a
+    prompt that landed after the original call returned reports as delivered
+    rather than staying unconfirmed forever.
+
+    Passing `to` instead lists every message you sent that agent. That is a
+    convenience view only: with several messages to one agent it cannot tell
+    you which one you lost the response for, so it is not a substitute for the
+    key.
+    """
+    session_id = _active_session_id()
+
+    def _run() -> dict:
+        if not session_id:
+            return {"success": False, "reason": "session_not_found"}
+        if not idempotency_key:
+            if to:
+                return {
+                    "success": True,
+                    "to": to,
+                    "deliveries": delivery_store.list_for_sender(
+                        _deliveries_file(session_id), IDENTITY, to
+                    ),
+                    "note": (
+                        "Convenience list. Use delivery_status(idempotency_key) "
+                        "to identify one specific message."
+                    ),
+                }
+            return {
+                "success": False,
+                "reason": delivery_store.KEY_REQUIRED,
+                "detail": "Pass either an idempotency_key or a `to` agent name.",
+            }
+        agents = _load_agents(session_id)
+        with delivery_transaction(_deliveries_file(session_id)) as txn:
+            record = txn.get(IDENTITY, idempotency_key)
+            if record is None:
+                # Deliberately indistinguishable from another sender's key:
+                # the namespace is per-sender, so from here it does not exist.
+                return {
+                    "success": False,
+                    "reason": "delivery_not_found",
+                    "idempotency_key": idempotency_key,
+                    "detail": (
+                        "No message with that idempotency_key was sent by you "
+                        "in this session."
+                    ),
+                }
+            if _reconcile_delivery_record(
+                session_id, record, _find_agent(agents, str(record.get("to") or ""))
+            ):
+                txn.touch()
+            return {"success": True, **public_view(record)}
+
+    return _annotate(await run_blocking(_run))
+
+
+@mcp.tool()
+async def deliver_pending(idempotency_key: str = "") -> dict:
+    """Finish the guaranteed-path messages you were told to come back for.
+
+    This is the cooperative tail R1 declares. There is no background dispatcher,
+    so a message that returned status="queued" is completed only when you call
+    this (or follow_up_agent again with the same key).
+
+    For each of your unsettled messages it reconciles first — rescanning for
+    the previous attempt's receipt — and only then re-delivers, so a prompt
+    that already landed is never sent twice. Pass an idempotency_key to drain
+    just that one.
+
+    Draining happens HERE and in follow_up_agent, and nowhere else. agent_status,
+    check_agent and list_agents stay cheap reads on purpose.
+    """
+    session_id = _active_session_id()
+
+    def _run() -> dict:
+        if not session_id:
+            return {"success": False, "reason": "session_not_found"}
+        store = _deliveries_file(session_id)
+        agents = _load_agents(session_id)
+        # Reconcile everything first, under one lock, so a message that
+        # already landed is settled before anything considers resending it.
+        pending: list[dict] = []
+        with delivery_transaction(store) as txn:
+            for record in txn.for_sender(IDENTITY):
+                if idempotency_key and record.get("idempotency_key") != idempotency_key:
+                    continue
+                if is_terminal(record):
+                    continue
+                if _reconcile_delivery_record(
+                    session_id, record, _find_agent(agents, str(record.get("to") or ""))
+                ):
+                    txn.touch()
+                if not is_terminal(record) and record.get("phase") == PHASE_PENDING:
+                    pending.append(dict(record))
+
+        results: list[dict] = []
+        for record in pending:
+            deadline = _delivery_clock() + _DELIVERY_CALL_BUDGET_SECONDS
+            results.append(
+                _guaranteed_delivery(
+                    session_id,
+                    str(record.get("to") or ""),
+                    str(record.get("prompt") or ""),
+                    bool((record.get("options") or {}).get("replace_if_idle", True)),
+                    record,
+                    deadline,
+                )
+            )
+
+        return {
+            "success": True,
+            "attempted": len(results),
+            "deliveries": delivery_store.list_for_sender(store, IDENTITY),
+        }
+
+    return _annotate(await run_blocking(_run))
 
 
 def _cleanup_agent_artifacts(
@@ -2698,6 +3356,14 @@ async def kill_agent(name: str) -> dict:
                         "(`win-agent-teams lease force`) if the holder is hung."
                     ),
                 }
+
+            # Reconcile BEFORE concluding anything. An in-flight attempt may
+            # already have an unread receipt on disk, and recording that
+            # message as failed because we are killing the target would
+            # reintroduce exactly the false status this feature removes.
+            # Records are settled here, never deleted: unlike the inbox lines
+            # purged below, the sender's audit trail must outlive the target.
+            _reconcile_deliveries_for_target(session_id, name, agent)
 
             owned = process_manager.owns_process(
                 str(agent.get("pid")), _agent_create_token(agent)

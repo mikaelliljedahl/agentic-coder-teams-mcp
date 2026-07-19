@@ -225,10 +225,12 @@ class TestCheckAgentCompactShape:
 class TestFollowUpAgentInternalDict:
     """Regression: follow_up_agent must keep consuming the rich internal dict."""
 
-    def test_follow_up_refuses_busy_agent_with_recent_activity(
+    def test_follow_up_waits_on_a_busy_agent_with_recent_activity(
         self, session: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """B2 — the busy branch waits and then returns the cooperative tail."""
         _add_agent(session, spawned_at=1000.0, cwd="C:\\project")
+        monkeypatch.setattr(server_simple, "_DELIVERY_CALL_BUDGET_SECONDS", 0.0)
         monkeypatch.setattr(
             server_simple.process_manager,
             "health_check",
@@ -248,14 +250,16 @@ class TestFollowUpAgentInternalDict:
             ),
         )
 
-        result = asyncio.run(server_simple.follow_up_agent("worker", "next task"))
+        result = asyncio.run(
+            server_simple.follow_up_agent("worker", "next task", "k12")
+        )
 
         assert result["success"] is False
-        assert result["reason"] == "agent_busy"
-        assert "backend_session_id" in result
-        assert "last_activity_at" in result
+        assert result["status"] == "queued"
+        assert result["phase"] == "pending"
+        assert result["message_id"]
 
-    def test_follow_up_reports_backend_session_missing(
+    def test_follow_up_reports_no_delivery_path_without_a_backend_session(
         self, session: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _add_agent(session, spawned_at=1000.0, cwd="C:\\project")
@@ -279,10 +283,13 @@ class TestFollowUpAgentInternalDict:
             ),
         )
 
-        result = asyncio.run(server_simple.follow_up_agent("worker", "next task"))
+        result = asyncio.run(
+            server_simple.follow_up_agent("worker", "next task", "k13")
+        )
 
         assert result["success"] is False
-        assert result["reason"] == "backend_session_missing"
+        assert result["reason"] == "no_delivery_path"
+        assert result["state"] == "no_backend_session"
 
 
 class TestListAgentsCompactRows:

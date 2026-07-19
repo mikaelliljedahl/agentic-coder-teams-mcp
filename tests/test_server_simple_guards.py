@@ -475,7 +475,7 @@ def test_list_backends_enumerates_registry(isolated, monkeypatch):
 
 def test_follow_up_agent_no_session(isolated, monkeypatch):
     _no_session(monkeypatch)
-    result = asyncio.run(ss.follow_up_agent("worker", "next"))
+    result = asyncio.run(ss.follow_up_agent("worker", "next", "k44"))
     assert result["success"] is False
     assert result["reason"] == "session_not_found"
 
@@ -498,6 +498,6 @@ def test_follow_up_agent_unsupported_backend(isolated, monkeypatch):
         ),
     )
     monkeypatch.setattr(ss, "_active_session_id", lambda **kwargs: "s1")
-    result = asyncio.run(ss.follow_up_agent("worker", "next"))
+    result = asyncio.run(ss.follow_up_agent("worker", "next", "k45"))
     assert result["success"] is False
     assert result["reason"] == "backend_not_supported"

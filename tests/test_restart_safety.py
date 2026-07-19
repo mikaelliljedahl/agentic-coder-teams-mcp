@@ -128,7 +128,7 @@ def test_tokenless_recovered_record_never_graceful_shutdowns_pid(
     _idle_output(monkeypatch)
     calls = _no_shutdown(monkeypatch)
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k39"))
 
     assert result["success"] is True
     assert calls["graceful"] == []  # never touched the unproven PID
@@ -150,7 +150,7 @@ def test_reused_pid_does_not_get_graceful_shutdown(
     _idle_output(monkeypatch)
     calls = _no_shutdown(monkeypatch)
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k40"))
 
     assert result["success"] is True
     assert calls["graceful"] == []
@@ -221,17 +221,20 @@ def test_waiting_marker_allows_immediate_follow_up(
     _no_shutdown(monkeypatch)
     _write_state_marker("waiting")
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k41"))
 
     assert result["success"] is True
     assert follow_up.backend.resume_calls[0][1] == "backend-session-id"
 
 
-def test_recent_activity_without_waiting_marker_is_busy(
+def test_recent_activity_without_waiting_marker_waits_rather_than_resuming(
     follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # No "waiting" marker: the inactivity timer still guards a genuinely busy
-    # agent (recent activity, running marker) from being torn down.
+    # agent (recent activity, running marker) from being torn down. Since B2
+    # that guard is a bounded wait rather than a refusal — but the invariant
+    # under test is unchanged: the busy agent's process is NOT replaced.
+    monkeypatch.setattr(ss, "_DELIVERY_CALL_BUDGET_SECONDS", 0.0)
     _write_agent(follow_up.tmp_path, create_token="tok")
     monkeypatch.setattr(
         ss.process_manager,
@@ -241,10 +244,11 @@ def test_recent_activity_without_waiting_marker_is_busy(
     _busy_by_timer_output(monkeypatch)
     _write_state_marker("running")
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k42"))
 
     assert result["success"] is False
-    assert result["reason"] == "agent_busy"
+    assert result["status"] == "queued"
+    assert result["phase"] == "pending"
     assert follow_up.backend.resume_calls == []
 
 
@@ -262,7 +266,7 @@ def test_follow_up_resume_persists_new_create_token(
         ss.process_manager, "creation_token", lambda h: f"fresh-token-{h}"
     )
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k43"))
 
     assert result["success"] is True
     agents = ss._load_agents("session-id")

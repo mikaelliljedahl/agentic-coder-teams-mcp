@@ -124,9 +124,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     clock = _Clock()
     monkeypatch.setattr(server_simple, "_delivery_clock", clock)
     monkeypatch.setattr(server_simple, "_delivery_sleep", clock.sleep)
-    monkeypatch.setattr(server_simple, "_DELIVERY_CONFIRM_BOUND_SECONDS", 5.0)
+    monkeypatch.setattr(server_simple, "_DELIVERY_CALL_BUDGET_SECONDS", 10.0)
     monkeypatch.setattr(server_simple, "_DELIVERY_POLL_SECONDS", 1.0)
-    monkeypatch.setattr(server_simple, "_LEASE_QUEUE_WAIT_SECONDS", 3.0)
     return SimpleNamespace(
         tmp_path=tmp_path,
         session_dir=session_dir,
@@ -185,7 +184,7 @@ async def test_worker_following_up_its_lead_is_refused(
     _child_alive(monkeypatch, True)
     _as(monkeypatch, "worker-b")
 
-    result = await server_simple.follow_up_agent("lead-a", "please stop")
+    result = await server_simple.follow_up_agent("lead-a", "please stop", "k14")
 
     assert result["success"] is False
     assert result["reason"] == "not_spawner"
@@ -200,7 +199,7 @@ async def test_upstream_refusal_names_the_rule_and_points_at_send_message(
     _child_alive(monkeypatch, True)
     _as(monkeypatch, "worker-b")
 
-    result = await server_simple.follow_up_agent("lead-a", "please stop")
+    result = await server_simple.follow_up_agent("lead-a", "please stop", "k15")
 
     detail = result["detail"]
     assert "send_message" in detail
@@ -222,7 +221,7 @@ async def test_upstream_refusal_changes_nothing_on_disk(
     before = _snapshot(env.session_dir)
     before_generation = server_simple._record_generation(_record("lead-a"))
 
-    await server_simple.follow_up_agent("lead-a", "please stop")
+    await server_simple.follow_up_agent("lead-a", "please stop", "k16")
 
     assert _snapshot(env.session_dir) == before
     assert server_simple._record_generation(_record("lead-a")) == before_generation
@@ -239,7 +238,7 @@ async def test_sibling_follow_up_is_refused(
     _child_alive(monkeypatch, True)
     _as(monkeypatch, "worker-b")
 
-    result = await server_simple.follow_up_agent("worker-c", "do my work")
+    result = await server_simple.follow_up_agent("worker-c", "do my work", "k17")
 
     assert result["success"] is False
     assert result["reason"] == "not_spawner"
@@ -258,7 +257,7 @@ async def test_record_without_a_spawner_refuses_rather_than_allowing(
     _child_alive(monkeypatch, True)
     _as(monkeypatch, "team-lead")
 
-    result = await server_simple.follow_up_agent("orphan", "carry on")
+    result = await server_simple.follow_up_agent("orphan", "carry on", "k18")
 
     assert result["success"] is False
     assert result["reason"] == "parent_unknown"
@@ -291,7 +290,7 @@ async def test_nested_lead_can_follow_up_the_agent_it_spawned(
     _child_alive(monkeypatch, True)
     _as(monkeypatch, "lead-a")
 
-    result = await server_simple.follow_up_agent("worker-b", "next prompt")
+    result = await server_simple.follow_up_agent("worker-b", "next prompt", "k19")
 
     assert result["success"] is True
     assert result["status"] == "delivered"
@@ -315,7 +314,7 @@ async def test_resume_preserves_the_spawner_on_the_record(
     _child_alive(monkeypatch, True)
     _as(monkeypatch, "lead-a")
 
-    await server_simple.follow_up_agent("worker-b", "next prompt")
+    await server_simple.follow_up_agent("worker-b", "next prompt", "k20")
 
     after = _record("worker-b")
     assert after[SPAWNED_BY_FIELD] == "lead-a"
@@ -471,7 +470,7 @@ async def test_cli_adopted_record_then_passes_the_direction_guard(
     _child_alive(monkeypatch, True)
     _as(monkeypatch, "team-lead")
 
-    result = await server_simple.follow_up_agent("orphan", "carry on")
+    result = await server_simple.follow_up_agent("orphan", "carry on", "k21")
 
     assert result["success"] is True
     assert _record("orphan")[SPAWNED_BY_SOURCE_FIELD] == SPAWNED_BY_SOURCE_OPERATOR

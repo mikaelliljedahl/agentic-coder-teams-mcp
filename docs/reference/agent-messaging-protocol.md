@@ -214,6 +214,23 @@ delivery, no push, no wake of the recipient process. The recipient sees it only
 if it later calls `read_messages`. The docstring states this outright
 (`src/claude_teams/server_simple.py:1314-1316`).
 
+`send_message` is therefore the **upstream and inbox-polling** path only. To
+reach an agent you spawned, use `follow_up_agent`: it delivers and confirms
+rather than appending and hoping.
+
+**Guaranteed-path messages never enter the actionable inbox.** A message
+delivered by `follow_up_agent` is resumed into the target's context and recorded
+in the *sender's* delivery store; it is never written to `inbox-{name}.jsonl`.
+If it were, a polling worker could read and act on the same instruction a second
+time. The rejected alternative — write to the inbox, then pre-advance the
+recipient's cursor — is unsafe: the cursor is a per-sender consumed **count**,
+not a message-id set, and `read_messages` advances to the maximum selected
+position, so advancing past an audit record silently destroys every earlier
+unread message from that same sender. It also breaks the single-writer
+invariant, and since kill purges a sender's inbox lines, an inbox-resident audit
+record would be destroyed by killing the **sender** — losing exactly the trail
+R4 requires to survive.
+
 ### `read_messages(from_agent, since_seq, full, limit, max_chars)`
 
 Reads **the caller's own** inbox — `inbox-{IDENTITY}.jsonl` — never anyone
@@ -291,9 +308,52 @@ An unknown agent name returns a stable all-zero payload with `state: "dead"`,
 `alive: false` — **not** an error (`src/claude_teams/server_simple.py:883-903`,
 `1543`). You cannot distinguish "never existed" from "killed" from this tool.
 
-### `follow_up_agent(name, prompt, replace_if_idle=True)`
+### `follow_up_agent(name, prompt, idempotency_key, replace_if_idle=True)`
 
 See [section 4](#4-follow_up_agent-in-detail).
+
+`idempotency_key` is **required** and is chosen by the caller *before* the call.
+That ordering is the point: a server-generated id would only ever reach the
+sender inside the response, so a sender that loses the response would have
+nothing to ask about. Validation runs before anything is created and before any
+waiting — missing/empty (`idempotency_key_required`), malformed
+(`idempotency_key_malformed`), or over
+`delivery_store.MAX_IDEMPOTENCY_KEY_LENGTH` (`idempotency_key_too_long`).
+
+The uniqueness namespace is `(session, sender IDENTITY, key)`, so two senders
+may reuse one textual key. Reusing a key with a byte-identical
+recipient/prompt/options returns or reconciles the existing attempt and never
+creates a second; reusing it with **any** differing field returns
+`idempotency_conflict` and mutates nothing.
+
+### `delivery_status(idempotency_key="", to="")`
+
+The sender's query contract (R4). Returns
+`{message_id, idempotency_key, to, status, phase, reason, attempts, nonce,
+created_at, settled_at}` for one of **your own** messages. Another sender's key
+is reported as `delivery_not_found` — the namespace is per-sender, so from here
+it genuinely does not exist. Survives a server restart, because the store is a
+file.
+
+**It is an active reconciler, not a passive lookup.** An attempt sitting at
+`phase="unconfirmed"` is rescanned for its receipt before this answers.
+Without that, response-loss recovery would keep reporting `unconfirmed` forever
+after the nonce had actually landed — a false status in the other direction.
+
+Passing `to` instead returns a convenience list. It deliberately cannot serve
+response-loss recovery: with several messages to one agent, nothing identifies
+which row is the one whose response was lost.
+
+### `deliver_pending(idempotency_key="")`
+
+Completes the cooperative tail. Reconciles every unsettled message of yours
+first — rescanning for the previous attempt's nonce — and only then re-delivers,
+so a prompt that already landed is never sent a second time.
+
+**The drain allow-list is exactly `deliver_pending` and `follow_up_agent`.**
+`agent_status`, `check_agent` and `list_agents` deliberately do **not** drain:
+they are advertised as cheap reads, and draining there would turn each into a
+slow mutator.
 
 ### `kill_agent(name)`
 
@@ -427,6 +487,8 @@ Everything lives under `~/.claude/agent-sessions/<session-uuid>/`
 | `state-{name}.json` | the **worker's own** lifecycle hook process (`src/claude_teams/hooks.py:88-89`) | server status tools; watcher |
 | `prompts/{name}.<nonce>.prompt.txt` | server, before a claude-code spawn/resume (`_materialize_prompt`) | the worker itself, as a file read |
 | `operation-leases.json` | server, temp-file + atomic replace (`src/claude_teams/leases.py:save_leases`) | server |
+| `deliveries.json` | server, under `deliveries.lock`, temp-file + atomic replace (`src/claude_teams/delivery_store.py:save_records`) | server (`delivery_status`, `deliver_pending`) |
+| `deliveries.lock` | lock file only (`src/claude_teams/filelock.py:file_lock`) | server |
 | `mcp/{name}.mcp.json` | server (`src/claude_teams/server_simple.py:1122-1123`) | the claude CLI |
 | `hooks-{name}.settings.json` | server (`src/claude_teams/hooks.py:147-148`) | the claude CLI |
 | `codex-hook-{name}.cmd` | server, Windows only (`src/claude_teams/hooks.py:182-184`) | Codex's hook runner |
@@ -440,6 +502,19 @@ One JSON object per line, appended:
 `{"from": <sender IDENTITY>, "text": <str>, "ts": <ISO-8601 UTC>}`
 (`src/claude_teams/server_simple.py:1325-1331`). Append-only; nothing ever
 rewrites or compacts it. The file is deleted only by `kill_agent`.
+
+**`deliveries.json` is the opposite, on purpose.** Kill purges inbox lines and
+cursor entries so a same-named successor does not inherit live actionable state.
+Delivery records are **never deleted** — not by kill, not by agent-record
+cleanup. The inbox is live state; the delivery store is the sender's audit
+trail, and its whole value is that a settled outcome stays queryable after the
+target is gone. Do not extend the inbox's delete-on-kill to it.
+
+It takes the same cross-process file-lock transaction model as the registry
+(`src/claude_teams/filelock.py`), not the inbox's `_inbox_lock` — that one is a
+`threading.Lock` and is in-process only by design, because an inbox's owner is
+the single writer of its own cursor. Several per-agent MCP servers share one
+session dir, so the delivery store needs the real thing.
 
 ### Cursor semantics
 
@@ -526,6 +601,73 @@ Separately, per-agent stdout/stderr logs go to
 
 ## 4. `follow_up_agent` in detail
 
+### The delivery model: bounded in-call delivery with a cooperative tail
+
+**The originating call performs the delivery.** When the target is busy the call
+does not refuse and does not return immediately — it waits, bounded, for the
+target to reach a resumable point, then resumes and confirms. Within the bound
+this is genuine guaranteed delivery: no queue, no dependency on anyone coming
+back.
+
+**The bound is ONE total budget** (`_DELIVERY_CALL_BUDGET_SECONDS`), covering
+the wait, lease acquisition, the resume, and confirmation — deliberately not a
+per-step timeout, which would let one call spend the advertised budget several
+times over. The server cannot know each client's deadline, so this is a
+documented server-side constant rather than an assumption about the caller; it
+is echoed back as `call_budget_s` on every result.
+
+If the budget expires without a lease ever being acquired, the call returns
+`queued(phase="pending")` together with an explicit `sender_obligation`, and the
+message stays durably queryable. **The tail is cooperative**: there is no
+dispatcher (see the non-goal in `requirements.md`), so nothing completes it
+unless the sender calls `deliver_pending` or repeats `follow_up_agent` with the
+same key.
+
+### The delivery state machine
+
+Public statuses are exactly R4's three. `sent` and `unconfirmed` are **phases
+beneath `queued`**, never additional statuses — a four-state machine would
+contradict R4, and exposing `sent` invites reading it as "arrived".
+
+```text
+queued(pending)     --(lease acquired, resume spawned)--> queued(sent)
+queued(sent)        --(nonce confirmed)----------------->  delivered [terminal]
+queued(sent)        --(child dead before receipt)------->  failed(not_delivered) [terminal]
+queued(sent)        --(budget expired, child alive)----->  queued(unconfirmed)
+queued(unconfirmed) --(nonce found on rescan)----------->  delivered [terminal]
+queued(unconfirmed) --(child dead, grace passed, no nonce)-> failed(not_delivered) [terminal]
+queued(pending)     --(budget expired, never leased)---->  queued(pending)  [cooperative tail]
+```
+
+Three rules that are easy to get wrong:
+
+- **A never-leased message does not expire into `failed`.** There is one
+  timeout — the call budget — so the same instant cannot mean both "come back
+  for it" and "it will never happen". A pending message stays queued and
+  queryable until delivered, reconciled, or the session is cleaned up.
+- **A timeout with a live child never terminates as failed.** It stays
+  non-terminal until the child is dead *and* one transcript-flush grace
+  (`_UNCONFIRMED_FLUSH_GRACE_SECONDS`) has passed. A live child with no receipt
+  legitimately stays `queued(unconfirmed)` indefinitely — honest, rather than
+  silently expired. Only definite non-delivery is terminal.
+- **A retry rescans for the prior attempt's nonce before re-sending.** This, not
+  receiver-side dedupe, is what prevents a duplicate prompt: the recipient is a
+  backend conversation, not a consumer with a dedupe table.
+
+The lease is **not** held across `unconfirmed`. It converts to the durable
+pending-delivery record on the agent, which keeps serializing that target until
+reconciliation, so neither a future delivery nor a kill is blocked by a lease
+nobody is progressing.
+
+### Kill-time cleanup reconciles before concluding
+
+`kill_agent` settles every in-flight attempt against the target, but **rescans
+for the nonce first** and records `delivered` if it landed. An in-flight
+attempt may already have an unread receipt on disk; marking that message failed
+because the target is being killed would reintroduce exactly the false-status
+problem this protocol exists to remove. Only a genuinely receipt-less attempt
+becomes `failed(not_delivered)`. Nothing is deleted.
+
 ### It starts a NEW OS PROCESS
 
 This is the single most important fact about this tool. `follow_up_agent` does
@@ -549,25 +691,30 @@ Evaluated in this order, in `_do_follow_up`:
 | Order | Condition | Refusal reason |
 |-------|-----------|----------------|
 | 1 | No session resolved | `session_not_found` |
-| 2 | `name` not in `agents.json` | `agent_not_found` |
+| 2 | `name` not in `agents.json` | `no_delivery_path` (`state="record_removed"`) |
 | 2a | Record has no `spawned_by` | `parent_unknown` |
 | 2b | Caller's `IDENTITY` is not the record's `spawned_by` | `not_spawner` |
 | 3 | Backend not loadable, or `supports_resume()` false | `backend_not_supported` |
 | 3a | Binding outcome is not `bound` | `binding_<outcome>` |
-| 4 | No `backend_session_id` known | `backend_session_missing` |
+| 4 | No `backend_session_id` known | `no_delivery_path` (`state="no_backend_session"`) |
 | — | *`idle_by_marker` resolved here; a `waiting` marker skips 5–7* | |
-| 5 | Alive, **not idle by marker**, and `last_message is None` | `agent_busy` |
+| 5 | Alive, **not idle by marker**, and `last_message is None` | *not a refusal* — **bounded wait** (B2) |
 | 6 | Alive, **not idle by marker**, and `last_activity_at is None` | `agent_state_unknown` |
-| 7 | Alive, **not idle by marker**, and last activity < 60 s ago | `agent_busy` |
+| 7 | Alive, **not idle by marker**, and last activity < 60 s ago | *not a refusal* — **bounded wait** (B2) |
 | 8 | Alive, judged idle, and `replace_if_idle=False` | `agent_idle_but_alive` |
 | 8a | Another caller holds the operation lease | *queued, never refused* — see [4b](#4b-the-operation-lease) |
 | 9 | `backend.resume(...)` raised | `resume_failed` |
 | 10 | Resumed child exited inside the settle window | `resume_not_confirmed` |
 | 11 | Resumed child died with no receipt | `not_delivered` |
 | 12 | Scan bound expired, child still alive | *not a refusal* — `queued(phase="unconfirmed")` |
+| 13 | The whole call budget expired without ever leasing | *not a refusal* — `queued(phase="pending")`, the cooperative tail |
 
-Gates 2a/2b are evaluated first of all, before the binding resolve and before
-any write; gate 3a is evaluated before the lease is reserved; gates 10-12 happen
+Gates 2 and 2a/2b are ALSO evaluated once up front, read-only, before the
+delivery record is created — a refusal from either must leave the session
+byte-identical, and creating the record first would have written a file. They
+are then re-evaluated under the registry lock, and that evaluation is the
+authoritative one. Gates 2a/2b are evaluated first of all, before the binding
+resolve and before any write; gate 3a is evaluated before the lease is reserved; gates 10-12 happen
 **after** the registry lock has been released (see
 [4a](#4a-delivery-confirmation)).
 
@@ -632,8 +779,10 @@ computed by re-running `_resolve_agent_state` and testing for `"waiting"`. When
 it is true, checks 5, 6 and 7 — the entire transcript-derived heuristic block —
 are skipped. The comment above it explains why the ordering matters: an agent
 parked at a Stop hook before emitting any assistant text has no `last_message`,
-so checking that first reported `agent_busy` for precisely the case we know is
-idle.
+so checking that first would have made us WAIT out the whole call budget for
+precisely the case we know for certain is idle. (Before B2 the same ordering
+bug produced an `agent_busy` refusal; the ordering fix predates the change from
+refusal to wait and still matters for the same reason.)
 
 The inactivity heuristic (check 8) compares against the module constant
 `_FOLLOW_UP_IDLE_SECONDS = 60.0` **directly**
@@ -842,9 +991,10 @@ said any newly surfaced id is persisted; that is superseded, and the change is
 load-bearing: an unverified read that wrote an id would poison the record for
 every later call.
 
-Consequence: **`follow_up_agent` fails with `backend_session_missing` until the
-target CLI has flushed enough of its rollout file to be discovered.** A freshly
-spawned agent is not immediately followable-up.
+Consequence: **`follow_up_agent` returns `no_delivery_path` with
+`state="no_backend_session"` until the target CLI has flushed enough of its
+rollout file to be discovered.** A freshly spawned agent is not immediately
+followable-up.
 
 ### 3a. Transcript binding
 
@@ -1123,16 +1273,18 @@ Hook wiring is regenerated on **every** spawn and every follow-up
 
 Facts about current behavior. No remedies are proposed here.
 
-### A busy worker is reachable by neither tool
+### A busy worker is now reachable — within a bound (was: reachable by neither tool)
 
-`send_message` writes to a file and nothing more; the docstring states the agent
-sees it only if it calls `read_messages` (its own docstring says so).
-`follow_up_agent` refuses a busy agent with `agent_busy` — two sites in
-`_do_follow_up`, the no-`last_message` check and the inactivity timer, both
-behind the marker resolution. There is therefore
-no mechanism at all — no push, no stdin write, no signal — to reach a worker
-that is mid-task and not polling. Coordination with a busy worker is possible
-only after it parks (marker `waiting`) or voluntarily polls.
+`send_message` still writes to a file and nothing more. `follow_up_agent` no
+longer refuses a busy agent: both former `agent_busy` sites (the
+no-`last_message` check and the inactivity timer, both behind the marker
+resolution) are now bounded waits. A spawner addressing its own child gets
+`delivered`/`failed` inside the budget, or `queued(phase="pending")` with a
+stated obligation if the target never parks in time.
+
+What remains true: there is still no push, stdin write or signal. Delivery
+happens by *resume*, so it needs the target to reach a resumable point — and if
+it never does within the budget, completing the message is the sender's job.
 
 ### Codex workers do not poll `read_messages`
 
@@ -1193,13 +1345,15 @@ It is read by `_idle_seconds()` (`src/claude_teams/server_simple.py:104-112`),
 which is used only by `_resolve_agent_state`
 (`src/claude_teams/server_simple.py:180`). The `follow_up_agent` inactivity
 check uses the bare constant (`src/claude_teams/server_simple.py:1642`). Tuning
-the env var changes reported `state` but not who gets refused as `agent_busy`.
+the env var changes reported `state` but not who is judged busy enough to be
+waited for rather than resumed immediately.
 
-### `kill_agent` destroys the target's unread inbox
+### `kill_agent` destroys the target's unread inbox (but not delivery records)
 
 `inbox-{name}.jsonl` and its cursor are deleted outright
 (`src/claude_teams/server_simple.py:1751-1752`). Any message sent to that agent
-and not yet read is gone.
+and not yet read is gone. Delivery records in `deliveries.json` are deliberately
+**not** touched: they are the sender's audit trail and must outlive the target.
 
 ### A follow-up overwrites the spawn prompt file
 

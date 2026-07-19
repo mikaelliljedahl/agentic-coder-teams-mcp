@@ -19,7 +19,42 @@ def test_follow_up_agent_description_explains_non_polling_use_case() -> None:
     assert "not polling read_messages" in description
     assert "send_message only writes to an inbox" in description
     assert "continuing a spawned agent" in description
-    assert 'reason="agent_busy"' in description
+
+
+def test_follow_up_agent_description_states_the_bounded_wait_not_a_refusal() -> None:
+    """B2 — the docstring is the contract calling agents actually read.
+
+    It previously advertised ``reason="agent_busy"``, which is exactly the
+    dead end R1 removes; leaving that text would keep leads picking wrong.
+    """
+    description = server_simple.follow_up_agent.__doc__ or ""
+
+    assert 'reason="agent_busy"' not in description
+    assert "A busy agent is NOT refused" in description
+    assert "idempotency_key is REQUIRED" in description
+
+
+def test_follow_up_agent_description_names_all_three_statuses() -> None:
+    description = server_simple.follow_up_agent.__doc__ or ""
+
+    for status in ("delivered", "failed", "queued"):
+        assert f'"{status}"' in description
+
+
+def test_delivery_status_description_says_it_reconciles() -> None:
+    """A passive-lookup reading would make response-loss recovery useless."""
+    description = server_simple.delivery_status.__doc__ or ""
+
+    assert "ACTIVE reconciler" in description
+    assert "idempotency_key" in description
+
+
+def test_deliver_pending_description_names_the_drain_allow_list() -> None:
+    description = server_simple.deliver_pending.__doc__ or ""
+
+    assert "no background dispatcher" in description
+    assert "agent_status" in description
+    assert "stay cheap reads" in description
 
 
 def test_check_agent_description_documents_full_len() -> None:

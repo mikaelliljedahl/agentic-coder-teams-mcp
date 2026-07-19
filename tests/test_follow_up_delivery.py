@@ -170,9 +170,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     clock = _Clock()
     monkeypatch.setattr(server_simple, "_delivery_clock", clock)
     monkeypatch.setattr(server_simple, "_delivery_sleep", clock.sleep)
-    monkeypatch.setattr(server_simple, "_DELIVERY_CONFIRM_BOUND_SECONDS", 5.0)
+    monkeypatch.setattr(server_simple, "_DELIVERY_CALL_BUDGET_SECONDS", 10.0)
     monkeypatch.setattr(server_simple, "_DELIVERY_POLL_SECONDS", 1.0)
-    monkeypatch.setattr(server_simple, "_LEASE_QUEUE_WAIT_SECONDS", 3.0)
     return SimpleNamespace(
         tmp_path=tmp_path,
         transcript=transcript,
@@ -225,7 +224,7 @@ async def test_immediately_exiting_child_is_not_confirmed_and_leaves_the_record(
     _install(monkeypatch, backend)
     before = dict(_record())
 
-    result = await server_simple.follow_up_agent(AGENT, "next prompt")
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k22")
 
     assert result["success"] is False
     assert result["reason"] == "resume_not_confirmed"
@@ -255,7 +254,7 @@ async def test_nonce_in_the_correct_transcript_is_delivered(
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
 
-    result = await server_simple.follow_up_agent(AGENT, "next prompt")
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k23")
 
     assert result["success"] is True
     assert result["status"] == "delivered"
@@ -286,7 +285,7 @@ async def test_a_surviving_old_process_growing_the_transcript_does_not_confirm(
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
 
-    result = await server_simple.follow_up_agent(AGENT, "next prompt")
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k24")
 
     assert result["success"] is False
     assert result["reason"] == "delivery_unconfirmed"
@@ -312,7 +311,7 @@ async def test_the_old_process_writing_the_shared_state_marker_does_not_confirm(
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
 
-    result = await server_simple.follow_up_agent(AGENT, "next prompt")
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k25")
 
     assert result["success"] is False
     assert result["reason"] == "delivery_unconfirmed"
@@ -341,7 +340,7 @@ async def test_a_nonce_echoed_only_in_a_diagnostic_does_not_confirm(
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
 
-    result = await server_simple.follow_up_agent(AGENT, "next prompt")
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k26")
 
     assert result["success"] is False
     assert result["reason"] == "delivery_unconfirmed"
@@ -362,7 +361,7 @@ async def test_dead_child_with_no_receipt_is_definite_non_delivery(
     _install(monkeypatch, backend)
     monkeypatch.setattr(server_simple.process_manager, "health_check", health)
 
-    result = await server_simple.follow_up_agent(AGENT, "next prompt")
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k27")
 
     assert result["success"] is False
     assert result["reason"] == "not_delivered"
@@ -378,7 +377,7 @@ async def test_bound_expiry_with_a_live_child_is_queued_not_terminal(
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
 
-    result = await server_simple.follow_up_agent(AGENT, "next prompt")
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k28")
 
     # R6: neither delivered nor terminally failed.
     assert result["success"] is False
@@ -398,7 +397,7 @@ async def test_a_later_flush_reconciles_and_does_not_resend(
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
 
-    first = await server_simple.follow_up_agent(AGENT, "next prompt")
+    first = await server_simple.follow_up_agent(AGENT, "next prompt", "k29")
     assert first["phase"] == "unconfirmed"
     nonce = _nonce_of(backend.resume_calls[0][0].prompt)
 
@@ -408,7 +407,7 @@ async def test_a_later_flush_reconciles_and_does_not_resend(
         _claude_user_record(f"next prompt {DELIVERY_MARKER_PREFIX}{nonce}"),
     )
 
-    second = await server_simple.follow_up_agent(AGENT, "next prompt")
+    second = await server_simple.follow_up_agent(AGENT, "next prompt", "k30")
 
     assert second["success"] is True
     assert second["status"] == "delivered"
@@ -445,7 +444,7 @@ async def test_confirmation_does_not_hold_the_registry_lock(
         server_simple.process_manager, "health_check", probe_registry_during_poll
     )
 
-    await server_simple.follow_up_agent(AGENT, "next prompt")
+    await server_simple.follow_up_agent(AGENT, "next prompt", "k31")
 
     assert read_ok.is_set(), (
         "a concurrent registry read blocked during confirmation, so the "
@@ -484,7 +483,7 @@ async def test_a_second_valid_caller_queues_and_does_not_resume(
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
 
-    result = await server_simple.follow_up_agent(AGENT, "next prompt")
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k32")
 
     assert result["status"] == "queued"
     assert result["phase"] == "pending"
@@ -514,7 +513,9 @@ async def test_concurrent_callers_never_resume_at_the_same_time(
     def call() -> None:
         import asyncio
 
-        outcome = asyncio.run(server_simple.follow_up_agent(AGENT, "next prompt"))
+        outcome = asyncio.run(
+            server_simple.follow_up_agent(AGENT, "next prompt", "k33")
+        )
         with lock:
             results.append(outcome)
 
@@ -703,9 +704,9 @@ async def test_each_call_writes_a_distinct_prompt_file(
     _child_alive(monkeypatch, True)
     sensitive = "line one\n'quoted'"
 
-    await server_simple.follow_up_agent(AGENT, sensitive)
+    await server_simple.follow_up_agent(AGENT, sensitive, "k34")
     first = sorted(server_simple._prompts_dir(SESSION).iterdir())
-    await server_simple.follow_up_agent(AGENT, sensitive)
+    await server_simple.follow_up_agent(AGENT, sensitive, "k35")
     second = sorted(server_simple._prompts_dir(SESSION).iterdir())
 
     assert len(first) == 1
@@ -721,7 +722,7 @@ async def test_an_unconfirmed_attempt_keeps_its_prompt_file(
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
 
-    result = await server_simple.follow_up_agent(AGENT, "line one\n'quoted'")
+    result = await server_simple.follow_up_agent(AGENT, "line one\n'quoted'", "k36")
 
     assert result["phase"] == "unconfirmed"
     assert list(server_simple._prompts_dir(SESSION).iterdir())
@@ -743,7 +744,7 @@ async def test_a_confirmed_attempt_removes_its_prompt_file(
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
 
-    result = await server_simple.follow_up_agent(AGENT, "line one\n'quoted'")
+    result = await server_simple.follow_up_agent(AGENT, "line one\n'quoted'", "k37")
 
     assert result["status"] == "delivered"
     assert list(server_simple._prompts_dir(SESSION).iterdir()) == []
