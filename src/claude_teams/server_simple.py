@@ -847,7 +847,7 @@ The watcher ignores non-actionable churn — `running` hook transitions and
 one JSON wake record: `reason="message"` for unread inbox data,
 `reason="waiting"` for a marker that settles as waiting, or `reason="output"`
 for a selected output. A waiting marker must persist for a short settle window
-(`WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`, default 1.5s) before it wakes; one that
+(`WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`, default 15s) before it wakes; one that
 resumes `running` within the window is suppressed as a brief park. On a message,
 call `read_messages`; on waiting, call this tool for the status delta.
 
@@ -1215,7 +1215,7 @@ async def spawn_agent(
     coordinator (bounded foreground for Codex). It ignores non-actionable churn
     (``running`` transitions and ``SubagentStop``) and wakes on unread inbox
     data, a selected output, or a ``waiting`` marker that persists past a short
-    settle window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 1.5s) — a
+    settle window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 15s) — a
     marker resuming ``running`` within the window is suppressed. Branch on its
     JSON ``reason``: call ``read_messages`` for ``message`` and
     ``agent_status``/``check_agent`` for ``waiting``. Re-check status after
@@ -2055,7 +2055,7 @@ async def agent_watch_paths(names: list[str] | None = None) -> list[dict]:
     It ignores non-actionable churn (``running`` transitions and
     ``SubagentStop``) and emits ``reason=message`` for unread inbox data or
     ``reason=waiting`` for a waiting marker that persists past a short settle
-    window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 1.5s). Call
+    window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 15s). Call
     ``read_messages`` for message and ``agent_status``/``check_agent`` for
     waiting. Re-check status after timeout exit 2 before watching again.
     """

@@ -543,11 +543,11 @@ def test_waiting_agent_tolerates_unhashable_event(tmp_path: Path) -> None:
 
 def test_settle_seconds_from_env_rejects_bad_values(monkeypatch) -> None:
     monkeypatch.delenv("WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS", raising=False)
-    assert cli._settle_seconds_from_env() == 1.5
+    assert cli._settle_seconds_from_env() == 15.0
 
     for bad in ("abc", "nan", "-1", "inf"):
         monkeypatch.setenv("WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS", bad)
-        assert cli._settle_seconds_from_env() == 1.5
+        assert cli._settle_seconds_from_env() == 15.0
 
     monkeypatch.setenv("WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS", "0")
     assert cli._settle_seconds_from_env() == 0.0

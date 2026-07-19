@@ -25,7 +25,7 @@ _WATCH_DEFAULT_PATTERN = "state-*.json"
 # next tool call. Waking a coordinator for it is a false positive.
 _NON_ACTIONABLE_WAITING_EVENTS: frozenset[str] = frozenset({"SubagentStop"})
 
-_WATCH_SETTLE_DEFAULT_SECONDS = 1.5
+_WATCH_SETTLE_DEFAULT_SECONDS = 15.0
 
 
 def _settle_seconds_from_env() -> float:
@@ -203,7 +203,7 @@ def watch(
     ``SubagentStop`` (a worker's own Task subagent finishing) are ignored, and a
     marker whose state is ``waiting`` exits 0 only after it *persists* as waiting
     for a short settle window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default
-    1.5s) — a marker that resumes ``running`` inside the window is suppressed as
+    15s) — a marker that resumes ``running`` inside the window is suppressed as
     a brief park. Other files selected by PATTERN wake on any creation/change.
     Unless ``--no-inbox`` is passed, unread messages for ``AGENT_NAME`` (or the
     root ``team-lead`` identity) also exit 0 without consuming them. When several
