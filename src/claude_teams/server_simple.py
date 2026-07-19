@@ -31,6 +31,16 @@ from claude_teams.async_utils import run_blocking
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.process_manager import process_manager
 from claude_teams.backends.registry import registry
+from claude_teams.messaging import (
+    load_inbox_cursors as _load_inbox_cursors,
+)
+from claude_teams.messaging import (
+    read_inbox_by_sender,
+    unread_sender_counts,
+)
+from claude_teams.messaging import (
+    save_inbox_cursors as _save_inbox_cursors,
+)
 
 # Identity: env vars (works for Claude Code via --mcp-config)
 # For Codex: the codex backend passes identity per-spawn via a `-c
@@ -248,44 +258,6 @@ def _inbox_lock(name: str) -> threading.Lock:
             lock = threading.Lock()
             _inbox_locks[name] = lock
         return lock
-
-
-def _load_inbox_cursors(path: Path) -> dict[str, int]:
-    """Load the per-sender counter sidecar, rejecting anything malformed.
-
-    Requires a JSON object whose keys are strings and values are non-negative
-    ints (``bool`` is excluded: ``isinstance(True, int)`` is ``True``). Any
-    corrupt or unreadable file is treated as empty and logged; this never
-    raises.
-    """
-    if not path.exists():
-        return {}
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as err:
-        logger.warning("ignoring corrupt inbox cursor file %s: %s", path, err)
-        return {}
-    if not isinstance(value, dict):
-        logger.warning("ignoring non-dict inbox cursor file %s", path)
-        return {}
-    cursors: dict[str, int] = {}
-    for key, count in value.items():
-        if (
-            isinstance(key, str)
-            and isinstance(count, int)
-            and not isinstance(count, bool)
-            and count >= 0
-        ):
-            cursors[key] = count
-    return cursors
-
-
-def _save_inbox_cursors(path: Path, cursors: dict[str, int]) -> None:
-    """Atomically persist the counter via a uniquely named temp file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(json.dumps(cursors), encoding="utf-8")
-    tmp.replace(path)  # atomic rename onto the sidecar
 
 
 def _bindings_dir() -> Path:
@@ -869,18 +841,29 @@ This file is on disk and survives MCP server restarts; this tool is cheap
 and auto-restarts the server if it had died from host idle timeout. Do not
 tight-poll this tool — use the watch recipe below instead.
 
-Recommended low-token loop: watch the marker path(s) (from spawn_agent's
-`state_marker_path`/`session_dir`/`expected_outputs`, or from
-`agent_watch_paths`) for a change, then call this tool for the delta.
+Recommended low-token loop: run `win-agent-teams watch <session-dir>`.
+The watcher ignores non-actionable churn — `running` hook transitions and
+`SubagentStop` (a worker's own internal Task subagent finishing) — and emits
+one JSON wake record: `reason="message"` for unread inbox data,
+`reason="waiting"` for a marker that settles as waiting, or `reason="output"`
+for a selected output. A waiting marker must persist for a short settle window
+(`WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`, default 1.5s) before it wakes; one that
+resumes `running` within the window is suppressed as a brief park. On a message,
+call `read_messages`; on waiting, call this tool for the status delta.
 
 - Claude Code coordinator: run the watch as a BACKGROUND command. Its
-  completion triggers a harness wake for the idle coordinator; when woken,
-  call this tool.
+  completion triggers a harness wake for the idle coordinator; branch on the
+  emitted reason as above.
 - Codex coordinator: Codex has no idle-wake, so run the watch as a BOUNDED
   FOREGROUND command within the same turn (e.g. `win-agent-teams watch
-  <session-dir> --timeout 60`, looped). On return, read the marker JSON
-  directly from disk as the primary post-change read (server-independent),
-  and treat this tool as an optional richer follow-up.
+  <session-dir> --timeout 60`, looped), then branch on its emitted reason.
+  A marker read is useful for `reason="waiting"`; `reason="message"` requires
+  `read_messages` because no state marker need have changed.
+
+Timeout exit 2 means no actionable edge settled; re-check status before
+starting the next watch because an agent may already be waiting due to the
+small status-check/watch-baseline race, or a genuine waiting edge may have
+arrived inside the final unfinished settle window.
 """.strip()
 
 
@@ -1036,29 +1019,16 @@ def _last_non_empty_line(text: str | None) -> str:
 
 def _sender_message_count(session_id: str, reader: str, sender: str) -> int:
     """Return how many valid messages ``sender`` has sent to ``reader``'s inbox."""
-    inbox = _inbox_file(session_id, reader)
-    if not inbox.exists():
-        return 0
-    count = 0
-    for raw in inbox.read_text(encoding="utf-8").splitlines():
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        try:
-            msg = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(msg, dict) and msg.get("from") == sender:
-            count += 1
-    return count
+    by_sender = read_inbox_by_sender(_inbox_file(session_id, reader))
+    return len(by_sender.get(sender, []))
 
 
 def _sender_unread_count(session_id: str, reader: str, sender: str) -> int:
     """Return ``sender``'s unread (not-yet-consumed) message count for ``reader``."""
-    total = _sender_message_count(session_id, reader, sender)
-    cursors = _load_inbox_cursors(_inbox_cursor_file(session_id, reader))
-    consumed = min(cursors.get(sender, 0), total)
-    return total - consumed
+    counts = unread_sender_counts(
+        _inbox_file(session_id, reader), _inbox_cursor_file(session_id, reader)
+    )
+    return counts.get(sender, 0)
 
 
 def _compact_check_view(
@@ -1240,13 +1210,16 @@ async def spawn_agent(
     call, so you can always re-query even after it died from host
     inactivity.
 
-    Recommended coordination pattern: do NOT tight-poll. Instead background-
-    watch ``session_dir`` (or the declared ``expected_outputs`` paths, the
-    precise-target variant) for a change, then call ``agent_status`` (or
-    ``check_agent``) once the watch reports a change. See the ``agent_status``
-    /``check_agent``/``list_agents``/``agent_watch_paths`` docstrings for the
-    full watch recipe (background watch for Claude Code coordinators,
-    bounded foreground watch for Codex coordinators).
+    Recommended coordination pattern: do NOT tight-poll. Run
+    ``win-agent-teams watch session_dir`` in the background for a Claude Code
+    coordinator (bounded foreground for Codex). It ignores non-actionable churn
+    (``running`` transitions and ``SubagentStop``) and wakes on unread inbox
+    data, a selected output, or a ``waiting`` marker that persists past a short
+    settle window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 1.5s) — a
+    marker resuming ``running`` within the window is suppressed. Branch on its
+    JSON ``reason``: call ``read_messages`` for ``message`` and
+    ``agent_status``/``check_agent`` for ``waiting``. Re-check status after
+    timeout exit 2 before mounting the next watch.
     """
 
     def _do_spawn() -> dict:
@@ -1429,26 +1402,9 @@ async def read_messages(
             # early-return here: a stored forward cursor still needs clamping
             # and persisting, otherwise a bad value would survive and could
             # later swallow a sender's first message.
-            by_sender: dict[str, list[tuple[int, dict]]] = {}
-            if inbox.exists():
-                # Group valid messages by sender in file order, tracking each
-                # message's global position so the result preserves file order.
-                for index, raw in enumerate(
-                    inbox.read_text(encoding="utf-8").splitlines()
-                ):
-                    stripped = raw.strip()
-                    if not stripped:
-                        continue
-                    try:
-                        msg = json.loads(stripped)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(msg, dict):
-                        continue
-                    sender = msg.get("from")
-                    if not isinstance(sender, str) or not sender:
-                        continue
-                    by_sender.setdefault(sender, []).append((index, msg))
+            # Group valid messages by sender in file order, tracking each
+            # message's global position so the result preserves file order.
+            by_sender = read_inbox_by_sender(inbox)
 
             # Clamp any stored count that exceeds the observed valid-message
             # count for that sender down to the observed count. This covers
@@ -1490,6 +1446,10 @@ async def read_messages(
                 for position, index, msg in per_sender_batches[sender]
             ]
             selected.sort(key=lambda item: item[2])  # global file order
+            # The pending backlog is measured before any limit clipping so a
+            # non-consuming peek (limit=0) or a clipped batch still reports the
+            # true unread count instead of just the returned batch size.
+            total_unread = len(selected)
             has_more = False
             if effective_limit is not None and len(selected) > effective_limit:
                 selected = selected[:effective_limit]
@@ -1530,7 +1490,7 @@ async def read_messages(
 
             result: dict = {
                 "messages": messages,
-                "unread_count": len(messages),
+                "unread_count": total_unread,
                 "has_more": has_more,
             }
             if from_agent:
@@ -2091,9 +2051,13 @@ async def agent_watch_paths(names: list[str] | None = None) -> list[dict]:
     (unknown names are skipped). Minimal payload, no bodies.
 
     Canonical watch recipe: background-watch (or, for a Codex coordinator,
-    bounded-foreground-watch) these ``state_marker_path`` paths — e.g. via
-    ``win-agent-teams watch <session-dir>`` — and call ``agent_status`` (or
-    ``check_agent``) once a watched path changes, rather than tight-polling.
+    bounded-foreground-watch) via ``win-agent-teams watch <session-dir>``.
+    It ignores non-actionable churn (``running`` transitions and
+    ``SubagentStop``) and emits ``reason=message`` for unread inbox data or
+    ``reason=waiting`` for a waiting marker that persists past a short settle
+    window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 1.5s). Call
+    ``read_messages`` for message and ``agent_status``/``check_agent`` for
+    waiting. Re-check status after timeout exit 2 before watching again.
     """
     session_id = _active_session_id()
 

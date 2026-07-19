@@ -5,7 +5,10 @@ import logging
 from collections.abc import Iterator
 
 from claude_teams.backends.base import Backend
-from claude_teams.backends.contracts import BackendNotRegisteredError, NoBackendsAvailableError
+from claude_teams.backends.contracts import (
+    BackendNotRegisteredError,
+    NoBackendsAvailableError,
+)
 
 logger = logging.getLogger(__name__)
 

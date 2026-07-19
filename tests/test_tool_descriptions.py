@@ -46,6 +46,11 @@ def _assert_disk_contract_note(description: str) -> None:
     assert "foreground" in description.lower()
     assert "Claude Code" in description
     assert "Codex" in description
+    assert 'reason="message"' in description
+    assert "read_messages" in description
+    assert 'reason="waiting"' in description
+    assert "exit 2" in description
+    assert "re-check" in description
 
 
 async def _registered_description(tool_name: str) -> str:

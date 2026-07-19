@@ -5,7 +5,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypedDict, runtime_checkable
 
-
 # ---------------------------------------------------------------------------
 # Backend-specific exceptions (previously in claude_teams.errors)
 # ---------------------------------------------------------------------------
@@ -15,6 +14,7 @@ class BackendNotRegisteredError(KeyError):
     """Raised when a requested backend name is not in the registry."""
 
     def __init__(self, name: str, available: Iterable[str]) -> None:
+        """Build the message from the missing name and the available backends."""
         available_str = ", ".join(sorted(available)) or "(none)"
         super().__init__(f"Backend {name!r} not found. Available: {available_str}")
 
@@ -23,13 +23,17 @@ class NoBackendsAvailableError(RuntimeError):
     """Raised when no spawner backend binaries are on PATH."""
 
     def __init__(self) -> None:
-        super().__init__("No backends available. Install at least one agentic CLI tool.")
+        """Build the fixed no-backends-available message."""
+        super().__init__(
+            "No backends available. Install at least one agentic CLI tool."
+        )
 
 
 class BackendBinaryNotFoundError(FileNotFoundError):
     """Raised when a backend's CLI binary cannot be located on PATH."""
 
     def __init__(self, binary_name: str, backend_name: str) -> None:
+        """Build the message from the binary and backend names."""
         super().__init__(
             f"Could not find {binary_name!r} on PATH. "
             f"Install {backend_name} or add it to PATH."
@@ -40,6 +44,7 @@ class InvalidEnvVarNameError(ValueError):
     """Raised when a spawn env-var key fails the safe-name pattern."""
 
     def __init__(self, key: str) -> None:
+        """Build the message from the offending env-var key."""
         super().__init__(f"Invalid environment variable name: {key!r}")
 
 
@@ -47,6 +52,7 @@ class PermissionBypassUnsupportedValueError(ValueError):
     """Raised when ``permission_mode='bypass'`` is requested without support."""
 
     def __init__(self, backend_name: str) -> None:
+        """Build the message from the backend name."""
         super().__init__(
             f"Backend {backend_name!r} does not support permission_mode='bypass'."
         )
@@ -58,6 +64,7 @@ class UnsupportedBackendModelError(ValueError):
     def __init__(
         self, generic_name: str, backend_name: str, supported: Iterable[str]
     ) -> None:
+        """Build the message from the model, backend, and supported models."""
         super().__init__(
             f"Unsupported model {generic_name!r} for {backend_name}. "
             f"Supported: {', '.join(supported)}"
