@@ -259,9 +259,7 @@ def test_maybe_cleanup_tolerates_corrupt_stamp(isolated):
 
 
 def test_message_recipient_known_agent_used_verbatim(isolated):
-    _make_session(
-        isolated.base, "s1", json.dumps([{"name": "worker", "pid": 1}])
-    )
+    _make_session(isolated.base, "s1", json.dumps([{"name": "worker", "pid": 1}]))
     recipient, warning = ss._message_recipient("worker", "s1")
     assert recipient == "worker"
     assert warning is None
@@ -286,9 +284,7 @@ def test_prune_superseded_bindings_no_dir_is_noop(isolated):
 
 
 def test_prune_superseded_bindings_skips_unreadable(isolated, monkeypatch):
-    path = _write_binding(
-        isolated.base, "deadbeef", {"session_id": "s1"}
-    )
+    path = _write_binding(isolated.base, "deadbeef", {"session_id": "s1"})
     real_read = Path.read_text
 
     def flaky_read(self, *args, **kwargs):
@@ -367,9 +363,7 @@ def test_distinct_binding_sessions_filters_foreign_and_stale(isolated):
     _make_session(isolated.base, "fresh", json.dumps([{"name": "w"}]))
     _write_binding(isolated.base, "b_fresh", _binding_meta("fresh"))
     # Foreign identity -> excluded (line 537).
-    _write_binding(
-        isolated.base, "b_foreign", _binding_meta("other", identity="nope")
-    )
+    _write_binding(isolated.base, "b_foreign", _binding_meta("other", identity="nope"))
     # Stale mtime (well beyond retention) -> excluded (line 539).
     old = time.time() - ss._RETENTION_DAYS_DEFAULT * 86400.0 - 10_000.0
     _write_binding(isolated.base, "b_stale", _binding_meta("stale"), mtime=old)

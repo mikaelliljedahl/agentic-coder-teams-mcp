@@ -1494,9 +1494,7 @@ def test_matching_jsonl_files_skips_unstattable_file(tmp_path, monkeypatch):
         return real_stat(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", flaky_stat)
-    assert ao._matching_jsonl_files(
-        directory, 0.0, pattern="rollout-*.jsonl"
-    ) == []
+    assert ao._matching_jsonl_files(directory, 0.0, pattern="rollout-*.jsonl") == []
 
 
 # ---- _codex_candidate_dirs: bad timestamp ---------------------------------
@@ -1599,29 +1597,25 @@ def test_last_claude_message_none_without_assistant(tmp_path):
 
 def test_claude_session_id_none_when_absent(tmp_path):
     path = tmp_path / "c.jsonl"
-    path.write_text("\nnot json\n[]\n{\"type\": \"user\"}\n", encoding="utf-8")
+    path.write_text('\nnot json\n[]\n{"type": "user"}\n', encoding="utf-8")
     assert _claude_session_id(path) is None
 
 
 def test_claude_session_id_oserror(tmp_path, monkeypatch):
     path = tmp_path / "c.jsonl"
-    monkeypatch.setattr(
-        Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError())
-    )
+    monkeypatch.setattr(Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError()))
     assert _claude_session_id(path) is None
 
 
 def test_claude_started_at_none_when_absent(tmp_path):
     path = tmp_path / "c.jsonl"
-    path.write_text("\nnot json\n[]\n{\"foo\": 1}\n", encoding="utf-8")
+    path.write_text('\nnot json\n[]\n{"foo": 1}\n', encoding="utf-8")
     assert _claude_started_at(path) is None
 
 
 def test_claude_started_at_oserror(tmp_path, monkeypatch):
     path = tmp_path / "c.jsonl"
-    monkeypatch.setattr(
-        Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError())
-    )
+    monkeypatch.setattr(Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError()))
     assert _claude_started_at(path) is None
 
 

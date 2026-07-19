@@ -83,7 +83,7 @@ def test_codex_agents_skips_non_dict_agents_table(tmp_path):
 def test_codex_agents_skips_non_dict_entry(tmp_path):
     cwd = tmp_path / "proj"
     # ``agents.foo`` is a string value, not a sub-table.
-    _write(cwd / ".codex" / "config.toml", "[agents]\nfoo = \"bar\"\n")
+    _write(cwd / ".codex" / "config.toml", '[agents]\nfoo = "bar"\n')
 
     assert discover_codex_style_agents(str(cwd), "codex") == []
 
@@ -93,8 +93,8 @@ def test_codex_agents_skips_entry_without_config_file(tmp_path):
     _write(
         cwd / ".codex" / "config.toml",
         # Missing config_file, empty config_file, and non-string config_file.
-        "[agents.missing]\nmodel = \"x\"\n"
-        "[agents.empty]\nconfig_file = \"\"\n"
+        '[agents.missing]\nmodel = "x"\n'
+        '[agents.empty]\nconfig_file = ""\n'
         "[agents.nonstr]\nconfig_file = 42\n",
     )
 
@@ -105,7 +105,7 @@ def test_codex_agents_yields_valid_entry(tmp_path):
     cwd = tmp_path / "proj"
     _write(
         cwd / ".codex" / "config.toml",
-        "[agents.reviewer]\nconfig_file = \"/personas/reviewer.md\"\n",
+        '[agents.reviewer]\nconfig_file = "/personas/reviewer.md"\n',
     )
 
     profiles = discover_codex_style_agents(str(cwd), "codex")
@@ -122,11 +122,11 @@ def test_codex_agents_project_overrides_home(tmp_path, monkeypatch):
 
     _write(
         home / ".codex" / "config.toml",
-        "[agents.shared]\nconfig_file = \"/home/shared.md\"\n",
+        '[agents.shared]\nconfig_file = "/home/shared.md"\n',
     )
     _write(
         cwd / ".codex" / "config.toml",
-        "[agents.shared]\nconfig_file = \"/proj/shared.md\"\n",
+        '[agents.shared]\nconfig_file = "/proj/shared.md"\n',
     )
 
     profiles = {p.name: p for p in discover_codex_style_agents(str(cwd), "codex")}
@@ -175,9 +175,7 @@ def test_goose_recipes_first_dir_wins_on_collision(tmp_path, monkeypatch):
     _write(first / "shared.yaml", "from first")
     _write(second / "shared.yaml", "from second")
 
-    monkeypatch.setenv(
-        "GOOSE_RECIPE_PATH", os.pathsep.join([str(first), str(second)])
-    )
+    monkeypatch.setenv("GOOSE_RECIPE_PATH", os.pathsep.join([str(first), str(second)]))
 
     profiles = {p.name: p for p in discover_goose_recipes("/anything")}
     # setdefault keeps the first directory's entry.
