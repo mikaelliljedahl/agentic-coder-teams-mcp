@@ -48,9 +48,7 @@ def _make_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
 @pytest.fixture
 def _direct_launch(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the direct node+cli.js launcher (no shim, no PATH dependency)."""
-    monkeypatch.setattr(
-        PiBackend, "_launcher", lambda self: ["node", "cli.js"]
-    )
+    monkeypatch.setattr(PiBackend, "_launcher", lambda self: ["node", "cli.js"])
 
 
 @pytest.fixture
@@ -151,16 +149,12 @@ class TestPiBuildCommand:
         assert "-p" not in cmd
         assert "--mode" not in cmd
 
-    def test_headless_when_no_tty(
-        self, _make_request, _direct_launch, _tty, _models
-    ):
+    def test_headless_when_no_tty(self, _make_request, _direct_launch, _tty, _models):
         _tty(False)
         cmd = PiBackend().build_command(_make_request())
         assert cmd[2:5] == ["-p", "--mode", "json"]
 
-    def test_session_binding_flags(
-        self, _make_request, _direct_launch, _tty, _models
-    ):
+    def test_session_binding_flags(self, _make_request, _direct_launch, _tty, _models):
         cmd = PiBackend().build_command(_make_request())
         assert "--session-id" in cmd
         assert cmd[cmd.index("--session-id") + 1] == "worker"
@@ -220,9 +214,7 @@ class TestPiBuildCommand:
 
 
 class TestPiBuildResume:
-    def test_resume_adds_continue(
-        self, _make_request, _direct_launch, _tty, _models
-    ):
+    def test_resume_adds_continue(self, _make_request, _direct_launch, _tty, _models):
         cmd = PiBackend().build_resume_command(_make_request(), "sid-abc")
         assert "--continue" in cmd
         assert cmd[cmd.index("--session-id") + 1] == "worker"
@@ -230,9 +222,7 @@ class TestPiBuildResume:
 
 class TestPiBuildEnv:
     def test_identity_and_state_dir(self, _make_request):
-        env = PiBackend().build_env(
-            _make_request(extra={"session_dir": r"C:\sess\S1"})
-        )
+        env = PiBackend().build_env(_make_request(extra={"session_dir": r"C:\sess\S1"}))
         assert env["AGENT_NAME"] == "worker"
         assert env["AGENT_SESSION_ID"] == "team"
         assert env["AGENT_PARENT_NAME"] == "team-lead"

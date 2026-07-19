@@ -157,9 +157,7 @@ def read_pi_output(
         return None
 
     matched = [
-        c
-        for c in candidates
-        if expected_session_id and c[2] == expected_session_id
+        c for c in candidates if expected_session_id and c[2] == expected_session_id
     ]
     mtime, path, session_id = max(matched or candidates, key=lambda item: item[0])
     message = _last_pi_message(path)

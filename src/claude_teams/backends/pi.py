@@ -34,9 +34,13 @@ _PI_PROVIDER = "openai-codex"
 # ``CommandLineToArgvW`` — the shim would route it through ``cmd.exe`` and
 # truncate a multi-line prompt at the first newline (the same class of bug the
 # Codex backend avoids by resolving ``codex.exe`` directly).
-_PI_ENTRY_REL = _LOCAL_PATH_CLS(
-    "node_modules"
-) / "@earendil-works" / "pi-coding-agent" / "dist" / "cli.js"
+_PI_ENTRY_REL = (
+    _LOCAL_PATH_CLS("node_modules")
+    / "@earendil-works"
+    / "pi-coding-agent"
+    / "dist"
+    / "cli.js"
+)
 
 # Seconds to wait for ``pi --list-models`` before giving up on live model
 # discovery and treating the model set as unknown (skip validation).
