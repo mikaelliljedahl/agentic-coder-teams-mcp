@@ -1659,23 +1659,16 @@ async def follow_up_agent(
                 return _follow_up_failure("backend_session_missing", name, status)
 
             if alive:
-                last_message = status.get("last_message")
-                if last_message is None:
-                    if changed:
-                        _save_agents_transaction(session_id, agents)
-                    return _follow_up_failure("agent_busy", name, status)
                 last_activity_at = status.get("last_activity_at")
-                if last_activity_at is None:
-                    if changed:
-                        _save_agents_transaction(session_id, agents)
-                    return _follow_up_failure("agent_state_unknown", name, status)
                 # A hook-written "waiting" marker is an authoritative idle
                 # signal: the agent has reached a wait/stop hook and is parked
-                # awaiting input, so we can resume it immediately. The
-                # inactivity-timer check below is a heuristic that exists only
-                # for when no reliable marker is available; a "waiting" marker
-                # overrides it, avoiding a needless wait for an agent we
-                # already know is idle.
+                # awaiting input, so we can resume it immediately. It is
+                # resolved FIRST, ahead of the transcript-derived checks below,
+                # which are only heuristics for when no reliable marker exists.
+                # Ordering matters: an agent parked at a Stop hook before
+                # emitting any assistant text has no ``last_message``, and
+                # checking that first reported ``agent_busy`` for precisely the
+                # case we know for certain is idle.
                 idle_by_marker = (
                     _resolve_agent_state(
                         alive=True,
@@ -1684,13 +1677,19 @@ async def follow_up_agent(
                     )
                     == "waiting"
                 )
-                if (
-                    not idle_by_marker
-                    and time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS
-                ):
-                    if changed:
-                        _save_agents_transaction(session_id, agents)
-                    return _follow_up_failure("agent_busy", name, status)
+                if not idle_by_marker:
+                    if status.get("last_message") is None:
+                        if changed:
+                            _save_agents_transaction(session_id, agents)
+                        return _follow_up_failure("agent_busy", name, status)
+                    if last_activity_at is None:
+                        if changed:
+                            _save_agents_transaction(session_id, agents)
+                        return _follow_up_failure("agent_state_unknown", name, status)
+                    if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
+                        if changed:
+                            _save_agents_transaction(session_id, agents)
+                        return _follow_up_failure("agent_busy", name, status)
                 if not replace_if_idle:
                     if changed:
                         _save_agents_transaction(session_id, agents)

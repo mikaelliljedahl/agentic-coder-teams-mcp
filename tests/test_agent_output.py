@@ -1208,6 +1208,56 @@ async def test_follow_up_agent_refuses_idle_live_agent_without_replace(
 
 
 @pytest.mark.asyncio
+async def test_follow_up_agent_waiting_marker_overrides_quiet_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``waiting`` marker beats an absent ``last_message``.
+
+    The marker is the authoritative idle signal, but the ``last_message is
+    None`` check used to run ahead of it, so an agent parked at a Stop hook
+    before producing any assistant text was reported ``agent_busy`` — the one
+    case where we know for certain it is idle.
+    """
+    backend = _FakeResumeBackend()
+    _setup_follow_up_session(tmp_path, monkeypatch, backend)
+    _write_agent_for_follow_up(tmp_path)
+    (tmp_path / "sessions" / "session-id" / "state-worker.json").write_text(
+        json.dumps({"state": "waiting", "event": "Stop", "ts": 950.0}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (True, "alive"),
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager, "owns_process", lambda handle, token: True
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "graceful_shutdown",
+        lambda handle, timeout_s=5.0: True,
+    )
+    monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(
+        server_simple,
+        "read_codex_output",
+        lambda spawned_at, cwd, **kwargs: SimpleNamespace(
+            last_activity_at=990.0,
+            last_message=None,
+            backend_session_id="backend-session-id",
+        ),
+    )
+
+    result = await server_simple.follow_up_agent("worker", "next prompt")
+
+    assert result["success"] is True, (
+        f"waiting marker must override a quiet transcript, got {result}"
+    )
+    assert backend.resume_calls, "expected a resume, not a busy refusal"
+
+
+@pytest.mark.asyncio
 async def test_follow_up_agent_replaces_idle_live_agent_when_allowed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
