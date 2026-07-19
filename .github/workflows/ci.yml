@@ -7,7 +7,35 @@ on:
   workflow_dispatch:
 
 jobs:
-  verify:
+  # Required QA gate — runs on Linux (GitHub). A PR must not merge unless this
+  # passes: linting, a clean `ty check`, and a 100%-green test suite. Make this
+  # job a required status check in the branch protection rules for `main`.
+  qa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.26"
+
+      - run: uv sync --locked --group dev
+
+      - name: Lint (format)
+        run: uv run ruff format --check .
+
+      - name: Lint (check)
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run ty check
+
+      - name: Tests
+        run: uv run pytest
+
+  # Cross-platform coverage: the suite must also pass on Windows (the primary
+  # runtime target). Not the type/lint gate — those run once, on Linux, in `qa`.
+  tests-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -16,12 +44,7 @@ jobs:
         with:
           version: "0.9.26"
 
-      - run: uv sync --group dev
+      - run: uv sync --locked --group dev
 
-      - run: uv run ruff format --check .
-
-      - run: uv run ruff check .
-
-      - run: uv run ty check
-
-      - run: uv run pytest
+      - name: Tests
+        run: uv run pytest

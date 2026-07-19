@@ -118,10 +118,10 @@ class TestBreakawayFallback:
             calls.append(creationflags)
             if len(calls) == 1:
                 err = OSError("access denied")
-                # ``winerror`` is a Windows-only OSError attribute; ty checks
-                # against the Linux stdlib where it is absent. The test
-                # deliberately simulates the Windows exception shape.
-                err.winerror = 5  # ty: ignore[unresolved-attribute]
+                # ``winerror`` is a Windows-only OSError attribute; ``setattr``
+                # simulates the Windows exception shape while staying clean for
+                # the type checker on both Linux and Windows.
+                setattr(err, "winerror", 5)  # noqa: B010
                 raise err
             return _fake_process()
 
@@ -143,7 +143,7 @@ class TestBreakawayFallback:
             calls.append(creationflags)
             err = OSError("file not found")
             # Windows-only OSError attribute; see note above.
-            err.winerror = 2  # ty: ignore[unresolved-attribute]
+            setattr(err, "winerror", 2)  # noqa: B010
             raise err
 
         monkeypatch.setattr(process_manager_mod.subprocess, "Popen", fake_popen)
