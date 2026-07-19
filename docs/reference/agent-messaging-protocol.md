@@ -2,10 +2,24 @@
 
 Reference for the `win-agent-teams` MCP server as it behaves today. Audience: an
 agent that must spawn, message, and retire other agents **without reading the
-source**. Every claim below is cited as `path:line` against this worktree.
+source**.
 
 This document describes current behavior only. It proposes nothing. Known
 defects are stated as facts in [Sharp edges](#sharp-edges).
+
+## How to read the citations
+
+**Symbol names are authoritative; line numbers are not.** Claims cite
+`path:line`, but `server_simple.py` in particular churns fast — a verification
+pass found 112 of its 113 line citations had drifted by 9–50 lines within a
+handful of merged PRs, while every named constant, function, field and value
+was still correct. Search for the named symbol rather than jumping to the
+number, and treat a line that does not contain what the claim describes as
+drift, not as a contradiction.
+
+If a **claim** turns out to be false, that is a defect in this document: fix it
+here in the same change that alters the behaviour. A reference that is trusted
+and wrong is worse than no reference.
 
 ---
 
@@ -100,6 +114,13 @@ dict-returning tool results (`src/claude_teams/server_simple.py:602-624`).
 Every tool body runs on a worker thread via `run_blocking`
 (`src/claude_teams/async_utils.py:7-21`).
 
+`_with_disk_note` appends `_DISK_CONTRACT_NOTE` — the state-marker schema and
+the `win-agent-teams watch` recipe — to the *registered* descriptions of
+`check_agent`, `list_agents`, `agent_status` and `agent_watch_paths`. That
+appended text, not the raw docstring in the source, is what a calling agent
+actually reads, so a change there changes the contract those agents see. It must
+sit below the `@mcp.tool()` decorator to take effect.
+
 ### `spawn_agent(prompt, name, backend, model, cwd, permission_mode, reasoning_effort, expected_outputs)`
 
 **Mechanically**, under the `agents.json` file lock
@@ -188,7 +209,8 @@ Mechanics per call:
 4. Advance and persist cursors (`src/claude_teams/server_simple.py:1458-1475`).
 
 **Returns** `{messages, cursors, seq, unread_count, has_more}`. Each message is
-`{from, text, ts, seq}` where `seq` is the sender's 1-based per-sender count.
+`{from, text, ts, seq}` where `seq` is the sender's 1-based per-sender count —
+plus `truncated` and `full_len` on each message when `max_chars` is set.
 `unread_count` is measured *before* limit clipping, so it is the true backlog,
 not the returned batch size (`src/claude_teams/server_simple.py:1449-1452`).
 `cursors` is the map when `from_agent` is unset; `seq` is a scalar and `cursors`
@@ -431,7 +453,7 @@ Continuity comes purely from the backend CLI's own `--resume` /
 
 ### The liveness gate
 
-Evaluated in this order (`src/claude_teams/server_simple.py:1582-1660`):
+Evaluated in this order, in `_do_follow_up`:
 
 | Order | Condition | Refusal reason |
 |-------|-----------|----------------|
@@ -439,12 +461,18 @@ Evaluated in this order (`src/claude_teams/server_simple.py:1582-1660`):
 | 2 | `name` not in `agents.json` | `agent_not_found` |
 | 3 | Backend not loadable, or `supports_resume()` false | `backend_not_supported` |
 | 4 | No `backend_session_id` known | `backend_session_missing` |
-| 5 | Alive and `last_message is None` | `agent_busy` |
-| 6 | Alive and `last_activity_at is None` | `agent_state_unknown` |
-| 7 | Alive, not idle by marker, and `output.busy_hint` | `agent_busy` |
-| 8 | Alive, not idle by marker, and last activity < 60 s ago | `agent_busy` |
-| 9 | Alive, judged idle, and `replace_if_idle=False` | `agent_idle_but_alive` |
-| 10 | `backend.resume(...)` raised | `resume_failed` |
+| — | *`idle_by_marker` resolved here; a `waiting` marker skips 5–7* | |
+| 5 | Alive, **not idle by marker**, and `last_message is None` | `agent_busy` |
+| 6 | Alive, **not idle by marker**, and `last_activity_at is None` | `agent_state_unknown` |
+| 7 | Alive, **not idle by marker**, and last activity < 60 s ago | `agent_busy` |
+| 8 | Alive, judged idle, and `replace_if_idle=False` | `agent_idle_but_alive` |
+| 9 | `backend.resume(...)` raised | `resume_failed` |
+
+Checks 5–7 all sit **behind** the marker resolution. An earlier revision of this
+document listed 5 and 6 as unconditional on `alive`, and carried an extra row for
+an `output.busy_hint` check; that field and its branch no longer exist, and the
+marker now precedes the transcript-derived checks rather than following two of
+them.
 
 Both `claude-code` and `codex` return `supports_resume() == True`
 (`src/claude_teams/backends/claude_code.py:113-115`,
@@ -452,12 +480,12 @@ Both `claude-code` and `codex` return `supports_resume() == True`
 backend binary vanished from `PATH`.
 
 **The authoritative signal is the `waiting` marker.** `idle_by_marker` is
-computed by re-running the state resolver and testing for `"waiting"`
-(`src/claude_teams/server_simple.py:1629-1636`). When it is true, checks 7 and 8
-are skipped entirely (`src/claude_teams/server_simple.py:1637`). The comment
-above it states plainly that `busy_hint` and the inactivity timer are heuristics
-that exist only for when no reliable marker is available
-(`src/claude_teams/server_simple.py:1622-1628`).
+computed by re-running `_resolve_agent_state` and testing for `"waiting"`. When
+it is true, checks 5, 6 and 7 — the entire transcript-derived heuristic block —
+are skipped. The comment above it explains why the ordering matters: an agent
+parked at a Stop hook before emitting any assistant text has no `last_message`,
+so checking that first reported `agent_busy` for precisely the case we know is
+idle.
 
 The inactivity heuristic (check 8) compares against the module constant
 `_FOLLOW_UP_IDLE_SECONDS = 60.0` **directly**
@@ -504,8 +532,9 @@ of the CLI's rollout log:
   (`src/claude_teams/agent_output.py:134-140`).
 
 `_sync_backend_session_id` persists it onto the registry record the first time
-it is observed (`src/claude_teams/server_simple.py:980-987`), and both
-`check_agent` and `follow_up_agent` write the registry back when it changes
+it is observed, and both `check_agent` and `follow_up_agent` write the registry
+back when it changes — `follow_up_agent` at every one of its refusal exits, so a
+newly discovered id is not lost when the call goes on to refuse
 (`src/claude_teams/server_simple.py:1546-1547`, `1603`).
 
 Consequence: **`follow_up_agent` fails with `backend_session_missing` until the
@@ -690,10 +719,10 @@ Facts about current behavior. No remedies are proposed here.
 ### A busy worker is reachable by neither tool
 
 `send_message` writes to a file and nothing more; the docstring states the agent
-sees it only if it calls `read_messages`
-(`src/claude_teams/server_simple.py:1314-1316`). `follow_up_agent` refuses a
-busy agent with `agent_busy`
-(`src/claude_teams/server_simple.py:1616`, `1641`, `1645`). There is therefore
+sees it only if it calls `read_messages` (its own docstring says so).
+`follow_up_agent` refuses a busy agent with `agent_busy` — two sites in
+`_do_follow_up`, the no-`last_message` check and the inactivity timer, both
+behind the marker resolution. There is therefore
 no mechanism at all — no push, no stdin write, no signal — to reach a worker
 that is mid-task and not polling. Coordination with a busy worker is possible
 only after it parks (marker `waiting`) or voluntarily polls.
@@ -733,16 +762,15 @@ The code carries this reasoning inline
 (`src/claude_teams/cli.py:277-291`). Reordering these three statements silently
 loses wake events without failing loudly.
 
-### `busy_hint` is dead code
+### The only non-marker busy heuristic is a 60-second timer
 
-`AgentOutput.busy_hint` defaults to `False`
-(`src/claude_teams/agent_output.py:42`) and **no production code path ever sets
-it to `True`** — neither `read_codex_output`
-(`src/claude_teams/agent_output.py:71-76`) nor `read_claude_output`
-(`src/claude_teams/agent_output.py:113-118`) passes the field. The
-`follow_up_agent` check at `src/claude_teams/server_simple.py:1638` can
-therefore never fire outside tests. The effective non-marker busy heuristic is
-the 60-second inactivity timer alone.
+When no `waiting` marker is available, busy/idle rests entirely on
+`_FOLLOW_UP_IDLE_SECONDS` — was there transcript activity in the last 60 s.
+There is no signal derived from what the agent is actually doing.
+
+(A vestigial `AgentOutput.busy_hint` field once suggested otherwise. It was
+never set `True` by any code path, so its branch was unreachable; both were
+removed. Any document or memory describing it is stale.)
 
 ### `WIN_AGENT_TEAMS_IDLE_SECONDS` does not affect the follow-up gate
 
