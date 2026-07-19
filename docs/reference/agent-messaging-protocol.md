@@ -75,11 +75,19 @@ fills with the spawner's `IDENTITY` (`src/claude_teams/server_simple.py:1261`).
 
 `agents.json` records no parent field. A spawned agent's record is
 `{name, pid, backend, session_id, status, spawned_at, cwd, model,
-permission_mode, reasoning_effort, create_token}`
-(`src/claude_teams/server_simple.py:1275-1289`). The only parent information
+permission_mode, reasoning_effort, create_token, correlation_id,
+prompt_transport}` (`spawn_agent._do_spawn`). The only parent information
 that exists is the `AGENT_PARENT_NAME` env var inside the child process, used to
 resolve the `"team-lead"` alias when that child sends a message
 (`src/claude_teams/server_simple.py:792-796`).
+
+`correlation_id` is **required and load-bearing**: a non-empty string, written
+at spawn and preserved through resume. Constructing or migrating a record
+without it is not a harmless omission — an absent field classifies the agent as
+`legacy`, which under R8 makes it permanently ineligible for follow-up and
+recoverable only by kill-and-respawn. `prompt_transport` records which transport
+that spawn used (`argv` or `sidecar`) and is what lets the binding ladder's
+gate 0 tell a not-yet-readable sidecar spawn from a genuinely unbindable one.
 
 **All agents in a session share one flat registry.** `AGENT_SESSION_ID` is
 propagated verbatim to every descendant, and `_active_session_id` returns it

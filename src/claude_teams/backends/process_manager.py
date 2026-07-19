@@ -95,9 +95,14 @@ def _force_kill_pid(handle: str) -> None:
     failing quietly. Keeping one implementation is what stops that drifting
     apart again.
 
-    A non-integer handle and any ``OSError`` (gone, or not ours to signal) are
-    both ignored — callers treat killing as best-effort and prove ownership
-    separately.
+    A non-integer handle is ignored on both platforms. On POSIX an ``OSError``
+    from ``os.kill`` (gone, or not ours to signal) is suppressed too. The
+    Windows branch does not suppress: ``subprocess.run`` is already
+    ``check=False``, so a failed ``taskkill`` is reported through its exit code
+    rather than raised, and an ``OSError`` there means ``taskkill.exe`` itself
+    could not be executed — a broken environment worth surfacing, not a dead
+    PID worth ignoring. Callers treat killing as best-effort and prove
+    ownership separately.
     """
     try:
         pid = int(handle)

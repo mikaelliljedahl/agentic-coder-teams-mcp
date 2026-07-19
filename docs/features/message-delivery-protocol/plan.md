@@ -201,13 +201,25 @@ Review 3 flagged that an all-history scan on every read is a performance risk:
 `agent_status` fallback, so scanning hundreds of transcripts per agent becomes
 quadratic in a long-lived project.
 
-- **Tier 1 — validate the stored binding directly.** Open the stored session's
-  transcript by id, with no mtime cutoff. This is the case the cutoff would
-  wrongly exclude, and it is a single file open, not a scan.
-- **Tier 2 — correction scan**, only when tier 1 is missing or mismatched. Keeps
-  the existing time window (`:194-210`) as a first pass, with an all-history
-  fallback if the window yields nothing. The token, not mtime, decides identity;
-  the window is only an ordering heuristic.
+- **Tier 1 — make the stored binding a cutoff-free candidate.** Open the stored
+  session's transcript by id with no mtime cutoff, so the one case the cutoff
+  would wrongly exclude is always considered. It is a single file open, not a
+  scan.
+- **Tier 2 — correction scan.** Keeps the existing time window (`:194-210`) as a
+  first pass, with an all-history fallback if the window yields nothing. The
+  token, not mtime, decides identity; the window is only an ordering heuristic.
+
+  **A tier-1 token hit does not short-circuit tier 2.** An earlier draft said
+  tier 2 ran "only when tier 1 is missing or mismatched", which contradicted
+  this section's own ambiguity test: "two token matches, one of them the stored
+  transcript → `ambiguous`" is unreachable if a stored-transcript hit returns
+  early. The test is the intent and the short-circuit was the error. Binding to
+  the stored transcript merely because its token matches is the *old* ladder's
+  "keep" behaviour — the precise trust this feature exists to remove, since a
+  second transcript claiming the same token is evidence the binding is not
+  provable, not a race to be won by whoever is checked first. Tier 1 is
+  therefore an eligibility rule, not a fast path, and its cost is repaid by the
+  validated-binding cache below: a cache hit performs no scan at all.
 - **Cache** validated bindings. Key: `{backend, normalized cwd, correlation_id,
   backend_session_id, canonical path, file identity, parsed session id,
   grammar_version}`. Invalidate on correlation/session/cwd change, path
