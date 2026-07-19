@@ -44,6 +44,7 @@ from claude_teams.messaging import (
     load_inbox_cursors as _load_inbox_cursors,
 )
 from claude_teams.messaging import (
+    purge_sender_from_inbox,
     read_inbox_by_sender,
     unread_sender_counts,
 )
@@ -1805,15 +1806,21 @@ def _cleanup_agent_artifacts(session_id: str, name: str) -> None:
     ):
         with suppress(OSError):
             path.unlink(missing_ok=True)
-    # Drop the killed agent's sender entry from the lead/parent reader cursor so
-    # its stale per-sender high-water mark cannot suppress a same-name agent's
-    # first future message.
-    reader_cursor = _inbox_cursor_file(session_id, IDENTITY)
-    cursors = _load_inbox_cursors(reader_cursor)
-    if name in cursors:
-        del cursors[name]
-        with suppress(OSError):
-            _save_inbox_cursors(reader_cursor, cursors)
+    # Wipe the killed agent's history from the lead/parent reader inbox and drop
+    # its per-sender cursor entry, so a later same-name agent starts with a clean
+    # slate. Purging the delivered messages (not just the cursor) is what keeps
+    # the lead's already-read backlog from resurfacing as unread: unread is
+    # `total_from_sender - consumed`, so deleting the cursor alone would reset
+    # `consumed` to 0 while the messages remained. Serialized against a
+    # concurrent read via the reader inbox lock.
+    with _inbox_lock(IDENTITY):
+        purge_sender_from_inbox(_inbox_file(session_id, IDENTITY), name)
+        reader_cursor = _inbox_cursor_file(session_id, IDENTITY)
+        cursors = _load_inbox_cursors(reader_cursor)
+        if name in cursors:
+            del cursors[name]
+            with suppress(OSError):
+                _save_inbox_cursors(reader_cursor, cursors)
 
 
 @mcp.tool()

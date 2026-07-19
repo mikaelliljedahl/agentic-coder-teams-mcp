@@ -1,5 +1,6 @@
 """Pure helpers for reading the disk-backed JSONL inbox protocol."""
 
+import contextlib
 import json
 import os
 import uuid
@@ -59,6 +60,45 @@ def read_inbox_by_sender(path: Path) -> dict[str, list[tuple[int, dict]]]:
             continue
         by_sender.setdefault(sender, []).append((index, message))
     return by_sender
+
+
+def purge_sender_from_inbox(inbox_path: Path, sender: str) -> None:
+    """Remove every valid message from ``sender`` in ``inbox_path`` in place.
+
+    Lines that fail to parse, are not JSON objects, or belong to another sender
+    are preserved verbatim so the surviving inbox is byte-faithful for other
+    senders. Best-effort: a missing inbox or write error is silently ignored.
+    Written atomically via a temp file + replace, matching ``save_inbox_cursors``.
+    """
+    if not inbox_path.exists():
+        return
+    try:
+        lines = inbox_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    kept: list[str] = []
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped:
+            try:
+                message = json.loads(stripped)
+            except json.JSONDecodeError:
+                message = None
+            if isinstance(message, dict) and message.get("from") == sender:
+                continue
+        kept.append(raw)
+    text = "\n".join(kept)
+    if text:
+        text += "\n"
+    tmp = inbox_path.with_name(
+        f"{inbox_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(inbox_path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
 
 
 def unread_sender_counts(inbox_path: Path, cursor_path: Path) -> dict[str, int]:

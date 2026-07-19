@@ -176,6 +176,70 @@ class TestKillCleansArtifacts:
         remaining = json.loads(lead_cursor.read_text(encoding="utf-8"))
         assert "worker" not in remaining
 
+    def test_kill_wipes_killed_agents_messages_from_reader_inbox(
+        self, session: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Killing an agent removes its already-delivered messages from the
+        lead's inbox and its cursor entry, while preserving other senders."""
+        _add_agent(session)
+        _stub_owns(monkeypatch, owned=True)
+        reader_inbox = server_simple._inbox_file(session, server_simple.IDENTITY)
+        reader_inbox.write_text(
+            "\n".join(
+                [
+                    json.dumps({"from": "worker", "text": "w1", "ts": "t"}),
+                    json.dumps({"from": "other", "text": "o1", "ts": "t"}),
+                    json.dumps({"from": "worker", "text": "w2", "ts": "t"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        reader_cursor = server_simple._inbox_cursor_file(
+            session, server_simple.IDENTITY
+        )
+        reader_cursor.write_text(
+            json.dumps({"worker": 2, "other": 0}), encoding="utf-8"
+        )
+
+        asyncio.run(server_simple.kill_agent("worker"))
+
+        by_sender = server_simple.read_inbox_by_sender(reader_inbox)
+        assert "worker" not in by_sender
+        assert [m["text"] for _, m in by_sender["other"]] == ["o1"]
+        cursors = json.loads(reader_cursor.read_text(encoding="utf-8"))
+        assert "worker" not in cursors
+        assert cursors.get("other") == 0
+
+    def test_kill_does_not_resurface_read_messages_as_unread(
+        self, session: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reported quirk: after kill, the killed agent's already-read
+        messages must not reappear as unread on the next read."""
+        _add_agent(session)
+        _stub_owns(monkeypatch, owned=True)
+        reader_inbox = server_simple._inbox_file(session, server_simple.IDENTITY)
+        reader_inbox.write_text(
+            "\n".join(
+                [
+                    json.dumps({"from": "worker", "text": "w1", "ts": "t"}),
+                    json.dumps({"from": "worker", "text": "w2", "ts": "t"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        reader_cursor = server_simple._inbox_cursor_file(
+            session, server_simple.IDENTITY
+        )
+        reader_cursor.write_text(json.dumps({"worker": 2}), encoding="utf-8")
+
+        asyncio.run(server_simple.kill_agent("worker"))
+        result = asyncio.run(server_simple.read_messages(""))
+
+        assert result["unread_count"] == 0
+        assert result["messages"] == []
+
 
 class TestNaturalDeathKeepsRecord:
     def test_dead_agent_stays_listed_and_not_removed(
