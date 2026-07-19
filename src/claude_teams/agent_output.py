@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 _MTIME_SLACK_SECONDS = 2.0
 _REVERSE_READ_CHUNK_SIZE = 64 * 1024
@@ -348,13 +348,16 @@ def _content_text(
         return content
     if not isinstance(content, list):
         return None
-    parts = [
-        item["text"]
-        for item in content
-        if isinstance(item, dict)
-        and item.get("type") == text_type
-        and isinstance(item.get("text"), str)
-    ]
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        mapping = cast("dict[str, object]", item)
+        if mapping.get("type") != text_type:
+            continue
+        text = mapping.get("text")
+        if isinstance(text, str):
+            parts.append(text)
     if not parts:
         return None
     return "".join(parts)

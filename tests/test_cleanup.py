@@ -110,7 +110,8 @@ class TestCleanupSafety:
         stamp = base.sessions / ".last-cleanup"
         stamp.write_text("0", encoding="utf-8")
         _age(bindings, 99)
-        os.utime(stamp, (time.time() - 99 * 86400,) * 2)
+        old = time.time() - 99 * 86400
+        os.utime(stamp, (old, old))
 
         ss.cleanup_old_sessions(max_age_days=30)
 

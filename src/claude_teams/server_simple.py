@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Literal, cast
 
 if os.name == "nt":
     import msvcrt
@@ -614,7 +615,7 @@ def _recovery_note() -> dict:
     return note
 
 
-def _annotate(result: object) -> object:
+def _annotate(result: dict) -> dict:
     """Merge the recovery nudge into a dict tool result (no-op otherwise)."""
     note = _recovery_note()
     if isinstance(result, dict) and note:
@@ -906,7 +907,11 @@ def _empty_agent_check(name: str, *, full: bool = False) -> dict:
 def _safe_float(value: object) -> float:
     """Coerce persisted numeric metadata to a float."""
     try:
-        return float(value or 0.0)
+        # ``value or 0.0`` is evaluated unchanged at runtime; ``cast`` only
+        # relaxes the static type so ``float`` accepts the (typed ``object``)
+        # persisted value. This preserves conversion of any float-convertible
+        # input (Decimal, Fraction, bytes, custom __float__).
+        return float(cast(Any, value or 0.0))
     except (TypeError, ValueError):
         return 0.0
 
@@ -1077,7 +1082,7 @@ def _compact_check_view(
 
 def _follow_up_failure(reason: str, name: str, status: dict | None = None) -> dict:
     """Build a structured ``follow_up_agent`` failure payload."""
-    payload = {
+    payload: dict[str, object] = {
         "success": False,
         "name": name,
         "reason": reason,
@@ -1259,7 +1264,10 @@ async def spawn_agent(
                 color="blue",
                 cwd=agent_cwd,
                 lead_session_id=IDENTITY,
-                permission_mode=permission_mode,  # type: ignore[arg-type]
+                permission_mode=cast(
+                    'Literal["default", "require_approval", "bypass"]',
+                    permission_mode,
+                ),
                 reasoning_effort=effort,
                 extra=extra,
             )
@@ -1694,7 +1702,10 @@ async def follow_up_agent(
                 color="blue",
                 cwd=agent_cwd,
                 lead_session_id=IDENTITY,
-                permission_mode=permission_mode,  # type: ignore[arg-type]
+                permission_mode=cast(
+                    'Literal["default", "require_approval", "bypass"]',
+                    permission_mode,
+                ),
                 reasoning_effort=effort,
                 extra=extra,
             )

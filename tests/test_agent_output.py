@@ -693,9 +693,7 @@ async def test_spawn_agent_persists_output_lookup_metadata(
         def resolve_launch(
             self, model: str, reasoning_effort: str | None
         ) -> tuple[str, str | None]:
-            return (
-                model if model.strip() else self.default_model()
-            ), reasoning_effort
+            return (model if model.strip() else self.default_model()), reasoning_effort
 
         def spawn(self, request: object) -> SimpleNamespace:
             return SimpleNamespace(process_handle="456")
@@ -755,9 +753,7 @@ async def test_spawn_agent_deduplicates_name_within_session(
         def resolve_launch(
             self, model: str, reasoning_effort: str | None
         ) -> tuple[str, str | None]:
-            return (
-                model if model.strip() else self.default_model()
-            ), reasoning_effort
+            return (model if model.strip() else self.default_model()), reasoning_effort
 
         def spawn(self, request: object) -> SimpleNamespace:
             self.next_pid += 1
@@ -1104,7 +1100,7 @@ class _FakeResumeBackend:
 
 
 def _write_agent_for_follow_up(tmp_path: Path, **overrides: object) -> None:
-    record = {
+    record: dict[str, object] = {
         "name": "worker",
         "pid": 123,
         "backend": "codex",

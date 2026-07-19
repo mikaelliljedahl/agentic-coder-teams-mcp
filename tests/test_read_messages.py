@@ -3,13 +3,14 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from claude_teams import server_simple
 
 
-def _read(from_agent: str = "", **kwargs: object) -> dict:
+def _read(from_agent: str = "", **kwargs: Any) -> dict:
     return asyncio.run(server_simple.read_messages(from_agent, **kwargs))
 
 

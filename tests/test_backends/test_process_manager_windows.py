@@ -118,7 +118,10 @@ class TestBreakawayFallback:
             calls.append(creationflags)
             if len(calls) == 1:
                 err = OSError("access denied")
-                err.winerror = 5
+                # ``winerror`` is a Windows-only OSError attribute; ``setattr``
+                # simulates the Windows exception shape while staying clean for
+                # the type checker on both Linux and Windows.
+                setattr(err, "winerror", 5)  # noqa: B010
                 raise err
             return _fake_process()
 
@@ -139,7 +142,8 @@ class TestBreakawayFallback:
         def fake_popen(cmd, creationflags=0, **kwargs):
             calls.append(creationflags)
             err = OSError("file not found")
-            err.winerror = 2
+            # Windows-only OSError attribute; see note above.
+            setattr(err, "winerror", 2)  # noqa: B010
             raise err
 
         monkeypatch.setattr(process_manager_mod.subprocess, "Popen", fake_popen)

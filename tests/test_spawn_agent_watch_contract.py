@@ -6,11 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from claude_teams import server_simple
+from claude_teams.backends.contracts import SpawnRequest
 
 
 class _FakeBackend:
     def __init__(self) -> None:
-        self.last_request: object = None
+        self.last_request: SpawnRequest | None = None
 
     def default_model(self) -> str:
         return "sonnet"
@@ -23,7 +24,7 @@ class _FakeBackend:
     ) -> tuple[str, str | None]:
         return (model if model.strip() else self.default_model()), reasoning_effort
 
-    def spawn(self, request: object) -> SimpleNamespace:
+    def spawn(self, request: SpawnRequest) -> SimpleNamespace:
         self.last_request = request
         return SimpleNamespace(process_handle="789")
 
@@ -112,8 +113,11 @@ async def test_spawn_agent_writes_claude_prompt_file_for_sensitive_prompt(
         / "worker.prompt.txt"
     )
     assert prompt_path.read_text(encoding="utf-8") == prompt
-    assert backend.last_request.prompt == prompt
-    assert backend.last_request.extra["prompt_file_path"] == str(prompt_path)
+    request = backend.last_request
+    assert request is not None
+    assert request.extra is not None
+    assert request.prompt == prompt
+    assert request.extra["prompt_file_path"] == str(prompt_path)
 
 
 @pytest.mark.asyncio

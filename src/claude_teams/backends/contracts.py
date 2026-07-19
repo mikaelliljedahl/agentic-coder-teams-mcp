@@ -79,9 +79,7 @@ class BackendModelUnavailableError(RuntimeError):
     installed CLI (e.g. a GPT-5.6 model requiring a newer codex or account).
     """
 
-    def __init__(
-        self, model: str, backend_name: str, available: Iterable[str]
-    ) -> None:
+    def __init__(self, model: str, backend_name: str, available: Iterable[str]) -> None:
         """Build the message from the model, backend, and available models."""
         super().__init__(
             f"Model {model!r} is not available for {backend_name} on this "
@@ -305,6 +303,14 @@ class Backend(Protocol):
 
     def spawn(self, request: SpawnRequest) -> SpawnResult:
         """Spawn a backend worker and return its process handle."""
+        ...
+
+    def resume(self, request: SpawnRequest, backend_session_id: str) -> SpawnResult:
+        """Resume a backend-native conversation as a new process.
+
+        Backends that cannot resume natively still provide this member (see
+        ``supports_resume``); callers gate on ``supports_resume`` before use.
+        """
         ...
 
     def health_check(self, handle: str) -> HealthStatus:
