@@ -85,6 +85,37 @@ def _powershell_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _force_kill_pid(handle: str) -> None:
+    """Force-kill a PID, best-effort, on both Windows and POSIX.
+
+    Shared by every process manager's ``_kill_pid``. It exists because the
+    three managers each carried their own copy and only one of them grew the
+    Windows branch: the other two called ``signal.SIGKILL`` unguarded, which
+    does not exist on Windows and would raise ``AttributeError`` rather than
+    failing quietly. Keeping one implementation is what stops that drifting
+    apart again.
+
+    A non-integer handle and any ``OSError`` (gone, or not ours to signal) are
+    both ignored — callers treat killing as best-effort and prove ownership
+    separately.
+    """
+    try:
+        pid = int(handle)
+    except ValueError:
+        return
+    if os.name == "nt":
+        taskkill = shutil.which("taskkill.exe") or "C:\\Windows\\System32\\taskkill.exe"
+        subprocess.run(  # noqa: S603 - PID is parsed as int before invocation.
+            [taskkill, "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
+
+
 def _read_windows_creation_token(pid: int) -> str | None:
     """Return a Windows process's creation FILETIME as an opaque string token.
 
@@ -728,23 +759,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
         process.terminate()
 
     def _kill_pid(self, handle: str) -> None:
-        try:
-            pid = int(handle)
-        except ValueError:
-            return
-        if os.name == "nt":
-            taskkill = (
-                shutil.which("taskkill.exe") or "C:\\Windows\\System32\\taskkill.exe"
-            )
-            subprocess.run(  # noqa: S603 - PID is parsed as int before invocation.
-                [taskkill, "/PID", str(pid), "/T", "/F"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            return
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
+        _force_kill_pid(handle)
 
     def _pid_alive(self, handle: str) -> bool:
         try:
@@ -1607,12 +1622,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
         )
 
     def _kill_pid(self, handle: str) -> None:
-        try:
-            pid = int(handle)
-        except ValueError:
-            return
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
+        _force_kill_pid(handle)
 
     def _pid_alive(self, handle: str) -> bool:
         try:
@@ -2084,12 +2094,7 @@ class LinuxTerminalProcessManager(_PidOwnershipMixin):
         return len(parts) == _PROC_STAT_SPLIT_FIELD_COUNT and parts[1].startswith("Z ")
 
     def _kill_pid(self, handle: str) -> None:
-        try:
-            pid = int(handle)
-        except ValueError:
-            return
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
+        _force_kill_pid(handle)
 
 
 def read_log_tail(path: Path, lines: int | None = None) -> str:
