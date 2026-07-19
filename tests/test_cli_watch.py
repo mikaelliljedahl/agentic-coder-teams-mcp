@@ -1,20 +1,20 @@
 """Tests for the `win-agent-teams watch` CLI helper (item 5)."""
 
+import json
 import threading
 import time
 from pathlib import Path
 
 from typer.testing import CliRunner
 
+from claude_teams import cli
 from claude_teams.cli import app
 
 runner = CliRunner()
 
 
 def test_watch_exits_2_on_timeout_with_no_change(tmp_path: Path) -> None:
-    result = runner.invoke(
-        app, ["watch", str(tmp_path), "--timeout", "1"]
-    )
+    result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "1"])
 
     assert result.exit_code == 2
 
@@ -29,9 +29,7 @@ def test_watch_exits_0_and_prints_path_when_file_created(tmp_path: Path) -> None
     thread = threading.Thread(target=_create_after_delay)
     thread.start()
     try:
-        result = runner.invoke(
-            app, ["watch", str(tmp_path), "--timeout", "5"]
-        )
+        result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "5"])
     finally:
         thread.join()
 
@@ -56,9 +54,7 @@ def test_watch_exits_0_and_prints_path_when_file_mtime_changes(tmp_path: Path) -
     thread = threading.Thread(target=_touch_after_delay)
     thread.start()
     try:
-        result = runner.invoke(
-            app, ["watch", str(tmp_path), "--timeout", "5"]
-        )
+        result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "5"])
     finally:
         thread.join()
 
@@ -86,9 +82,7 @@ def test_watch_detects_same_mtime_rewrite(tmp_path: Path) -> None:
     thread = threading.Thread(target=_rewrite_same_mtime_after_delay)
     thread.start()
     try:
-        result = runner.invoke(
-            app, ["watch", str(tmp_path), "--timeout", "5"]
-        )
+        result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "5"])
     finally:
         thread.join()
 
@@ -130,3 +124,274 @@ def test_watch_default_pattern_ignores_non_matching_files(tmp_path: Path) -> Non
     result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "1"])
 
     assert result.exit_code == 2
+
+
+def test_watch_ignores_running_transitions_until_waiting(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.02)
+    target = tmp_path / "state-worker.json"
+
+    def _transition() -> None:
+        time.sleep(0.06)
+        target.write_text('{"state":"running","event":"PreToolUse"}')
+        time.sleep(0.08)
+        target.write_text('{"state":"running","event":"PostToolUse"}')
+        time.sleep(0.08)
+        target.write_text('{"state":"waiting","event":"Stop"}')
+
+    thread = threading.Thread(target=_transition)
+    thread.start()
+    try:
+        result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "2"])
+    finally:
+        thread.join()
+
+    assert result.exit_code == 0
+    wake = json.loads(result.stdout)
+    assert wake["reason"] == "waiting"
+    assert wake["agent"] == "worker"
+    assert wake["path"].endswith("state-worker.json")
+
+
+def test_watch_running_transition_alone_times_out(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.02)
+    target = tmp_path / "state-worker.json"
+
+    def _write_running() -> None:
+        time.sleep(0.05)
+        target.write_text('{"state":"running","event":"PreToolUse"}')
+
+    thread = threading.Thread(target=_write_running)
+    thread.start()
+    try:
+        result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "0.3"])
+    finally:
+        thread.join()
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+
+
+def test_watch_preexisting_waiting_marker_is_not_a_new_edge(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.02)
+    (tmp_path / "state-worker.json").write_text('{"state":"waiting","event":"Stop"}')
+
+    result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "0.15"])
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+
+
+def test_watch_wakes_for_preexisting_unread_message(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox-team-lead.jsonl"
+    inbox.write_text(json.dumps({"from": "worker", "text": "done"}) + "\n")
+
+    result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "1"])
+
+    assert result.exit_code == 0
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1
+    wake = json.loads(lines[0])
+    assert wake == {
+        "reason": "message",
+        "from": ["worker"],
+        "path": str(inbox),
+    }
+
+
+def test_watch_does_not_wake_for_consumed_message(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.02)
+    inbox = tmp_path / "inbox-team-lead.jsonl"
+    inbox.write_text(json.dumps({"from": "worker", "text": "done"}) + "\n")
+    (tmp_path / "inbox-team-lead.pos.json").write_text('{"worker":1}')
+
+    result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "0.15"])
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+
+
+def test_watch_uses_nested_agent_identity(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_NAME", "parent-agent")
+    wrong_inbox = tmp_path / "inbox-team-lead.jsonl"
+    wrong_inbox.write_text(json.dumps({"from": "wrong", "text": "ignore"}) + "\n")
+    expected_inbox = tmp_path / "inbox-parent-agent.jsonl"
+    expected_inbox.write_text(
+        json.dumps({"from": "child", "text": "wake parent"}) + "\n"
+    )
+
+    result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "1"])
+
+    assert result.exit_code == 0
+    wake = json.loads(result.stdout)
+    assert wake["reason"] == "message"
+    assert wake["from"] == ["child"]
+    assert wake["path"] == str(expected_inbox)
+
+
+def test_watch_detects_completed_append_after_partial_line(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.02)
+    inbox = tmp_path / "inbox-team-lead.jsonl"
+
+    def _append_in_two_stages() -> None:
+        time.sleep(0.06)
+        inbox.write_text('{"from":"worker"')
+        time.sleep(0.08)
+        with inbox.open("a", encoding="utf-8") as handle:
+            handle.write(',"text":"done"}\n')
+
+    thread = threading.Thread(target=_append_in_two_stages)
+    thread.start()
+    try:
+        result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "2"])
+    finally:
+        thread.join()
+
+    assert result.exit_code == 0
+    wake = json.loads(result.stdout)
+    assert wake["reason"] == "message"
+    assert wake["from"] == ["worker"]
+
+
+def test_watch_message_reason_wins_over_waiting(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.1)
+    marker = tmp_path / "state-worker.json"
+    inbox = tmp_path / "inbox-team-lead.jsonl"
+
+    def _make_both_ready() -> None:
+        time.sleep(0.03)
+        marker.write_text('{"state":"waiting","event":"Stop"}')
+        inbox.write_text(json.dumps({"from": "worker", "text": "done"}) + "\n")
+
+    thread = threading.Thread(target=_make_both_ready)
+    thread.start()
+    try:
+        result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "2"])
+    finally:
+        thread.join()
+
+    assert result.exit_code == 0
+    wake = json.loads(result.stdout)
+    assert wake["reason"] == "message"
+
+
+def test_watch_custom_state_pattern_remains_semantic(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.02)
+    marker = tmp_path / "state-worker.json"
+
+    def _write_running() -> None:
+        time.sleep(0.05)
+        marker.write_text('{"state":"running","event":"PreToolUse"}')
+
+    thread = threading.Thread(target=_write_running)
+    thread.start()
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "watch",
+                str(tmp_path),
+                "--timeout",
+                "0.25",
+                "--pattern",
+                "state-worker.json",
+            ],
+        )
+    finally:
+        thread.join()
+
+    assert result.exit_code == 2
+
+
+def test_watch_message_wakes_during_running_marker_churn(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.05)
+    marker = tmp_path / "state-worker.json"
+    inbox = tmp_path / "inbox-team-lead.jsonl"
+
+    def _write_running_and_message() -> None:
+        time.sleep(0.03)
+        marker.write_text('{"state":"running","event":"PreToolUse"}')
+        inbox.write_text(json.dumps({"from": "worker", "text": "progress"}) + "\n")
+
+    thread = threading.Thread(target=_write_running_and_message)
+    thread.start()
+    try:
+        result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "2"])
+    finally:
+        thread.join()
+
+    assert result.exit_code == 0
+    wake = json.loads(result.stdout)
+    assert wake["reason"] == "message"
+    assert wake["from"] == ["worker"]
+
+
+def test_watch_custom_pattern_keeps_inbox_enabled_by_default(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox-team-lead.jsonl"
+    inbox.write_text(json.dumps({"from": "worker", "text": "wake"}) + "\n")
+
+    result = runner.invoke(
+        app,
+        ["watch", str(tmp_path), "--timeout", "1", "--pattern", "report.md"],
+    )
+
+    assert result.exit_code == 0
+    wake = json.loads(result.stdout)
+    assert wake["reason"] == "message"
+
+
+def test_watch_treats_corrupt_cursor_as_unread(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox-team-lead.jsonl"
+    inbox.write_text(json.dumps({"from": "worker", "text": "wake"}) + "\n")
+    (tmp_path / "inbox-team-lead.pos.json").write_text("{broken")
+
+    result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "1"])
+
+    assert result.exit_code == 0
+    wake = json.loads(result.stdout)
+    assert wake["reason"] == "message"
+    assert wake["from"] == ["worker"]
+
+
+def test_watch_no_inbox_preserves_artifact_only_behavior(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.02)
+    inbox = tmp_path / "inbox-team-lead.jsonl"
+    inbox.write_text(json.dumps({"from": "worker", "text": "ignore"}) + "\n")
+    output = tmp_path / "report.md"
+
+    def _write_output() -> None:
+        time.sleep(0.07)
+        output.write_text("done")
+
+    thread = threading.Thread(target=_write_output)
+    thread.start()
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "watch",
+                str(tmp_path),
+                "--timeout",
+                "2",
+                "--pattern",
+                "report.md",
+                "--no-inbox",
+            ],
+        )
+    finally:
+        thread.join()
+
+    assert result.exit_code == 0
+    wake = json.loads(result.stdout)
+    assert wake == {"reason": "output", "path": str(output)}

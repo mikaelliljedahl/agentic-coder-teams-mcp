@@ -242,25 +242,25 @@ State-marker environment variables:
 
 ### Coordinating without polling (the marker file bus)
 
-A coordinator cannot be *pushed* to: the harness never wakes an idle agent on
-an MCP event, and this MCP server itself may be shut down after a few minutes
-of host inactivity. What survives is the **file bus** — workers are detached
-processes and their state markers are on disk — so coordination is built on
-watching files, not on the server staying up. (The tool descriptions carry the
-same recipe, since a spawned agent only reads those, not this README.)
+A coordinator cannot be *pushed* to directly by MCP, and this MCP server itself
+may be shut down after a few minutes of host inactivity. What survives is the
+**file bus** — workers are detached processes, state markers and inboxes are on
+disk — so coordination is built on a semantic background watcher, not on the
+server staying up. (The tool descriptions carry the same recipe, since a
+spawned agent only reads those, not this README.)
 
 The loop:
 
 1. `spawn_agent(..., expected_outputs=["report.md", ...])` returns
    `state_marker_path`, `session_dir`, and echoes `expected_outputs`. Declare
    the exact files the agent is told to create so you can watch precise paths.
-2. Watch those paths / the `session_dir` for changes. The injected worker hook
-   writes `state-{name}.json` on every lifecycle transition (→ `waiting` when a
-   turn ends), independent of this server.
-3. On a change, read the marker JSON directly (works even if the server is
-   down) or call `agent_status(names)` for the delta (this auto-restarts the
-   server if it had exited). Use `agent_watch_paths(names)` to (re)discover the
-   exact marker paths if you didn't keep the `spawn_agent` return.
+2. Run `win-agent-teams watch <session_dir>`. It ignores lifecycle writes that
+   remain `running` and exits only for actionable work: unread lead inbox data,
+   a changed marker whose state is `waiting`, or a selected output change.
+3. Branch on its single JSON wake record: `reason="message"` → call
+   `read_messages`; `reason="waiting"` → call `agent_status(names)` (or read the
+   marker directly); `reason="output"` → inspect the output. Use
+   `agent_watch_paths(names)` to rediscover marker paths after recovery.
 
 Wake wiring differs by orchestrator:
 
@@ -268,15 +268,21 @@ Wake wiring differs by orchestrator:
   completion triggers the harness background-task notification, waking you.
   Then call `agent_status`. You can stay idle in between.
 - **Codex coordinator** — Codex has no idle-wake, so run a **bounded
-  foreground** watch inside the turn and read the marker from disk when it
-  returns; loop as needed.
+  foreground** watch inside the turn and branch on its JSON reason; loop as
+  needed. On timeout exit 2, re-check status before starting the next watch to
+  close the small status-check/watch-baseline race.
 
 A ready-made bounded watcher ships as a CLI (needs no MCP server):
 
 ```bash
 win-agent-teams watch <session-dir> [--timeout SECONDS] [--pattern 'state-*.json']
-# exit 0 + prints the changed path(s) on a change; exit 2 on timeout
+# exit 0 + one JSON reason (message/waiting/output); exit 2 on timeout
+# add --no-inbox when a custom pattern must remain artifact-only
 ```
+
+Inbox wake is now enabled even when `--pattern` is supplied. Existing scripts
+that used a custom pattern exclusively to await an artifact should add
+`--no-inbox` to preserve that behavior.
 
 ### Follow-up / Resume
 

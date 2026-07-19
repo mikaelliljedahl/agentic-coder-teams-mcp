@@ -249,7 +249,20 @@ class TestClaudeCodeBuildEnv:
 
         assert env["CLAUDECODE"] == "1"
         assert env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
-        assert len(env) == 2
+        assert len(env) == 5
+
+    def test_supplies_child_identity_for_nested_orchestration(self, _make_request):
+        request = _make_request(
+            name="child",
+            team_name="team-123",
+            lead_session_id="parent-agent",
+        )
+
+        env = ClaudeCodeBackend().build_env(request)
+
+        assert env["AGENT_NAME"] == "child"
+        assert env["AGENT_SESSION_ID"] == "team-123"
+        assert env["AGENT_PARENT_NAME"] == "parent-agent"
 
 
 class TestClaudeCodePermissionSupport:
@@ -293,9 +306,7 @@ class TestClaudeCodeHooksSettings:
         settings_path = tmp_path / "hooks-worker.settings.json"
         settings_path.write_text("{}", encoding="utf-8")
         backend = ClaudeCodeBackend()
-        request = _make_request(
-            extra={"hooks_settings_path": str(settings_path)}
-        )
+        request = _make_request(extra={"hooks_settings_path": str(settings_path)})
 
         cmd = backend.build_command(request)
 
@@ -309,9 +320,7 @@ class TestClaudeCodeHooksSettings:
         settings_path = tmp_path / "hooks-worker.settings.json"
         settings_path.write_text("{}", encoding="utf-8")
         backend = ClaudeCodeBackend()
-        request = _make_request(
-            extra={"hooks_settings_path": str(settings_path)}
-        )
+        request = _make_request(extra={"hooks_settings_path": str(settings_path)})
 
         cmd = backend.build_command(request)
 
@@ -335,9 +344,7 @@ class TestClaudeCodeHooksSettings:
         settings_path = tmp_path / "hooks-worker.settings.json"
         settings_path.write_text("{}", encoding="utf-8")
         backend = ClaudeCodeBackend()
-        request = _make_request(
-            extra={"hooks_settings_path": str(settings_path)}
-        )
+        request = _make_request(extra={"hooks_settings_path": str(settings_path)})
 
         cmd = backend.build_resume_command(request, "resume-session-id")
 
@@ -351,9 +358,7 @@ class TestClaudeCodeHooksSettings:
         settings_path = tmp_path / "hooks-worker.settings.json"
         settings_path.write_text("{}", encoding="utf-8")
         backend = ClaudeCodeBackend()
-        request = _make_request(
-            extra={"hooks_settings_path": str(settings_path)}
-        )
+        request = _make_request(extra={"hooks_settings_path": str(settings_path)})
 
         cmd = backend.build_resume_command(request, "resume-session-id")
 

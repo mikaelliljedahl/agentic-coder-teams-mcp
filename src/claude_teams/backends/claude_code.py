@@ -1,4 +1,5 @@
 """Claude Code backend integration."""
+
 import os
 import shutil
 from pathlib import Path
@@ -276,12 +277,15 @@ class ClaudeCodeBackend(BaseBackend):
             request: Backend-agnostic spawn parameters.
 
         Returns:
-            Dict with CLAUDECODE and CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS.
+            Claude Code settings plus the child process's orchestration identity.
 
         """
         env = {
             "CLAUDECODE": "1",
             "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+            "AGENT_NAME": request.name,
+            "AGENT_SESSION_ID": request.team_name,
+            "AGENT_PARENT_NAME": request.lead_session_id,
         }
         agent_capability = (request.extra or {}).get("agent_capability")
         if agent_capability:
