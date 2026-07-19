@@ -229,17 +229,22 @@ messages are drained. Use `limit=0` to peek.
 
 ### `check_agent(name, full=False, max_chars=200)`
 
-Reads the registry record, does a liveness check, and scans the backend rollout
-log for the agent's last assistant message
-(`src/claude_teams/server_simple.py:1540-1548`). Persists a newly discovered
-`backend_session_id` back into `agents.json` as a side effect
-(`src/claude_teams/server_simple.py:1546-1547`).
+Reads the registry record, does a liveness check, and resolves the agent's
+transcript through the binding ladder (`_resolve_agent_binding`, see
+[section 3a](#3a-transcript-binding)). Persists a newly discovered
+`backend_session_id` back into `agents.json` **only when the binding outcome is
+`bound`** (`_sync_backend_session_id`); a `pending`, `unverified`, `ambiguous`,
+`legacy` or `indeterminate` read never writes an id to the record, because
+persisting one would make every later read trust it.
 
 **Returns** `{name, state, alive, pid, backend, last_activity_at, unread_count,
-last_line, seq, truncated, full_len, heartbeat_age_s, stalled}`
-(`src/claude_teams/server_simple.py:1061-1075`). `full=True` adds
-`last_message` and `backend_session_id`
-(`src/claude_teams/server_simple.py:1550-1556`).
+last_line, seq, truncated, full_len, heartbeat_age_s, stalled, binding,
+binding_retriable}`. `full=True` adds `last_message` and `backend_session_id`.
+
+`binding` is the binding outcome for this call and `binding_retriable` says
+whether retrying could change it. `last_message` / `last_activity_at` are
+populated only for `bound` and `legacy`; the other four outcomes carry no
+transcript-derived data at all.
 
 `state` resolution precedence (`src/claude_teams/server_simple.py:154-182`):
 
@@ -316,20 +321,38 @@ recoverable_sessions}` (`src/claude_teams/server_simple.py:1882-1889`).
 ### `list_agents(full=False)`
 
 Compact rows `{name, state, alive, pid, backend, last_activity_at,
-unread_count}` (`src/claude_teams/server_simple.py:1916-1924`). `full=True`
-returns the raw registry record plus `last_line`, `truncated`, `full_len`
-(`src/claude_teams/server_simple.py:1954-1967`). Empty list when no session
+unread_count, binding}`. `full=True` returns the raw registry record plus
+`last_line`, `truncated`, `full_len`, `binding`, and
+`backend_session_id_verified`.
+
+`binding` is the binding outcome (see [section 3a](#3a-transcript-binding)),
+kept as its own field and never folded into lifecycle `state` — "this process is
+running" and "we know which transcript is its" are independent facts. In a
+compact row it is `null` when the row was answered entirely from the state
+marker and no transcript was consulted.
+
+`full=True` echoes the raw record, which includes whatever
+`backend_session_id` is stored. `backend_session_id_verified` is `true` only
+when this call actually bound that transcript, so a `legacy` record's stored id
+is never presented as if it were verified. Empty list when no session
 resolved (`src/claude_teams/server_simple.py:1945-1946`) — indistinguishable
 from a session with no agents; call `session_info()` to tell them apart.
 
 ### `agent_status(names=None)`
 
 The cheap path. Rows are exactly `{name, state, last_activity_ts, unread_count,
-seq, heartbeat_age_s, stalled}` (`src/claude_teams/server_simple.py:1990-1998`).
-Cost is one marker read + one cursor read + one liveness check per agent; a
-rollout-log scan happens **only** as a fallback when no marker exists
-(`src/claude_teams/server_simple.py:1977-1981`). Unknown names are silently
-skipped (`src/claude_teams/server_simple.py:2036-2038`).
+seq, heartbeat_age_s, stalled}`. Cost is one marker read + one cursor read + one
+liveness check per agent; a rollout-log scan happens **only** as a fallback when
+no marker exists. Unknown names are silently skipped.
+
+When that fallback runs and the binding is neither `bound` nor `legacy`, `state`
+is `"unknown"` and `last_activity_ts` is `null`: there is no activity signal
+this tool is entitled to report, and guessing `running`/`idle` from an unrelated
+transcript's mtime is exactly the bug the ladder exists to prevent. Liveness and
+an authoritative marker still win — a dead process is `"dead"`, and a
+hook-written `waiting`/`running` is a direct observation. The fallback stays
+cheap: exactly one binding resolution, never a second scan and never an
+all-history rescan layered on top of it.
 
 ### `agent_watch_paths(names=None)`
 
@@ -412,15 +435,13 @@ through to the activity heuristic (`src/claude_teams/server_simple.py:151`,
 The server does not capture agent transcripts. It reads the CLIs' own logs.
 
 - **claude-code**: `~/.claude/projects/<cwd with `\`/`:` replaced by `-`>/*.jsonl`.
-  Matched by `backend_session_id` when known, else by start time, then narrowed
-  to the transcript carrying the agent's correlation marker when one is
-  persisted (`read_claude_output`).
-- **codex**: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Matched by the
-  rollout's `session_meta` `cwd` plus start time, then narrowed the same way
-  (`read_codex_output`, `_matching_codex_rollouts`).
+- **codex**: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, scoped by the
+  rollout's `session_meta` `cwd`.
 
-Both readers fall back to the unnarrowed candidate set when no log carries the
-marker yet — e.g. the CLI has not flushed the prompt.
+Which of those files belongs to a given agent is decided by the binding ladder
+(next section), not by recency. `read_claude_output` / `read_codex_output`
+remain as the **legacy** readers — they match on start time and mtime and are
+used only for records that predate correlation ids.
 
 #### Correlation ids
 
@@ -430,9 +451,8 @@ derived from agent name + session id: a killed agent's name can be reused once
 its record is removed, so a derived token could identify two different
 conversations.
 
-`_read_agent_output` loads the persisted id and passes
-`correlation_marker_token(id)` to both readers. It is **never re-derived** when
-the record does not carry one. `classify_correlation` distinguishes:
+The id is **never re-derived** when a record does not carry one.
+`classify_correlation` distinguishes:
 
 | Record state | Classification | Meaning |
 |---|---|---|
@@ -440,9 +460,12 @@ the record does not carry one. `classify_correlation` distinguishes:
 | Present but empty/blank/wrong type | `unverified` | Corrupt. |
 | Present, non-blank string | `valid` | Bindable. |
 
-Both non-`valid` cases currently read as if no marker existed, which reproduces
-the pre-correlation behaviour. Consumers that must act differently on the two
-(notably the follow-up gate) land with the validation ladder.
+The two non-`valid` cases are deliberately **not** collapsed: absent means
+"predates correlation", malformed means "corrupt", and only the first is a
+compatibility case.
+
+The record also carries `prompt_transport` (`"argv"` or `"sidecar"`), written at
+spawn and rewritten at every resume. Gate 0 of the ladder needs it.
 
 The id survives resume: `follow_up_agent` reads it off the record, passes it
 back in `SpawnRequest.extra`, and writes it back on the updated record. Dropping
@@ -486,6 +509,7 @@ Evaluated in this order, in `_do_follow_up`:
 | 1 | No session resolved | `session_not_found` |
 | 2 | `name` not in `agents.json` | `agent_not_found` |
 | 3 | Backend not loadable, or `supports_resume()` false | `backend_not_supported` |
+| 3a | Binding outcome is not `bound` | `binding_<outcome>` |
 | 4 | No `backend_session_id` known | `backend_session_missing` |
 | — | *`idle_by_marker` resolved here; a `waiting` marker skips 5–7* | |
 | 5 | Alive, **not idle by marker**, and `last_message is None` | `agent_busy` |
@@ -519,9 +543,39 @@ The inactivity heuristic (check 8) compares against the module constant
 `WIN_AGENT_TEAMS_IDLE_SECONDS` does **not** affect this gate even though it does
 affect the `state` field reported by `check_agent` / `agent_status`.
 
-Failure payloads carry `{success: false, name, reason}` plus `alive`,
-`backend_session_id`, `last_activity_at`, and the unbounded `last_message` when
-a status was computed (`src/claude_teams/server_simple.py:1078-1094`).
+#### Gate 3a — the binding gate
+
+A follow-up starts a new process against a stored `backend_session_id`. That is
+only safe when we have positively identified which transcript belongs to this
+agent, so **every non-`bound` outcome refuses**, with reason `binding_pending`,
+`binding_unverified`, `binding_ambiguous`, `binding_legacy` or
+`binding_indeterminate`.
+
+| Outcome | `retriable` | Meaning for the caller |
+|---|---|---|
+| `pending` | `true` | Sidecar spawn whose read receipt has not landed. Retry shortly. |
+| `indeterminate` | `true` | A candidate could not be read. Retry shortly. |
+| `unverified` | `false` | No transcript can be attributed to this agent. Kill and respawn. |
+| `ambiguous` | `false` | Two transcripts carry the marker. Kill and respawn. |
+| `legacy` | `false` | Record predates correlation ids. Kill and respawn. |
+
+The `retriable` flag is the whole point of the split: a caller that retries on
+`unverified` spins forever, and one that gives up on `pending` fails a spawn
+that was about to bind normally.
+
+**`legacy` refuses, with no compatibility exception (R8).** An agent spawned
+before correlation ids existed cannot be followed up. Its stored session id may
+be exactly the wrong pinned id this mechanism exists to fix, and resuming on it
+would let a delivery nonce be confirmed in someone else's conversation and
+reported as `delivered` — the original bug with a false receipt attached. The
+only recovery is `kill_agent` followed by a fresh `spawn_agent`; the refusal's
+`detail` field says so. Read-only tools (`check_agent`, `list_agents`,
+`agent_status`) keep working against legacy records unchanged.
+
+Failure payloads carry `{success: false, name, reason, retriable}`, a `detail`
+string for the binding refusals, plus `alive`, `backend_session_id`,
+`last_activity_at`, `binding`, and the unbounded `last_message` when a status
+was computed.
 
 ### Kill-and-respawn under `replace_if_idle`
 
@@ -558,14 +612,102 @@ of the CLI's rollout log:
   (`src/claude_teams/agent_output.py:134-140`).
 
 `_sync_backend_session_id` persists it onto the registry record the first time
-it is observed, and both `check_agent` and `follow_up_agent` write the registry
-back when it changes — `follow_up_agent` at every one of its refusal exits, so a
-newly discovered id is not lost when the call goes on to refuse
-(`src/claude_teams/server_simple.py:1546-1547`, `1603`).
+it is observed **and only when the binding outcome is `bound`**, and both
+`check_agent` and `follow_up_agent` write the registry back when it changes —
+`follow_up_agent` at every one of its refusal exits, so a newly discovered id is
+not lost when the call goes on to refuse. An earlier revision of this document
+said any newly surfaced id is persisted; that is superseded, and the change is
+load-bearing: an unverified read that wrote an id would poison the record for
+every later call.
 
 Consequence: **`follow_up_agent` fails with `backend_session_missing` until the
 target CLI has flushed enough of its rollout file to be discovered.** A freshly
 spawned agent is not immediately followable-up.
+
+### 3a. Transcript binding
+
+`_resolve_agent_binding` maps an agent record to exactly one transcript, or to a
+named reason why it cannot. It returns a `BindingResult` with an `outcome` and,
+for `bound` and `legacy` only, an `output`. The other four outcomes carry no
+transcript-derived data, because there is no transcript we are entitled to
+attribute to the agent.
+
+#### The gates, in order
+
+| Gate | Condition | Outcome |
+|---|---|---|
+| 1. Metadata | `correlation_id` absent | `legacy` |
+| 1. Metadata | present but empty/blank/wrong type | `unverified` |
+| 2. Scan | any candidate could not be read | `indeterminate` |
+| 3. Count | zero matches, inside gate 0's window | `pending` |
+| 3. Count | zero matches, otherwise | `unverified` |
+| 3. Count | two or more matches | `ambiguous` |
+| 4. Session id | one match, no parseable `sessionId` | `unverified` |
+| 4. Session id | one match with an id | `bound` (re-pinning if it differs) |
+
+**Gate 0 (sidecar-pending).** For a Claude sidecar spawn, argv carries only a
+"read this file" instruction, so the correlation marker cannot appear in the
+transcript until the agent has read the file and its tool result is recorded.
+While `prompt_transport == "sidecar"`, the child is alive, and the spawn is
+inside the pending window (`DEFAULT_SIDECAR_PENDING_WINDOW_S`, 120 s), zero
+matches is `pending` rather than `unverified`. The window ends when the receipt
+appears (the marker shows up, so the count gate binds normally), the child dies,
+or the deadline passes — after which zero matches falls through to the count
+gate like any other. `pending` is **call-local**: never cached, never persisted.
+
+Gate 0 is numbered first in the design because it changes the meaning of an
+observation, but it is evaluated where zero matches is decided: it is a branch
+of the count gate, and it cannot precede the metadata gate because a `legacy`
+record has no token to scan for at all.
+
+**Gate 2 never guesses.** The scanner returns three states — present, definitely
+absent, and *could not read*. An unreadable candidate makes the whole scan
+`indeterminate`; a match count computed from a partially failed scan is not a
+count we are entitled to use. `indeterminate` is retriable; `unverified` is
+terminal.
+
+**Gate 3 has no max-mtime fallback.** The token decides identity, never
+recency. Two Claude sessions in one project directory, with the foreign one more
+recently written, must still resolve to the agent's own transcript — that is the
+core bug this ladder exists to fix.
+
+#### Candidate enumeration
+
+Two tiers, so a correct binding does not cost an all-history scan on every read
+(`_resolve_agent_binding` is reached by `check_agent`, both `list_agents` forms,
+and the `agent_status` fallback):
+
+- **Tier 1** resolves the stored `backend_session_id` to a concrete path with
+  **no mtime cutoff**, so a long-running session older than the window is still
+  revalidated. This is not an existing primitive: Claude names transcripts after
+  the session id but that is a convention, so the resolver tries the direct name
+  first and falls back to parsing `sessionId`; Codex matches the `session_meta`
+  `payload.id`.
+- **Tier 2** is the correction scan: the existing mtime window first, then all
+  history if the window yields nothing.
+
+The tier-1 path **joins** the candidate set rather than short-circuiting it. A
+tier-1 hit alone cannot answer the count gate, because a second transcript may
+also carry the marker — and that is `ambiguous`, not a licence to keep the
+stored binding.
+
+#### The validated-binding cache
+
+Successful bindings are cached in memory, keyed by `{backend, normalized cwd,
+correlation_id, stored backend session id}`. Only `bound` is ever cached;
+`pending`, `unverified`, `ambiguous` and `indeterminate` never are.
+
+Each entry stores the canonical path, an OS file identity (`st_dev`, `st_ino`),
+the size, a fixed-length header hash, the parsed session id, and
+`BINDING_GRAMMAR_VERSION`. An entry is discarded when the path disappears, the
+file identity changes, the file shrinks (truncation), the header hash changes
+(replacement), the parsed session id no longer matches, or the grammar version
+differs — so an entry written by older code is never trusted. **Appends do not
+invalidate**: the header length is frozen at the size seen when the entry was
+written, so growth leaves the hash untouched.
+
+`(mtime_ns, size)` alone — the watcher's change detector — is deliberately not
+used here. It detects change; it is not collision-proof identity.
 
 ### Prompt materialization and transport (claude-code)
 

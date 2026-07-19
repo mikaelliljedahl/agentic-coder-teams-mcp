@@ -32,13 +32,15 @@ from fastmcp import FastMCP
 
 from claude_teams import hooks
 from claude_teams.agent_output import (
+    BINDING_LEGACY,
     CORRELATION_FIELD,
+    PROMPT_TRANSPORT_FIELD,
+    PROMPT_TRANSPORT_SIDECAR,
+    BindingResult,
     classify_correlation,
     correlated_prompt,
-    correlation_marker_token,
     new_correlation_id,
-    read_claude_output,
-    read_codex_output,
+    resolve_agent_binding,
 )
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends.contracts import SpawnRequest
@@ -967,38 +969,14 @@ def _stored_backend_session_id(agent: dict) -> str | None:
     return None
 
 
-def _read_agent_output(agent: dict):
-    """Read fallback output for an agent record."""
-    backend = agent.get("backend")
-    spawned_at = _safe_float(agent.get("spawned_at"))
-    cwd = str(agent.get("cwd") or "")
-    if spawned_at <= 0 or not cwd:
-        return None
-    backend_session_id = _stored_backend_session_id(agent)
-    # A2: ``status`` distinguishes ``legacy`` (record predates correlation) from
-    # ``unverified`` (correlation field present but corrupt). Both currently
-    # yield ``None`` here, which reproduces the pre-correlation read behaviour;
-    # the consumers that must act differently on the two land with A2/A6. The
-    # id is never re-derived when absent.
-    _status, correlation_id = classify_correlation(agent)
-    correlation_token = (
-        correlation_marker_token(correlation_id) if correlation_id else None
-    )
-    if backend == "codex":
-        return read_codex_output(
-            spawned_at,
-            cwd,
-            backend_session_id=backend_session_id,
-            correlation_token=correlation_token,
-        )
-    if backend == "claude-code":
-        return read_claude_output(
-            spawned_at,
-            cwd,
-            backend_session_id=backend_session_id,
-            correlation_token=correlation_token,
-        )
-    return None
+def _resolve_agent_binding(agent: dict) -> BindingResult:
+    """Resolve an agent record to its transcript via the A2 validation ladder.
+
+    ``child_alive`` is passed lazily: liveness is only consulted by gate 0
+    (the sidecar-pending branch of the count gate), so the common path never
+    pays for a process probe.
+    """
+    return resolve_agent_binding(agent, child_alive=lambda: _agent_alive(agent))
 
 
 def _agent_create_token(agent: dict) -> str | None:
@@ -1036,9 +1014,16 @@ def _agent_alive(agent: dict) -> bool:
     return alive
 
 
-def _sync_backend_session_id(agent: dict, output) -> bool:
-    """Persist a newly discovered backend session id onto an agent record."""
-    if output is None or not output.backend_session_id:
+def _sync_backend_session_id(agent: dict, binding: BindingResult) -> bool:
+    """Persist a newly discovered backend session id onto an agent record.
+
+    Only a **bound** binding may write to the record. An ``unverified`` or
+    ``pending`` read has not identified a transcript we are entitled to
+    attribute to this agent, and persisting an id from one would poison the
+    record permanently — every later read would then trust it.
+    """
+    output = binding.output
+    if not binding.bound or output is None or not output.backend_session_id:
         return False
     if agent.get("backend_session_id") == output.backend_session_id:
         return False
@@ -1046,22 +1031,26 @@ def _sync_backend_session_id(agent: dict, output) -> bool:
     return True
 
 
-def _agent_check_payload(name: str, agent: dict, alive: bool, output) -> dict:
+def _agent_check_payload(
+    name: str, agent: dict, alive: bool, binding: BindingResult
+) -> dict:
     """Build the rich INTERNAL check payload for an existing agent record.
 
     Consumed by ``follow_up_agent``/``_follow_up_failure`` (which need the
     unbounded ``last_message`` to decide busy/idle) and projected down to the
     compact public ``check_agent`` shape by ``_compact_check_view``.
     """
-    backend_session_id = _stored_backend_session_id(agent)
+    output = binding.output
     return {
         "name": name,
         "alive": alive,
         "pid": agent["pid"],
         "backend": agent.get("backend"),
-        "backend_session_id": backend_session_id,
+        "backend_session_id": _stored_backend_session_id(agent),
         "last_activity_at": output.last_activity_at if output else None,
         "last_message": output.last_message if output else None,
+        "binding": binding.outcome,
+        "binding_retriable": binding.retriable,
     }
 
 
@@ -1131,16 +1120,28 @@ def _compact_check_view(
         "full_len": full_len,
         "heartbeat_age_s": heartbeat_age_s,
         "stalled": stalled,
+        "binding": internal.get("binding"),
+        "binding_retriable": internal.get("binding_retriable"),
     }
 
 
-def _follow_up_failure(reason: str, name: str, status: dict | None = None) -> dict:
+def _follow_up_failure(
+    reason: str,
+    name: str,
+    status: dict | None = None,
+    *,
+    retriable: bool = False,
+    detail: str = "",
+) -> dict:
     """Build a structured ``follow_up_agent`` failure payload."""
     payload: dict[str, object] = {
         "success": False,
         "name": name,
         "reason": reason,
+        "retriable": retriable,
     }
+    if detail:
+        payload["detail"] = detail
     if status:
         payload.update(
             {
@@ -1148,9 +1149,43 @@ def _follow_up_failure(reason: str, name: str, status: dict | None = None) -> di
                 "backend_session_id": status.get("backend_session_id"),
                 "last_activity_at": status.get("last_activity_at"),
                 "last_message": status.get("last_message"),
+                "binding": status.get("binding"),
             }
         )
     return payload
+
+
+#: Why each non-``bound`` binding outcome blocks a follow-up, and what the
+#: caller should do about it. ``legacy`` names kill-and-respawn because R8
+#: allows no compatibility exception: a legacy stored id may be exactly the
+#: wrong pinned id this feature exists to fix, and resuming on it would let a
+#: nonce be confirmed in the wrong conversation and reported as delivered.
+_BINDING_REFUSAL_DETAIL = {
+    "pending": (
+        "The agent was launched with a prompt sidecar and has not yet recorded "
+        "reading it, so its transcript cannot be identified yet. Retry shortly."
+    ),
+    "unverified": (
+        "No transcript could be confidently attributed to this agent, so a "
+        "follow-up cannot be confirmed as delivered. Do not retry; kill the "
+        "agent and respawn it if you need to continue the work."
+    ),
+    "ambiguous": (
+        "More than one transcript carries this agent's correlation marker, so "
+        "resuming could continue the wrong conversation. Kill and respawn."
+    ),
+    "legacy": (
+        "This agent predates correlation ids, so its stored session id cannot "
+        "be verified and a follow-up could be delivered into the wrong "
+        "conversation. Kill the agent and respawn it (kill_agent then "
+        "spawn_agent); there is no way to make an existing legacy agent "
+        "resumable."
+    ),
+    "indeterminate": (
+        "A candidate transcript could not be read, so the binding is unknown "
+        "rather than absent. Retry shortly."
+    ),
+}
 
 
 def _create_session() -> str:
@@ -1242,6 +1277,17 @@ def _correlation_extra(correlation_id: str | None) -> dict[str, str]:
     rather than filled with an invented id.
     """
     return {CORRELATION_FIELD: correlation_id} if correlation_id else {}
+
+
+def _prompt_transport(prompt_extra: dict[str, str]) -> str:
+    """Return the transport that carried the final prompt, for the record.
+
+    Gate 0 of the binding ladder needs this: a sidecar launch cannot show its
+    correlation marker in the transcript until the agent has read the file, so
+    zero token matches means "not yet" rather than "never". An argv launch
+    carries the marker directly and gets no such grace period.
+    """
+    return PROMPT_TRANSPORT_SIDECAR if prompt_extra.get("prompt_file_path") else "argv"
 
 
 def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str, str]:
@@ -1399,6 +1445,7 @@ async def spawn_agent(
                     "reasoning_effort": effort,
                     "create_token": create_token,
                     CORRELATION_FIELD: correlation_id,
+                    PROMPT_TRANSPORT_FIELD: _prompt_transport(prompt_extra),
                 }
             )
             _save_agents_transaction(session_id, agents)
@@ -1660,10 +1707,10 @@ async def check_agent(
             if agent is None:
                 return _empty_agent_check(name, full=full)
             alive = _agent_alive(agent)
-            output = _read_agent_output(agent)
-            if _sync_backend_session_id(agent, output):
+            binding = _resolve_agent_binding(agent)
+            if _sync_backend_session_id(agent, binding):
                 _save_agents_transaction(session_id, agents)
-            internal = _agent_check_payload(name, agent, alive, output)
+            internal = _agent_check_payload(name, agent, alive, binding)
             view = _compact_check_view(session_id, name, internal, max_chars=max_chars)
             if full:
                 view.update(
@@ -1717,14 +1764,41 @@ async def follow_up_agent(
 
             pid = agent["pid"]
             alive = _agent_alive(agent)
-            output = _read_agent_output(agent)
-            changed = _sync_backend_session_id(agent, output)
-            status = _agent_check_payload(name, agent, alive, output)
-            backend_session_id = status.get("backend_session_id")
-            if not backend_session_id:
+            binding = _resolve_agent_binding(agent)
+            changed = _sync_backend_session_id(agent, binding)
+            status = _agent_check_payload(name, agent, alive, binding)
+
+            def _refuse(
+                reason: str, *, retriable: bool = False, detail: str = ""
+            ) -> dict:
+                """Flush any newly bound session id, then refuse.
+
+                Every refusal below shares this: a session id discovered by
+                this call is still worth persisting even though the follow-up
+                itself is not proceeding.
+                """
                 if changed:
                     _save_agents_transaction(session_id, agents)
-                return _follow_up_failure("backend_session_missing", name, status)
+                return _follow_up_failure(
+                    reason, name, status, retriable=retriable, detail=detail
+                )
+
+            # A2/A6/R8: a follow-up is only safe against a transcript we have
+            # positively identified. Every other outcome refuses, including
+            # ``legacy`` — resuming on an unverifiable stored id is precisely
+            # how a nonce gets confirmed in the wrong conversation and reported
+            # as delivered. ``pending`` and ``indeterminate`` are retriable;
+            # the other three are terminal for this agent.
+            if not binding.bound:
+                return _refuse(
+                    f"binding_{binding.outcome}",
+                    retriable=binding.retriable,
+                    detail=_BINDING_REFUSAL_DETAIL.get(binding.outcome, ""),
+                )
+
+            backend_session_id = status.get("backend_session_id")
+            if not backend_session_id:
+                return _refuse("backend_session_missing")
 
             if alive:
                 last_activity_at = status.get("last_activity_at")
@@ -1747,21 +1821,13 @@ async def follow_up_agent(
                 )
                 if not idle_by_marker:
                     if status.get("last_message") is None:
-                        if changed:
-                            _save_agents_transaction(session_id, agents)
-                        return _follow_up_failure("agent_busy", name, status)
+                        return _refuse("agent_busy")
                     if last_activity_at is None:
-                        if changed:
-                            _save_agents_transaction(session_id, agents)
-                        return _follow_up_failure("agent_state_unknown", name, status)
+                        return _refuse("agent_state_unknown")
                     if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
-                        if changed:
-                            _save_agents_transaction(session_id, agents)
-                        return _follow_up_failure("agent_busy", name, status)
+                        return _refuse("agent_busy")
                 if not replace_if_idle:
-                    if changed:
-                        _save_agents_transaction(session_id, agents)
-                    return _follow_up_failure("agent_idle_but_alive", name, status)
+                    return _refuse("agent_idle_but_alive")
 
                 # Fail closed: only shut down / kill the PID when we can prove
                 # it is still OUR process (in-memory ownership or a matching
@@ -1829,9 +1895,7 @@ async def follow_up_agent(
                 result = backend.resume(request, str(backend_session_id))
             except Exception:
                 logger.debug("Failed resuming backend session", exc_info=True)
-                if changed:
-                    _save_agents_transaction(session_id, agents)
-                return _follow_up_failure("resume_failed", name, status)
+                return _refuse("resume_failed")
 
             new_pid = int(result.process_handle)
             new_create_token = process_manager.creation_token(str(new_pid))
@@ -1851,6 +1915,10 @@ async def follow_up_agent(
                     # Explicit even though ``update`` would preserve it: the
                     # id surviving resume is the property R8 depends on.
                     **_correlation_extra(correlation_id),
+                    # The resume prompt may take a different transport than
+                    # the spawn prompt did, and gate 0's grace period restarts
+                    # from this attempt.
+                    PROMPT_TRANSPORT_FIELD: _prompt_transport(prompt_extra),
                 }
             )
             _save_agents_transaction(session_id, agents)
@@ -2041,8 +2109,15 @@ def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:
     name = str(agent.get("name") or "")
     marker = _read_state_marker(session_id, name)
     last_activity_at = _marker_timestamp(marker)
+    # The binding is resolved only on the transcript-fallback path. A compact
+    # row answered entirely from the state marker must not pay for a scan,
+    # which is the whole point of the marker; ``binding`` is then ``None``,
+    # meaning "not evaluated on this call" rather than any binding outcome.
+    binding_outcome: str | None = None
     if last_activity_at is None:
-        output = _read_agent_output(agent)
+        binding = _resolve_agent_binding(agent)
+        binding_outcome = binding.outcome
+        output = binding.output
         last_activity_at = output.last_activity_at if output else None
     state = _resolve_agent_state(
         alive=alive, marker=marker, last_activity_at=last_activity_at
@@ -2056,6 +2131,10 @@ def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:
         "backend": agent.get("backend"),
         "last_activity_at": last_activity_at,
         "unread_count": unread_count,
+        # Binding outcome is its own field, never folded into lifecycle
+        # ``state``: "this process is running" and "we know which transcript
+        # is its" are independent facts.
+        "binding": binding_outcome,
     }
 
 
@@ -2086,7 +2165,8 @@ async def list_agents(full: bool = False) -> list[dict]:
             if not full:
                 result.append(_list_agents_row(session_id, agent, alive))
                 continue
-            output = _read_agent_output(agent)
+            binding = _resolve_agent_binding(agent)
+            output = binding.output
             last_line, truncated, full_len = _truncate(
                 _last_non_empty_line(output.last_message if output else None),
                 _DEFAULT_LAST_LINE_MAX_CHARS,
@@ -2098,6 +2178,10 @@ async def list_agents(full: bool = False) -> list[dict]:
                     "last_line": last_line,
                     "truncated": truncated,
                     "full_len": full_len,
+                    "binding": binding.outcome,
+                    # The raw record's ``backend_session_id`` is echoed here,
+                    # so it must never read as verified unless it actually is.
+                    "backend_session_id_verified": binding.bound,
                 }
             )
         return result
@@ -2111,12 +2195,25 @@ def _agent_status_row(session_id: str, agent: dict) -> dict:
     alive = _agent_alive(agent)
     marker = _read_state_marker(session_id, name)
     last_activity_ts = _marker_timestamp(marker)
+    unbound = False
     if last_activity_ts is None:
-        output = _read_agent_output(agent)
+        # No marker timestamp: fall back to the transcript, but stay cheap.
+        # This is exactly one binding resolution — no second scan and no
+        # all-history rescan layered on top of it.
+        binding = _resolve_agent_binding(agent)
+        output = binding.output
         last_activity_ts = output.last_activity_at if output else None
+        unbound = not binding.bound and binding.outcome != BINDING_LEGACY
     state = _resolve_agent_state(
         alive=alive, marker=marker, last_activity_at=last_activity_ts
     )
+    # When the fallback produced no trustworthy binding there is no activity
+    # signal we are entitled to report, so say ``unknown`` rather than guess
+    # ``running``/``idle`` from someone else's mtime. Liveness and an
+    # authoritative marker still win: a dead process is dead, and a hook-written
+    # ``waiting``/``running`` is a direct observation, not an inference.
+    if unbound and alive and state not in _VALID_MARKER_STATES:
+        state = "unknown"
     seq = _sender_message_count(session_id, IDENTITY, name)
     unread_count = _sender_unread_count(session_id, IDENTITY, name)
     heartbeat_age_s, stalled = _heartbeat_fields(

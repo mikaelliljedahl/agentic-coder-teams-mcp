@@ -7,6 +7,23 @@ from pathlib import Path
 import pytest
 
 from claude_teams import server_simple
+from claude_teams.agent_output import (
+    BINDING_BOUND,
+    BINDING_LEGACY,
+    AgentOutput,
+    BindingResult,
+)
+
+
+def _binding(output: AgentOutput | None = None, outcome: str | None = None):
+    """Pin ``_resolve_agent_binding`` to a fixed A2 outcome for a consumer test.
+
+    Defaults to ``bound`` when an output is supplied and ``legacy`` when it is
+    not — ``legacy`` is the outcome whose consumer behaviour is unchanged from
+    before the validation ladder, so pre-ladder expectations still hold.
+    """
+    resolved = outcome or (BINDING_BOUND if output is not None else BINDING_LEGACY)
+    return lambda agent: BindingResult(resolved, output)
 
 
 @pytest.fixture
@@ -161,7 +178,7 @@ class TestAgentStatusStallFields:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
+        monkeypatch.setattr(server_simple, "_resolve_agent_binding", _binding(None))
 
         result = asyncio.run(server_simple.agent_status(names=["worker"]))
 

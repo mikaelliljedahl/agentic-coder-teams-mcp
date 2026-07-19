@@ -152,15 +152,21 @@ def test_safe_float_bad_values():
     assert ss._safe_float("3.5") == 3.5
 
 
-def test_read_agent_output_unknown_backend_returns_none():
+def test_resolve_agent_binding_unknown_backend_is_unverified():
     agent = {
         "backend": "mystery",
         "spawned_at": 1.0,
         "cwd": "/some/where",
         "name": "a",
         "session_id": "s",
+        "correlation_id": "corr-1",
     }
-    assert ss._read_agent_output(agent) is None
+    binding = ss._resolve_agent_binding(agent)
+    # No binder exists for an unknown backend, so nothing can be verified --
+    # and "cannot verify" is terminal, not retriable.
+    assert binding.outcome == "unverified"
+    assert binding.output is None
+    assert binding.retriable is False
 
 
 def test_last_non_empty_line_all_blank():

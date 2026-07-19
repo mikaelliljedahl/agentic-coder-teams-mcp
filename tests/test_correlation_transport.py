@@ -300,6 +300,51 @@ async def test_codex_spawn_prompt_is_not_marked_by_the_server(
 # --------------------------------------------------------------------------
 
 
+def _write_marked_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record: dict,
+    correlation_id: str,
+    *,
+    session_id: str,
+) -> None:
+    """Write a Claude transcript carrying ``correlation_id``'s marker."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    encoded = re.sub(r"[\\/:]", "-", str(Path(record["cwd"]).resolve()))
+    project_dir = tmp_path / ".claude" / "projects" / encoded
+    project_dir.mkdir(parents=True, exist_ok=True)
+    stamp = (
+        datetime.fromtimestamp(float(record["spawned_at"]) + 5, tz=UTC)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    rows = [
+        {
+            "type": "user",
+            "timestamp": stamp,
+            "sessionId": session_id,
+            "message": {
+                "role": "user",
+                "content": f"task {correlation_marker_token(correlation_id)}",
+            },
+        },
+        {
+            "type": "assistant",
+            "timestamp": stamp,
+            "sessionId": session_id,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        },
+    ]
+    path = project_dir / f"{session_id}.jsonl"
+    body = "\n".join(json.dumps(row) for row in rows) + "\n"
+    path.write_text(body, encoding="utf-8")
+    mtime = float(record["spawned_at"]) + 10
+    os.utime(path, (mtime, mtime))
+
+
 @pytest.mark.asyncio
 async def test_correlation_id_survives_spawn_restart_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -311,16 +356,19 @@ async def test_correlation_id_survives_spawn_restart_read(
     correlation_id = _record(result["session_id"])["correlation_id"]
 
     # Simulate a restart: re-read the record from disk and go through the
-    # read path, which must pass the persisted id to the reader.
-    seen: dict[str, object] = {}
-    monkeypatch.setattr(
-        server_simple,
-        "read_claude_output",
-        lambda *args, **kwargs: seen.update(kwargs) or None,
+    # read path, which must recover the binding from the persisted id alone.
+    # A2 moved the scan into the ladder, so the observable is the binding
+    # itself rather than an argument handed to the reader.
+    record = _record(result["session_id"])
+    _write_marked_transcript(
+        tmp_path, monkeypatch, record, correlation_id, session_id="restarted-session"
     )
-    server_simple._read_agent_output(_record(result["session_id"]))
 
-    assert seen["correlation_token"] == correlation_marker_token(correlation_id)
+    binding = server_simple._resolve_agent_binding(record)
+
+    assert binding.outcome == ao.BINDING_BOUND
+    assert binding.output is not None
+    assert binding.output.backend_session_id == "restarted-session"
 
 
 def test_absent_correlation_field_is_legacy_and_never_rederived() -> None:
@@ -349,16 +397,17 @@ def test_valid_correlation_field_is_valid() -> None:
     assert correlation_id == "abc123"
 
 
-def test_legacy_record_passes_no_correlation_token_to_the_reader(
+def test_legacy_record_reads_without_a_correlation_token(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     seen: dict[str, object] = {}
     monkeypatch.setattr(
-        server_simple,
+        ao,
         "read_codex_output",
         lambda *args, **kwargs: seen.update(kwargs) or None,
     )
-    server_simple._read_agent_output(
+
+    binding = server_simple._resolve_agent_binding(
         {
             "name": "worker",
             "session_id": "sess",
@@ -368,7 +417,10 @@ def test_legacy_record_passes_no_correlation_token_to_the_reader(
         }
     )
 
-    assert seen["correlation_token"] is None
+    # No id was ever issued for this record, so none is invented: the ladder
+    # stops at the metadata gate and falls back to the un-correlated reader.
+    assert binding.outcome == ao.BINDING_LEGACY
+    assert "correlation_token" not in seen
 
 
 @pytest.mark.asyncio

@@ -26,28 +26,19 @@ Living handoff document. Update it as work lands; it is the source of truth for
 | `docs:` | synced watch-command return fields after `8e5aa32`. |
 | `docs:` | folded PR #30 (kill purges inbox + cursor) into B1 and B4. |
 | `docs:` | fixed 7 reference claims invalidated by Phase 0 and A7. |
+| `feat:` | **A1b/A1** — per-spawn correlation id, server-owned prompt materialization. |
+| `refactor:` | shared Windows-aware force-kill helper (clears the old `ty` red). |
+| `feat:` | **A2 + A6** — the validation ladder and all five consumer decisions. |
 
 ## Next, in dependency order
 
 **Phase A (remaining).** Everything reads the correlation id, so A1b is first.
 
-1. **A1b** — per-spawn correlation id: generate before `backend.spawn`, persist
-   on the agent record, preserve through resume/CAS, carry via
-   `SpawnRequest.extra`, make Codex's `_correlated_prompt` consume it instead of
-   deriving its own (prevents double markers), load it in `_read_agent_output`.
-2. **A1** — server owns final prompt materialization. Sensitivity test on the
-   *user prompt only*, then append the marker: single-line on argv,
-   newline-delimited in the sidecar. Ordering is load-bearing — reversing it
-   routes every Claude spawn through a file read.
-3. **A2** — four sequential gates (metadata → scan → count → session-id) plus
-   gate 0 for sidecar-pending. Two-tier enumeration + validated-binding cache.
-   Legacy records **refuse** follow-up.
-4. **A3 / A4 / A4b** — child liveness as early-failure only; nonce confirmation
+1. **A3 / A4 / A4b** — child liveness as early-failure only; nonce confirmation
    against named receipt records; per-target operation lease with
    `holder_create_token` fencing, atomic temp+replace storage, refuse-on-kill
    with a CLI operator escape.
-5. **A5 / A6** — unique prompt files with lifecycle rules; explicit consumer
-   decisions for all **five** binding outcomes.
+2. **A5** — unique prompt files with lifecycle rules.
 
 **Then** C1+C2 (direction guard — deliberately ahead of Phase B), then Phase B,
 then C3+C4.
@@ -63,11 +54,8 @@ uv run pytest
 
 There is no `.venv` in a fresh worktree; `uv sync` first.
 
-**Known pre-existing red:** `ty check` reports 2 diagnostics for
-`signal.SIGKILL`, which does not exist on Windows. Present on clean `main` too.
-Reported, deliberately not silently fixed — it needs a decision on whether that
-gate is meant to pass on Windows at all. **Do not describe the repo as green
-while this stands.**
+All four gates are **green** as of the A2/A6 commit (691 passed, 1 skipped). The
+old `signal.SIGKILL` `ty` red was fixed by the shared force-kill helper.
 
 ## Working rules learned the hard way
 
@@ -102,6 +90,18 @@ while this stands.**
   cannot be followed up and must be killed and respawned. Accepted cost; the
   alternative lets a nonce be confirmed in the wrong conversation and reported
   as `delivered` — the original bug with a false receipt attached.
+- **A2's tier 1 does not short-circuit the count gate.** The plan reads as
+  though a tier-1 token hit binds immediately, but the plan's own test requires
+  `ambiguous` when two transcripts carry the marker and one of them is the
+  stored one. The stored transcript therefore joins the candidate set as an
+  extra, cutoff-free candidate rather than returning early. Steady-state cost is
+  covered by the validated-binding cache, which does no scan at all on a hit.
+- **A2's gate 0 is evaluated inside the count gate.** It is numbered 0 because
+  it changes the meaning of an observation, but it only ever reinterprets *zero
+  matches*, and it cannot precede the metadata gate: a `legacy` record has no
+  token to scan for.
+- **`agent_status` keeps liveness precedence over `state="unknown"`.** A dead
+  process still reports `dead`; `unknown` replaces only the mtime-recency guess.
 - **Guaranteed-path messages never enter the actionable inbox.** They go to a
   separate audit store. Since PR #30, kill purges a sender's inbox messages
   entirely, so an inbox-resident audit record would be destroyed by killing the

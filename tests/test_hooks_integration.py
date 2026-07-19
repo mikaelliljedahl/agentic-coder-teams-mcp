@@ -10,7 +10,24 @@ from types import SimpleNamespace
 import pytest
 
 from claude_teams import hooks, server_simple
+from claude_teams.agent_output import (
+    BINDING_BOUND,
+    BINDING_LEGACY,
+    AgentOutput,
+    BindingResult,
+)
 from claude_teams.backends.contracts import SpawnRequest
+
+
+def _binding(output: AgentOutput | None = None, outcome: str | None = None):
+    """Pin ``_resolve_agent_binding`` to a fixed A2 outcome for a consumer test.
+
+    Defaults to ``bound`` when an output is supplied and ``legacy`` when it is
+    not — ``legacy`` is the outcome whose consumer behaviour is unchanged from
+    before the validation ladder, so pre-ladder expectations still hold.
+    """
+    resolved = outcome or (BINDING_BOUND if output is not None else BINDING_LEGACY)
+    return lambda agent: BindingResult(resolved, output)
 
 
 class _FakeClaudeBackend:
@@ -132,7 +149,7 @@ def test_marker_roundtrip_drives_check_agent_state(
         "health_check",
         lambda pid, expected_token=None: (True, ""),
     )
-    monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
+    monkeypatch.setattr(server_simple, "_resolve_agent_binding", _binding(None))
 
     # Drive the real emit() entrypoint as the hook would.
     payload = json.dumps({"hook_event_name": "Stop", "session_id": session_id})

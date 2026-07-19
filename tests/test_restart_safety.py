@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from claude_teams import server_simple as ss
+from claude_teams.agent_output import BINDING_BOUND, AgentOutput, BindingResult
 from claude_teams.backends.contracts import SpawnRequest
 
 
@@ -88,11 +89,15 @@ def _idle_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ss.time, "time", lambda: 1_000.0)
     monkeypatch.setattr(
         ss,
-        "read_codex_output",
-        lambda spawned_at, cwd, **kwargs: SimpleNamespace(
-            last_activity_at=900.0,
-            last_message="done",
-            backend_session_id="backend-session-id",
+        "_resolve_agent_binding",
+        lambda agent: BindingResult(
+            BINDING_BOUND,
+            AgentOutput(
+                last_activity_at=900.0,
+                last_message="done",
+                rollout_path="t.jsonl",
+                backend_session_id="backend-session-id",
+            ),
         ),
     )
 
@@ -165,11 +170,15 @@ def _busy_by_timer_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ss.time, "time", lambda: 1_000.0)
     monkeypatch.setattr(
         ss,
-        "read_codex_output",
-        lambda spawned_at, cwd, **kwargs: SimpleNamespace(
-            last_activity_at=990.0,
-            last_message="done",
-            backend_session_id="backend-session-id",
+        "_resolve_agent_binding",
+        lambda agent: BindingResult(
+            BINDING_BOUND,
+            AgentOutput(
+                last_activity_at=990.0,
+                last_message="done",
+                rollout_path="t.jsonl",
+                backend_session_id="backend-session-id",
+            ),
         ),
     )
 
