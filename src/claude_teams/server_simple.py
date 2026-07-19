@@ -19,6 +19,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -30,15 +31,17 @@ else:
 
 from fastmcp import FastMCP
 
-from claude_teams import hooks
+from claude_teams import delivery, hooks
 from claude_teams.agent_output import (
     BINDING_LEGACY,
     CORRELATION_FIELD,
     PROMPT_TRANSPORT_FIELD,
     PROMPT_TRANSPORT_SIDECAR,
     BindingResult,
+    _make_binder,
     classify_correlation,
     correlated_prompt,
+    correlation_marker_token,
     new_correlation_id,
     resolve_agent_binding,
 )
@@ -46,6 +49,30 @@ from claude_teams.async_utils import run_blocking
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.process_manager import process_manager
 from claude_teams.backends.registry import registry
+from claude_teams.delivery import (
+    DELIVERY_DELIVERED,
+    DELIVERY_FAILED,
+    DELIVERY_UNCONFIRMED,
+    SCAN_FOUND,
+    DeliveryOutcome,
+    ReceiptScanner,
+    confirm_delivery,
+    delivered_prompt,
+    new_delivery_nonce,
+    prompt_file_name,
+    remove_prompt_file,
+    stale_prompt_files,
+)
+from claude_teams.leases import (
+    LEASES_FILE_NAME,
+    finalize_lease,
+    reconcile_lease,
+    release_lease,
+    reserve_lease,
+)
+from claude_teams.leases import (
+    drop_agent as _drop_agent_lease,
+)
 from claude_teams.messaging import (
     load_inbox_cursors as _load_inbox_cursors,
 )
@@ -105,6 +132,31 @@ _NO_AUTOADOPT_ENV = "WIN_AGENT_TEAMS_NO_AUTOADOPT"
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"killed"})
 _RETENTION_DAYS_ENV = "WIN_AGENT_TEAMS_RETENTION_DAYS"
 _CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60.0
+
+# A4/A4b timing. Held as module attributes rather than literals so tests can
+# inject a clock and drive the poll loop deterministically: the repo already
+# carries one flaky wall-clock watcher test and confirmation is far more
+# timing-dense than that.
+_DELIVERY_CONFIRM_BOUND_SECONDS = 20.0
+_DELIVERY_POLL_SECONDS = 0.25
+#: How long a queued caller waits for the per-target FIFO before returning the
+#: cooperative ``queued`` tail. It never gets a refusal (R1).
+_LEASE_QUEUE_WAIT_SECONDS = 30.0
+#: How long a lease is nominally valid. Purely informational: expiry alone
+#: NEVER reclaims a lease — see ``leases.reconcile_lease``.
+_LEASE_TTL_SECONDS = 120.0
+#: Age after which an orphaned prompt sidecar may be garbage-collected. Long
+#: on purpose: deleting a file a still-running CLI may yet read is worse than
+#: leaving a few kilobytes behind.
+_PROMPT_GC_AGE_SECONDS = 24 * 60 * 60.0
+
+_delivery_clock = time.monotonic
+_delivery_sleep = time.sleep
+
+#: Agent-record field holding an attempt that resumed but was never confirmed.
+#: R6's "live uncertainty": it must survive the call so a retry reconciles it
+#: instead of delivering the same instruction a second time.
+PENDING_DELIVERY_FIELD = "pending_delivery"
 _CLAUDE_PROMPT_FILE_CHARS: frozenset[str] = frozenset({"'", '"', "\n", "\r"})
 logger = logging.getLogger(__name__)
 
@@ -241,9 +293,38 @@ def _state_marker_file(session_id: str, name: str) -> Path:
     return _session_dir(session_id) / f"state-{name}.json"
 
 
+def _prompts_dir(session_id: str) -> Path:
+    """Return the directory holding an agent's prompt sidecars."""
+    return _session_dir(session_id) / "prompts"
+
+
 def _prompt_file(session_id: str, name: str) -> Path:
-    """Return the per-agent prompt sidecar path for lossless Claude launches."""
-    return _session_dir(session_id) / "prompts" / f"{name}.prompt.txt"
+    """Return the legacy deterministic prompt sidecar path.
+
+    Superseded by :func:`_attempt_prompt_file` (A5). Retained only so cleanup
+    still removes files written by an older version of this server.
+    """
+    return _prompts_dir(session_id) / f"{name}.prompt.txt"
+
+
+def _attempt_prompt_file(session_id: str, name: str, nonce: str) -> Path:
+    """Return this call's unique prompt sidecar path (A5).
+
+    One path per call, keyed on the attempt's nonce, so two concurrent calls to
+    the same agent can never overwrite each other's prompt — and so a file left
+    behind can be attributed back to the attempt that wrote it.
+    """
+    return _prompts_dir(session_id) / prompt_file_name(name, nonce)
+
+
+def _leases_file(session_id: str) -> Path:
+    """Return the per-session operation-lease store (A4b).
+
+    Deliberately a separate file from ``agents.json``: the registry is written
+    with a plain overwrite, so a crash mid-write could otherwise destroy the
+    registry *and* the lease at once.
+    """
+    return _session_dir(session_id) / LEASES_FILE_NAME
 
 
 def _read_state_marker(session_id: str, name: str) -> dict | None:
@@ -1188,6 +1269,192 @@ _BINDING_REFUSAL_DETAIL = {
 }
 
 
+@dataclass(frozen=True)
+class _FollowUpPlan:
+    """Everything phase 2 needs, captured while the registry lock was held."""
+
+    agent_name: str
+    backend: Any
+    backend_name: str
+    backend_session_id: str
+    request: SpawnRequest
+    old_pid: str
+    old_create_token: str | None
+    alive: bool
+    nonce: str
+    operation_id: str
+    generation: int
+    prompt_file: Path | None
+    prompt_transport: str
+    scanner: ReceiptScanner
+    model: object
+    permission_mode: str
+    effort: str | None
+    correlation_id: str | None
+    agent_cwd: str
+
+
+@dataclass(frozen=True)
+class _FollowUpPrep:
+    """Result of phase 1: a refusal, a plan, or a place in the FIFO queue."""
+
+    refusal: dict | None = None
+    plan: _FollowUpPlan | None = None
+    ticket: str | None = None
+    queue_position: int = 0
+
+
+#: Sentinel outcome for "the backend never returned a child at all". Distinct
+#: from every scan outcome because there is nothing to have confirmed.
+_DELIVERY_RESUME_FAILED = DeliveryOutcome(DELIVERY_FAILED, "resume_failed")
+
+#: Why each terminal non-delivery blocks, in the caller's terms. R6 requires
+#: that a definite non-delivery is never dressed up as progress.
+_DELIVERY_FAILURE_DETAIL = {
+    "resume_not_confirmed": (
+        "The resumed backend process exited immediately, so the resume never "
+        "attached to the conversation (typically an invalid session id). "
+        "Nothing was delivered and the agent record is unchanged."
+    ),
+    "not_delivered": (
+        "The resumed process died without the prompt ever appearing in the "
+        "target's context. This is a definite non-delivery, not a timeout."
+    ),
+    "rotation_ambiguous": (
+        "The target's transcript was replaced by more than one candidate "
+        "successor, so delivery cannot be attributed to either. Kill and "
+        "respawn rather than retrying."
+    ),
+    "resume_failed": (
+        "The backend refused to resume the session. Nothing was delivered."
+    ),
+}
+
+
+def _optional_path(value: object) -> Path | None:
+    """Return ``value`` as a :class:`Path`, or ``None`` when it is not a path."""
+    return Path(value) if isinstance(value, str) and value else None
+
+
+def _record_generation(agent: dict) -> int:
+    """Return the agent record's CAS generation (absent counts as 0)."""
+    value = agent.get("generation")
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _bump_generation(agent: dict) -> int:
+    """Advance the record's generation and return the new value.
+
+    The operator force path calls this *before* terminating anything, so a
+    holder that is still alive can no longer finalize: its CAS is fenced out.
+    """
+    generation = _record_generation(agent) + 1
+    agent["generation"] = generation
+    return generation
+
+
+def _lease_holder_live(pid: int, token: str | None) -> bool:
+    """Fail-closed liveness for a lease holder, PID-reuse safe.
+
+    A holder PID with no creation token, or one whose live token no longer
+    matches, is NOT ours — the same model destructive PID operations use.
+    """
+    if pid == os.getpid():
+        # This process is the holder and is obviously running. Asking the OS
+        # for our own creation token is both wasteful and, on a recovered
+        # record, unreliable.
+        return True
+    return process_manager.owns_process(str(pid), token)
+
+
+def _delivery_successors(agent: dict, backend_name: str, session_id: str):
+    """Return a callable enumerating candidate successor transcripts.
+
+    Used only when the scanned transcript rotates, is truncated, or is
+    replaced. Continuity is re-established from backend session id plus file
+    identity, so this only has to supply the candidate set.
+    """
+    spawned_at = _safe_float(agent.get("spawned_at"))
+    cwd = str(agent.get("cwd") or "")
+
+    def _candidates() -> list[Path]:
+        binder = _make_binder(backend_name, spawned_at, cwd)
+        if binder is None:
+            return []
+        try:
+            return list(binder.candidates(all_history=True))
+        except OSError:
+            return []
+
+    _ = session_id
+    return _candidates
+
+
+def _delivery_scanner(
+    agent: dict,
+    backend_name: str,
+    backend_session_id: str,
+    binding: BindingResult,
+    session_id: str,
+) -> ReceiptScanner:
+    """Build a scanner anchored on the transcript this resume targets."""
+    output = binding.output
+    path = Path(output.rollout_path) if output and output.rollout_path else None
+    if path is None:
+        binder = _make_binder(
+            backend_name,
+            _safe_float(agent.get("spawned_at")),
+            str(agent.get("cwd") or ""),
+        )
+        if binder is not None:
+            path = binder.resolve_by_session_id(backend_session_id)
+    _, correlation_id = classify_correlation(agent)
+    return ReceiptScanner(
+        path,
+        backend=backend_name,
+        backend_session_id=backend_session_id,
+        successors=_delivery_successors(agent, backend_name, session_id),
+        correlation_token=(
+            correlation_marker_token(correlation_id) if correlation_id else None
+        ),
+    )
+
+
+def _pending_delivery(agent: dict) -> dict | None:
+    """Return the unconfirmed attempt recorded on this agent, if any."""
+    value = agent.get(PENDING_DELIVERY_FIELD)
+    return value if isinstance(value, dict) else None
+
+
+def _reconcile_pending_delivery(
+    agent: dict,
+    backend_name: str,
+    backend_session_id: str,
+    binding: BindingResult,
+    session_id: str,
+) -> bool:
+    """Rescan a prior unconfirmed attempt's nonce before sending anything new.
+
+    R6 requires this: a transcript write buffered past the previous call's
+    bound can arrive afterwards, so an ``unconfirmed`` attempt may in fact have
+    landed. Re-sending without checking would deliver the same instruction
+    twice. Returns whether the earlier attempt is now confirmed.
+    """
+    pending = _pending_delivery(agent)
+    if pending is None:
+        return False
+    nonce = pending.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        return False
+    scanner = _delivery_scanner(
+        agent, backend_name, backend_session_id, binding, session_id
+    )
+    # rewind(), not snapshot(): reconciliation must see the WHOLE transcript,
+    # because the record it is looking for was written before this call began.
+    scanner.rewind()
+    return scanner.poll(nonce) == SCAN_FOUND
+
+
 def _create_session() -> str:
     sid = str(uuid.uuid4())
     base = _session_dir(sid)
@@ -1233,6 +1500,9 @@ def _materialize_prompt(
     backend_name: str,
     prompt: str,
     correlation_id: str | None,
+    *,
+    file_token: str,
+    delivery_nonce: str | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Build the final prompt the agent will see, and choose its transport.
 
@@ -1255,15 +1525,26 @@ def _materialize_prompt(
     Codex is left untouched here: its backend appends the same server-issued id
     itself (``CodexBackend._correlated_prompt``), so marking here too would
     give Codex two markers.
+
+    A5: the sidecar path carries ``file_token`` so it is unique per call.
+    ``delivery_nonce`` additionally appends the A4 delivery marker — supplied
+    for a follow-up, whose delivery must be confirmed, and omitted for a spawn,
+    which has nothing to confirm against.
     """
     if backend_name != "claude-code":
+        if delivery_nonce:
+            # Codex quotes the prompt verbatim, so the marker travels in the
+            # prompt itself; the newline form matches its correlation marker.
+            prompt = delivered_prompt(prompt, delivery_nonce, single_line=False)
         return prompt, {}
     use_file = _needs_prompt_file(prompt)
     if correlation_id:
         prompt = correlated_prompt(prompt, correlation_id, single_line=not use_file)
+    if delivery_nonce:
+        prompt = delivered_prompt(prompt, delivery_nonce, single_line=not use_file)
     if not use_file:
         return prompt, {}
-    path = _prompt_file(session_id, agent_name)
+    path = _attempt_prompt_file(session_id, agent_name, file_token)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(prompt, encoding="utf-8")
     return prompt, {"prompt_file_path": str(path)}
@@ -1394,8 +1675,17 @@ async def spawn_agent(
             # Generated before backend.spawn: the id must already be inside the
             # final initial prompt, which is materialized on the next line.
             correlation_id = new_correlation_id()
+            # A5: even a spawn gets a unique prompt-file path, so a spawn and a
+            # concurrent follow-up for the same name cannot collide. No
+            # delivery marker: a spawn either produced a PID or raised, so
+            # there is nothing for A4 to confirm against.
             final_prompt, prompt_extra = _materialize_prompt(
-                session_id, agent_name, backend_name, prompt, correlation_id
+                session_id,
+                agent_name,
+                backend_name,
+                prompt,
+                correlation_id,
+                file_token=new_delivery_nonce(),
             )
             extra = {
                 "mcp_config_path": str(mcp_config_path),
@@ -1471,7 +1761,7 @@ async def spawn_agent(
 async def send_message(text: str, to: str = "team-lead") -> dict:
     """Write a message to an inbox for agents that actively poll read_messages.
 
-    ``to`` defaults to ``"team-lead"``, which reaches the agent that spawned you —
+    ``to`` defaults to ``"team-lead"``, which reaches the agent that spawned you â€”
     that is almost always what you want from a subagent. A lead can target a
     child by its agent name. Any unknown recipient is routed to the lead with a
     ``warning`` in the result rather than silently written to a dead inbox.
@@ -1520,7 +1810,7 @@ async def read_messages(
     Returns ``{messages, cursors, seq, unread_count, has_more}``. Each
     message is ``{from, text, ts, seq}`` where ``seq`` is that sender's
     1-based per-sender COUNT after this message (i.e. the sender's
-    high-water mark once this message is consumed) — the same number space
+    high-water mark once this message is consumed) â€” the same number space
     as the persisted per-sender cursor. ``cursors`` is the per-sender
     high-water map; a scalar ``seq`` (instead of ``cursors``) is returned
     only when ``from_agent`` is set.
@@ -1724,6 +2014,200 @@ async def check_agent(
     return _annotate(await run_blocking(_do_check))
 
 
+def _build_resume_request(
+    session_id: str,
+    agent: dict,
+    agent_name: str,
+    agent_cwd: str,
+    backend: Any,
+    backend_name: str,
+    prompt: str,
+    nonce: str,
+) -> tuple[object, str, str | None, str | None, SpawnRequest, dict[str, str]]:
+    """Materialize this attempt's prompt and build the resume request.
+
+    Extracted from ``follow_up_agent`` so the tool body stays readable; it is
+    pure request construction and performs no registry or lease mutation.
+    """
+    mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
+
+    # Reuse the concrete model resolved at spawn. Preserve a stored blank
+    # verbatim (blank means "defer to codex config"); only a genuinely absent
+    # key falls back to the backend default. Do NOT coerce blank via ``or`` —
+    # default_model() may be a capability tier name (e.g. "medium"), which must
+    # never reach ``-c model``.
+    stored_model = agent.get("model")
+    model = stored_model if isinstance(stored_model, str) else backend.default_model()
+    permission_mode = str(agent.get("permission_mode") or "bypass")
+    effort_value = agent.get("reasoning_effort")
+    effort = effort_value if isinstance(effort_value, str) else None
+    # Carry the spawn-time id forward verbatim. Dropping it here would silently
+    # downgrade the agent to ``legacy``, which per R8 means it can never be
+    # followed up again. A legacy record stays legacy: no id is minted on
+    # resume, because a fresh id would not appear anywhere in the conversation
+    # that already exists.
+    _, correlation_id = classify_correlation(agent)
+    final_prompt, prompt_extra = _materialize_prompt(
+        session_id,
+        agent_name,
+        backend_name,
+        prompt,
+        correlation_id,
+        file_token=nonce,
+        delivery_nonce=nonce,
+    )
+    extra = {
+        "mcp_config_path": str(mcp_config_path),
+        "agent_capability": "",
+        **_correlation_extra(correlation_id),
+        **prompt_extra,
+        **_hook_extra(session_id, agent_name, backend_name),
+    }
+    request = SpawnRequest(
+        agent_id=f"{agent_name}@{session_id}",
+        name=agent_name,
+        team_name=session_id,
+        prompt=final_prompt,
+        model=model,
+        agent_type="worker",
+        color="blue",
+        cwd=agent_cwd,
+        lead_session_id=IDENTITY,
+        permission_mode=cast(
+            'Literal["default", "require_approval", "bypass"]', permission_mode
+        ),
+        reasoning_effort=effort,
+        extra=extra,
+    )
+    return model, permission_mode, effort, correlation_id, request, prompt_extra
+
+
+def _finalize_follow_up(
+    session_id: str,
+    plan: _FollowUpPlan,
+    outcome: DeliveryOutcome,
+    new_pid: int | None,
+) -> dict:
+    """Phase 3 — CAS the record back under the lock, then release the lease.
+
+    The CAS key is generation **and** ``operation_id``. Generation alone is not
+    enough: an agent name reused after removal starts a fresh record that can
+    legitimately be back at the same generation, and a stale finalize must not
+    update it.
+    """
+    with _agents_transaction(session_id) as agents:
+        agent = next((a for a in agents if a["name"] == plan.agent_name), None)
+        won = finalize_lease(
+            _leases_file(session_id),
+            plan.agent_name,
+            plan.operation_id,
+            plan.generation,
+        )
+        if agent is None or not won:
+            # Fenced out, or the record was replaced underneath us. Never
+            # write: the record this attempt described no longer exists.
+            return _follow_up_failure(
+                "operation_superseded",
+                plan.agent_name,
+                retriable=True,
+                detail=(
+                    "This delivery attempt was fenced or its agent record was "
+                    "replaced while the resume was in flight."
+                ),
+            )
+
+        # Only a delivered or still-in-flight attempt writes the record. A
+        # resume that never attached (A3) or a child that died without a
+        # receipt leaves nothing worth tracking, and R6 forbids describing
+        # either as progress — so the record stays exactly as it was.
+        if new_pid is None or outcome.status not in {
+            DELIVERY_DELIVERED,
+            DELIVERY_UNCONFIRMED,
+        }:
+            if outcome.status == DELIVERY_FAILED:
+                # The child is provably gone, so no CLI can still be waiting
+                # to read this attempt's prompt file.
+                remove_prompt_file(plan.prompt_file)
+            if new_pid is None:
+                return _follow_up_failure(
+                    "resume_failed", plan.agent_name, retriable=True
+                )
+            return _follow_up_failure(
+                outcome.reason or "not_delivered",
+                plan.agent_name,
+                retriable=False,
+                detail=_DELIVERY_FAILURE_DETAIL.get(outcome.reason, ""),
+            )
+
+        agent.update(
+            {
+                "pid": new_pid,
+                "backend": plan.backend_name,
+                "session_id": session_id,
+                "status": "running",
+                "spawned_at": time.time(),
+                "cwd": plan.agent_cwd,
+                "backend_session_id": plan.backend_session_id,
+                "model": plan.model,
+                "permission_mode": plan.permission_mode,
+                "reasoning_effort": plan.effort,
+                "create_token": process_manager.creation_token(str(new_pid)),
+                # Explicit even though ``update`` would preserve it: the id
+                # surviving resume is the property R8 depends on.
+                **_correlation_extra(plan.correlation_id),
+                # The resume prompt may take a different transport than the
+                # spawn prompt did, and gate 0's grace period restarts from
+                # this attempt.
+                PROMPT_TRANSPORT_FIELD: plan.prompt_transport,
+            }
+        )
+        agent.pop(PENDING_DELIVERY_FIELD, None)
+        if outcome.status == DELIVERY_UNCONFIRMED:
+            # R6 live uncertainty: remember the attempt so the next call
+            # reconciles it rather than re-sending. The prompt file stays on
+            # disk — a still-running CLI may not have read it yet.
+            agent[PENDING_DELIVERY_FIELD] = {
+                "nonce": plan.nonce,
+                "operation_id": plan.operation_id,
+                "attempted_at": time.time(),
+                "prompt_file": str(plan.prompt_file) if plan.prompt_file else "",
+            }
+        _bump_generation(agent)
+        _save_agents_transaction(session_id, agents)
+
+    if outcome.status == DELIVERY_DELIVERED:
+        # The receipt record IS proof the CLI read the sidecar, so removing it
+        # now cannot race a pending read.
+        remove_prompt_file(plan.prompt_file)
+        return {
+            "success": True,
+            "name": plan.agent_name,
+            "status": "delivered",
+            "pid": new_pid,
+            "backend": plan.backend_name,
+            "backend_session_id": plan.backend_session_id,
+            "replaced_existing": plan.alive,
+            "session_id": session_id,
+        }
+    return {
+        "success": False,
+        "name": plan.agent_name,
+        "status": "queued",
+        "phase": "unconfirmed",
+        "reason": "delivery_unconfirmed",
+        "retriable": True,
+        "pid": new_pid,
+        "backend_session_id": plan.backend_session_id,
+        "session_id": session_id,
+        "detail": (
+            "The resumed child is still alive but the prompt has not been "
+            "observed in its context within the scan bound. This is NOT a "
+            "failure and NOT a delivery: retry this same call and it will "
+            "reconcile the prior attempt before resending."
+        ),
+    }
+
+
 @mcp.tool()
 async def follow_up_agent(
     name: str,
@@ -1744,23 +2228,35 @@ async def follow_up_agent(
     """
     session_id = _active_session_id()
 
-    def _do_follow_up() -> dict:  # noqa: PLR0911 - mirrors explicit refusal reasons.
-        if not session_id:
-            return _follow_up_failure("session_not_found", name)
+    def _prepare(ticket: str | None) -> _FollowUpPrep:  # noqa: PLR0911
+        """Phase 1 — validate, reserve the lease, and build the request.
+
+        Runs entirely inside ``_agents_transaction``. Reserving the lease while
+        the registry lock is held is what makes the reservation atomic against
+        another server preparing the same target: without it two callers could
+        both snapshot the same generation and both resume, and the losing CAS
+        could not undo an already-spawned child.
+        """
         with _agents_transaction(session_id) as agents:
             agent = next((a for a in agents if a["name"] == name), None)
             if agent is None:
-                return _follow_up_failure("agent_not_found", name)
+                return _FollowUpPrep(
+                    refusal=_follow_up_failure("agent_not_found", name)
+                )
 
             backend_name = str(agent.get("backend") or "")
             try:
                 backend = registry.get(backend_name)
             except Exception:
                 logger.debug("Failed loading backend for follow-up", exc_info=True)
-                return _follow_up_failure("backend_not_supported", name)
+                return _FollowUpPrep(
+                    refusal=_follow_up_failure("backend_not_supported", name)
+                )
 
             if not getattr(backend, "supports_resume", lambda: False)():
-                return _follow_up_failure("backend_not_supported", name)
+                return _FollowUpPrep(
+                    refusal=_follow_up_failure("backend_not_supported", name)
+                )
 
             pid = agent["pid"]
             alive = _agent_alive(agent)
@@ -1770,7 +2266,7 @@ async def follow_up_agent(
 
             def _refuse(
                 reason: str, *, retriable: bool = False, detail: str = ""
-            ) -> dict:
+            ) -> _FollowUpPrep:
                 """Flush any newly bound session id, then refuse.
 
                 Every refusal below shares this: a session id discovered by
@@ -1779,8 +2275,10 @@ async def follow_up_agent(
                 """
                 if changed:
                     _save_agents_transaction(session_id, agents)
-                return _follow_up_failure(
-                    reason, name, status, retriable=retriable, detail=detail
+                return _FollowUpPrep(
+                    refusal=_follow_up_failure(
+                        reason, name, status, retriable=retriable, detail=detail
+                    )
                 )
 
             # A2/A6/R8: a follow-up is only safe against a transcript we have
@@ -1799,6 +2297,36 @@ async def follow_up_agent(
             backend_session_id = status.get("backend_session_id")
             if not backend_session_id:
                 return _refuse("backend_session_missing")
+
+            # R6: a prior attempt that expired with a live child may in fact
+            # have landed, because a buffered transcript write can arrive after
+            # the call returned. Reconcile BEFORE sending, or the same
+            # instruction is delivered twice.
+            if _reconcile_pending_delivery(
+                agent, backend_name, str(backend_session_id), binding, session_id
+            ):
+                reconciled = _pending_delivery(agent) or {}
+                remove_prompt_file(_optional_path(reconciled.get("prompt_file")))
+                agent.pop(PENDING_DELIVERY_FIELD, None)
+                _bump_generation(agent)
+                _save_agents_transaction(session_id, agents)
+                return _FollowUpPrep(
+                    refusal={
+                        "success": True,
+                        "name": name,
+                        "status": "delivered",
+                        "reconciled": True,
+                        "pid": agent.get("pid"),
+                        "backend": backend_name,
+                        "backend_session_id": str(backend_session_id),
+                        "session_id": session_id,
+                        "detail": (
+                            "A previous attempt's prompt was confirmed in the "
+                            "target's context after that call returned; it was "
+                            "not sent again."
+                        ),
+                    }
+                )
 
             if alive:
                 last_activity_at = status.get("last_activity_at")
@@ -1829,127 +2357,187 @@ async def follow_up_agent(
                 if not replace_if_idle:
                     return _refuse("agent_idle_but_alive")
 
-                # Fail closed: only shut down / kill the PID when we can prove
-                # it is still OUR process (in-memory ownership or a matching
-                # creation token). A tokenless recovered record or a reused PID
-                # is left untouched — we resume via backend_session_id instead
-                # of risking a foreign kill.
-                if process_manager.owns_process(
-                    str(pid), _agent_create_token(agent)
-                ) and not process_manager.graceful_shutdown(str(pid), timeout_s=5.0):
-                    process_manager.kill_process(str(pid))
-
             agent_name = str(agent.get("name") or name)
             agent_cwd = str(agent.get("cwd") or Path.cwd())
-            mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
+            generation = _record_generation(agent)
+            operation_id = uuid.uuid4().hex
+            nonce = new_delivery_nonce()
 
-            # Reuse the concrete model resolved at spawn. Preserve a stored
-            # blank verbatim (blank means "defer to codex config"); only a
-            # genuinely absent key falls back to the backend default. Do NOT
-            # coerce blank via ``or`` — default_model() may be a capability
-            # tier name (e.g. "medium"), which must never reach ``-c model``.
-            stored_model = agent.get("model")
-            model = (
-                stored_model
-                if isinstance(stored_model, str)
-                else backend.default_model()
+            # A4b — reserve the right to resume BEFORE the lock is released.
+            # A second valid caller is queued behind per-target FIFO; it is
+            # never refused, because refusing a valid caller would hand back
+            # exactly the dead end R1 forbids.
+            reservation = reserve_lease(
+                _leases_file(session_id),
+                agent_name,
+                generation=generation,
+                operation_id=operation_id,
+                backend_session_id=str(backend_session_id),
+                nonce=nonce,
+                holder_pid=os.getpid(),
+                holder_create_token=process_manager.creation_token(str(os.getpid())),
+                deadline=time.time() + _LEASE_TTL_SECONDS,
+                now=time.time(),
+                holder_live=_lease_holder_live,
+                ticket=ticket,
             )
-            permission_mode = str(agent.get("permission_mode") or "bypass")
-            effort_value = agent.get("reasoning_effort")
-            effort = effort_value if isinstance(effort_value, str) else None
-            # Carry the spawn-time id forward verbatim. Dropping it here would
-            # silently downgrade the agent to ``legacy``, which per R8 means it
-            # can never be followed up again. A legacy record stays legacy: no
-            # id is minted on resume, because a fresh id would not appear
-            # anywhere in the conversation that already exists.
-            _, correlation_id = classify_correlation(agent)
-            final_prompt, prompt_extra = _materialize_prompt(
-                session_id, agent_name, backend_name, prompt, correlation_id
+            if changed:
+                _save_agents_transaction(session_id, agents)
+            if not reservation.granted:
+                return _FollowUpPrep(
+                    ticket=reservation.ticket, queue_position=reservation.position
+                )
+
+            (
+                model,
+                permission_mode,
+                effort,
+                correlation_id,
+                request,
+                prompt_extra,
+            ) = _build_resume_request(
+                session_id,
+                agent,
+                agent_name,
+                agent_cwd,
+                backend,
+                backend_name,
+                prompt,
+                nonce,
             )
-            extra = {
-                "mcp_config_path": str(mcp_config_path),
-                "agent_capability": "",
-                **_correlation_extra(correlation_id),
-                **prompt_extra,
-                **_hook_extra(session_id, agent_name, backend_name),
-            }
-            request = SpawnRequest(
-                agent_id=f"{agent_name}@{session_id}",
-                name=agent_name,
-                team_name=session_id,
-                prompt=final_prompt,
-                model=model,
-                agent_type="worker",
-                color="blue",
-                cwd=agent_cwd,
-                lead_session_id=IDENTITY,
-                permission_mode=cast(
-                    'Literal["default", "require_approval", "bypass"]',
-                    permission_mode,
+
+            # Anchored BEFORE the resume, on the last COMPLETE record: that is
+            # what makes the later scan an observation of *this* attempt rather
+            # than of history that was already there.
+            scanner = _delivery_scanner(
+                agent, backend_name, str(backend_session_id), binding, session_id
+            )
+            scanner.snapshot()
+
+            return _FollowUpPrep(
+                plan=_FollowUpPlan(
+                    agent_name=agent_name,
+                    backend=backend,
+                    backend_name=backend_name,
+                    backend_session_id=str(backend_session_id),
+                    request=request,
+                    old_pid=str(pid),
+                    old_create_token=_agent_create_token(agent),
+                    alive=alive,
+                    nonce=nonce,
+                    operation_id=operation_id,
+                    generation=generation,
+                    prompt_file=_optional_path(prompt_extra.get("prompt_file_path")),
+                    prompt_transport=_prompt_transport(prompt_extra),
+                    scanner=scanner,
+                    model=model,
+                    permission_mode=permission_mode,
+                    effort=effort,
+                    correlation_id=correlation_id,
+                    agent_cwd=agent_cwd,
                 ),
-                reasoning_effort=effort,
-                extra=extra,
+                ticket=reservation.ticket,
             )
+
+    def _do_follow_up() -> dict:
+        if not session_id:
+            return _follow_up_failure("session_not_found", name)
+        ticket: str | None = None
+        queue_deadline = _delivery_clock() + _LEASE_QUEUE_WAIT_SECONDS
+        while True:
+            prep = _prepare(ticket)
+            if prep.refusal is not None:
+                return prep.refusal
+            if prep.plan is not None:
+                break
+            # Queued behind per-target FIFO. R1: a valid caller is never handed
+            # a dead end, so this waits rather than refusing, and the honest
+            # cooperative tail only appears once the wait budget is spent.
+            ticket = prep.ticket
+            if _delivery_clock() >= queue_deadline:
+                return {
+                    "success": False,
+                    "name": name,
+                    "status": "queued",
+                    "phase": "pending",
+                    "reason": "operation_in_progress",
+                    "retriable": True,
+                    "queue_position": prep.queue_position,
+                    "session_id": session_id,
+                    "detail": (
+                        "Another delivery to this agent is still in flight. "
+                        "Nothing was sent. Call follow_up_agent again; your "
+                        "place in the per-target queue is preserved."
+                    ),
+                }
+            _delivery_sleep(_DELIVERY_POLL_SECONDS)
+
+        plan = prep.plan
+        # Phase 2 — the registry lock is NOT held here. Shutdown, resume and
+        # confirmation all take real time, and holding a cross-process lock
+        # across them would block every registry reader on the machine.
+        try:
+            # Fail closed: only signal a PID we can prove is still ours.
+            if (
+                plan.alive
+                and process_manager.owns_process(plan.old_pid, plan.old_create_token)
+                and not process_manager.graceful_shutdown(plan.old_pid, timeout_s=5.0)
+            ):
+                process_manager.kill_process(plan.old_pid)
 
             try:
-                result = backend.resume(request, str(backend_session_id))
+                result = plan.backend.resume(plan.request, plan.backend_session_id)
             except Exception:
                 logger.debug("Failed resuming backend session", exc_info=True)
-                return _refuse("resume_failed")
+                return _finalize_follow_up(
+                    session_id, plan, _DELIVERY_RESUME_FAILED, None
+                )
 
             new_pid = int(result.process_handle)
-            new_create_token = process_manager.creation_token(str(new_pid))
-            agent.update(
-                {
-                    "pid": new_pid,
-                    "backend": backend_name,
-                    "session_id": session_id,
-                    "status": "running",
-                    "spawned_at": time.time(),
-                    "cwd": agent_cwd,
-                    "backend_session_id": str(backend_session_id),
-                    "model": model,
-                    "permission_mode": permission_mode,
-                    "reasoning_effort": effort,
-                    "create_token": new_create_token,
-                    # Explicit even though ``update`` would preserve it: the
-                    # id surviving resume is the property R8 depends on.
-                    **_correlation_extra(correlation_id),
-                    # The resume prompt may take a different transport than
-                    # the spawn prompt did, and gate 0's grace period restarts
-                    # from this attempt.
-                    PROMPT_TRANSPORT_FIELD: _prompt_transport(prompt_extra),
-                }
+            outcome = confirm_delivery(
+                plan.scanner,
+                plan.nonce,
+                child_alive=lambda: process_manager.health_check(str(new_pid))[0],
+                bound_s=_DELIVERY_CONFIRM_BOUND_SECONDS,
+                poll_interval_s=_DELIVERY_POLL_SECONDS,
+                clock=_delivery_clock,
+                sleep=_delivery_sleep,
             )
-            _save_agents_transaction(session_id, agents)
-            return {
-                "success": True,
-                "name": agent_name,
-                "pid": new_pid,
-                "backend": backend_name,
-                "backend_session_id": str(backend_session_id),
-                "replaced_existing": alive,
-                "session_id": session_id,
-            }
+            return _finalize_follow_up(session_id, plan, outcome, new_pid)
+        finally:
+            # Belt and braces: a crash between here and ``_finalize`` would
+            # otherwise leave the lease held by a process that is no longer
+            # working on it. ``release_lease`` is a no-op once finalize won.
+            release_lease(_leases_file(session_id), plan.agent_name, plan.operation_id)
 
     return _annotate(await run_blocking(_do_follow_up))
 
 
-def _cleanup_agent_artifacts(session_id: str, name: str) -> None:
+def _cleanup_agent_artifacts(
+    session_id: str, name: str, *, child_exited: bool = True
+) -> None:
     """Best-effort removal of a killed agent's on-disk artifacts.
 
     Prevents a later agent spawned with the same name from inheriting the dead
     agent's state marker, prompt sidecar, inbox messages, or read cursors.
     Every operation is best-effort and never raises.
+
+    A5: per-attempt prompt sidecars are removed **only** when the child is
+    confirmed gone, or once they age past :data:`_PROMPT_GC_AGE_SECONDS`.
+    Deleting them because a new call started would race a concurrent attempt
+    whose CLI has not read its file yet, and a timeout-failure alone is
+    explicitly not enough — the process may still be about to read it.
     """
     for path in (
         _state_marker_file(session_id, name),
+        # The old deterministic path, written by servers predating A5.
         _prompt_file(session_id, name),
         _inbox_file(session_id, name),
         _inbox_cursor_file(session_id, name),
     ):
         with suppress(OSError):
             path.unlink(missing_ok=True)
+    _gc_prompt_files(session_id, name, child_exited=child_exited)
     # Wipe the killed agent's history from the lead/parent reader inbox and drop
     # its per-sender cursor entry, so a later same-name agent starts with a clean
     # slate. Purging the delivered messages (not just the cursor) is what keeps
@@ -1965,6 +2553,20 @@ def _cleanup_agent_artifacts(session_id: str, name: str) -> None:
             del cursors[name]
             with suppress(OSError):
                 _save_inbox_cursors(reader_cursor, cursors)
+
+
+def _gc_prompt_files(session_id: str, name: str, *, child_exited: bool) -> None:
+    """Remove this agent's per-attempt prompt sidecars, conservatively (A5)."""
+    directory = _prompts_dir(session_id)
+    if child_exited:
+        with suppress(OSError):
+            for path in directory.glob(delivery.prompt_file_glob(name)):
+                remove_prompt_file(path)
+        return
+    for path in stale_prompt_files(
+        directory, name, older_than=_PROMPT_GC_AGE_SECONDS, now=time.time()
+    ):
+        remove_prompt_file(path)
 
 
 @mcp.tool()
@@ -1989,15 +2591,49 @@ async def kill_agent(name: str) -> dict:
             agent = next((a for a in agents if a["name"] == name), None)
             if agent is None:
                 return {"success": False, "name": name}
-            # Fail closed: never kill a PID we cannot prove is still ours.
-            if process_manager.owns_process(
+
+            # A4b — refuse while a delivery to this agent is provably in
+            # flight. Killing now could orphan an already-spawned resumed
+            # child, and waiting here would deadlock: the holder needs this
+            # very lock to finalize. A lease whose holder is dead, or whose
+            # creation token no longer matches, is reconciled automatically
+            # and the kill proceeds. Ordinary kill NEVER bypasses a live
+            # lease; the operator escape lives in the CLI, behind the session
+            # recovery token.
+            lease = reconcile_lease(
+                _leases_file(session_id), name, holder_live=_lease_holder_live
+            )
+            if lease is not None:
+                return {
+                    "success": False,
+                    "name": name,
+                    "reason": "operation_in_progress",
+                    "retriable": True,
+                    "holder_pid": lease.holder_pid,
+                    "operation_id": lease.operation_id,
+                    "detail": (
+                        "A follow-up delivery to this agent is in flight and "
+                        "its holder is provably alive. Retry once it settles, "
+                        "or use the CLI operator path "
+                        "(`win-agent-teams lease force`) if the holder is hung."
+                    ),
+                }
+
+            owned = process_manager.owns_process(
                 str(agent.get("pid")), _agent_create_token(agent)
-            ):
+            )
+            # Fail closed: never kill a PID we cannot prove is still ours.
+            if owned:
                 process_manager.kill_process(str(agent["pid"]))
             remaining = [a for a in agents if a.get("name") != name]
             agents[:] = remaining
             _save_agents_transaction(session_id, agents)
-            _cleanup_agent_artifacts(session_id, name)
+            _drop_agent_lease(_leases_file(session_id), name)
+            # The child is gone if we just killed it or it was already dead;
+            # only then may its prompt sidecars be removed outright.
+            _cleanup_agent_artifacts(
+                session_id, name, child_exited=owned or not _agent_alive(agent)
+            )
             return {"success": True, "name": name}
 
     return await run_blocking(_do_kill)

@@ -76,7 +76,10 @@ fills with the spawner's `IDENTITY` (`src/claude_teams/server_simple.py:1261`).
 `agents.json` records no parent field. A spawned agent's record is
 `{name, pid, backend, session_id, status, spawned_at, cwd, model,
 permission_mode, reasoning_effort, create_token, correlation_id,
-prompt_transport}` (`spawn_agent._do_spawn`). The only parent information
+prompt_transport}` (`spawn_agent._do_spawn`), plus two fields written only by
+`follow_up_agent`: `generation` (int, the CAS counter — absent counts as 0) and
+`pending_delivery` (present only while an attempt is unconfirmed, see
+[section 4a](#4a-delivery-confirmation)). The only parent information
 that exists is the `AGENT_PARENT_NAME` env var inside the child process, used to
 resolve the `"team-lead"` alias when that child sends a message
 (`src/claude_teams/server_simple.py:792-796`).
@@ -281,23 +284,40 @@ See [section 4](#4-follow_up_agent-in-detail).
 
 ### `kill_agent(name)`
 
-Terminal and destructive (`src/claude_teams/server_simple.py:1782-1798`):
+Terminal and destructive (`kill_agent._do_kill`):
 
+0. **Refuses outright while a delivery to this agent is in flight** and its
+   lease holder is provably alive, returning `reason="operation_in_progress"`
+   with `retriable: true`, `holder_pid` and `operation_id`. Nothing is killed
+   and the record survives. Killing under a live lease could orphan an
+   already-spawned resumed child, and *waiting* here would deadlock — the
+   holder needs this very lock to finalize. A lease whose holder is dead, or
+   whose creation token no longer matches (PID reuse), is reconciled
+   automatically and the kill proceeds. **Ordinary `kill_agent` never bypasses
+   a live lease**; the escape hatch is CLI-only (see
+   [section 4b](#4b-the-operation-lease)).
 1. Signals the OS process **only** when `owns_process` proves it is still ours —
    live in-memory ownership or a matching creation token
    (`src/claude_teams/server_simple.py:1790-1793`,
    `src/claude_teams/backends/process_manager.py:253-267`). A reused or foreign
    PID is left running.
 2. Removes the record from `agents.json`.
-3. Deletes `state-{name}.json`, `prompts/{name}.prompt.txt`,
-   `inbox-{name}.jsonl`, and `inbox-{name}.pos.json`
-   (`src/claude_teams/server_simple.py:1749-1755`) — **any unread messages
-   addressed to that agent are destroyed**.
+3. Deletes `state-{name}.json`, `inbox-{name}.jsonl`, and
+   `inbox-{name}.pos.json` (`_cleanup_agent_artifacts`) — **any unread messages
+   addressed to that agent are destroyed** — plus the legacy deterministic
+   `prompts/{name}.prompt.txt`.
+3a. Deletes `prompts/{name}.<nonce>.prompt.txt` **only when the child is
+   confirmed gone** (we just killed it, or it was already dead). Otherwise only
+   files past the 24 h age threshold are collected. A still-running CLI may not
+   have read its prompt file yet, and a timeout is explicitly not licence to
+   delete it (see [section 4c](#4c-prompt-file-lifecycle)).
 4. Deletes the killed agent's sender entry from the caller's own cursor file
    (`src/claude_teams/server_simple.py:1759-1764`).
 
 **Returns** `{"success": true, "name": name}`; `{"success": false, "name":
-name}` with **no `reason` field** when the agent is not in the registry
+name, "reason": "operation_in_progress", ...}` under a live lease; `{"success":
+false, "name": name}` with **no `reason` field** when the agent is not in the
+registry
 (`src/claude_teams/server_simple.py:1788`); `{"success": false, "name": name,
 "reason": "session_not_found"}` with no session.
 
@@ -392,7 +412,8 @@ Everything lives under `~/.claude/agent-sessions/<session-uuid>/`
 | `inbox-{name}.jsonl` | any agent's `send_message` (append) (`src/claude_teams/server_simple.py:1332-1333`) | the owner's `read_messages`; watcher (`src/claude_teams/cli.py:223`) |
 | `inbox-{name}.pos.json` | the owner's `read_messages` (`src/claude_teams/server_simple.py:1475`) | owner; watcher (read-only) |
 | `state-{name}.json` | the **worker's own** lifecycle hook process (`src/claude_teams/hooks.py:88-89`) | server status tools; watcher |
-| `prompts/{name}.prompt.txt` | server, before a claude-code spawn/resume (`src/claude_teams/server_simple.py:1135-1137`) | the worker itself, as a file read |
+| `prompts/{name}.<nonce>.prompt.txt` | server, before a claude-code spawn/resume (`_materialize_prompt`) | the worker itself, as a file read |
+| `operation-leases.json` | server, temp-file + atomic replace (`src/claude_teams/leases.py:save_leases`) | server |
 | `mcp/{name}.mcp.json` | server (`src/claude_teams/server_simple.py:1122-1123`) | the claude CLI |
 | `hooks-{name}.settings.json` | server (`src/claude_teams/hooks.py:147-148`) | the claude CLI |
 | `codex-hook-{name}.cmd` | server, Windows only (`src/claude_teams/hooks.py:182-184`) | Codex's hook runner |
@@ -524,7 +545,14 @@ Evaluated in this order, in `_do_follow_up`:
 | 6 | Alive, **not idle by marker**, and `last_activity_at is None` | `agent_state_unknown` |
 | 7 | Alive, **not idle by marker**, and last activity < 60 s ago | `agent_busy` |
 | 8 | Alive, judged idle, and `replace_if_idle=False` | `agent_idle_but_alive` |
+| 8a | Another caller holds the operation lease | *queued, never refused* — see [4b](#4b-the-operation-lease) |
 | 9 | `backend.resume(...)` raised | `resume_failed` |
+| 10 | Resumed child exited inside the settle window | `resume_not_confirmed` |
+| 11 | Resumed child died with no receipt | `not_delivered` |
+| 12 | Scan bound expired, child still alive | *not a refusal* — `queued(phase="unconfirmed")` |
+
+Gate 3a is evaluated before the lease is reserved; gates 10-12 happen **after**
+the registry lock has been released (see [4a](#4a-delivery-confirmation)).
 
 Checks 5–7 all sit **behind** the marker resolution. An earlier revision of this
 document listed 5 and 6 as unconditional on `alive`, and carried an extra row for
@@ -608,6 +636,130 @@ potentially leaving the old process running.
 Tokens are captured at spawn time from the just-live child
 (`src/claude_teams/server_simple.py:1269-1273`) and re-captured after every
 resume (`src/claude_teams/server_simple.py:1711`).
+
+### 4a. Delivery confirmation
+
+A returned PID is **not** evidence that a follow-up arrived, and neither is
+transcript growth or a state-marker transition. Markers are keyed on agent
+*name* and hooks write only `state`/`event`/`ts`, so a surviving old process and
+a freshly resumed one write byte-identical markers.
+
+So each attempt embeds a cryptographically random **delivery nonce** in the
+final prompt (`wat-deliver:<32 hex>`, `src/claude_teams/delivery.py`), and
+`delivered` is set only when that exact nonce is found in a **named receipt
+record** of the transcript whose `backend_session_id` is being resumed.
+Confirmation requires **both** child survival and the receipt record.
+
+| Backend | Receipt record |
+|---|---|
+| `claude-code` | the `type: "user"` record — either literal user text (argv transport) or the `tool_result` carrying the prompt-file contents (sidecar transport) |
+| `codex` | the rollout record for user input (`response_item` with `payload.role == "user"`) |
+
+Four scanner rules are load-bearing:
+
+- **Semantic, not substring.** The nonce is read from a *parsed* receipt
+  record. A nonce echoed in a CLI diagnostic, in an assistant reply, or in
+  serialized argv does not confirm anything.
+- **Marker grammar is strict.** A fixed delimiter plus the full 32-hex id,
+  with hex lookarounds on both sides — the prefix alone, a truncated id, or an
+  id embedded in a longer hex run never match.
+- **Record boundary, not raw EOF.** The pre-resume anchor is the offset of the
+  last *complete* JSONL record. Partial bytes are retained between polls rather
+  than skipped, because the readers drop malformed lines **permanently** and a
+  fragment consumed at EOF would never be reconsidered once its remainder
+  arrived.
+- **Identity/size regression means rotation, not absence.** Continuity is
+  re-established by backend session id **plus** file identity. The correlation
+  token corroborates when several candidates survive that test, but is never a
+  precondition — a successor may legitimately not replay the spawn marker.
+  More than one candidate is `ambiguous`, never a guess.
+
+#### The three non-delivery outcomes (R6)
+
+| Situation | Result | Terminal? |
+|---|---|---|
+| Child exited inside the settle window | `reason="resume_not_confirmed"` | yes |
+| Child died later with no receipt | `reason="not_delivered"` | yes |
+| Bound expired, child still alive | `status="queued", phase="unconfirmed"` | **no** |
+
+The third is R6's *live uncertainty*: a transcript write buffered past the bound
+can still arrive, so it is neither delivered nor terminally failed. The attempt
+is recorded on the agent as `pending_delivery` `{nonce, operation_id,
+attempted_at, prompt_file}`, and the **next** `follow_up_agent` call rescans for
+that nonce across the whole transcript *before* sending anything. When it is
+found the call returns `{success: true, status: "delivered", reconciled: true}`
+and **no second prompt is sent**.
+
+Only a `delivered` or `unconfirmed` outcome writes the agent record. A resume
+that never attached, or a child that died without a receipt, leaves the record
+exactly as it was — there is nothing worth tracking and R6 forbids describing
+either as progress.
+
+### 4b. The operation lease
+
+Confirmation polls for tens of seconds and therefore cannot run inside
+`_agents_transaction`, which holds a **cross-process** file lock for its whole
+body. The lock is released around resume-and-confirm.
+
+Compare-and-swap after the fact is not sufficient: two callers could snapshot
+the same generation, both resume, and both deliver distinct nonces, and the
+losing CAS cannot undo an irreversible side effect. So a caller **atomically
+reserves a per-agent lease while the registry lock is still held**
+(`src/claude_teams/leases.py`). The lease holds `{generation, operation_id,
+backend_session_id, nonce, holder_pid, holder_create_token, deadline}` and does
+not itself resume. Finalization CASes on generation **and** `operation_id` —
+generation alone is not enough, because a name reused after removal starts a
+fresh record that can legitimately be back at the same generation.
+
+- **A second valid caller queues** behind per-target FIFO with a ticket; it is
+  **not** refused. Refusing a valid caller would hand back exactly the dead end
+  R1 forbids. Once the wait budget is spent it gets the honest cooperative tail
+  `{status: "queued", phase: "pending", reason: "operation_in_progress",
+  retriable: true, queue_position}` — and nothing was sent.
+- **Storage is crash-atomic and outside the registry.** `agents.json` is
+  overwritten with a plain write, so a crash mid-write could destroy the
+  registry *and* the lease. Leases live in `operation-leases.json`, written with
+  the temp-file + atomic-replace pattern `save_inbox_cursors` uses.
+- **Expiry is not fencing, and neither is a bare PID.** A holder that is alive
+  but slow after spawning would otherwise let a second caller observe expiry,
+  fail to find a not-yet-flushed nonce, and retry into a delivery still in
+  flight. Reclaiming therefore checks holder liveness; **wall-clock expiry alone
+  never justifies a resend.** Because a dead holder's PID can be reused,
+  `holder_pid` is paired with `holder_create_token` and validated fail-closed,
+  exactly as `owns_process` does.
+
+#### The operator escape (CLI only)
+
+Unconditional refusal would make a hung-but-live holder's agent permanently
+unkillable. `win-agent-teams lease {inspect,clear,force} <session> <agent>
+--token <lead_token>` is gated on the session recovery token and is not
+reachable over MCP:
+
+- `inspect` — reports the attempt nonce, holder liveness and the lease's
+  generation, so an operator can check by hand whether the prompt landed.
+- `clear` — removes a lease whose holder is dead or token-mismatched. It
+  **refuses a provably live holder** (exit 3).
+- `force` — for a live-but-overdue holder. Order is load-bearing: it **bumps
+  the fencing generation first**, so the original holder can no longer win its
+  finalize CAS; only then does it terminate the resumed child (and only when
+  ownership is provable); only then does it release the lease.
+
+### 4c. Prompt-file lifecycle
+
+Prompt sidecars are `prompts/{name}.<nonce>.prompt.txt` — one per call, so two
+concurrent calls to the same agent can never overwrite each other's prompt.
+
+| Attempt outcome | Sidecar |
+|---|---|
+| `delivered` | removed immediately — the receipt *is* proof the CLI read it |
+| `resume_not_confirmed` / `not_delivered` | removed — the child is provably gone |
+| `unconfirmed` | **kept** — a live CLI may not have read it yet |
+| `kill_agent`, child confirmed gone | all of the agent's sidecars removed |
+| anything else | age-based GC only, 24 h |
+
+There is deliberately **no** "delete this agent's stale files at the start of a
+new call": that would race a concurrent attempt whose CLI has not read its file
+yet. Timeout-failure alone is never sufficient grounds for deletion.
 
 ### `backend_session_id` scraping
 

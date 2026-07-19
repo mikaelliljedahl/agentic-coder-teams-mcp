@@ -115,20 +115,23 @@ async def test_spawn_agent_writes_claude_prompt_file_for_sensitive_prompt(
         prompt, name="worker", backend="claude-code", cwd=str(tmp_path)
     )
 
-    prompt_path = (
-        server_simple._session_dir(result["session_id"])
-        / "prompts"
-        / "worker.prompt.txt"
+    # A5: one prompt file per call, keyed on a per-call token, so two
+    # concurrent calls for the same agent can never overwrite each other.
+    prompts = sorted(
+        (server_simple._session_dir(result["session_id"]) / "prompts").glob(
+            "worker.*.prompt.txt"
+        )
     )
+    assert len(prompts) == 1, f"expected exactly one per-call sidecar, got {prompts}"
     # The user prompt is preserved losslessly at the head of the sidecar; the
     # correlation marker it is followed by is asserted in
     # tests/test_correlation_transport.py.
-    assert prompt_path.read_text(encoding="utf-8").startswith(prompt)
+    assert prompts[0].read_text(encoding="utf-8").startswith(prompt)
     request = backend.last_request
     assert request is not None
     assert request.extra is not None
     assert request.prompt.startswith(prompt)
-    assert request.extra["prompt_file_path"] == str(prompt_path)
+    assert request.extra["prompt_file_path"] == str(prompts[0])
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ import pytest
 from claude_teams import server_simple as ss
 from claude_teams.agent_output import BINDING_BOUND, AgentOutput, BindingResult
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.delivery import DeliveryOutcome
 
 
 class _FakeResumeBackend:
@@ -50,6 +51,13 @@ def follow_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespac
     monkeypatch.setattr(ss, "_session_id", "session-id")
     monkeypatch.setattr(ss, "registry", _FakeRegistry(backend))
     monkeypatch.setattr(ss, "_inbox_locks", {})
+    # These tests are about the fail-closed PID gate and token persistence, not
+    # about A4 confirmation, so the confirmation outcome is pinned exactly as
+    # the binding is. Confirmation itself is proven against real transcripts in
+    # tests/test_delivery_confirmation.py and tests/test_follow_up_delivery.py.
+    monkeypatch.setattr(
+        ss, "confirm_delivery", lambda *a, **k: DeliveryOutcome("delivered", "")
+    )
     return SimpleNamespace(backend=backend, tmp_path=tmp_path)
 
 
@@ -127,7 +135,7 @@ def test_reused_pid_does_not_get_graceful_shutdown(
     follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Stored token mismatches the live PID's token (PID reuse after reboot).
-    _write_agent(follow_up.tmp_path, create_token="stale-token")  # noqa: S106
+    _write_agent(follow_up.tmp_path, create_token="stale-token")
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",
@@ -197,7 +205,7 @@ def test_waiting_marker_allows_immediate_follow_up(
     # A "waiting" state marker is authoritative: even though activity is recent
     # (the inactivity timer would say busy), the agent is parked at a wait hook
     # and must be resumable immediately.
-    _write_agent(follow_up.tmp_path, create_token="tok")  # noqa: S106
+    _write_agent(follow_up.tmp_path, create_token="tok")
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",
@@ -219,7 +227,7 @@ def test_recent_activity_without_waiting_marker_is_busy(
 ) -> None:
     # No "waiting" marker: the inactivity timer still guards a genuinely busy
     # agent (recent activity, running marker) from being torn down.
-    _write_agent(follow_up.tmp_path, create_token="tok")  # noqa: S106
+    _write_agent(follow_up.tmp_path, create_token="tok")
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",
@@ -238,7 +246,7 @@ def test_recent_activity_without_waiting_marker_is_busy(
 def test_follow_up_resume_persists_new_create_token(
     follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _write_agent(follow_up.tmp_path, create_token="stale-token")  # noqa: S106
+    _write_agent(follow_up.tmp_path, create_token="stale-token")
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",
@@ -253,4 +261,4 @@ def test_follow_up_resume_persists_new_create_token(
 
     assert result["success"] is True
     agents = ss._load_agents("session-id")
-    assert agents[0]["create_token"] == "fresh-token-789"  # noqa: S105
+    assert agents[0]["create_token"] == "fresh-token-789"

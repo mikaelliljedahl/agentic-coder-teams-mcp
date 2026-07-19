@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from claude_teams import agent_output as ao
-from claude_teams import server_simple
+from claude_teams import delivery, server_simple
 from claude_teams.agent_output import (
     BINDING_BOUND,
     AgentOutput,
@@ -40,6 +40,7 @@ from claude_teams.backends import process_base
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.backends.codex import CodexBackend
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.delivery import DeliveryOutcome
 
 
 def _write_jsonl(path: Path, rows: list[Any], mtime: float) -> None:
@@ -1161,6 +1162,28 @@ def _pin_binding(
     )
 
 
+def _pin_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: str = "delivered",
+    reason: str = "",
+) -> None:
+    """Pin A4 confirmation to a fixed outcome.
+
+    The sibling of :func:`_pin_binding`, and used for the same reason: these
+    tests are about busy/idle refusal, model selection, correlation
+    preservation and so on, not about whether a nonce turned up in a
+    transcript. The confirmation behaviour itself is covered end to end in
+    ``tests/test_delivery_confirmation.py`` and ``tests/test_follow_up_delivery.py``
+    against real transcripts and real poll/exit transitions — never a mock.
+    """
+    monkeypatch.setattr(
+        server_simple,
+        "confirm_delivery",
+        lambda *a, **k: DeliveryOutcome(status, reason),
+    )
+
+
 def _setup_follow_up_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: object
 ) -> None:
@@ -1174,6 +1197,7 @@ def _setup_follow_up_session(
     # dedicated A6 tests below. Individual tests re-patch this when they need
     # a particular transcript-derived signal.
     _pin_binding(monkeypatch)
+    _pin_delivery(monkeypatch)
 
 
 @pytest.mark.asyncio
@@ -1197,7 +1221,10 @@ async def test_follow_up_agent_resumes_dead_agent(
     assert result["replaced_existing"] is False
     request, backend_session_id = backend.resume_calls[0]
     assert backend_session_id == "backend-session-id"
-    assert request.prompt == "next prompt"
+    # A4: the resume prompt carries this attempt's delivery marker, which is
+    # the only thing that later lets the receipt be attributed to this call.
+    assert request.prompt.startswith("next prompt")
+    assert request.prompt.count(delivery.DELIVERY_MARKER_PREFIX) == 1
     assert request.permission_mode == "bypass"
     agents = server_simple._load_agents("session-id")
     assert len(agents) == 1
@@ -1406,7 +1433,11 @@ async def test_follow_up_agent_refuses_legacy_record_and_invents_no_id(
     assert result["success"] is False
     assert result["reason"] == "binding_legacy"
     assert result["retriable"] is False
-    assert "kill" in str(result["detail"]).lower()
+    # The refusal must name the ONLY recovery, not just say "no": an agent
+    # predating correlation can never be made resumable.
+    detail = str(result["detail"]).lower()
+    assert "kill" in detail
+    assert "respawn" in detail
     assert backend.resume_calls == []
     # No id is minted to paper over the gap: a fresh one would not appear
     # anywhere in the conversation that already exists.
@@ -1448,6 +1479,7 @@ async def test_follow_up_agent_recovers_session_after_mcp_restart(
         ],
     )
     _pin_binding(monkeypatch)
+    _pin_delivery(monkeypatch)
     monkeypatch.setattr(server_simple, "_session_id", "")
     monkeypatch.setattr(
         server_simple.process_manager,

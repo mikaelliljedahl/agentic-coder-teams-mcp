@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from claude_teams import leases, server_simple
 from claude_teams.backends.registry import registry
 from claude_teams.messaging import unread_sender_counts
 from claude_teams.server_simple import mcp
@@ -104,6 +105,143 @@ def backends(
             ", ".join(row["supported_models"]),
         )
     console.print(table)
+
+
+lease_app = typer.Typer(
+    name="lease",
+    help="Operator escape hatch for a stuck per-agent delivery lease (A4b).",
+    no_args_is_help=True,
+)
+app.add_typer(lease_app, name="lease")
+
+
+def _authorize(session_id: str, token: str) -> None:
+    """Abort unless ``token`` is the session's recovery token.
+
+    This path can terminate a live child and fence out a running delivery, so
+    it is deliberately CLI-only and gated. Nothing reachable over MCP can call
+    it: ordinary ``kill_agent`` never bypasses a live lease.
+    """
+    if not token or token != server_simple._ensure_lead_token(session_id):
+        console.print("[red]Invalid or missing session recovery token.[/red]")
+        raise typer.Exit(code=2)
+
+
+def _lease_or_exit(session_id: str, agent: str):
+    lease = leases.active_lease(server_simple._leases_file(session_id), agent)
+    if lease is None:
+        console.print(f"[yellow]No lease held for {agent!r}.[/yellow]")
+        raise typer.Exit(code=1)
+    return lease
+
+
+def _describe(lease, *, holder_live: bool, child_alive: bool | None) -> dict:
+    return {
+        "agent": lease.agent,
+        "operation_id": lease.operation_id,
+        "generation": lease.generation,
+        "backend_session_id": lease.backend_session_id,
+        # The attempt nonce: what an operator needs to check by hand whether
+        # the prompt actually reached the target before forcing anything.
+        "attempt_nonce": lease.nonce,
+        "holder_pid": lease.holder_pid,
+        "holder_live": holder_live,
+        "resumed_child_alive": child_alive,
+        "deadline": lease.deadline,
+    }
+
+
+@lease_app.command("inspect")
+def lease_inspect(
+    session_id: str = typer.Argument(..., help="Session id holding the agent."),
+    agent: str = typer.Argument(..., help="Agent name."),
+    token: str = typer.Option(..., "--token", help="Session recovery token."),
+) -> None:
+    """Show the attempt nonce, holder liveness, and resumed-child liveness."""
+    _authorize(session_id, token)
+    lease = _lease_or_exit(session_id, agent)
+    holder_live = server_simple._lease_holder_live(
+        lease.holder_pid, lease.holder_create_token
+    )
+    console.print_json(
+        json.dumps(_describe(lease, holder_live=holder_live, child_alive=None))
+    )
+
+
+@lease_app.command("clear")
+def lease_clear(
+    session_id: str = typer.Argument(..., help="Session id holding the agent."),
+    agent: str = typer.Argument(..., help="Agent name."),
+    token: str = typer.Option(..., "--token", help="Session recovery token."),
+) -> None:
+    """Clear a lease whose holder is dead or token-mismatched.
+
+    Refuses a provably live holder: clearing under one would let a second
+    caller resume into a delivery that is still in progress. Use ``force`` for
+    a live-but-hung holder — it fences the holder out first.
+    """
+    _authorize(session_id, token)
+    lease = _lease_or_exit(session_id, agent)
+    if server_simple._lease_holder_live(lease.holder_pid, lease.holder_create_token):
+        console.print(
+            "[red]Holder is provably live; refusing to clear. "
+            "Use `lease force` if it is hung.[/red]"
+        )
+        raise typer.Exit(code=3)
+    leases.force_clear_lease(server_simple._leases_file(session_id), agent)
+    console.print(f"[green]Cleared stale lease for {agent!r}.[/green]")
+
+
+@lease_app.command("force")
+def lease_force(
+    session_id: str = typer.Argument(..., help="Session id holding the agent."),
+    agent: str = typer.Argument(..., help="Agent name."),
+    token: str = typer.Option(..., "--token", help="Session recovery token."),
+) -> None:
+    """Fence out a live-but-overdue holder, then release the lease.
+
+    Order is load-bearing. The **fencing generation is bumped first**, so the
+    original holder can no longer win its finalize CAS — otherwise it could
+    wake up after we terminated its child and write a record describing a
+    delivery that no longer exists. Only then is the resumed child terminated
+    (and only when ownership is provable), and only then is the lease cleared.
+    """
+    _authorize(session_id, token)
+    lease = _lease_or_exit(session_id, agent)
+    lease_path = server_simple._leases_file(session_id)
+
+    fenced_generation = None
+    child_pid = None
+    record: dict | None = None
+    with server_simple._agents_transaction(session_id) as agents:
+        record = next((a for a in agents if a.get("name") == agent), None)
+        if record is not None:
+            # Step 1 — fence, before anything irreversible happens.
+            fenced_generation = server_simple._bump_generation(record)
+            child_pid = record.get("pid")
+            server_simple._save_agents_transaction(session_id, agents)
+
+    # Step 2 — terminate the resumed child, but only when ownership is provable.
+    terminated = False
+    if record is not None and child_pid is not None:
+        create_token = server_simple._agent_create_token(record)
+        if server_simple.process_manager.owns_process(str(child_pid), create_token):
+            server_simple.process_manager.kill_process(str(child_pid))
+            terminated = True
+
+    # Step 3 — only now release the lease.
+    leases.force_clear_lease(lease_path, agent)
+    console.print_json(
+        json.dumps(
+            {
+                "forced": True,
+                "agent": agent,
+                "fenced_generation": fenced_generation,
+                "attempt_nonce": lease.nonce,
+                "child_terminated": terminated,
+            }
+        )
+    )
 
 
 def _snapshot_mtimes(session_dir: Path, pattern: str) -> dict[str, tuple[int, int]]:
