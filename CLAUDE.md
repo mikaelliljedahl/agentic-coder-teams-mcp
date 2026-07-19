@@ -42,3 +42,7 @@ docs/features/<feature>/
 ```
 
 `implementation.md` should summarize the red/green evidence, final design, deviations from the plan, and validation commands. Broader reorganization of existing documentation should be performed as a separate follow-up feature unless it is required by the current change.
+
+## Reference documentation
+
+- `docs/reference/agent-messaging-protocol.md` documents how spawn, messaging, follow-up, the lifecycle hooks, the on-disk session contract, and the `watch` CLI actually behave. Read it instead of re-deriving the protocol from `server_simple.py`, `cli.py`, `hooks.py`, and the backends.
