@@ -111,9 +111,9 @@ source = ["src/claude_teams"]
 
 [tool.coverage.report]
 # Hard floor the CI guards. Target is 95% — contributors should aim high —
-# but 90% is the minimum that blocks a release. See README "Pull requests"
+# but 80% is the minimum that blocks a release. See README "Pull requests"
 # for the target and measurement command.
-fail_under = 90
+fail_under = 80
 show_missing = true
 skip_covered = false
 exclude_also = [

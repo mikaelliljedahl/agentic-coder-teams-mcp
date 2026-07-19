@@ -11,8 +11,23 @@ from typing import Any
 
 import pytest
 
+from claude_teams import agent_output as ao
 from claude_teams import server_simple
 from claude_teams.agent_output import (
+    _claude_session_id,
+    _claude_started_at,
+    _codex_candidate_dirs,
+    _content_text,
+    _first_json_object,
+    _iter_lines_reverse,
+    _last_claude_message,
+    _last_codex_message,
+    _normalize_path,
+    _parse_timestamp,
+    _resolve_path_text,
+    _rollout_contains_token,
+    _started_after,
+    _truncate_tail,
     codex_correlation_token,
     read_claude_output,
     read_codex_output,
@@ -1303,3 +1318,395 @@ async def test_follow_up_agent_recovers_session_after_mcp_restart(
     assert result["success"] is True
     assert result["session_id"] == session_id
     assert backend.resume_calls[0][1] == "backend-session-id"
+
+
+# ==========================================================================
+# Guard / error-branch coverage for private helpers.
+#
+# These exercise the defensive branches (early-return guards, malformed-input
+# skips, and file-IO error handlers) that the public happy-path tests above do
+# not reach. Fault injection uses monkeypatching of ``Path.open``/``stat``
+# rather than filesystem permissions so it is portable and deterministic.
+# ==========================================================================
+
+# ---- read_codex_output / read_claude_output entry guards ------------------
+
+
+def test_read_codex_output_rejects_bad_inputs(tmp_path, monkeypatch):
+    # Isolate home so that, should the guard under test regress, execution
+    # cannot reach the developer's real ~/.codex/sessions tree.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert read_codex_output(0.0, "/some/cwd") is None
+    assert read_codex_output(-1.0, "/some/cwd") is None
+    assert read_codex_output(100.0, "") is None
+
+
+def test_read_codex_output_none_when_cwd_normalizes_empty(monkeypatch):
+    # Contract-isolation: a non-empty cwd never *naturally* normalizes to "",
+    # so force the helper to model the defensive branch at line 58-59.
+    monkeypatch.setattr(ao, "_normalize_path", lambda value: "")
+    assert read_codex_output(100.0, "/real/cwd") is None
+
+
+def test_read_claude_output_rejects_bad_inputs(tmp_path, monkeypatch):
+    # Isolate home so a regressed guard cannot reach ~/.claude/projects.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert read_claude_output(0.0, "/some/cwd") is None
+    assert read_claude_output(100.0, "") is None
+
+
+def test_read_claude_output_none_when_cwd_resolves_empty(monkeypatch):
+    # Contract-isolation: mirrors the Codex normalization test above — a
+    # non-empty cwd never naturally resolves to "", so the helper is forced to
+    # model the defensive branch at lines 90-92 (not a real filesystem edge).
+    monkeypatch.setattr(ao, "_resolve_path_text", lambda value: "")
+    assert read_claude_output(100.0, "/real/cwd") is None
+
+
+def test_read_codex_output_none_when_no_message_and_no_session_id(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    spawned_at = 1_762_969_000.0
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    # session_meta with a non-string id (-> session_id None) and no assistant
+    # response_item (-> last message None) hits the "return None" at line 70.
+    meta = {
+        "type": "session_meta",
+        "payload": {
+            "id": 12345,  # non-string -> session_id resolves to None
+            "timestamp": _timestamp_at(spawned_at),
+            "cwd": str(cwd.resolve()),
+        },
+    }
+    path = _codex_path(home, spawned_at, "rollout-none.jsonl")
+    _write_jsonl(path, [meta], spawned_at + 1)
+
+    assert read_codex_output(spawned_at, str(cwd)) is None
+
+
+def test_read_claude_output_none_when_no_message_and_no_session_id(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    spawned_at = 1_762_969_000.0
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    project_dir = _claude_project_dir(home, cwd)
+    # A record with a timestamp (so _started_after passes) but no sessionId and
+    # no assistant message -> last message None, session id None -> line 112.
+    path = project_dir / "sess.jsonl"
+    _write_jsonl(
+        path,
+        [{"type": "user", "timestamp": _timestamp_at(spawned_at)}],
+        spawned_at + 1,
+    )
+
+    assert read_claude_output(spawned_at, str(cwd)) is None
+
+
+# ---- _matching_codex_rollouts malformed-meta skips ------------------------
+
+
+def test_read_codex_output_skips_non_session_meta_and_bad_payload(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    spawned_at = 1_762_969_000.0
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    # Valid OLDER rollout with a matching cwd + an assistant message. It must be
+    # the selection, proving both newer malformed rollouts were excluded.
+    _write_jsonl(
+        _codex_path(home, spawned_at, "rollout-good.jsonl"),
+        [_codex_meta(cwd, timestamp=_timestamp_at(spawned_at)), _codex_message("GOOD")],
+        spawned_at + 1,
+    )
+    # NEWER non-session_meta rollout whose payload DOES carry a matching cwd, so
+    # only the ``type != session_meta`` skip (line 136) keeps it out. If that
+    # skip regressed it would win on mtime and return "WRONG".
+    _write_jsonl(
+        _codex_path(home, spawned_at, "rollout-a.jsonl"),
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "cwd": str(cwd),
+                    "timestamp": _timestamp_at(spawned_at),
+                },
+            },
+            _codex_message("WRONG"),
+        ],
+        spawned_at + 5,
+    )
+    # NEWER session_meta whose payload is not a dict -> skipped at line 139
+    # (without the guard, ``payload.get`` on a str would raise).
+    _write_jsonl(
+        _codex_path(home, spawned_at, "rollout-b.jsonl"),
+        [{"type": "session_meta", "payload": "not-a-dict"}],
+        spawned_at + 6,
+    )
+
+    result = read_codex_output(spawned_at, str(cwd))
+    assert result is not None
+    assert result.last_message == "GOOD"
+
+
+# ---- _rollout_contains_token ---------------------------------------------
+
+
+def test_rollout_contains_token_found(tmp_path):
+    path = tmp_path / "r.jsonl"
+    path.write_text("first line has wat-corr:abc\nsecond\n", encoding="utf-8")
+    assert _rollout_contains_token(path, "wat-corr:abc") is True
+
+
+def test_rollout_contains_token_beyond_max_lines(tmp_path):
+    path = tmp_path / "r.jsonl"
+    path.write_text("l0\nl1\nl2\ntoken-here\n", encoding="utf-8")
+    # Token is on line index 3 but scan stops after 2 lines.
+    assert _rollout_contains_token(path, "token-here", max_lines=2) is False
+
+
+def test_rollout_contains_token_oserror(tmp_path, monkeypatch):
+    path = tmp_path / "missing.jsonl"
+
+    def boom(*args, **kwargs):
+        raise OSError
+
+    monkeypatch.setattr(Path, "open", boom)
+    assert _rollout_contains_token(path, "x") is False
+
+
+# ---- _matching_jsonl_files: per-file stat failure -------------------------
+
+
+def test_matching_jsonl_files_skips_unstattable_file(tmp_path, monkeypatch):
+    directory = tmp_path / "dir"
+    directory.mkdir()
+    (directory / "rollout-x.jsonl").write_text("{}\n", encoding="utf-8")
+
+    real_stat = Path.stat
+
+    def flaky_stat(self, *args, **kwargs):
+        if self.name == "rollout-x.jsonl":
+            raise OSError
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    assert ao._matching_jsonl_files(
+        directory, 0.0, pattern="rollout-*.jsonl"
+    ) == []
+
+
+# ---- _codex_candidate_dirs: bad timestamp ---------------------------------
+
+
+def test_codex_candidate_dirs_bad_timestamp_returns_empty():
+    # A wildly out-of-range epoch makes datetime.fromtimestamp raise.
+    assert _codex_candidate_dirs(1e20) == []
+
+
+# ---- _first_json_object ---------------------------------------------------
+
+
+def test_first_json_object_skips_blank_and_invalid(tmp_path):
+    path = tmp_path / "f.jsonl"
+    path.write_text('\n   \nnot json\n{"a": 1}\n', encoding="utf-8")
+    assert _first_json_object(path) == {"a": 1}
+
+
+def test_first_json_object_none_when_all_bad(tmp_path):
+    path = tmp_path / "f.jsonl"
+    path.write_text("\nnope\n{bad\n", encoding="utf-8")
+    assert _first_json_object(path) is None
+
+
+def test_first_json_object_oserror(tmp_path, monkeypatch):
+    path = tmp_path / "f.jsonl"
+
+    def boom(*args, **kwargs):
+        raise OSError
+
+    monkeypatch.setattr(Path, "open", boom)
+    assert _first_json_object(path) is None
+
+
+# ---- _last_codex_message / _last_claude_message skip logic ----------------
+
+
+def test_last_codex_message_skips_malformed_returns_older(tmp_path):
+    path = tmp_path / "r.jsonl"
+    older = _codex_message("older answer")
+    # File order: valid older record first, malformed record last. Reverse read
+    # sees the malformed line first (JSONDecodeError -> skip) then the valid one.
+    path.write_text(json.dumps(older) + "\n{bad json\n", encoding="utf-8")
+    assert _last_codex_message(path) == "older answer"
+
+
+def test_last_codex_message_none_without_assistant(tmp_path):
+    path = tmp_path / "r.jsonl"
+    path.write_text(
+        json.dumps({"type": "response_item", "payload": {"role": "user"}}) + "\n",
+        encoding="utf-8",
+    )
+    assert _last_codex_message(path) is None
+
+
+def test_last_codex_message_skips_non_assistant_returns_older(tmp_path):
+    path = tmp_path / "r.jsonl"
+    older = _codex_message("older answer")
+    # NEWER record is a non-assistant (role=user) that nonetheless carries
+    # output_text — only the role check at line 261 keeps it out. Reverse read
+    # sees it first; if that skip regressed it would return "newer user text".
+    newer_user = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "output_text", "text": "newer user text"}],
+        },
+    }
+    path.write_text(
+        json.dumps(older) + "\n" + json.dumps(newer_user) + "\n", encoding="utf-8"
+    )
+    assert _last_codex_message(path) == "older answer"
+
+
+def test_last_claude_message_skips_bad_records_returns_older(tmp_path):
+    path = tmp_path / "c.jsonl"
+    older = _claude_message([{"type": "text", "text": "older text"}])
+    lines = [
+        json.dumps(older),
+        "{bad json",  # JSONDecodeError -> skip (line 276)
+        json.dumps({"type": "assistant", "message": "not-a-dict"}),  # skip (279)
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert _last_claude_message(path) == "older text"
+
+
+def test_last_claude_message_none_without_assistant(tmp_path):
+    path = tmp_path / "c.jsonl"
+    path.write_text(
+        json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n",
+        encoding="utf-8",
+    )
+    assert _last_claude_message(path) is None
+
+
+# ---- _claude_session_id / _claude_started_at ------------------------------
+
+
+def test_claude_session_id_none_when_absent(tmp_path):
+    path = tmp_path / "c.jsonl"
+    path.write_text("\nnot json\n[]\n{\"type\": \"user\"}\n", encoding="utf-8")
+    assert _claude_session_id(path) is None
+
+
+def test_claude_session_id_oserror(tmp_path, monkeypatch):
+    path = tmp_path / "c.jsonl"
+    monkeypatch.setattr(
+        Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError())
+    )
+    assert _claude_session_id(path) is None
+
+
+def test_claude_started_at_none_when_absent(tmp_path):
+    path = tmp_path / "c.jsonl"
+    path.write_text("\nnot json\n[]\n{\"foo\": 1}\n", encoding="utf-8")
+    assert _claude_started_at(path) is None
+
+
+def test_claude_started_at_oserror(tmp_path, monkeypatch):
+    path = tmp_path / "c.jsonl"
+    monkeypatch.setattr(
+        Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError())
+    )
+    assert _claude_started_at(path) is None
+
+
+# ---- _parse_timestamp / _started_after ------------------------------------
+
+
+def test_parse_timestamp_variants():
+    assert _parse_timestamp(None) is None
+    assert _parse_timestamp("") is None
+    assert _parse_timestamp("not-a-timestamp") is None
+    # Trailing-Z form is normalized and parsed.
+    assert _parse_timestamp("2025-01-01T00:00:00Z") is not None
+
+
+def test_started_after_none_is_true():
+    assert _started_after(None, 100.0) is True
+    assert _started_after(100.0, 100.0) is True
+    assert _started_after(10.0, 100.0) is False
+
+
+# ---- _content_text --------------------------------------------------------
+
+
+def test_content_text_non_list_returns_none():
+    # Use non-iterable inputs: without the ``isinstance(content, list)`` guard
+    # the subsequent ``for item in content`` would raise TypeError, so a clean
+    # ``None`` proves the guard (not merely the later empty-parts return).
+    assert _content_text(None, "text") is None
+    assert _content_text(123, "text") is None
+
+
+def test_content_text_no_matching_parts_returns_none():
+    assert _content_text([{"type": "image"}], "text") is None
+
+
+# ---- _iter_lines_reverse --------------------------------------------------
+
+
+def test_iter_lines_reverse_oserror_yields_nothing(tmp_path, monkeypatch):
+    path = tmp_path / "r.jsonl"
+
+    def boom(*args, **kwargs):
+        raise OSError
+
+    monkeypatch.setattr(Path, "open", boom)
+    assert list(_iter_lines_reverse(path)) == []
+
+
+def test_iter_lines_reverse_multichunk(tmp_path):
+    # Exceed the 64 KiB reverse-read chunk so the multi-iteration buffer join
+    # path is exercised, and lines come back newest-first.
+    path = tmp_path / "big.jsonl"
+    lines = [f"line-{i}" for i in range(6000)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = list(_iter_lines_reverse(path))
+    assert result[0] == "line-5999"
+    assert result[-1] == "line-0"
+    assert len(result) == 6000
+
+
+# ---- _truncate_tail / _normalize_path / _resolve_path_text ----------------
+
+
+def test_truncate_tail_non_positive_budget():
+    assert _truncate_tail("abcdef", 0) == ""
+    assert _truncate_tail("abcdef", -5) == ""
+
+
+def test_normalize_path_empty_input():
+    assert _normalize_path("") == ""
+
+
+def test_resolve_path_text_empty_input():
+    assert _resolve_path_text("") == ""
+
+
+def test_resolve_path_text_falls_back_on_resolve_error(monkeypatch):
+    def boom(self, *args, **kwargs):
+        raise OSError
+
+    monkeypatch.setattr(Path, "resolve", boom)
+    # Falls back to the expanduser'd path instead of raising.
+    result = _resolve_path_text("~/somewhere")
+    assert result == str(Path("~/somewhere").expanduser())
