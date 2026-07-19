@@ -105,7 +105,7 @@ class TestKillFailClosed:
     def test_skips_process_kill_on_token_mismatch_but_removes_record(
         self, session: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _add_agent(session, create_token="stale-token")  # noqa: S106
+        _add_agent(session, create_token="stale-token")
         calls = _stub_owns(monkeypatch, owned=False)
 
         result = asyncio.run(server_simple.kill_agent("worker"))

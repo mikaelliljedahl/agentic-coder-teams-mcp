@@ -104,6 +104,11 @@ max-statements = 80
     "PT019",    # @patch decorators inject mocks as args by design
     "SIM117",   # nested ``with`` blocks read clearer in setup
     "PLC0415",  # inline imports for patching are normal
+    # The "token" family in this codebase is PID *creation tokens*, correlation
+    # markers and session recovery ids — opaque identifiers, never credentials.
+    # Bandit's name-based heuristic cannot tell the difference, and the tests
+    # necessarily pass literal ones. Production code gets no such leniency.
+    "S105", "S106", "S107",
 ]
 
 [tool.coverage.run]

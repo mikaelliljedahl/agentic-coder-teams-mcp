@@ -102,7 +102,7 @@ class TestInMemoryOwnershipIsReuseSafe:
 class TestTokenAwareHealthCheck:
     def test_reports_dead_on_token_mismatch(self) -> None:
         handle = str(os.getpid())
-        alive, _ = pm.process_manager.health_check(handle, expected_token="wrong")  # noqa: S106
+        alive, _ = pm.process_manager.health_check(handle, expected_token="wrong")
         assert alive is False
 
     def test_reports_alive_on_token_match(self) -> None:
