@@ -26,7 +26,7 @@ def session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 def _add_agent(session_id: str, **overrides: object) -> dict:
-    agent = {
+    agent: dict[str, object] = {
         "name": "worker",
         "pid": 4242,
         "backend": "claude-code",

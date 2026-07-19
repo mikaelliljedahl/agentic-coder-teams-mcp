@@ -1,16 +1,18 @@
 """Tests for spawn_agent's watch-contract return payload (item 1)."""
 
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from claude_teams import server_simple
+from claude_teams.backends.contracts import SpawnRequest
 
 
 class _FakeBackend:
     def __init__(self) -> None:
-        self.last_request: object = None
+        self.last_request: SpawnRequest | None = None
 
     def default_model(self) -> str:
         return "sonnet"
@@ -23,7 +25,7 @@ class _FakeBackend:
     ) -> tuple[str, str | None]:
         return (model if model.strip() else self.default_model()), reasoning_effort
 
-    def spawn(self, request: object) -> SimpleNamespace:
+    def spawn(self, request: SpawnRequest) -> SimpleNamespace:
         self.last_request = request
         return SimpleNamespace(process_handle="789")
 
@@ -42,7 +44,7 @@ class _FakeRegistry:
 
 
 @pytest.mark.asyncio
-async def test_spawn_agent_returns_state_marker_path_and_session_dir(
+async def test_spawn_agent_returns_watch_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
@@ -67,6 +69,13 @@ async def test_spawn_agent_returns_state_marker_path_and_session_dir(
     expected_session_dir = server_simple._session_dir(session_id)
     assert Path(result["session_dir"]) == expected_session_dir
     assert Path(result["session_dir"]).is_absolute()
+
+    assert isinstance(result["watch_argv"], list)
+    assert result["watch_argv"][4] == result["session_dir"]
+    assert shlex.split(result["watch_command_bash"]) == result["watch_argv"]
+    powershell_session = "'" + result["session_dir"].replace("'", "''") + "'"
+    assert powershell_session in result["watch_command_powershell"]
+    assert "watch_command" not in result
 
     assert result["expected_outputs"] == []
 
@@ -112,8 +121,11 @@ async def test_spawn_agent_writes_claude_prompt_file_for_sensitive_prompt(
         / "worker.prompt.txt"
     )
     assert prompt_path.read_text(encoding="utf-8") == prompt
-    assert backend.last_request.prompt == prompt
-    assert backend.last_request.extra["prompt_file_path"] == str(prompt_path)
+    request = backend.last_request
+    assert request is not None
+    assert request.extra is not None
+    assert request.prompt == prompt
+    assert request.extra["prompt_file_path"] == str(prompt_path)
 
 
 @pytest.mark.asyncio
@@ -145,4 +157,28 @@ def test_spawn_agent_docstring_documents_watch_contract() -> None:
     assert '"ts"' in description
     assert "survives" in description
     assert "restart" in description
-    assert "watch" in description.lower()
+    assert "watch_argv" in description
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_and_watch_paths_return_equal_watch_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
+    backend = _FakeBackend()
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path / "sessions")
+    monkeypatch.setattr(server_simple, "_session_id", "")
+    monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
+    spawned = await server_simple.spawn_agent(
+        "prompt", name="worker", backend="claude-code", cwd=str(tmp_path)
+    )
+
+    watched = await server_simple.agent_watch_paths()
+
+    keys = {
+        "session_dir",
+        "watch_argv",
+        "watch_command_bash",
+        "watch_command_powershell",
+    }
+    assert {key: spawned[key] for key in keys} == {key: watched[key] for key in keys}

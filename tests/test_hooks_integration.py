@@ -10,11 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 from claude_teams import hooks, server_simple
+from claude_teams.backends.contracts import SpawnRequest
 
 
 class _FakeClaudeBackend:
     def __init__(self) -> None:
-        self.last_request: object = None
+        self.last_request: SpawnRequest | None = None
 
     def default_model(self) -> str:
         return "sonnet"
@@ -27,7 +28,7 @@ class _FakeClaudeBackend:
     ) -> tuple[str, str | None]:
         return (model if model.strip() else self.default_model()), reasoning_effort
 
-    def spawn(self, request: object) -> SimpleNamespace:
+    def spawn(self, request: SpawnRequest) -> SimpleNamespace:
         self.last_request = request
         return SimpleNamespace(process_handle="789")
 
@@ -59,7 +60,10 @@ async def test_spawn_agent_writes_claude_settings_file_and_threads_extra(
         "prompt", name="worker", backend="claude-code", cwd=str(tmp_path)
     )
 
-    extra = backend.last_request.extra
+    request = backend.last_request
+    assert request is not None
+    assert request.extra is not None
+    extra = request.extra
     assert "hooks_settings_path" in extra
     settings_path_str = extra["hooks_settings_path"]
     assert result["name"] == "worker"
@@ -89,7 +93,10 @@ async def test_spawn_agent_writes_codex_hook_overrides_extra(
         "prompt", name="worker", backend="codex", cwd=str(tmp_path)
     )
 
-    extra = backend.last_request.extra
+    request = backend.last_request
+    assert request is not None
+    assert request.extra is not None
+    extra = request.extra
     assert "hook_overrides" in extra
     overrides = json.loads(extra["hook_overrides"])
     assert overrides  # non-empty argv list

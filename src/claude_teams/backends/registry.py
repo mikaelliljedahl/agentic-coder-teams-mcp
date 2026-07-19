@@ -17,6 +17,7 @@ _BUILTIN_BACKENDS: dict[str, str] = {
     "codex": "claude_teams.backends.codex.CodexBackend",
 }
 
+
 class BackendRegistry:
     """Discovers and manages available spawner backends.
 

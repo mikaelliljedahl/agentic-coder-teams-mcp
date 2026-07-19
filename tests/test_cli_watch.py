@@ -418,9 +418,7 @@ def test_watch_wakes_on_stop_after_subagent_stop(tmp_path: Path, monkeypatch) ->
     assert wake["agent"] == "worker"
 
 
-def test_watch_settle_suppresses_transient_waiting(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_watch_settle_suppresses_transient_waiting(tmp_path: Path, monkeypatch) -> None:
     """A waiting marker that flips back to running within the settle window is
     churn (agent parked briefly, then resumed) and must not wake."""
     monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.02)
@@ -500,9 +498,7 @@ def test_watch_settles_overlapping_waits_independently(
     assert wake["agent"] == "worker-a"
 
 
-def test_watch_output_not_starved_by_settling_wait(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_watch_output_not_starved_by_settling_wait(tmp_path: Path, monkeypatch) -> None:
     """When an output lands in the same poll a pending wait matures, the output
     must win — otherwise `before = after` consumes the output edge and the next
     invocation baselines it, so it is never reported (message > output > waiting)."""

@@ -693,9 +693,7 @@ async def test_spawn_agent_persists_output_lookup_metadata(
         def resolve_launch(
             self, model: str, reasoning_effort: str | None
         ) -> tuple[str, str | None]:
-            return (
-                model if model.strip() else self.default_model()
-            ), reasoning_effort
+            return (model if model.strip() else self.default_model()), reasoning_effort
 
         def spawn(self, request: object) -> SimpleNamespace:
             return SimpleNamespace(process_handle="456")
@@ -755,9 +753,7 @@ async def test_spawn_agent_deduplicates_name_within_session(
         def resolve_launch(
             self, model: str, reasoning_effort: str | None
         ) -> tuple[str, str | None]:
-            return (
-                model if model.strip() else self.default_model()
-            ), reasoning_effort
+            return (model if model.strip() else self.default_model()), reasoning_effort
 
         def spawn(self, request: object) -> SimpleNamespace:
             self.next_pid += 1
@@ -1104,7 +1100,7 @@ class _FakeResumeBackend:
 
 
 def _write_agent_for_follow_up(tmp_path: Path, **overrides: object) -> None:
-    record = {
+    record: dict[str, object] = {
         "name": "worker",
         "pid": 123,
         "backend": "codex",
@@ -1498,9 +1494,7 @@ def test_matching_jsonl_files_skips_unstattable_file(tmp_path, monkeypatch):
         return real_stat(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", flaky_stat)
-    assert ao._matching_jsonl_files(
-        directory, 0.0, pattern="rollout-*.jsonl"
-    ) == []
+    assert ao._matching_jsonl_files(directory, 0.0, pattern="rollout-*.jsonl") == []
 
 
 # ---- _codex_candidate_dirs: bad timestamp ---------------------------------
@@ -1603,29 +1597,25 @@ def test_last_claude_message_none_without_assistant(tmp_path):
 
 def test_claude_session_id_none_when_absent(tmp_path):
     path = tmp_path / "c.jsonl"
-    path.write_text("\nnot json\n[]\n{\"type\": \"user\"}\n", encoding="utf-8")
+    path.write_text('\nnot json\n[]\n{"type": "user"}\n', encoding="utf-8")
     assert _claude_session_id(path) is None
 
 
 def test_claude_session_id_oserror(tmp_path, monkeypatch):
     path = tmp_path / "c.jsonl"
-    monkeypatch.setattr(
-        Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError())
-    )
+    monkeypatch.setattr(Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError()))
     assert _claude_session_id(path) is None
 
 
 def test_claude_started_at_none_when_absent(tmp_path):
     path = tmp_path / "c.jsonl"
-    path.write_text("\nnot json\n[]\n{\"foo\": 1}\n", encoding="utf-8")
+    path.write_text('\nnot json\n[]\n{"foo": 1}\n', encoding="utf-8")
     assert _claude_started_at(path) is None
 
 
 def test_claude_started_at_oserror(tmp_path, monkeypatch):
     path = tmp_path / "c.jsonl"
-    monkeypatch.setattr(
-        Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError())
-    )
+    monkeypatch.setattr(Path, "open", lambda *a, **k: (_ for _ in ()).throw(OSError()))
     assert _claude_started_at(path) is None
 
 

@@ -53,7 +53,7 @@ def follow_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespac
 
 
 def _write_agent(tmp_path: Path, **overrides: object) -> None:
-    record = {
+    record: dict[str, object] = {
         "name": "worker",
         "pid": 123,
         "backend": "codex",

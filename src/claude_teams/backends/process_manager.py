@@ -12,7 +12,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, ClassVar
+from typing import IO, Any, ClassVar, cast
 
 from claude_teams.agent_output import codex_correlation_token
 from claude_teams.backends.contracts import SpawnRequest, SpawnResult
@@ -93,7 +93,9 @@ def _read_windows_creation_token(pid: int) -> str | None:
     the process is gone or the times are unreadable (e.g. access denied) — the
     caller must fail closed on ``None``.
     """
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # ``WinDLL`` is a Windows-only ctypes member (this function only runs on
+    # Windows); ``getattr`` keeps the type checker platform-agnostic.
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)  # noqa: B009
     kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
     kernel32.OpenProcess.restype = ctypes.c_void_p
     kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [
@@ -403,7 +405,9 @@ class WindowsJobObject:
         self._handle: int | None = None
         if os.name != "nt":
             return
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # ``WinDLL`` is a Windows-only ctypes member (this function only runs on
+        # Windows); ``getattr`` keeps the type checker platform-agnostic.
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)  # noqa: B009
         handle = kernel32.CreateJobObjectW(None, None)
         if not handle:
             return
@@ -428,14 +432,18 @@ class WindowsJobObject:
         process_handle = getattr(process, "_handle", None)
         if process_handle is None:
             return
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # ``WinDLL`` is a Windows-only ctypes member (this function only runs on
+        # Windows); ``getattr`` keeps the type checker platform-agnostic.
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)  # noqa: B009
         kernel32.AssignProcessToJobObject(self._handle, process_handle)
 
     def close(self) -> None:
         """Close the underlying job handle."""
         if self._handle is None or os.name != "nt":
             return
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # ``WinDLL`` is a Windows-only ctypes member (this function only runs on
+        # Windows); ``getattr`` keeps the type checker platform-agnostic.
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)  # noqa: B009
         kernel32.CloseHandle(self._handle)
         self._handle = None
 
@@ -571,7 +579,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
         return SpawnResult(process_handle=handle, backend_type=backend_type)
 
     def _popen(
-        self, cmd: list[str], creationflags: int, **kwargs: object
+        self, cmd: list[str], creationflags: int, **kwargs: Any
     ) -> subprocess.Popen[str]:
         """Spawn a process, retrying once without breakaway if it's denied.
 
@@ -633,7 +641,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
 
     def _tracked_alive(self, info: object) -> bool:
         """Our tracked Popen child is alive only while ``poll()`` is ``None``."""
-        return info.process.poll() is None  # type: ignore[attr-defined]
+        return cast(ProcessInfo, info).process.poll() is None
 
     def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
         """Terminate a process by PID handle, escalating to kill if needed."""
@@ -752,7 +760,9 @@ class WindowsProcessManager(_PidOwnershipMixin):
         return True
 
     def _windows_pid_alive(self, pid: int) -> bool:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # ``WinDLL`` is a Windows-only ctypes member (this function only runs on
+        # Windows); ``getattr`` keeps the type checker platform-agnostic.
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)  # noqa: B009
         kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         kernel32.OpenProcess.restype = ctypes.c_void_p
         kernel32.GetExitCodeProcess.argtypes = [
@@ -768,7 +778,9 @@ class WindowsProcessManager(_PidOwnershipMixin):
             pid,
         )
         if not process_handle:
-            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+            # ``get_last_error`` is a Windows-only ctypes member; ``getattr``
+            # keeps the type checker platform-agnostic.
+            return getattr(ctypes, "get_last_error")() == _ERROR_ACCESS_DENIED  # noqa: B009
         try:
             exit_code = ctypes.c_ulong()
             if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
@@ -877,8 +889,15 @@ class WindowsProcessManager(_PidOwnershipMixin):
         # Shared across both backends. ``--suppressApplicationTitle`` keeps the
         # tab labelled with the agent name (the agent CLI otherwise rewrites the
         # console title at runtime, reverting the tab to a generic name).
-        wt_head = [wt, "-w", window_id, "nt", "--title", title,
-                   "--suppressApplicationTitle"]
+        wt_head = [
+            wt,
+            "-w",
+            window_id,
+            "nt",
+            "--title",
+            title,
+            "--suppressApplicationTitle",
+        ]
 
         # Legacy direct-launch for codex (codex.exe as the tab's console-root
         # process) is now opt-in only. By default codex takes the same wrapper
@@ -1032,9 +1051,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
         # BOM required: Windows PowerShell 5.1 decodes a BOM-less file as ANSI
         # (Windows-1252), corrupting non-ASCII bytes (e.g. the correlation-marker
         # em-dash). utf-8-sig writes the BOM so 5.1 reads it as UTF-8.
-        wrapper_path.write_text(
-            "\r\n".join(lines) + "\r\n", encoding="utf-8-sig"
-        )
+        wrapper_path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8-sig")
 
     def _tab_window_id(self, team_name: str) -> str:
         """Return the Windows Terminal ``-w`` window name for a team.
@@ -1176,9 +1193,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
                 pid = int(record.get("ProcessId"))
             except (TypeError, ValueError):
                 continue
-            matches.append(
-                (_codex_creation_epoch_ms(record.get("CreationDate")), pid)
-            )
+            matches.append((_codex_creation_epoch_ms(record.get("CreationDate")), pid))
         if not matches:
             return None
         # Newest CreationDate wins so a stale same-token process can't shadow the
@@ -1190,14 +1205,13 @@ class WindowsProcessManager(_PidOwnershipMixin):
         self, handle: str, tab: WindowsTerminalTabInfo, expected_token: str | None
     ) -> tuple[bool, str]:
         """PID-reuse-safe liveness for a tab agent via its launcher token."""
-        alive, detail = self._pid_health_with_token(
-            handle, expected_token or tab.token
-        )
+        alive, detail = self._pid_health_with_token(handle, expected_token or tab.token)
         if not alive and not tab.exit_logged:
             tab.exit_logged = True
-            with contextlib.suppress(OSError), tab.log_path.open(
-                "a", encoding="utf-8"
-            ) as fh:
+            with (
+                contextlib.suppress(OSError),
+                tab.log_path.open("a", encoding="utf-8") as fh,
+            ):
                 fh.write(f"[tab agent exited] {detail}\n")
         return alive, detail
 
@@ -1365,7 +1379,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
 
     def _tracked_alive(self, info: object) -> bool:
         """Ownership is proven by pane liveness, never a (reusable) bare PID."""
-        alive, _ = self._pane_alive(info.pane_id)  # type: ignore[attr-defined]
+        alive, _ = self._pane_alive(cast(TmuxProcessInfo, info).pane_id)
         return alive
 
     def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
@@ -1755,7 +1769,7 @@ class LinuxTerminalProcessManager(_PidOwnershipMixin):
         sidecar PID's liveness is still used for non-destructive display/cleanup
         in ``server_simple._agent_alive`` (the accepted residual).
         """
-        return info.terminal_process.poll() is None  # type: ignore[attr-defined]
+        return cast(LinuxTerminalProcessInfo, info).terminal_process.poll() is None
 
     def resolve_agent_pid(self, handle: str, team_name: str, agent_name: str) -> str:
         """Return the real agent PID from the sidecar, else the launcher handle.

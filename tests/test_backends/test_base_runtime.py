@@ -480,9 +480,7 @@ class TestWindowsTerminalTabSpawn:
         # claude-code still gets --debug-file so its log is captured.
         assert "--debug-file" in text
 
-    def test_tab_lifecycle_dispatch(
-        self, _make_spawn_request, monkeypatch, tmp_path
-    ):
+    def test_tab_lifecycle_dispatch(self, _make_spawn_request, monkeypatch, tmp_path):
         manager, _ = self._prep_manager(monkeypatch, tmp_path)
         manager.spawn_process(
             _make_spawn_request(),
@@ -828,9 +826,7 @@ class TestWindowsTerminalTabSpawn:
         monkeypatch.setattr(
             manager, "_child_pids", lambda h: child_calls.append(h) or []
         )
-        monkeypatch.setattr(
-            manager, "_win_wait_pid_exit", lambda h, t: not alive["v"]
-        )
+        monkeypatch.setattr(manager, "_win_wait_pid_exit", lambda h, t: not alive["v"])
 
         manager.kill_process("7777")
 
@@ -1239,9 +1235,7 @@ class TestLinuxTerminalProcessManager:
 
         assert manager._discover_terminal() == "/opt/bin/custom-terminal"
 
-    def test_skips_qterminal_when_an_instance_is_already_running(
-        self, monkeypatch
-    ):
+    def test_skips_qterminal_when_an_instance_is_already_running(self, monkeypatch):
         manager = process_manager_mod.LinuxTerminalProcessManager()
         terminal_paths = {
             "qterminal": "/usr/bin/qterminal",
@@ -1308,9 +1302,7 @@ class TestLinuxTerminalProcessManager:
             "terminal launcher exited; waiting for agent pid",
         )
 
-    def test_kill_stops_agent_pid_and_terminal_process(
-        self, tmp_path, monkeypatch
-    ):
+    def test_kill_stops_agent_pid_and_terminal_process(self, tmp_path, monkeypatch):
         manager = process_manager_mod.LinuxTerminalProcessManager()
         process = MagicMock(pid=4242)
         process.poll.return_value = None

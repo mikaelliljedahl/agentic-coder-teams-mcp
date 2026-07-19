@@ -248,4 +248,5 @@ class TestToolDescriptionsMentionRecovery:
     async def test_list_agents_and_agent_status_point_at_session_info(self) -> None:
         for tool_name in ("list_agents", "agent_status"):
             tool = await ss.mcp.get_tool(tool_name)
+            assert tool is not None
             assert "session_info" in (tool.description or "")
