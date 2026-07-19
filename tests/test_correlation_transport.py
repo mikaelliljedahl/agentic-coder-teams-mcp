@@ -390,6 +390,52 @@ def test_malformed_correlation_field_is_unverified(value: object) -> None:
     assert correlation_id is None
 
 
+@pytest.mark.parametrize("value", ["", "   ", 42, None, ["x"], {}, True])
+def test_persisted_malformed_id_after_restart_is_unverified_not_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    """The full persist -> reload-from-disk -> read path, not just the classifier.
+
+    Absent and malformed must never be conflated: **absent** means the record
+    predates correlation (a compatibility case), **malformed** means it is
+    corrupt. Only the first is a compatibility case, and neither is ever
+    resolved by re-deriving an id. Proving this at the classifier alone says
+    nothing about what survives a JSON round trip — ``True`` in particular is
+    an ``int`` subclass, and an unconstrained reader could accept it.
+    """
+    _session(tmp_path, monkeypatch)
+    result = await_spawn(tmp_path)
+
+    # Corrupt the persisted id on disk, then reload as a restarted server would.
+    agents = server_simple._load_agents(result)
+    agents[0]["correlation_id"] = value
+    server_simple._save_agents(result, agents)
+    reloaded = _record(result)
+
+    assert reloaded["correlation_id"] == value or reloaded["correlation_id"] is None
+    assert classify_correlation(reloaded) == ("unverified", None)
+
+    binding = server_simple._resolve_agent_binding(reloaded)
+
+    assert binding.outcome == ao.BINDING_UNVERIFIED, (
+        "a corrupt persisted id must be unverified, never legacy: legacy means "
+        "'predates correlation' and is the only compatibility case"
+    )
+    assert binding.output is None, "an unverified read may not carry transcript data"
+
+
+def await_spawn(tmp_path: Path) -> str:
+    """Spawn one agent synchronously and return its session id."""
+    import asyncio
+
+    result = asyncio.run(
+        server_simple.spawn_agent(
+            "plain prompt", name="worker", backend="claude-code", cwd=str(tmp_path)
+        )
+    )
+    return str(result["session_id"])
+
+
 def test_valid_correlation_field_is_valid() -> None:
     status, correlation_id = classify_correlation({"correlation_id": "abc123"})
 
