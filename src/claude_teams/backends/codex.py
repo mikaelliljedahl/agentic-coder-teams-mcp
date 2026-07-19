@@ -430,8 +430,10 @@ class CodexBackend(BaseBackend):
             args = json.loads(raw)
         except json.JSONDecodeError:
             return []
-        if not isinstance(args, list) or not args or not all(
-            isinstance(a, str) for a in args
+        if (
+            not isinstance(args, list)
+            or not args
+            or not all(isinstance(a, str) for a in args)
         ):
             return []
         return [*args, "--dangerously-bypass-hook-trust"]

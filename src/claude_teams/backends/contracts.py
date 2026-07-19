@@ -79,9 +79,7 @@ class BackendModelUnavailableError(RuntimeError):
     installed CLI (e.g. a GPT-5.6 model requiring a newer codex or account).
     """
 
-    def __init__(
-        self, model: str, backend_name: str, available: Iterable[str]
-    ) -> None:
+    def __init__(self, model: str, backend_name: str, available: Iterable[str]) -> None:
         """Build the message from the model, backend, and available models."""
         super().__init__(
             f"Model {model!r} is not available for {backend_name} on this "

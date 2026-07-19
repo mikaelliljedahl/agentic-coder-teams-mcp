@@ -386,9 +386,7 @@ class TestCodexHookOverrides:
         monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", raising=False)
         monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
         backend = CodexBackend()
-        request = _make_request(
-            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
-        )
+        request = _make_request(extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'})
 
         cmd = backend.build_command(request)
 
@@ -400,9 +398,7 @@ class TestCodexHookOverrides:
     ) -> None:
         monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "1")
         backend = CodexBackend()
-        request = _make_request(
-            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
-        )
+        request = _make_request(extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'})
 
         cmd = backend.build_command(request)
 
@@ -415,9 +411,7 @@ class TestCodexHookOverrides:
         monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", raising=False)
         monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
         backend = CodexBackend()
-        request = _make_request(
-            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
-        )
+        request = _make_request(extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'})
 
         cmd = backend.build_resume_command(request, "resume-session-id")
 
@@ -445,9 +439,7 @@ class TestCodexHookOverrides:
         monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
         monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "0")
         backend = CodexBackend()
-        request = _make_request(
-            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
-        )
+        request = _make_request(extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'})
 
         cmd = backend.build_command(request)
 
@@ -460,9 +452,7 @@ class TestCodexHookOverrides:
         monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS", "0")
         monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", raising=False)
         backend = CodexBackend()
-        request = _make_request(
-            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
-        )
+        request = _make_request(extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'})
 
         cmd = backend.build_command(request)
 
@@ -475,9 +465,7 @@ class TestCodexHookOverrides:
         monkeypatch.delenv("WIN_AGENT_TEAMS_STATE_HOOKS", raising=False)
         monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS_CODEX", "0")
         backend = CodexBackend()
-        request = _make_request(
-            extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'}
-        )
+        request = _make_request(extra={"hook_overrides": '["-c", "hooks.Stop=[]"]'})
 
         cmd = backend.build_resume_command(request, "resume-session-id")
 
