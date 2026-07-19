@@ -107,11 +107,13 @@ All findings accepted and addressed; verified against source.
 
 ## Whole-repo status (honest)
 
-The 90% `fail_under` gate remains **red** — it was already red on `main` (79.47%, pre-existing
-debt). This increment lowers the debt materially (→ 84.00%) but does not clear it; the dominant
-remaining gap is `backends/process_manager.py` (65%, 388 missed lines), scoped to a later increment.
-Runners-up for the next increment: `cli.py` (73%), `hooks.py` (86%), `codex.py` (88%),
-`process_base.py` (85%).
+The floor was **lowered from 90% to 80%** by maintainer decision (this increment brings the tree to
+84.00%), so `uv run pytest --cov` now **passes** (`Required test coverage of 80.0% reached. Total
+coverage: 84.00%`, exit 0). The 90% aspiration is noted below; the remaining debt is not gone, only
+below the (new) blocking line. The dominant remaining gap is still `backends/process_manager.py`
+(65%, 388 missed lines); runners-up: `cli.py` (73%), `hooks.py` (86%), `codex.py` (88%),
+`process_base.py` (85%). These are candidates for future increments toward the 95% target, but no
+longer block a release.
 
 ## Validation commands
 
