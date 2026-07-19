@@ -1986,7 +1986,7 @@ async def spawn_agent(
 async def send_message(text: str, to: str = "team-lead") -> dict:
     """Write a message to an inbox for agents that actively poll read_messages.
 
-    ``to`` defaults to ``"team-lead"``, which reaches the agent that spawned you â€”
+    ``to`` defaults to ``"team-lead"``, which reaches the agent that spawned you —
     that is almost always what you want from a subagent. A lead can target a
     child by its agent name. Any unknown recipient is routed to the lead with a
     ``warning`` in the result rather than silently written to a dead inbox.
@@ -2035,7 +2035,7 @@ async def read_messages(
     Returns ``{messages, cursors, seq, unread_count, has_more}``. Each
     message is ``{from, text, ts, seq}`` where ``seq`` is that sender's
     1-based per-sender COUNT after this message (i.e. the sender's
-    high-water mark once this message is consumed) â€” the same number space
+    high-water mark once this message is consumed) — the same number space
     as the persisted per-sender cursor. ``cursors`` is the per-sender
     high-water map; a scalar ``seq`` (instead of ``cursors``) is returned
     only when ``from_agent`` is set.
