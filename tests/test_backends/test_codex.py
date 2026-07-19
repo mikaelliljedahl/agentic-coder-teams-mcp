@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_teams.agent_output import codex_correlation_token
+from claude_teams.agent_output import CORRELATION_FIELD, correlation_marker_token
 from claude_teams.backends import codex as codex_module
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.codex import CodexBackend
@@ -26,7 +26,13 @@ def _make_request(tmp_path: Path) -> Callable[..., SpawnRequest]:
     )
 
     def factory(**overrides: str | bool | dict[str, str] | None) -> SpawnRequest:
-        return replace(default, **overrides)
+        request = replace(default, **overrides)
+        # Every real spawn carries the server-issued correlation id in ``extra``;
+        # the codex backend reads it from there instead of deriving one.
+        return replace(
+            request,
+            extra={CORRELATION_FIELD: "corr-test", **(request.extra or {})},
+        )
 
     return factory
 
@@ -210,7 +216,7 @@ class TestCodexBuildCommand:
         # The prompt (plus correlation marker) is a single verbatim argv token;
         # the native binary is launched directly so no escaping/wrapping.
         assert "fix the bug" in cmd[-1]
-        assert codex_correlation_token("worker@team") in cmd[-1]
+        assert correlation_marker_token("corr-test") in cmd[-1]
 
     def test_passes_multiline_prompt_verbatim_as_single_arg(self, _make_request):
         backend = CodexBackend()
@@ -220,7 +226,7 @@ class TestCodexBuildCommand:
 
         assert cmd[-1].startswith("first line\nsecond line")
         assert "\n" in cmd[-1]
-        assert codex_correlation_token("worker@team") in cmd[-1]
+        assert correlation_marker_token("corr-test") in cmd[-1]
 
     def test_passes_cmd_metachars_verbatim(self, _make_request):
         backend = CodexBackend()
@@ -324,7 +330,7 @@ class TestCodexReasoningEffort:
         cmd = backend.build_command(request)
 
         assert "fix the bug" in cmd[-1]
-        assert codex_correlation_token("worker@team") in cmd[-1]
+        assert correlation_marker_token("corr-test") in cmd[-1]
 
     def test_build_command_omits_c_override_when_none(self, _make_request):
         backend = CodexBackend()
@@ -521,7 +527,7 @@ class TestCodexAgentSelect:
 
         assert 'agents.reviewer.config_file="/abs/reviewer.md"' in cmd
         assert "go" in cmd[-1]
-        assert codex_correlation_token("worker@team") in cmd[-1]
+        assert correlation_marker_token("corr-test") in cmd[-1]
 
     def test_build_command_omits_agents_override_when_profile_none(self, _make_request):
         backend = CodexBackend()

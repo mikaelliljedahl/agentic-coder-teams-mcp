@@ -6,7 +6,8 @@ import contextlib
 import json
 import os
 import re
-from collections.abc import Iterator
+import uuid
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,16 +20,70 @@ _CORRELATION_SCAN_MAX_LINES = 500
 _LAST_MESSAGE_BUDGET = 1000  # max chars returned for last_message (marker included)
 
 
-def codex_correlation_token(agent_id: str) -> str:
-    """Return the stable per-agent marker embedded in the Codex prompt.
+_CORRELATION_MARKER_TEMPLATE = (
+    "[win-agent-teams correlation id: {token} — internal marker, ignore this line]"
+)
 
-    Two Codex agents spawned in the same ``cwd`` at nearly the same time are
-    otherwise indistinguishable before Codex's own session id is known
-    (matching falls back to cwd + start-time + mtime). The codex backend
-    appends this token to the initial prompt so the agent's rollout file can
-    be bound deterministically to the right logical agent.
+#: Correlation field present and usable — the record can be bound.
+CORRELATION_VALID = "valid"
+#: Correlation field absent — the record predates correlation. Compatibility
+#: case only; the id must never be re-derived to fill the gap.
+CORRELATION_LEGACY = "legacy"
+#: Correlation field present but empty, blank, or of the wrong type — corrupt.
+CORRELATION_UNVERIFIED = "unverified"
+
+CORRELATION_FIELD = "correlation_id"
+
+
+def new_correlation_id() -> str:
+    """Return a fresh per-spawn correlation id.
+
+    Generated once per spawn rather than derived from agent name + session id:
+    a killed agent's name can be reused once its record is removed, so a
+    derived token could identify two different conversations.
     """
-    return f"{_CODEX_CORRELATION_PREFIX}{agent_id}"
+    return uuid.uuid4().hex
+
+
+def correlation_marker_token(correlation_id: str) -> str:
+    """Return the scannable token form of a correlation id."""
+    return f"{_CODEX_CORRELATION_PREFIX}{correlation_id}"
+
+
+def correlation_marker(correlation_id: str) -> str:
+    """Return the human-readable marker line embedded in an agent's prompt."""
+    return _CORRELATION_MARKER_TEMPLATE.format(
+        token=correlation_marker_token(correlation_id)
+    )
+
+
+def correlated_prompt(prompt: str, correlation_id: str, *, single_line: bool) -> str:
+    """Append the correlation marker to ``prompt``.
+
+    ``single_line`` selects the argv form, joined by a space so the result
+    introduces no CLI-sensitive character. The multi-line form is used for
+    content that reaches the agent through a file (the Claude prompt sidecar)
+    or through a backend that quotes the prompt verbatim (Codex).
+    """
+    separator = " " if single_line else "\n\n"
+    return f"{prompt}{separator}{correlation_marker(correlation_id)}"
+
+
+def classify_correlation(record: Mapping[str, object]) -> tuple[str, str | None]:
+    """Classify an agent record's correlation field.
+
+    Returns ``(status, correlation_id)``. The absent and malformed cases are
+    deliberately distinct: **absent** means the record predates correlation
+    (``legacy``), **present but unusable** means it is corrupt
+    (``unverified``). Only the first is a compatibility case, and neither is
+    ever resolved by silently re-deriving an id.
+    """
+    if CORRELATION_FIELD not in record:
+        return CORRELATION_LEGACY, None
+    value = record[CORRELATION_FIELD]
+    if not isinstance(value, str) or not value.strip():
+        return CORRELATION_UNVERIFIED, None
+    return CORRELATION_VALID, value
 
 
 @dataclass(frozen=True)
@@ -81,6 +136,7 @@ def read_claude_output(
     max_bytes: int = _LAST_MESSAGE_BUDGET,
     *,
     backend_session_id: str | None = None,
+    correlation_token: str | None = None,
 ) -> AgentOutput | None:
     """Read the latest Claude Code assistant output for a spawned agent."""
     if spawned_at <= 0 or not cwd:
@@ -101,6 +157,19 @@ def read_claude_output(
             continue
         if _started_after(_claude_started_at(path), spawned_at):
             candidates.append((mtime, path))
+    # Before Claude's own session id is known, cwd + start-time matching cannot
+    # tell a spawned agent's transcript apart from any other Claude session in
+    # the same project dir. The server embeds a per-spawn correlation marker in
+    # the initial prompt, so prefer the transcript that actually carries it.
+    # Falls back to the unfiltered set when no transcript shows the marker yet.
+    if backend_session_id is None and correlation_token:
+        token_matched = [
+            item
+            for item in candidates
+            if _file_contains_token(item[1], correlation_token)
+        ]
+        if token_matched:
+            candidates = token_matched
     if not candidates:
         return None
 
@@ -162,21 +231,21 @@ def _matching_codex_rollouts(
         token_matched = [
             item
             for item in candidates
-            if _rollout_contains_token(item[1], correlation_token)
+            if _file_contains_token(item[1], correlation_token)
         ]
         if token_matched:
             return token_matched
     return candidates
 
 
-def _rollout_contains_token(
+def _file_contains_token(
     path: Path, token: str, max_lines: int = _CORRELATION_SCAN_MAX_LINES
 ) -> bool:
-    """Return whether ``token`` appears in the first ``max_lines`` of a rollout.
+    """Return whether ``token`` appears in the first ``max_lines`` of a log.
 
-    The token is embedded in the initial user prompt, which Codex records near
-    the start of the rollout. A bounded forward scan keeps this cheap and
-    avoids reading large rollout files in full.
+    The token is embedded in the initial user prompt, which both Codex and
+    Claude Code record near the start of their session logs. A bounded forward
+    scan keeps this cheap and avoids reading large files in full.
     """
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:

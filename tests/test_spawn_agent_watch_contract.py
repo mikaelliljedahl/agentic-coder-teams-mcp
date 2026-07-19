@@ -120,11 +120,14 @@ async def test_spawn_agent_writes_claude_prompt_file_for_sensitive_prompt(
         / "prompts"
         / "worker.prompt.txt"
     )
-    assert prompt_path.read_text(encoding="utf-8") == prompt
+    # The user prompt is preserved losslessly at the head of the sidecar; the
+    # correlation marker it is followed by is asserted in
+    # tests/test_correlation_transport.py.
+    assert prompt_path.read_text(encoding="utf-8").startswith(prompt)
     request = backend.last_request
     assert request is not None
     assert request.extra is not None
-    assert request.prompt == prompt
+    assert request.prompt.startswith(prompt)
     assert request.extra["prompt_file_path"] == str(prompt_path)
 
 

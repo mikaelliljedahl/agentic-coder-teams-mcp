@@ -134,13 +134,15 @@ sit below the `@mcp.tool()` decorator to take effect.
 3. Resolves backend (default `claude-code` when available, else the first
    available, `src/claude_teams/backends/registry.py:92-108`) and resolves
    `(model, effort)` together (`src/claude_teams/server_simple.py:1238`).
-4. Writes the per-agent MCP config, the optional prompt sidecar, and the hook
-   wiring into `SpawnRequest.extra`
-   (`src/claude_teams/server_simple.py:1240-1250`).
-5. Calls `backend.spawn(request)`, which builds argv and starts **a new OS
+4. Generates a fresh per-spawn correlation id (`new_correlation_id`) **before**
+   the backend is called, because the id has to be inside the final prompt.
+5. Writes the per-agent MCP config, materializes the final prompt and its
+   transport (`_materialize_prompt`, see §4), and puts the correlation id, the
+   optional prompt sidecar path, and the hook wiring into `SpawnRequest.extra`.
+6. Calls `backend.spawn(request)`, which builds argv and starts **a new OS
    process** (`src/claude_teams/backends/process_base.py:82-105`).
-6. Captures a PID creation token from the just-live child
-   (`src/claude_teams/server_simple.py:1273`) and appends the registry record.
+7. Captures a PID creation token from the just-live child and appends the
+   registry record, including `correlation_id`.
 
 **Returns** `{name, pid, backend, session_id, state_marker_path, session_dir,
 watch_argv, watch_command_bash, watch_command_powershell, expected_outputs}`
@@ -409,18 +411,42 @@ through to the activity heuristic (`src/claude_teams/server_simple.py:151`,
 
 The server does not capture agent transcripts. It reads the CLIs' own logs.
 
-- **claude-code**: `~/.claude/projects/<cwd with `\`/`:` replaced by `-`>/*.jsonl`
-  (`src/claude_teams/agent_output.py:94-95`, `426-427`). Matched by
-  `backend_session_id` when known, else by start time
-  (`src/claude_teams/agent_output.py:97-105`).
-- **codex**: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
-  (`src/claude_teams/agent_output.py:225-229`). Matched by the rollout's
-  `session_meta` `cwd` plus start time
-  (`src/claude_teams/agent_output.py:134-155`). Because two Codex agents in the
-  same cwd at the same moment are otherwise indistinguishable, the backend
-  appends a correlation token to the initial prompt
-  (`src/claude_teams/backends/codex.py:543-556`) and the reader prefers the
-  rollout containing it (`src/claude_teams/agent_output.py:162-169`).
+- **claude-code**: `~/.claude/projects/<cwd with `\`/`:` replaced by `-`>/*.jsonl`.
+  Matched by `backend_session_id` when known, else by start time, then narrowed
+  to the transcript carrying the agent's correlation marker when one is
+  persisted (`read_claude_output`).
+- **codex**: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Matched by the
+  rollout's `session_meta` `cwd` plus start time, then narrowed the same way
+  (`read_codex_output`, `_matching_codex_rollouts`).
+
+Both readers fall back to the unnarrowed candidate set when no log carries the
+marker yet — e.g. the CLI has not flushed the prompt.
+
+#### Correlation ids
+
+The correlation id is **generated once per spawn** (`new_correlation_id`) and
+persisted as `correlation_id` on the agent record. It is deliberately *not*
+derived from agent name + session id: a killed agent's name can be reused once
+its record is removed, so a derived token could identify two different
+conversations.
+
+`_read_agent_output` loads the persisted id and passes
+`correlation_marker_token(id)` to both readers. It is **never re-derived** when
+the record does not carry one. `classify_correlation` distinguishes:
+
+| Record state | Classification | Meaning |
+|---|---|---|
+| `correlation_id` key absent | `legacy` | Record predates correlation. Compatibility case. |
+| Present but empty/blank/wrong type | `unverified` | Corrupt. |
+| Present, non-blank string | `valid` | Bindable. |
+
+Both non-`valid` cases currently read as if no marker existed, which reproduces
+the pre-correlation behaviour. Consumers that must act differently on the two
+(notably the follow-up gate) land with the validation ladder.
+
+The id survives resume: `follow_up_agent` reads it off the record, passes it
+back in `SpawnRequest.extra`, and writes it back on the updated record. Dropping
+it there would silently reclassify a live agent as `legacy`.
 
 `last_message` is the last assistant message, capped at 1000 chars with a
 truncation marker (`src/claude_teams/agent_output.py:19`, `386-407`).
@@ -541,30 +567,47 @@ Consequence: **`follow_up_agent` fails with `backend_session_missing` until the
 target CLI has flushed enough of its rollout file to be discovered.** A freshly
 spawned agent is not immediately followable-up.
 
-### Prompt-file indirection (claude-code only)
+### Prompt materialization and transport (claude-code)
 
-If the backend is `claude-code` **and** the prompt contains any of `'`, `"`,
-`\n`, `\r` (`src/claude_teams/server_simple.py:92`,
-`src/claude_teams/server_simple.py:1131-1133`), the server writes the full
-prompt to `prompts/{name}.prompt.txt` and passes `prompt_file_path` in
-`extra`. The backend then puts only this fixed instruction on the command line
+The **server** builds the final prompt string and chooses its transport
+(`_materialize_prompt`), because the backend cannot do it: the sidecar is
+written before `backend.spawn`/`backend.resume`, and
+`ClaudeCodeBackend._prompt_arg` then replaces argv with a fixed instruction.
+
+Two rules, both load-bearing:
+
+1. **Transport is decided from the user prompt alone.** `_needs_prompt_file`
+   tests the *unmarked* user prompt against `_CLAUDE_PROMPT_FILE_CHARS`
+   (`'`, `"`, `\n`, `\r`) **before** the correlation marker is appended. Testing
+   the marked prompt would route every Claude spawn through a file read, since
+   the multi-line marker form always adds a newline.
+2. **The marker form differs per transport.** The argv branch appends a
+   **single-line** marker joined by a space, which introduces no CLI-sensitive
+   character — so the safety rule is respected, not bypassed. The sidecar branch
+   appends the newline-delimited form. `_CLAUDE_PROMPT_FILE_CHARS` is unchanged.
+
+When the sidecar is used, the server writes the **marked** prompt to
+`prompts/{name}.prompt.txt`, passes `prompt_file_path` in `extra`, and the
+backend puts only this fixed instruction on the command line
 (`src/claude_teams/backends/claude_code.py:258-271`):
 
 > `Read your complete task prompt from UTF-8 file path <path> then follow the file contents exactly.`
 
 **The worker must actually read that file.** The real prompt never reaches the
-model directly.
+model directly — and neither does the marker, until the read lands in context.
 
-This applies identically to `spawn_agent` and `follow_up_agent`, since both call
-`_write_prompt_file_extra` (`src/claude_teams/server_simple.py:1246-1248`,
-`1682-1684`), and the file path is the same for both — a follow-up **overwrites**
-the spawn prompt file.
+This applies identically to `spawn_agent` and `follow_up_agent`, and the file
+path is the same for both — a follow-up **overwrites** the spawn prompt file.
 
-Codex has no prompt-file path. `_write_prompt_file_extra` returns `{}` for any
-non-`claude-code` backend (`src/claude_teams/server_simple.py:1131-1134`). Codex
-relies on passing the prompt as a verbatim argv token via the native `.exe`,
-falling back to a JSON-encoded single-line form only when it is forced through
-the `codex.cmd` npm shim (`src/claude_teams/backends/codex.py:515-541`).
+Codex has no prompt-file path: `_materialize_prompt` returns the prompt
+unchanged for any non-`claude-code` backend. Codex relies on passing the prompt
+as a verbatim argv token via the native `.exe`, falling back to a JSON-encoded
+single-line form only when it is forced through the `codex.cmd` npm shim
+(`src/claude_teams/backends/codex.py`, `_prompt_arg`). Its marker is appended by
+`CodexBackend._correlated_prompt`, which **consumes** the server-issued id from
+`extra["correlation_id"]` rather than deriving one — so a Codex prompt carries
+exactly one marker, never two. With no id in `extra` the prompt goes out
+unmarked; no id is ever invented.
 
 ---
 
@@ -730,8 +773,8 @@ only after it parks (marker `waiting`) or voluntarily polls.
 ### Codex workers do not poll `read_messages`
 
 Nothing in the codex spawn path arranges for polling. The prompt is the caller's
-text plus a correlation marker
-(`src/claude_teams/backends/codex.py:543-556`); the environment is
+text plus the server-issued correlation marker
+(`CodexBackend._correlated_prompt`); the environment is
 `AGENT_NAME` / `AGENT_SESSION_ID` / `AGENT_PARENT_NAME` only
 (`src/claude_teams/backends/codex.py:566-570`). There is no Codex equivalent of
 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, which the claude-code backend sets to

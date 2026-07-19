@@ -32,7 +32,11 @@ from fastmcp import FastMCP
 
 from claude_teams import hooks
 from claude_teams.agent_output import (
-    codex_correlation_token,
+    CORRELATION_FIELD,
+    classify_correlation,
+    correlated_prompt,
+    correlation_marker_token,
+    new_correlation_id,
     read_claude_output,
     read_codex_output,
 )
@@ -971,17 +975,28 @@ def _read_agent_output(agent: dict):
     if spawned_at <= 0 or not cwd:
         return None
     backend_session_id = _stored_backend_session_id(agent)
+    # A2: ``status`` distinguishes ``legacy`` (record predates correlation) from
+    # ``unverified`` (correlation field present but corrupt). Both currently
+    # yield ``None`` here, which reproduces the pre-correlation read behaviour;
+    # the consumers that must act differently on the two land with A2/A6. The
+    # id is never re-derived when absent.
+    _status, correlation_id = classify_correlation(agent)
+    correlation_token = (
+        correlation_marker_token(correlation_id) if correlation_id else None
+    )
     if backend == "codex":
-        agent_id = f"{agent.get('name')}@{agent.get('session_id')}"
         return read_codex_output(
             spawned_at,
             cwd,
             backend_session_id=backend_session_id,
-            correlation_token=codex_correlation_token(agent_id),
+            correlation_token=correlation_token,
         )
     if backend == "claude-code":
         return read_claude_output(
-            spawned_at, cwd, backend_session_id=backend_session_id
+            spawned_at,
+            cwd,
+            backend_session_id=backend_session_id,
+            correlation_token=correlation_token,
         )
     return None
 
@@ -1168,18 +1183,65 @@ def _write_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Pat
     return path
 
 
-def _write_prompt_file_extra(
-    session_id: str, agent_name: str, backend_name: str, prompt: str
-) -> dict[str, str]:
-    """Write a lossless Claude prompt sidecar when argv transport is risky."""
-    if backend_name != "claude-code" or not any(
-        char in prompt for char in _CLAUDE_PROMPT_FILE_CHARS
-    ):
-        return {}
+def _needs_prompt_file(prompt: str) -> bool:
+    """Return whether a Claude prompt is too CLI-sensitive for argv transport.
+
+    Applied to the **user prompt only**, before any correlation marker is
+    appended (see :func:`_materialize_prompt`).
+    """
+    return any(char in prompt for char in _CLAUDE_PROMPT_FILE_CHARS)
+
+
+def _materialize_prompt(
+    session_id: str,
+    agent_name: str,
+    backend_name: str,
+    prompt: str,
+    correlation_id: str | None,
+) -> tuple[str, dict[str, str]]:
+    """Build the final prompt the agent will see, and choose its transport.
+
+    The backend cannot inject the correlation marker for Claude Code: the
+    sidecar is written here, before ``backend.spawn``/``backend.resume``, and
+    ``ClaudeCodeBackend._prompt_arg`` then replaces argv with a fixed
+    "read this file" instruction. So the server owns materialization.
+
+    Two rules are load-bearing:
+
+    1. Transport is decided from the **user prompt alone**, before the marker
+       is appended. Testing the marked prompt instead would route every Claude
+       spawn through a file read, since the multi-line marker form always
+       introduces a newline.
+    2. The marker form differs per transport. Argv gets a **single-line**
+       marker, which introduces no CLI-sensitive character and so respects
+       ``_CLAUDE_PROMPT_FILE_CHARS`` rather than bypassing it. The sidecar gets
+       the newline-delimited form.
+
+    Codex is left untouched here: its backend appends the same server-issued id
+    itself (``CodexBackend._correlated_prompt``), so marking here too would
+    give Codex two markers.
+    """
+    if backend_name != "claude-code":
+        return prompt, {}
+    use_file = _needs_prompt_file(prompt)
+    if correlation_id:
+        prompt = correlated_prompt(prompt, correlation_id, single_line=not use_file)
+    if not use_file:
+        return prompt, {}
     path = _prompt_file(session_id, agent_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(prompt, encoding="utf-8")
-    return {"prompt_file_path": str(path)}
+    return prompt, {"prompt_file_path": str(path)}
+
+
+def _correlation_extra(correlation_id: str | None) -> dict[str, str]:
+    """Return the ``SpawnRequest.extra`` entry carrying the correlation id.
+
+    ``SpawnRequest`` has no dedicated field, so the id travels in ``extra``.
+    Absent means the record predates correlation; the key is then omitted
+    rather than filled with an invented id.
+    """
+    return {CORRELATION_FIELD: correlation_id} if correlation_id else {}
 
 
 def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str, str]:
@@ -1283,12 +1345,17 @@ async def spawn_agent(
             mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
 
             agent_cwd = cwd.strip() or str(Path.cwd())
+            # Generated before backend.spawn: the id must already be inside the
+            # final initial prompt, which is materialized on the next line.
+            correlation_id = new_correlation_id()
+            final_prompt, prompt_extra = _materialize_prompt(
+                session_id, agent_name, backend_name, prompt, correlation_id
+            )
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
-                **_write_prompt_file_extra(
-                    session_id, agent_name, backend_name, prompt
-                ),
+                **_correlation_extra(correlation_id),
+                **prompt_extra,
                 **_hook_extra(session_id, agent_name, backend_name),
             }
 
@@ -1296,7 +1363,7 @@ async def spawn_agent(
                 agent_id=f"{agent_name}@{session_id}",
                 name=agent_name,
                 team_name=session_id,
-                prompt=prompt,
+                prompt=final_prompt,
                 model=resolved_model,
                 agent_type="worker",
                 color="blue",
@@ -1331,6 +1398,7 @@ async def spawn_agent(
                     "permission_mode": permission_mode,
                     "reasoning_effort": effort,
                     "create_token": create_token,
+                    CORRELATION_FIELD: correlation_id,
                 }
             )
             _save_agents_transaction(session_id, agents)
@@ -1723,19 +1791,27 @@ async def follow_up_agent(
             permission_mode = str(agent.get("permission_mode") or "bypass")
             effort_value = agent.get("reasoning_effort")
             effort = effort_value if isinstance(effort_value, str) else None
+            # Carry the spawn-time id forward verbatim. Dropping it here would
+            # silently downgrade the agent to ``legacy``, which per R8 means it
+            # can never be followed up again. A legacy record stays legacy: no
+            # id is minted on resume, because a fresh id would not appear
+            # anywhere in the conversation that already exists.
+            _, correlation_id = classify_correlation(agent)
+            final_prompt, prompt_extra = _materialize_prompt(
+                session_id, agent_name, backend_name, prompt, correlation_id
+            )
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
-                **_write_prompt_file_extra(
-                    session_id, agent_name, backend_name, prompt
-                ),
+                **_correlation_extra(correlation_id),
+                **prompt_extra,
                 **_hook_extra(session_id, agent_name, backend_name),
             }
             request = SpawnRequest(
                 agent_id=f"{agent_name}@{session_id}",
                 name=agent_name,
                 team_name=session_id,
-                prompt=prompt,
+                prompt=final_prompt,
                 model=model,
                 agent_type="worker",
                 color="blue",
@@ -1772,6 +1848,9 @@ async def follow_up_agent(
                     "permission_mode": permission_mode,
                     "reasoning_effort": effort,
                     "create_token": new_create_token,
+                    # Explicit even though ``update`` would preserve it: the
+                    # id surviving resume is the property R8 depends on.
+                    **_correlation_extra(correlation_id),
                 }
             )
             _save_agents_transaction(session_id, agents)

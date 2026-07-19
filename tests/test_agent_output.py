@@ -18,6 +18,7 @@ from claude_teams.agent_output import (
     _claude_started_at,
     _codex_candidate_dirs,
     _content_text,
+    _file_contains_token,
     _first_json_object,
     _iter_lines_reverse,
     _last_claude_message,
@@ -25,10 +26,9 @@ from claude_teams.agent_output import (
     _normalize_path,
     _parse_timestamp,
     _resolve_path_text,
-    _rollout_contains_token,
     _started_after,
     _truncate_tail,
-    codex_correlation_token,
+    correlation_marker_token,
     read_claude_output,
     read_codex_output,
 )
@@ -411,8 +411,8 @@ def test_read_codex_output_disambiguates_concurrent_agents_by_token(
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     cwd = tmp_path / "work"
     spawned_at = 1_762_969_000.0
-    token_a = codex_correlation_token("smoke-a@sess")
-    token_b = codex_correlation_token("smoke-b@sess")
+    token_a = correlation_marker_token("corr-a")
+    token_b = correlation_marker_token("corr-b")
 
     # Both spawned in the same cwd at ~the same time. rollout-b has the newer
     # mtime, so plain max(mtime) would wrongly bind agent-a to session-b.
@@ -458,7 +458,7 @@ def test_read_codex_output_falls_back_when_token_absent(
     )
 
     output = read_codex_output(
-        spawned_at, str(cwd), correlation_token=codex_correlation_token("ghost@sess")
+        spawned_at, str(cwd), correlation_token=correlation_marker_token("corr-ghost")
     )
 
     assert output is not None
@@ -469,12 +469,14 @@ def test_read_codex_output_falls_back_when_token_absent(
 def test_codex_build_command_embeds_correlation_token(tmp_path: Path) -> None:
     backend = CodexBackend()
     request = _make_request(
-        tmp_path, agent_id="worker@sess-uuid", prompt="single line task"
+        tmp_path,
+        prompt="single line task",
+        extra={"correlation_id": "corr-spawn"},
     )
 
     cmd = backend.build_command(request)
 
-    assert codex_correlation_token("worker@sess-uuid") in cmd[-1]
+    assert correlation_marker_token("corr-spawn") in cmd[-1]
 
 
 def test_read_claude_output_returns_latest_project_assistant(
@@ -719,6 +721,10 @@ async def test_spawn_agent_persists_output_lookup_metadata(
     )
 
     agents = server_simple._load_agents(result["session_id"])
+    # The correlation id is random per spawn, so it is asserted separately.
+    correlation_id = agents[0].pop("correlation_id")
+    assert isinstance(correlation_id, str)
+    assert correlation_id
     assert agents == [
         {
             "name": "worker",
@@ -1316,6 +1322,59 @@ async def test_follow_up_agent_rejects_backend_without_resume(
 
 
 @pytest.mark.asyncio
+async def test_follow_up_agent_preserves_correlation_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _FakeResumeBackend()
+    _setup_follow_up_session(tmp_path, monkeypatch, backend)
+    _write_agent_for_follow_up(tmp_path, correlation_id="corr-abc")
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (False, "dead"),
+    )
+    monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
+
+    result = await server_simple.follow_up_agent("worker", "next prompt")
+
+    assert result["success"] is True
+    request, _ = backend.resume_calls[0]
+    assert (request.extra or {})["correlation_id"] == "corr-abc"
+    # spawn -> resume -> read: the id must still be on the record afterwards.
+    agents = server_simple._load_agents("session-id")
+    assert agents[0]["correlation_id"] == "corr-abc"
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        server_simple,
+        "read_codex_output",
+        lambda *args, **kwargs: seen.update(kwargs) or None,
+    )
+    server_simple._read_agent_output(agents[0])
+    assert seen["correlation_token"] == ao.correlation_marker_token("corr-abc")
+
+
+@pytest.mark.asyncio
+async def test_follow_up_agent_does_not_invent_a_correlation_id_for_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _FakeResumeBackend()
+    _setup_follow_up_session(tmp_path, monkeypatch, backend)
+    _write_agent_for_follow_up(tmp_path)
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (False, "dead"),
+    )
+    monkeypatch.setattr(server_simple.time, "time", lambda: 1_000.0)
+
+    await server_simple.follow_up_agent("worker", "next prompt")
+
+    request, _ = backend.resume_calls[0]
+    assert "correlation_id" not in (request.extra or {})
+    assert "correlation_id" not in server_simple._load_agents("session-id")[0]
+
+
+@pytest.mark.asyncio
 async def test_follow_up_agent_recovers_session_after_mcp_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1499,30 +1558,30 @@ def test_read_codex_output_skips_non_session_meta_and_bad_payload(
     assert result.last_message == "GOOD"
 
 
-# ---- _rollout_contains_token ---------------------------------------------
+# ---- _file_contains_token ---------------------------------------------
 
 
-def test_rollout_contains_token_found(tmp_path):
+def test_file_contains_token_found(tmp_path):
     path = tmp_path / "r.jsonl"
     path.write_text("first line has wat-corr:abc\nsecond\n", encoding="utf-8")
-    assert _rollout_contains_token(path, "wat-corr:abc") is True
+    assert _file_contains_token(path, "wat-corr:abc") is True
 
 
-def test_rollout_contains_token_beyond_max_lines(tmp_path):
+def test_file_contains_token_beyond_max_lines(tmp_path):
     path = tmp_path / "r.jsonl"
     path.write_text("l0\nl1\nl2\ntoken-here\n", encoding="utf-8")
     # Token is on line index 3 but scan stops after 2 lines.
-    assert _rollout_contains_token(path, "token-here", max_lines=2) is False
+    assert _file_contains_token(path, "token-here", max_lines=2) is False
 
 
-def test_rollout_contains_token_oserror(tmp_path, monkeypatch):
+def test_file_contains_token_oserror(tmp_path, monkeypatch):
     path = tmp_path / "missing.jsonl"
 
     def boom(*args, **kwargs):
         raise OSError
 
     monkeypatch.setattr(Path, "open", boom)
-    assert _rollout_contains_token(path, "x") is False
+    assert _file_contains_token(path, "x") is False
 
 
 # ---- _matching_jsonl_files: per-file stat failure -------------------------

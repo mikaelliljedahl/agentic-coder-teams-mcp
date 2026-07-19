@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, ClassVar, cast
 
-from claude_teams.agent_output import codex_correlation_token
+from claude_teams.agent_output import CORRELATION_FIELD, correlation_marker_token
 from claude_teams.backends.contracts import SpawnRequest, SpawnResult
 
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -963,8 +963,16 @@ class WindowsProcessManager(_PidOwnershipMixin):
             text=True,
         )
         if codex_direct:
-            token = codex_correlation_token(request.agent_id)
-            pid = self._await_codex_tab_pid(token)
+            # PID discovery scans argv for the same server-issued marker the
+            # codex backend embedded in the prompt. Without an id there is no
+            # marker to find, so the discovery cannot succeed — fail loudly
+            # rather than scan for a derived token that is not in the argv.
+            correlation_id = (request.extra or {}).get(CORRELATION_FIELD)
+            pid = (
+                self._await_codex_tab_pid(correlation_marker_token(correlation_id))
+                if correlation_id
+                else None
+            )
             if pid is None:
                 raise WindowsTerminalTabSpawnError(title)
             # Persist the discovered PID to the same sidecar so restart recovery
