@@ -32,10 +32,33 @@ Living handoff document. Update it as work lands; it is the source of truth for
 | `test:` | the three coverage gaps the A1 review flagged (persisted-malformed-id restart path, legacy refusal wording, Codex direct-launch fail-loud). |
 | `feat:` | **A3 + A4 + A4b + A5** — `delivery.py` (nonce confirmation, rotation-aware receipt scanner), `leases.py` (per-target operation lease), the three-phase `follow_up_agent`, kill refusal + CLI operator escape, unique prompt files. |
 | `feat:` | **C1 + C2** — `spawned_by`/`spawned_by_source` on the record, the downstream-only direction guard ahead of every side effect, and `win-agent-teams adopt` (CLI-only, token + generation gated). |
+| `feat:` | **Phase B** — `filelock.py` (the registry's lock, extracted and shared) and `delivery_store.py` (the durable per-sender audit store). |
+| `feat:` | **Phase B** — the bounded wait (B2), the one-budget delivery loop (B0), the state machine (B1), `no_delivery_path` (B3), `delivery_status` + `deliver_pending`, kill-time reconciliation, and the reference update. |
 
 ## Next, in dependency order
 
-**Phase A and C1+C2 are complete.** Next: Phase B, then C3+C4.
+**Phase A, B and C1+C2 are complete.** Next: C3+C4.
+
+Phase B notes for whoever picks up C3+C4:
+
+- **`follow_up_agent` now takes a required `idempotency_key`.** Every existing
+  test call site was updated; a new one that omits it gets a validation error
+  before any waiting, not a delivery.
+- **`agent_busy` no longer exists as a returned reason.** Both former sites are
+  bounded waits. A test that wants the old fast refusal should set
+  `_DELIVERY_CALL_BUDGET_SECONDS = 0.0` and assert
+  `queued(phase="pending")` — otherwise it burns the whole real budget in wall
+  time, which is how the suite briefly went from 45 s to 178 s.
+- **`agent_not_found` and `backend_session_missing` became `no_delivery_path`**
+  with `state="record_removed"` / `state="no_backend_session"` (B3/R7).
+- **`_LEASE_QUEUE_WAIT_SECONDS` and `_DELIVERY_CONFIRM_BOUND_SECONDS` are
+  gone**, replaced by the single `_DELIVERY_CALL_BUDGET_SECONDS`. Keeping
+  per-step bounds alongside a total would have let one call spend the
+  advertised budget several times over.
+- The direction guard is now evaluated **twice**: read-only up front (so a
+  refusal still leaves the session byte-identical, which creating the durable
+  record first would have broken) and again under the registry lock, which
+  remains authoritative.
 
 C1+C2 note for whoever picks up Phase B: **every agent record now needs
 `spawned_by`**, and a test fixture that omits it gets `parent_unknown` rather
@@ -43,15 +66,16 @@ than reaching the code under test. Five existing fixtures were updated for
 this; new ones should set `"spawned_by": "team-lead"` (the default test
 `IDENTITY`) unless the test is about the guard itself.
 
-Phase B builds directly on two things A3–A5 established and should reuse rather
-than re-derive:
+Phase B did reuse the two things A3–A5 established, as intended:
 
-- `pending_delivery` on the agent record already is the "unconfirmed attempt"
-  state B1's status store needs, and `_reconcile_pending_delivery` already
-  implements "a retry reconciles before re-sending".
-- `_LEASE_QUEUE_WAIT_SECONDS` is the bounded in-call wait R1 describes. B1's
-  `queued(phase=pending)` tail is the same return shape `follow_up_agent`
-  already produces when that budget expires.
+- `pending_delivery` on the agent record is still the per-target "unconfirmed
+  attempt" state, and `_reconcile_pending_delivery` is still what stops a retry
+  re-sending. `deliveries.json` sits beside it as the *sender-side* record; the
+  two answer different questions and both are needed.
+- The bounded in-call wait R1 describes is now `_DELIVERY_CALL_BUDGET_SECONDS`
+  (the old `_LEASE_QUEUE_WAIT_SECONDS` was folded into it). The FIFO queue wait
+  and the busy wait share that one budget and produce the same
+  `queued(phase="pending")` tail.
 
 ## Quality gates — all four, whole repo
 
@@ -64,7 +88,7 @@ uv run pytest
 
 There is no `.venv` in a fresh worktree; `uv sync` first.
 
-All four gates are **green** as of the A3-A5 commit (778 passed, 1 skipped).
+All four gates are **green** as of the Phase B commits (855 passed, 1 skipped).
 
 Known intermittent, pre-existing and NOT caused by this work:
 `tests/test_cli_watch.py::test_watch_settle_wakes_persistent_waiting` fails
