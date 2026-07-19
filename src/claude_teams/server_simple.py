@@ -1,9 +1,17 @@
-"""Simplified MCP server for agent orchestration."""
+"""Simplified MCP server for agent orchestration.
+
+Watch command discovery assumes this distribution is installed in the normal
+Python environment of the interpreter running the server. The generated
+``python -m claude_teams.cli`` argv is not supported for embedded or frozen
+hosts, and a coordinator cwd containing another ``claude_teams`` checkout can
+shadow the installed module.
+"""
 
 import hashlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import sys
 import threading
@@ -829,6 +837,31 @@ def _truncate(text: str | None, max_chars: int | None) -> tuple[str, bool, int]:
 
 _DEFAULT_LAST_LINE_MAX_CHARS = 200
 
+
+def _watch_argv(session_dir: str | Path, timeout: float | None = None) -> list[str]:
+    """Return the canonical shell-neutral argv for watching ``session_dir``."""
+    argv = [sys.executable, "-m", "claude_teams.cli", "watch", str(session_dir)]
+    if timeout is not None:
+        argv.extend(["--timeout", str(timeout)])
+    return argv
+
+
+def _watch_command_bash(session_dir: str | Path, timeout: float | None = None) -> str:
+    """Render the watch argv for Bash."""
+    return " ".join(shlex.quote(token) for token in _watch_argv(session_dir, timeout))
+
+
+def _watch_command_powershell(
+    session_dir: str | Path, timeout: float | None = None
+) -> str:
+    """Render the watch argv for PowerShell."""
+    quoted = [
+        "'" + token.replace("'", "''") + "'"
+        for token in _watch_argv(session_dir, timeout)
+    ]
+    return "& " + " ".join(quoted)
+
+
 # Shared disk-contract + watch-recipe note, appended verbatim to the
 # docstrings of agent_status/check_agent/list_agents/agent_watch_paths (item
 # 2/3 of the coordinator-event-loop plan). The consuming agent only ever
@@ -842,7 +875,10 @@ This file is on disk and survives MCP server restarts; this tool is cheap
 and auto-restarts the server if it had died from host idle timeout. Do not
 tight-poll this tool — use the watch recipe below instead.
 
-Recommended low-token loop: run `win-agent-teams watch <session-dir>`.
+The `win-agent-teams` console script may not be on PATH. `spawn_agent` and
+`agent_watch_paths` return a ready-to-run, shell-neutral `watch_argv`, plus
+`watch_command_bash` and `watch_command_powershell` renderings. Use
+`watch_argv` for direct process spawning and for shells such as cmd.exe.
 The watcher ignores non-actionable churn — `running` hook transitions and
 `SubagentStop` (a worker's own internal Task subagent finishing) — and emits
 one JSON wake record: `reason="message"` for unread inbox data,
@@ -850,14 +886,16 @@ one JSON wake record: `reason="message"` for unread inbox data,
 for a selected output. A waiting marker must persist for a short settle window
 (`WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`, default 15s) before it wakes; one that
 resumes `running` within the window is suppressed as a brief park. On a message,
-call `read_messages`; on waiting, call this tool for the status delta.
+call `read_messages`; on waiting, call `agent_status` or `check_agent` for the
+status delta. Watch is one-shot: it exits on the first signal, so re-arm it
+after every wake.
 
 - Claude Code coordinator: run the watch as a BACKGROUND command. Its
   completion triggers a harness wake for the idle coordinator; branch on the
   emitted reason as above.
 - Codex coordinator: Codex has no idle-wake, so run the watch as a BOUNDED
-  FOREGROUND command within the same turn (e.g. `win-agent-teams watch
-  <session-dir> --timeout 60`, looped), then branch on its emitted reason.
+  FOREGROUND command within the same turn (for example, append `--timeout 60`
+  to `watch_argv`, looped), then branch on its emitted reason.
   A marker read is useful for `reason="waiting"`; `reason="message"` requires
   `read_messages` because no state marker need have changed.
 
@@ -1215,16 +1253,15 @@ async def spawn_agent(
     call, so you can always re-query even after it died from host
     inactivity.
 
-    Recommended coordination pattern: do NOT tight-poll. Run
-    ``win-agent-teams watch session_dir`` in the background for a Claude Code
-    coordinator (bounded foreground for Codex). It ignores non-actionable churn
-    (``running`` transitions and ``SubagentStop``) and wakes on unread inbox
-    data, a selected output, or a ``waiting`` marker that persists past a short
-    settle window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 15s) — a
-    marker resuming ``running`` within the window is suppressed. Branch on its
-    JSON ``reason``: call ``read_messages`` for ``message`` and
-    ``agent_status``/``check_agent`` for ``waiting``. Re-check status after
-    timeout exit 2 before mounting the next watch.
+    The result also includes ``session_dir``, shell-neutral ``watch_argv``, and
+    the shell-specific ``watch_command_bash`` and
+    ``watch_command_powershell`` renderings.
+
+    Recommended coordination pattern: do NOT tight-poll. Run the returned
+    ``watch_argv`` directly, or use the returned Bash/PowerShell rendering.
+    Use a background watch for Claude Code and a bounded foreground watch for
+    Codex. The watcher is one-shot, so re-arm it after every wake. Re-check
+    status after timeout exit 2 before mounting the next watch.
     """
 
     def _do_spawn() -> dict:
@@ -1297,13 +1334,17 @@ async def spawn_agent(
             )
             _save_agents_transaction(session_id, agents)
 
+        session_dir = str(_session_dir(session_id))
         return {
             "name": agent_name,
             "pid": pid,
             "backend": backend_name,
             "session_id": session_id,
             "state_marker_path": str(_state_marker_file(session_id, agent_name)),
-            "session_dir": str(_session_dir(session_id)),
+            "session_dir": session_dir,
+            "watch_argv": _watch_argv(session_dir),
+            "watch_command_bash": _watch_command_bash(session_dir),
+            "watch_command_powershell": _watch_command_powershell(session_dir),
             "expected_outputs": list(expected_outputs) if expected_outputs else [],
         }
 
@@ -2053,41 +2094,50 @@ async def agent_status(names: list[str] | None = None) -> list[dict]:
 
 
 @mcp.tool()
-async def agent_watch_paths(names: list[str] | None = None) -> list[dict]:
-    """Return each agent's watch path: ``{name, state_marker_path}``.
+@_with_disk_note
+async def agent_watch_paths(names: list[str] | None = None) -> dict:
+    """Return session watch metadata and minimal agent watch-path rows.
 
     Rediscover exactly what to watch when you did not retain a
     ``spawn_agent`` return (e.g. after resuming a session). ``names=None``
     returns all agents in the session; otherwise only the named agents
-    (unknown names are skipped). Minimal payload, no bodies.
-
-    Canonical watch recipe: background-watch (or, for a Codex coordinator,
-    bounded-foreground-watch) via ``win-agent-teams watch <session-dir>``.
-    It ignores non-actionable churn (``running`` transitions and
-    ``SubagentStop``) and emits ``reason=message`` for unread inbox data or
-    ``reason=waiting`` for a waiting marker that persists past a short settle
-    window (``WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS``, default 15s). Call
-    ``read_messages`` for message and ``agent_status``/``check_agent`` for
-    waiting. Re-check status after timeout exit 2 before watching again.
+    (unknown names are skipped). Each row contains only ``name`` and
+    ``state_marker_path``. Use ``has_session`` as the authoritative
+    discriminator between no session and a live session with zero agents.
     """
     session_id = _active_session_id()
 
-    def _do_watch_paths() -> list[dict]:
+    def _do_watch_paths() -> dict:
         if not session_id:
-            return []
+            return {
+                "has_session": False,
+                "session_dir": "",
+                "watch_argv": [],
+                "watch_command_bash": "",
+                "watch_command_powershell": "",
+                "agents": [],
+            }
         agents = _load_agents(session_id)
         if names is not None:
             wanted = set(names)
             agents = [a for a in agents if a.get("name") in wanted]
-        return [
-            {
-                "name": str(agent.get("name") or ""),
-                "state_marker_path": str(
-                    _state_marker_file(session_id, str(agent.get("name") or ""))
-                ),
-            }
-            for agent in agents
-        ]
+        session_dir = str(_session_dir(session_id))
+        return {
+            "has_session": True,
+            "session_dir": session_dir,
+            "watch_argv": _watch_argv(session_dir),
+            "watch_command_bash": _watch_command_bash(session_dir),
+            "watch_command_powershell": _watch_command_powershell(session_dir),
+            "agents": [
+                {
+                    "name": str(agent.get("name") or ""),
+                    "state_marker_path": str(
+                        _state_marker_file(session_id, str(agent.get("name") or ""))
+                    ),
+                }
+                for agent in agents
+            ],
+        }
 
     return await run_blocking(_do_watch_paths)
 

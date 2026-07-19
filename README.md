@@ -14,7 +14,7 @@ Minimal MCP server for spawning and communicating with Claude Code and Codex age
 | `kill_agent` | Force-kill an agent process |
 | `list_agents` | List all agents with compact status rows |
 | `agent_status` | Cheap per-agent state/watermark/stall rows (no bodies) |
-| `agent_watch_paths` | Per-agent `{name, state_marker_path}` — what to file-watch |
+| `agent_watch_paths` | Session watch envelope plus minimal `{name, state_marker_path}` agent rows |
 | `list_backends` | List available backends |
 
 ## Quick Start
@@ -253,9 +253,15 @@ spawned agent only reads those, not this README.)
 The loop:
 
 1. `spawn_agent(..., expected_outputs=["report.md", ...])` returns
-   `state_marker_path`, `session_dir`, and echoes `expected_outputs`. Declare
-   the exact files the agent is told to create so you can watch precise paths.
-2. Run `win-agent-teams watch <session_dir>`. It ignores non-actionable churn
+   `state_marker_path`, `session_dir`, shell-neutral `watch_argv`,
+   `watch_command_bash`, `watch_command_powershell`, and echoes
+   `expected_outputs`. Declare the exact files the agent is told to create so
+   you can watch precise paths. There is intentionally no unqualified
+   `watch_command` field.
+2. Execute `watch_argv` directly, or use the rendering for your current shell.
+   The `win-agent-teams` console script may not be on PATH; `watch_argv` uses
+   the server's interpreter with `-m claude_teams.cli` and is the canonical
+   value (also use it for cmd.exe). The watcher ignores non-actionable churn
    and exits only for actionable work: unread lead inbox data, a selected output
    change, or a marker that settles as `waiting`. Two writes are treated as
    churn and never wake on their own: `running` lifecycle transitions, and
@@ -265,11 +271,15 @@ The loop:
    before it wakes — one that flips back to `running` inside the window is
    suppressed as a brief park. A genuine `waiting` that arrives in the final
    settle window can fall past the deadline and surface as `exit 2`; the
-   mandated status re-check after a timeout recovers it.
+   mandated status re-check after a timeout recovers it. Each watch is
+   one-shot and exits on the first signal, so re-arm it after every wake.
 3. Branch on its single JSON wake record: `reason="message"` → call
    `read_messages`; `reason="waiting"` → call `agent_status(names)` (or read the
    marker directly); `reason="output"` → inspect the output. Use
-   `agent_watch_paths(names)` to rediscover marker paths after recovery.
+   `agent_watch_paths(names)` to rediscover an envelope containing the same
+   session-wide watch metadata and minimal `{name, state_marker_path}` agent
+   rows. Its `has_session` boolean distinguishes no active session from a live
+   session with zero agents.
 
 Wake wiring differs by orchestrator:
 
@@ -281,7 +291,10 @@ Wake wiring differs by orchestrator:
   needed. On timeout exit 2, re-check status before starting the next watch to
   close the small status-check/watch-baseline race.
 
-A ready-made bounded watcher ships as a CLI (needs no MCP server):
+A ready-made bounded watcher ships as a CLI (needs no MCP server). The command
+below documents the CLI shape; coordinators should use the returned
+`watch_argv` or shell-specific rendering because the console script may not be
+on PATH:
 
 ```bash
 win-agent-teams watch <session-dir> [--timeout SECONDS] [--pattern 'state-*.json']

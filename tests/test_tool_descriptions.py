@@ -53,6 +53,20 @@ def _assert_disk_contract_note(description: str) -> None:
     assert "re-check" in description
 
 
+def test_disk_contract_note_documents_discoverable_watch_argv() -> None:
+    note = server_simple._DISK_CONTRACT_NOTE
+
+    assert "may not be on PATH" in note
+    assert "watch_argv" in note
+
+
+def test_disk_contract_note_documents_one_shot_rearming() -> None:
+    note = server_simple._DISK_CONTRACT_NOTE
+
+    assert "one-shot" in note
+    assert "re-arm" in note
+
+
 async def _registered_description(tool_name: str) -> str:
     """Return the client-visible ``Tool.description`` FastMCP registered.
 
@@ -88,4 +102,11 @@ async def test_list_agents_description_documents_disk_contract_and_both_recipes(
     None
 ):
     description = await _registered_description("list_agents")
+    _assert_disk_contract_note(description)
+
+
+@pytest.mark.asyncio
+async def test_agent_watch_paths_registered_description_has_disk_contract() -> None:
+    description = await _registered_description("agent_watch_paths")
+
     _assert_disk_contract_note(description)

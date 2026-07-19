@@ -41,8 +41,9 @@ class TestAgentWatchPaths:
 
         result = asyncio.run(server_simple.agent_watch_paths())
 
-        assert len(result) == 2
-        names = {row["name"] for row in result}
+        assert result["has_session"] is True
+        assert Path(result["session_dir"]) == server_simple._session_dir(session)
+        names = {row["name"] for row in result["agents"]}
         assert names == {"worker-1", "worker-2"}
 
     def test_row_shape_is_minimal(self, session: str) -> None:
@@ -50,8 +51,8 @@ class TestAgentWatchPaths:
 
         result = asyncio.run(server_simple.agent_watch_paths())
 
-        assert len(result) == 1
-        row = result[0]
+        assert len(result["agents"]) == 1
+        row = result["agents"][0]
         assert set(row) == {"name", "state_marker_path"}
         expected = server_simple._state_marker_file(session, "worker")
         assert Path(row["state_marker_path"]) == expected
@@ -62,8 +63,8 @@ class TestAgentWatchPaths:
 
         result = asyncio.run(server_simple.agent_watch_paths(names=["worker-1"]))
 
-        assert len(result) == 1
-        assert result[0]["name"] == "worker-1"
+        assert len(result["agents"]) == 1
+        assert result["agents"][0]["name"] == "worker-1"
 
     def test_unknown_names_are_skipped(self, session: str) -> None:
         _add_agents(session, ["worker-1"])
@@ -72,23 +73,40 @@ class TestAgentWatchPaths:
             server_simple.agent_watch_paths(names=["worker-1", "ghost"])
         )
 
-        assert len(result) == 1
-        assert result[0]["name"] == "worker-1"
+        assert len(result["agents"]) == 1
+        assert result["agents"][0]["name"] == "worker-1"
 
-    def test_returns_empty_list_without_session(
+    def test_returns_empty_envelope_without_session_and_creates_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path)
+        session_base = tmp_path / "sessions"
+        monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
         monkeypatch.setattr(server_simple, "_session_id", "")
 
         result = asyncio.run(server_simple.agent_watch_paths())
 
-        assert result == []
+        assert result == {
+            "has_session": False,
+            "session_dir": "",
+            "watch_argv": [],
+            "watch_command_bash": "",
+            "watch_command_powershell": "",
+            "agents": [],
+        }
+        assert not session_base.exists()
+
+    def test_live_session_with_zero_agents_is_distinct(self, session: str) -> None:
+        result = asyncio.run(server_simple.agent_watch_paths())
+
+        assert result["has_session"] is True
+        assert result["agents"] == []
+        assert result["session_dir"]
+        assert result["watch_argv"]
 
 
 def test_agent_watch_paths_docstring_is_canonical_watch_recipe() -> None:
     description = server_simple.agent_watch_paths.__doc__ or ""
 
     assert "state_marker_path" in description
-    assert "watch" in description.lower()
+    assert "watch_argv" in description
     assert "agent_status" in description
