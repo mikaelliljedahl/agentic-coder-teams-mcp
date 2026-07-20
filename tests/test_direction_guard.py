@@ -426,6 +426,34 @@ def test_cli_adopt_refuses_a_stale_generation(env) -> None:
     assert SPAWNED_BY_FIELD not in _record("orphan")
 
 
+def test_cli_adopt_refuses_a_record_that_already_has_a_spawner(env) -> None:
+    """``adopt`` is recovery for a MISSING spawner, not re-parenting.
+
+    Documented as filling in a record whose ``spawned_by`` is absent, it would
+    otherwise re-parent **any** record given the token and the generation —
+    handing one agent follow-up rights over another agent's child, which is a
+    kill-and-respawn of that child's process. Operator-gated is not the same as
+    in-contract.
+    """
+    record = _record("worker-b")
+    assert record[SPAWNED_BY_FIELD] == "lead-a"
+
+    result = _adopt(
+        SESSION,
+        "worker-b",
+        "team-lead",
+        "--token",
+        _lead_token(),
+        "--expect-generation",
+        str(server_simple._record_generation(record)),
+    )
+
+    assert result.exit_code != 0
+    assert "already records" in result.output
+    assert _record("worker-b")[SPAWNED_BY_FIELD] == "lead-a"
+    assert SPAWNED_BY_SOURCE_OPERATOR not in json.dumps(_record("worker-b"))
+
+
 def test_cli_adopt_refuses_a_bad_token(env) -> None:
     result = _adopt(
         SESSION,

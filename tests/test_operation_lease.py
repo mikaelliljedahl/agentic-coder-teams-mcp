@@ -465,8 +465,9 @@ def test_force_clear_returns_the_cleared_lease_for_inspection(tmp_path: Path) ->
     path = _store(tmp_path)
     _reserve(path, operation_id="op-1")
 
-    cleared = force_clear_lease(path, "worker")
+    cleared, persisted = force_clear_lease(path, "worker")
 
+    assert persisted is True
     assert cleared is not None
     assert cleared.nonce == "n" * 32
     assert cleared.operation_id == "op-1"
@@ -474,4 +475,27 @@ def test_force_clear_returns_the_cleared_lease_for_inspection(tmp_path: Path) ->
 
 
 def test_force_clear_on_an_absent_lease_is_a_no_op(tmp_path: Path) -> None:
-    assert force_clear_lease(_store(tmp_path), "worker") is None
+    assert force_clear_lease(_store(tmp_path), "worker") == (None, True)
+
+
+def test_force_clear_refuses_to_clobber_a_different_operation(tmp_path: Path) -> None:
+    """The operator's fence/kill/clear window must not drop someone else's lease.
+
+    Terminating a child takes real time, and a queued caller can legitimately be
+    granted the target inside that window. Clearing unconditionally would drop
+    THAT caller's lease and let a third resume the same conversation underneath
+    it, which is the double delivery the lease exists to prevent.
+    """
+    path = _store(tmp_path)
+    _reserve(path, operation_id="op-new")
+
+    cleared, persisted = force_clear_lease(
+        path, "worker", expect_operation_id="op-fenced"
+    )
+
+    assert persisted is False
+    assert cleared is not None
+    assert cleared.operation_id == "op-new"
+    surviving = active_lease(path, "worker")
+    assert surviving is not None
+    assert surviving.operation_id == "op-new"

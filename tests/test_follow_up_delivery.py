@@ -693,6 +693,33 @@ async def test_a_generation_bump_fences_finalization_while_the_lease_still_exist
     assert leases.active_lease(server_simple._leases_file(SESSION), AGENT) is None
 
 
+def test_force_refuses_a_live_holder_that_is_not_yet_overdue(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "Force" is documented for a live-but-**overdue** holder, and enforces it.
+
+    Without the deadline comparison the operator escape can terminate a
+    delivery that is still comfortably inside its lease — the child is killed
+    and the generation fenced for an attempt that was doing nothing wrong.
+    """
+    _hold_lease(env, holder_pid=os.getpid(), token=_own_token())
+    lease_path = server_simple._leases_file(SESSION)
+    data = leases.load_leases(lease_path)
+    data[AGENT]["lease"]["deadline"] = 10_000.0
+    leases.save_leases(lease_path, data)
+    monkeypatch.setattr(cli.time, "time", lambda: 100.0)
+    generation_before = server_simple._record_generation(_record())
+
+    result = CliRunner().invoke(
+        cli.app, ["lease", "force", SESSION, AGENT, "--token", _token()]
+    )
+
+    assert result.exit_code == 3
+    assert "not yet overdue" in result.output
+    assert server_simple._record_generation(_record()) == generation_before
+    assert leases.active_lease(lease_path, AGENT) is not None
+
+
 def test_force_requires_the_session_recovery_token(env) -> None:
     _hold_lease(env, holder_pid=os.getpid(), token=_own_token())
 

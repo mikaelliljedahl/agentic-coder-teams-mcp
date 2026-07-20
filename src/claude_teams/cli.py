@@ -193,7 +193,21 @@ def lease_clear(
             "Use `lease force` if it is hung.[/red]"
         )
         raise typer.Exit(code=3)
-    leases.force_clear_lease(server_simple._leases_file(session_id), agent)
+    with server_simple._agents_file_lock(session_id):
+        # Under the registry lock, which is what ``reserve_lease`` holds when it
+        # grants. Clearing outside it can drop a lease that was granted in the
+        # meantime, letting a third caller resume the same conversation.
+        _, persisted = leases.force_clear_lease(
+            server_simple._leases_file(session_id),
+            agent,
+            expect_operation_id=lease.operation_id,
+        )
+    if not persisted:
+        console.print(
+            "[red]The lease was not cleared: either it moved to another "
+            "operation, or the store could not be written.[/red]"
+        )
+        raise typer.Exit(code=4)
     console.print(f"[green]Cleared stale lease for {agent!r}.[/green]")
 
 
@@ -210,10 +224,26 @@ def lease_force(
     wake up after we terminated its child and write a record describing a
     delivery that no longer exists. Only then is the resumed child terminated
     (and only when ownership is provable), and only then is the lease cleared.
+
+    "Overdue" is enforced, not merely described: a holder that is provably live
+    and still inside its deadline is doing exactly what the lease is for, and
+    forcing it kills a delivery in progress. Wait for the deadline, or use
+    ``lease clear`` once the holder is gone.
     """
     _authorize(session_id, token)
     lease = _lease_or_exit(session_id, agent)
     lease_path = server_simple._leases_file(session_id)
+
+    holder_live = server_simple._lease_holder_live(
+        lease.holder_pid, lease.holder_create_token
+    )
+    if holder_live and time.time() < lease.deadline:
+        console.print(
+            "[red]Holder is live and not yet overdue "
+            f"(deadline {lease.deadline}); refusing to force. Forcing here "
+            "would terminate a delivery that is still within its lease.[/red]"
+        )
+        raise typer.Exit(code=3)
 
     fenced_generation = None
     child_pid = None
@@ -234,19 +264,30 @@ def lease_force(
             server_simple.process_manager.kill_process(str(child_pid))
             terminated = True
 
-    # Step 3 — only now release the lease.
-    leases.force_clear_lease(lease_path, agent)
+    # Step 3 — only now release the lease, under the registry lock and only if
+    # it is still the operation we fenced. Terminating a child takes real time,
+    # and a queued caller can legitimately be granted the target inside that
+    # window; clearing unconditionally would drop THAT caller's lease and let a
+    # third resume the same conversation underneath it.
+    with server_simple._agents_file_lock(session_id):
+        cleared, persisted = leases.force_clear_lease(
+            lease_path, agent, expect_operation_id=lease.operation_id
+        )
     console.print_json(
         json.dumps(
             {
-                "forced": True,
+                "forced": persisted,
                 "agent": agent,
                 "fenced_generation": fenced_generation,
                 "attempt_nonce": lease.nonce,
                 "child_terminated": terminated,
+                "lease_cleared": persisted,
+                "held_by_operation": None if cleared is None else cleared.operation_id,
             }
         )
     )
+    if not persisted:
+        raise typer.Exit(code=4)
 
 
 @app.command("adopt")
@@ -275,6 +316,12 @@ def adopt(
     The parentage is stored as operator-asserted rather than spawn-derived,
     because it was asserted by a human and not observed at spawn.
 
+    Adoption is **recovery for a missing spawner, not re-parenting.** A record
+    that already names a spawner is refused: with the token and the generation
+    this would otherwise be able to move any record to any parent, which is
+    broader than the contract and would let an operator hand one agent
+    follow-up rights over another's child. Kill and respawn instead.
+
     A worker with filesystem access can still edit ``agents.json`` directly.
     That is an accepted non-goal: the guard prevents accidents, not bypasses.
     """
@@ -284,6 +331,14 @@ def adopt(
         if record is None:
             console.print(f"[red]No agent named {agent!r} in {session_id!r}.[/red]")
             raise typer.Exit(code=1)
+        current = record.get(SPAWNED_BY_FIELD)
+        if isinstance(current, str) and current:
+            console.print(
+                f"[red]{agent!r} already records {current!r} as its spawner. "
+                "adopt only fills in a MISSING spawner; it does not re-parent. "
+                "Kill and respawn the agent if the parentage is wrong.[/red]"
+            )
+            raise typer.Exit(code=4)
         actual = server_simple._record_generation(record)
         if actual != expect_generation:
             console.print(

@@ -824,6 +824,13 @@ adoption cannot be replayed against a record that moved underneath it), and it
 records `spawned_by_source: "operator_asserted"` so a later reader can tell an
 asserted parentage from an observed one.
 
+**Adoption fills in a MISSING `spawned_by`; it does not re-parent.** A record
+that already names a spawner is refused (exit 4). Without that the token plus a
+generation would move *any* record to *any* parent, handing one agent
+kill-and-respawn rights over another agent's child — broader than this contract,
+and operator-gated is not the same as in-contract. Recovery for a wrong
+parentage is `kill_agent` + `spawn_agent`.
+
 A refusal at 2a/2b **changes nothing**: no PID, no regenerated MCP config, no
 prompt sidecar, no lease acquired, no generation bump — and no delivery record.
 That is why the check sits ahead of every side effect rather than alongside the
@@ -1057,10 +1064,21 @@ reachable over MCP:
   generation, so an operator can check by hand whether the prompt landed.
 - `clear` — removes a lease whose holder is dead or token-mismatched. It
   **refuses a provably live holder** (exit 3).
-- `force` — for a live-but-overdue holder. Order is load-bearing: it **bumps
-  the fencing generation first**, so the original holder can no longer win its
-  finalize CAS; only then does it terminate the resumed child (and only when
-  ownership is provable); only then does it release the lease.
+- `force` — for a live-but-overdue holder, and "overdue" is **enforced**: a
+  holder that is provably live and still inside `lease.deadline` is refused
+  (exit 3), because forcing it would kill a delivery that is doing exactly what
+  the lease is for. Order is load-bearing: it **bumps the fencing generation
+  first**, so the original holder can no longer win its finalize CAS; only then
+  does it terminate the resumed child (and only when ownership is provable);
+  only then does it release the lease.
+
+Both `clear` and `force` release the lease **under the registry lock**, and as a
+compare-and-swap on the operation id they read. Terminating a child takes real
+time, and a queued caller can legitimately be granted the target inside that
+window; clearing unconditionally would drop *that* caller's lease and let a
+third resume the same conversation underneath it. A clear that does not match,
+or that fails to reach disk, exits 4 and reports which operation actually holds
+the lease — it never reports success for a lease it did not release.
 
 ### 4c. Prompt-file lifecycle
 

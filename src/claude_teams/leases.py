@@ -388,22 +388,40 @@ def finalize_lease(path: Path, agent: str, operation_id: str, generation: int) -
     return save_leases(path, data)
 
 
-def force_clear_lease(path: Path, agent: str) -> Lease | None:
-    """Operator escape: drop any lease for ``agent`` and return what was there.
+def force_clear_lease(
+    path: Path, agent: str, *, expect_operation_id: str | None = None
+) -> tuple[Lease | None, bool]:
+    """Operator escape: drop ``agent``'s lease. Returns ``(cleared, persisted)``.
 
     Reachable only from the CLI, behind the session recovery token. Ordinary
     ``kill_agent`` never bypasses the lease.
+
+    ``expect_operation_id`` makes the clear a compare-and-swap. The operator
+    path fences, then kills a child, then clears — and killing a child takes
+    real time, during which a queued caller can legitimately be granted the
+    target. Clearing unconditionally would drop *that* caller's lease, letting
+    a third resume the same conversation underneath it. When the stored lease
+    is a different operation the clear is refused and ``(lease, False)``
+    reports what is actually held.
+
+    ``persisted`` is the write result and callers must honour it: a clear that
+    never reached disk left the lease exactly where it was.
     """
     data = load_leases(path)
     entry = data.get(agent)
     if not isinstance(entry, dict):
-        return None
+        return None, True
     mapping = entry
     lease = _to_lease(agent, mapping.get("lease"))
+    if (
+        expect_operation_id is not None
+        and lease is not None
+        and lease.operation_id != expect_operation_id
+    ):
+        return lease, False
     mapping["lease"] = None
     mapping["waiters"] = []
-    save_leases(path, data)
-    return lease
+    return lease, save_leases(path, data)
 
 
 def drop_agent(path: Path, agent: str) -> None:
