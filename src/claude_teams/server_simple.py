@@ -898,39 +898,89 @@ def _maybe_cleanup_old_sessions() -> None:
         logger.debug("session cleanup skipped", exc_info=True)
 
 
-def _message_recipient(to: str, session_id: str) -> tuple[str, str | None]:
-    """Resolve a ``send_message`` recipient, never dropping it to a dead inbox.
+#: C3/R5 — how a ``send_message`` recipient relates to the caller. The first
+#: two are deliverable (by different paths); the last three are refused.
+RECIPIENT_CHILD = "child"
+RECIPIENT_SPAWNER = "spawner"
+RECIPIENT_SIBLING = "sibling"
+RECIPIENT_UNRELATED = "unrelated"
+RECIPIENT_UNKNOWN = "unknown"
 
-    Returns ``(recipient, warning)``. Rules:
+#: The refused classes, with the reason each is refused rather than routed.
+_UNADDRESSABLE_DETAIL = {
+    RECIPIENT_SIBLING: (
+        "is a sibling: you and it share a spawner, but neither spawned the "
+        "other. Agent-to-agent peer messaging is an explicit non-goal — route "
+        "the request through {spawner!r} instead."
+    ),
+    RECIPIENT_UNRELATED: (
+        "exists in this session but is neither an agent you spawned nor the "
+        "agent that spawned you (it may be a grandchild, or another lead's "
+        "worker). Messages travel one hop along the spawn edge only: message "
+        "your own child, or {spawner!r}."
+    ),
+    RECIPIENT_UNKNOWN: (
+        "does not name any agent in this session. Check the spelling against "
+        "list_agents. It was NOT re-routed to {spawner!r}: a typo silently "
+        "delivered upstream is how a message ends up read by the wrong agent, "
+        "or by nobody. Nothing was sent."
+    ),
+}
 
-    * ``"team-lead"``/``"lead"`` (and common aliases like
-      ``"orchestrator"``/``"parent"``) resolve to the agent that spawned this
-      one. For the root lead they stay ``ROOT_LEAD_NAME`` (its own inbox).
-    * A name that matches a known agent in this session is used verbatim
-      (a lead addressing a child, or a sibling).
-    * Any other / unknown name is routed to the lead anyway, with a warning,
-      so a typo'd recipient can never be silently written to an inbox no one
-      reads.
-    """
-    raw = to.strip()
-    lead_target = (
+
+def _spawner_target() -> str:
+    """Return the agent this one reports to: its spawner, or itself for root."""
+    return (
         (_AGENT_PARENT_NAME or ROOT_LEAD_NAME)
         if IDENTITY != ROOT_LEAD_NAME
         else ROOT_LEAD_NAME
     )
 
+
+def _classify_recipient(to: str, session_id: str) -> tuple[str, str]:
+    """Classify a ``send_message`` recipient relative to the caller (C3/R5).
+
+    Returns ``(recipient_class, resolved_name)``. The class decides the path:
+    a child goes through the guaranteed (Phase B) path, the spawner goes to the
+    inbox that the spawner's watcher is watching, and everything else is
+    refused.
+
+    This deliberately replaces the old "unknown name is routed to the lead with
+    a warning" rule. That rule made every typo an upstream message which the
+    lead would read as genuine, and it made `send_message` an accept-then-drop
+    path for any recipient that could not actually be reached — exactly what R5
+    forbids. A warning field is not a refusal: nothing consumed it.
+
+    The registry is flat (one ``agents.json``, no sub-sessions), so the
+    relationship is read from the record's ``spawned_by`` field, not inferred
+    from a tree.
+    """
+    raw = to.strip()
+    spawner = _spawner_target()
+
+    # The aliases mean "whoever spawned me" by definition, so they resolve
+    # before any registry lookup and can never be a typo.
     if raw.lower() in _LEAD_ALIASES:
-        return lead_target, None
+        return RECIPIENT_SPAWNER, spawner
 
-    known = {a.get("name") for a in _load_agents(session_id) if a.get("name")}
-    if raw in known:
-        return raw, None
+    agent = _find_agent(_load_agents(session_id), raw)
+    if agent is None:
+        # The root lead has no record of its own, so naming it explicitly is
+        # still upstream rather than unknown.
+        missing = RECIPIENT_SPAWNER if raw == ROOT_LEAD_NAME else RECIPIENT_UNKNOWN
+        return missing, raw
 
-    warning = (
-        f"unknown recipient {to!r}; routed to {lead_target!r}. "
-        'Use to="team-lead" to reach whoever spawned you.'
-    )
-    return lead_target, warning
+    # Checked before parentage: a spawner named explicitly is the same upstream
+    # path as the alias. Its own ``spawned_by`` points further up, so asking
+    # only "did I spawn this?" would refuse the one path R3 depends on.
+    if raw == spawner:
+        return RECIPIENT_SPAWNER, raw
+    parent = agent.get(SPAWNED_BY_FIELD)
+    if parent == IDENTITY:
+        return RECIPIENT_CHILD, raw
+    if parent == spawner:
+        return RECIPIENT_SIBLING, raw
+    return RECIPIENT_UNRELATED, raw
 
 
 def _truncate(text: str | None, max_chars: int | None) -> tuple[str, bool, int]:
@@ -1989,24 +2039,66 @@ async def spawn_agent(
 
 
 @mcp.tool()
-async def send_message(text: str, to: str = "team-lead") -> dict:
-    """Write a message to an inbox for agents that actively poll read_messages.
+async def send_message(
+    text: str, to: str = "team-lead", idempotency_key: str = ""
+) -> dict:
+    """Send a message one hop along the spawn edge: to your spawner, or a child.
 
     ``to`` defaults to ``"team-lead"``, which reaches the agent that spawned you —
-    that is almost always what you want from a subagent. A lead can target a
-    child by its agent name. Any unknown recipient is routed to the lead with a
-    ``warning`` in the result rather than silently written to a dead inbox.
+    that is almost always what you want from a subagent.
 
-    This is not a push/resume mechanism: a spawned agent will only see this
-    message if it calls read_messages after the message is sent. If the agent
-    is not polling, use follow_up_agent instead.
+    The recipient decides the path, and the two paths behave differently:
+
+    * **Your spawner** (the default) is written to its inbox. Its watcher wakes
+      it; it consumes the message with read_messages. This is the upstream path
+      and it is unchanged.
+    * **An agent you spawned** goes through the guaranteed path instead — the
+      same machinery as follow_up_agent, because a child that is not polling
+      would otherwise never see an inbox write. It therefore needs an
+      idempotency_key you choose before the call, and it returns the same
+      "delivered"/"failed"/"queued" statuses. Such a message
+      does NOT enter the recipient's inbox, so read_messages cannot repeat it.
+
+    Anyone else — a sibling, a grandchild, another lead's worker, or a name that
+    matches no agent — is REFUSED, and nothing is sent. A misspelled recipient
+    used to be re-routed to your lead with a warning; it no longer is, because
+    that turned a typo into a real-looking upstream message.
     """
     session_id = _active_session_id()
 
     def _do_send() -> dict:
         if not session_id:
             return {"success": False, "to": to, "reason": "session_not_found"}
-        recipient, warning = _message_recipient(to, session_id)
+
+        recipient_class, recipient = _classify_recipient(to, session_id)
+
+        if recipient_class == RECIPIENT_CHILD:
+            # R5: the only accept-then-drop risk left is a child that is not
+            # polling, so a downstream send is the guaranteed path, never an
+            # inbox append. B4 stays intact — the audit row is the record, and
+            # the inbox is untouched, so the text is presented exactly once.
+            return _guaranteed_send(
+                session_id,
+                recipient,
+                text,
+                idempotency_key,
+                True,
+                tool="send_message",
+            )
+
+        if recipient_class != RECIPIENT_SPAWNER:
+            detail = _UNADDRESSABLE_DETAIL[recipient_class].format(
+                spawner=_spawner_target()
+            )
+            return {
+                "success": False,
+                "to": to,
+                "reason": "recipient_not_addressable",
+                "recipient_class": recipient_class,
+                "retriable": False,
+                "detail": f"{to!r} {detail}",
+            }
+
         inbox = _inbox_file(session_id, recipient)
         line = json.dumps(
             {
@@ -2017,10 +2109,7 @@ async def send_message(text: str, to: str = "team-lead") -> dict:
         )
         with inbox.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
-        result = {"success": True, "to": recipient}
-        if warning:
-            result["warning"] = warning
-        return result
+        return {"success": True, "to": recipient}
 
     return _annotate(await run_blocking(_do_send))
 
@@ -3077,6 +3166,69 @@ def _settled_result(session_id: str, name: str, record: dict) -> dict:
     )
 
 
+def _guaranteed_send(
+    session_id: str,
+    name: str,
+    prompt: str,
+    idempotency_key: str,
+    replace_if_idle: bool,
+    *,
+    tool: str,
+) -> dict:
+    """Open (or recover) the durable record and run the bounded delivery.
+
+    Shared by ``follow_up_agent`` and the downstream branch of ``send_message``
+    (C3/R5). Both must produce the same statuses, the same idempotency
+    semantics, and the same audit rows, so they run the same code rather than
+    two implementations that agree today. ``tool`` only names the caller in the
+    key-validation message.
+    """
+    # Validation FIRST, before the record exists and before any waiting:
+    # a caller that got the key wrong must learn now, not a budget later.
+    invalid = validate_idempotency_key(idempotency_key)
+    if invalid is not None:
+        return {
+            "success": False,
+            "name": name,
+            "reason": invalid,
+            "retriable": False,
+            "detail": (
+                f"{tool} requires an idempotency_key you choose "
+                "before the call: 1-"
+                f"{delivery_store.MAX_IDEMPOTENCY_KEY_LENGTH} characters "
+                "from [A-Za-z0-9._:@=+-], starting alphanumeric. It is "
+                "what lets you recover the outcome if this response is "
+                "lost. Nothing was sent."
+            ),
+        }
+    if not session_id:
+        return _follow_up_failure("session_not_found", name)
+
+    # C2's invariant survives Phase B: a refused upstream follow-up must
+    # leave the session byte-identical, and creating the durable record
+    # first would have written a file. So the guard is re-run here, ahead
+    # of the store, as a read-only pre-flight. ``_prepare`` still checks it
+    # again under the registry lock — that one is authoritative; this one
+    # only decides whether we may touch disk at all.
+    preflight = _preflight_refusal(session_id, name)
+    if preflight is not None:
+        return preflight
+
+    options = {"replace_if_idle": replace_if_idle}
+    record, refusal = _open_delivery_record(
+        session_id, name, prompt, idempotency_key, options
+    )
+    if refusal is not None or record is None:
+        return refusal or _follow_up_failure("session_not_found", name)
+    if is_terminal(record):
+        return _settled_result(session_id, name, record)
+
+    deadline = _delivery_clock() + _DELIVERY_CALL_BUDGET_SECONDS
+    return _guaranteed_delivery(
+        session_id, name, prompt, replace_if_idle, record, deadline
+    )
+
+
 @mcp.tool()
 async def follow_up_agent(
     name: str,
@@ -3086,11 +3238,11 @@ async def follow_up_agent(
 ) -> dict:
     """Deliver a follow-up prompt to an agent you spawned, and confirm it landed.
 
-    Use this instead of send_message when the target agent is not polling read_messages.
-    send_message only writes to an inbox; follow_up_agent is the
-    mechanism for continuing a spawned agent that would otherwise never read an
-    inbox message. A busy agent is NOT refused: the call waits, bounded, for it
-    to reach a resumable point, then resumes and confirms.
+    This is the mechanism for continuing a spawned agent that would otherwise
+    never read an inbox message. send_message to an agent you spawned
+    routes through this same path, so the two are equivalent downstream.
+    A busy agent is NOT refused: the call waits, bounded, for the agent to
+    reach a resumable point, then resumes and confirms.
 
     idempotency_key is REQUIRED and is chosen by you before the call. It is how
     you recover the outcome if you lose this response (client timeout,
@@ -3118,49 +3270,13 @@ async def follow_up_agent(
     session_id = _active_session_id()
 
     def _run() -> dict:
-        # Validation FIRST, before the record exists and before any waiting:
-        # a caller that got the key wrong must learn now, not a budget later.
-        invalid = validate_idempotency_key(idempotency_key)
-        if invalid is not None:
-            return {
-                "success": False,
-                "name": name,
-                "reason": invalid,
-                "retriable": False,
-                "detail": (
-                    "follow_up_agent requires an idempotency_key you choose "
-                    "before the call: 1-"
-                    f"{delivery_store.MAX_IDEMPOTENCY_KEY_LENGTH} characters "
-                    "from [A-Za-z0-9._:@=+-], starting alphanumeric. It is "
-                    "what lets you recover the outcome if this response is "
-                    "lost. Nothing was sent."
-                ),
-            }
-        if not session_id:
-            return _follow_up_failure("session_not_found", name)
-
-        # C2's invariant survives Phase B: a refused upstream follow-up must
-        # leave the session byte-identical, and creating the durable record
-        # first would have written a file. So the guard is re-run here, ahead
-        # of the store, as a read-only pre-flight. ``_prepare`` still checks it
-        # again under the registry lock — that one is authoritative; this one
-        # only decides whether we may touch disk at all.
-        preflight = _preflight_refusal(session_id, name)
-        if preflight is not None:
-            return preflight
-
-        options = {"replace_if_idle": replace_if_idle}
-        record, refusal = _open_delivery_record(
-            session_id, name, prompt, idempotency_key, options
-        )
-        if refusal is not None or record is None:
-            return refusal or _follow_up_failure("session_not_found", name)
-        if is_terminal(record):
-            return _settled_result(session_id, name, record)
-
-        deadline = _delivery_clock() + _DELIVERY_CALL_BUDGET_SECONDS
-        return _guaranteed_delivery(
-            session_id, name, prompt, replace_if_idle, record, deadline
+        return _guaranteed_send(
+            session_id,
+            name,
+            prompt,
+            idempotency_key,
+            replace_if_idle,
+            tool="follow_up_agent",
         )
 
     return _annotate(await run_blocking(_run))

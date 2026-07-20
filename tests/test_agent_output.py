@@ -842,7 +842,7 @@ async def test_send_message_defaults_recipient_to_lead(
 
 
 @pytest.mark.asyncio
-async def test_send_message_unknown_recipient_routes_to_lead_with_warning(
+async def test_send_message_unknown_recipient_is_refused_not_rerouted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_base = tmp_path / "sessions"
@@ -852,15 +852,16 @@ async def test_send_message_unknown_recipient_routes_to_lead_with_warning(
     monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "parent")
     (session_base / "session-id").mkdir(parents=True)
 
-    # A typo'd / unknown recipient must not be silently written to a dead inbox.
+    # C3/R5: a typo'd recipient is refused. It used to be re-routed to the lead
+    # with a warning, which made every typo a real-looking upstream message.
     result = await server_simple.send_message(to="leed", text="hello")
 
-    assert result["success"] is True
-    assert result["to"] == "parent"
-    assert "warning" in result
-    assert "leed" in result["warning"]
-    # Routed to the parent inbox; no stray inbox-leed.jsonl created.
-    assert (session_base / "session-id" / "inbox-parent.jsonl").exists()
+    assert result["success"] is False
+    assert result["reason"] == "recipient_not_addressable"
+    assert result["recipient_class"] == server_simple.RECIPIENT_UNKNOWN
+    assert "leed" in result["detail"]
+    # Nothing written anywhere: not to the lead, not to a dead inbox.
+    assert not (session_base / "session-id" / "inbox-parent.jsonl").exists()
     assert not (session_base / "session-id" / "inbox-leed.jsonl").exists()
 
 

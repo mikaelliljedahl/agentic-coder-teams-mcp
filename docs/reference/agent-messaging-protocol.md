@@ -87,13 +87,17 @@ and `spawned_by_source` records how that parentage was established: `spawn`
 recovery path described in
 [gates 2a/2b](#gates-2a2b--the-direction-guard-not-a-security-boundary)).
 Both are preserved verbatim through every resume. `spawned_by` is what the
-`follow_up_agent` direction guard reads; a record without it is refused with
-`reason="parent_unknown"` rather than allowed.
+`follow_up_agent` direction guard reads *and* what `send_message`'s C3
+classification reads; a record without it is refused — `parent_unknown` from
+`follow_up_agent`, `recipient_class="unrelated"` from `send_message` — rather
+than allowed.
 
 This is a single field per record, not a tree: it names one parent and supports
-no ancestry query. It is also **not** the mechanism that resolves the
-`"team-lead"` alias — that still comes from the `AGENT_PARENT_NAME` env var
-inside the child process (`_message_recipient`).
+no ancestry query. Since the registry is flat, that single field is exactly what
+separates a child from a sibling, and it is why `send_message` can refuse a
+sibling without needing an ancestry walk. It is also **not** the mechanism that
+resolves the `"team-lead"` alias — that still comes from the
+`AGENT_PARENT_NAME` env var inside the child process (`_spawner_target`).
 
 `correlation_id` is **required and load-bearing**: a non-empty string, written
 at spawn and preserved through resume. Constructing or migrating a record
@@ -189,37 +193,52 @@ first real evidence of life is the appearance of `state-{name}.json`.
 does not expose (`src/claude_teams/backends/codex.py:237-246`) — there is no
 silent downgrade.
 
-### `send_message(text, to="team-lead")`
+### `send_message(text, to="team-lead", idempotency_key="")`
 
-Appends one JSON line to `inbox-{recipient}.jsonl`
-(`src/claude_teams/server_simple.py:1324-1333`). The line is
-`{"from": IDENTITY, "text": ..., "ts": <ISO-8601 UTC>}`.
+**The recipient decides the path.** `_classify_recipient` classifies `to`
+relative to the caller, and only two of the five classes are deliverable:
 
-Recipient resolution (`src/claude_teams/server_simple.py:777-809`):
+| Class | When | Behaviour |
+|---|---|---|
+| `spawner` | a lead alias, the name of `AGENT_PARENT_NAME`, or `team-lead` | append to `inbox-{spawner}.jsonl` — the upstream path, unchanged |
+| `child` | the record's `spawned_by` is the caller | the **guaranteed path**: `_guaranteed_send`, the same code `follow_up_agent` runs |
+| `sibling` | the record's `spawned_by` is the caller's own spawner | **refused** |
+| `unrelated` | in `agents.json`, but neither of the above (a grandchild, another lead's worker, a pre-C1 record with no `spawned_by`) | **refused** |
+| `unknown` | matches no agent in this session | **refused** |
 
-- Any of `""`, `team-lead`, `lead`, `orchestrator`, `parent`, `boss`, `manager`,
-  `up`, `supervisor` (case-insensitive, `src/claude_teams/server_simple.py:63-75`)
-  resolves to `AGENT_PARENT_NAME` for a worker, or to `team-lead` for the root
-  lead.
-- A name present in `agents.json` is used verbatim.
-- **Anything else is silently rerouted to the lead** with a `warning` string in
-  the result. A typo'd recipient never fails — it lands in the lead's inbox.
+Lead aliases are `""`, `team-lead`, `lead`, `orchestrator`, `parent`, `boss`,
+`manager`, `up`, `supervisor` (case-insensitive, `_LEAD_ALIASES`). They resolve
+before any registry lookup, so they can never be a typo. A spawner named
+explicitly is checked **before** parentage: the spawner's own `spawned_by`
+points further up, so asking only "did I spawn this?" would refuse the upstream
+path R3 depends on.
 
-**Returns** `{"success": true, "to": <resolved recipient>}` plus optional
-`warning`, or `{"success": false, "to": ..., "reason": "session_not_found"}`
-when no session resolved (`src/claude_teams/server_simple.py:1322`).
+**Returns:**
 
-**`success: true` proves only that a line was appended to a file.** There is no
-delivery, no push, no wake of the recipient process. The recipient sees it only
-if it later calls `read_messages`. The docstring states this outright
-(`src/claude_teams/server_simple.py:1314-1316`).
+- Upstream: `{"success": true, "to": <resolved recipient>}`.
+- Downstream: whatever `_guaranteed_send` returns — the same
+  `delivered`/`failed`/`queued(phase=…)` schema as `follow_up_agent`, including
+  `idempotency_conflict` and `idempotency_key_required`. A downstream send
+  without a key is refused before anything is sent.
+- Refused: `{"success": false, "to": ..., "reason": "recipient_not_addressable",
+  "recipient_class": ..., "retriable": false, "detail": ...}`.
+- No session: `{"success": false, "to": ..., "reason": "session_not_found"}`.
 
-`send_message` is therefore the **upstream and inbox-polling** path only. To
-reach an agent you spawned, use `follow_up_agent`: it delivers and confirms
-rather than appending and hoping.
+**A typo is refused, never re-routed (R5).** Until C3, an unknown recipient was
+written to the lead's inbox with a `warning` field in the result. Nothing ever
+consumed that field, so in practice a misspelled name became a real-looking
+upstream message that the lead read as genuine — and every unreachable recipient
+had an accept-then-drop path. Both are gone: the refusal names the class and
+says plainly that nothing was sent.
+
+**For the upstream class, `success: true` still proves only that a line was
+appended to a file.** There is no push and no wake from `send_message` itself;
+the guarantee comes from the recipient's watcher (§5), which is why R3 makes the
+watcher a protocol component rather than a convenience.
 
 **Guaranteed-path messages never enter the actionable inbox.** A message
-delivered by `follow_up_agent` is resumed into the target's context and recorded
+delivered by `follow_up_agent` — or by `send_message` to an agent you spawned,
+which is the same code — is resumed into the target's context and recorded
 in the *sender's* delivery store; it is never written to `inbox-{name}.jsonl`.
 If it were, a polling worker could read and act on the same instruction a second
 time. The rejected alternative — write to the inbox, then pre-advance the
@@ -484,7 +503,7 @@ Everything lives under `~/.claude/agent-sessions/<session-uuid>/`
 | `agents.json` | server, under an exclusive file lock (`src/claude_teams/server_simple.py:316-346`) | server |
 | `agents.lock` | lock file only (`src/claude_teams/server_simple.py:81`, `206-207`) | server |
 | `session.json` | server, on binding (`src/claude_teams/server_simple.py:423-426`) | server recovery |
-| `inbox-{name}.jsonl` | any agent's `send_message` (append) (`src/claude_teams/server_simple.py:1332-1333`) | the owner's `read_messages`; watcher (`src/claude_teams/cli.py:223`) |
+| `inbox-{name}.jsonl` | an agent's upstream `send_message` (append); since C3 only the owner's own children can write it (`src/claude_teams/server_simple.py:1332-1333`) | the owner's `read_messages`; watcher (`src/claude_teams/cli.py:223`) |
 | `inbox-{name}.pos.json` | the owner's `read_messages` (`src/claude_teams/server_simple.py:1475`) | owner; watcher (read-only) |
 | `state-{name}.json` | the **worker's own** lifecycle hook process (`src/claude_teams/hooks.py:88-89`) | server status tools; watcher |
 | `prompts/{name}.<nonce>.prompt.txt` | server, before a claude-code spawn/resume (`_materialize_prompt`) | the worker itself, as a file read |
@@ -1308,7 +1327,8 @@ Facts about current behavior. No remedies are proposed here.
 
 ### A busy worker is now reachable — within a bound (was: reachable by neither tool)
 
-`send_message` still writes to a file and nothing more. `follow_up_agent` no
+`send_message` upstream still writes to a file and nothing more; downstream it
+now routes through the guaranteed path (C3). `follow_up_agent` no
 longer refuses a busy agent: both former `agent_busy` sites (the
 no-`last_message` check and the inactivity timer, both behind the marker
 resolution) are now bounded waits. A spawner addressing its own child gets
@@ -1330,7 +1350,10 @@ text plus the server-issued correlation marker
 put its workers in Claude Code's native team-messaging mode
 (`src/claude_teams/backends/claude_code.py:284-285`). Messages sent to a Codex
 worker's inbox therefore accumulate unread unless the caller's own prompt text
-instructs the agent to poll.
+instructs the agent to poll. Since C3 this is much less likely to be reached by
+accident: a spawner addressing its own Codex child gets the guaranteed path, not
+an inbox append. It still applies to anything that writes upstream into a Codex
+lead's inbox.
 
 ### `kill_agent` still has no caller-identity check
 
@@ -1403,13 +1426,19 @@ fit 64 characters (`src/claude_teams/server_simple.py:360-374`). Kill does free
 the name for reuse, since it removes the record
 (`src/claude_teams/server_simple.py:1794-1795`).
 
-### An unknown recipient is silently rerouted, not rejected
+### `send_message` to a child no longer behaves like `send_message`
 
-`send_message` to a name that is neither a lead alias nor a known agent returns
-`success: true` with the message written to the *lead's* inbox and only a
-`warning` field to indicate it
-(`src/claude_teams/server_simple.py:805-809`). Callers that check only
-`success` will not notice.
+Resolved as of C3 — recorded because the *shape* of the result now depends on
+the recipient. An upstream send returns `{"success", "to"}`; a downstream send
+returns the full delivery schema (`status`, `phase`, `idempotency_key`, …) and
+requires a key. A caller that branches on `result["to"]` alone, or that assumes
+`send_message` never blocks, will be surprised: the downstream branch spends the
+same bounded call budget as `follow_up_agent`.
+
+The older hazard this replaces — an unknown recipient silently rerouted to the
+lead with only a `warning` field, which callers checking `success` never
+noticed — no longer exists. Unknown, sibling, and unrelated recipients are
+refused with `reason="recipient_not_addressable"` and nothing is written.
 
 ### `check_agent` cannot distinguish "unknown" from "dead"
 

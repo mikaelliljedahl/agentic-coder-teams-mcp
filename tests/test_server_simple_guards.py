@@ -260,23 +260,28 @@ def test_maybe_cleanup_tolerates_corrupt_stamp(isolated):
 
 
 # --------------------------------------------------------------------------
-# _message_recipient
+# _classify_recipient
 # --------------------------------------------------------------------------
 
 
-def test_message_recipient_known_agent_used_verbatim(isolated):
+def test_classify_recipient_own_child_is_the_guaranteed_path(isolated):
+    _make_session(
+        isolated.base,
+        "s1",
+        json.dumps([{"name": "worker", "pid": 1, ss.SPAWNED_BY_FIELD: "team-lead"}]),
+    )
+    assert ss._classify_recipient("worker", "s1") == (ss.RECIPIENT_CHILD, "worker")
+
+
+def test_classify_recipient_record_without_a_spawner_is_not_a_child(isolated):
+    """A pre-C1 record cannot be claimed as a child on a missing field alone."""
     _make_session(isolated.base, "s1", json.dumps([{"name": "worker", "pid": 1}]))
-    recipient, warning = ss._message_recipient("worker", "s1")
-    assert recipient == "worker"
-    assert warning is None
+    assert ss._classify_recipient("worker", "s1") == (ss.RECIPIENT_UNRELATED, "worker")
 
 
-def test_message_recipient_unknown_routes_to_lead_with_warning(isolated):
+def test_classify_recipient_unknown_is_refused_not_rerouted(isolated):
     _make_session(isolated.base, "s1", "[]")
-    recipient, warning = ss._message_recipient("ghost", "s1")
-    assert recipient == ss.ROOT_LEAD_NAME
-    assert warning is not None
-    assert "ghost" in warning
+    assert ss._classify_recipient("ghost", "s1") == (ss.RECIPIENT_UNKNOWN, "ghost")
 
 
 # --------------------------------------------------------------------------

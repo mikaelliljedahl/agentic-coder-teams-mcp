@@ -5,19 +5,27 @@ import pytest
 from claude_teams import server_simple
 
 
-def test_send_message_description_points_to_follow_up_for_non_polling_agents() -> None:
+def test_send_message_description_states_both_paths_and_the_refusal() -> None:
+    """C3/R5 — the docstring is the contract a calling agent actually reads.
+
+    It previously promised that an unknown recipient is re-routed to the lead
+    with a warning. Leaving that text would have agents keep relying on the
+    behaviour R5 removed.
+    """
     description = server_simple.send_message.__doc__ or ""
 
-    assert "actively poll read_messages" in description
-    assert "not a push/resume mechanism" in description
-    assert "use follow_up_agent instead" in description
+    assert "guaranteed path" in description
+    assert "does NOT enter the recipient's inbox" in description
+    assert "REFUSED" in description
+    assert "idempotency_key" in description
+    assert "re-routed" not in description.replace("used to be re-routed", "")
 
 
 def test_follow_up_agent_description_explains_non_polling_use_case() -> None:
     description = server_simple.follow_up_agent.__doc__ or ""
 
-    assert "not polling read_messages" in description
-    assert "send_message only writes to an inbox" in description
+    assert "never read an inbox message" in description
+    assert "routes through this same path" in description
     assert "continuing a spawned agent" in description
 
 
