@@ -1898,6 +1898,9 @@ async def spawn_agent(
             # Generated before backend.spawn: the id must already be inside the
             # final initial prompt, which is materialized on the next line.
             correlation_id = new_correlation_id()
+            # A5: collect anything a previous failed spawn/resume orphaned
+            # before adding to the directory ourselves.
+            _gc_stale_prompt_files(session_id)
             # A5: even a spawn gets a unique prompt-file path, so a spawn and a
             # concurrent follow-up for the same name cannot collide. No
             # delivery marker: a spawn either produced a PID or raised, so
@@ -2275,6 +2278,9 @@ def _build_resume_request(
     # resume, because a fresh id would not appear anywhere in the conversation
     # that already exists.
     _, correlation_id = classify_correlation(agent)
+    # A5: same sweep as the spawn path — a resume writes a sidecar too, and a
+    # resume that raises is exactly how one gets orphaned.
+    _gc_stale_prompt_files(session_id)
     final_prompt, prompt_extra = _materialize_prompt(
         session_id,
         agent_name,
@@ -3326,6 +3332,30 @@ def _cleanup_agent_artifacts(
             del cursors[name]
             with suppress(OSError):
                 _save_inbox_cursors(reader_cursor, cursors)
+
+
+def _gc_stale_prompt_files(session_id: str) -> None:
+    """Age-collect EVERY stale prompt sidecar in the session (A5).
+
+    Reachability, not correctness, is the point. A sidecar is written before
+    ``backend.spawn``/``backend.resume``; if that call raises, the file is left
+    with no agent record naming it. Sweeping only on ``kill_agent`` could never
+    collect it — there is no agent left to kill — and sweeping only the name
+    being delivered to would miss an orphan belonging to a name that never
+    comes back. So the sweep is session-wide and runs on the paths that create
+    sidecars in the first place: one glob, on a directory we are about to
+    write to anyway.
+
+    Age-based only, so it can never race a concurrent attempt whose CLI has
+    not read its file yet.
+    """
+    for path in stale_prompt_files(
+        _prompts_dir(session_id),
+        "*",
+        older_than=_PROMPT_GC_AGE_SECONDS,
+        now=time.time(),
+    ):
+        remove_prompt_file(path)
 
 
 def _gc_prompt_files(session_id: str, name: str, *, child_exited: bool) -> None:

@@ -852,3 +852,36 @@ def test_an_aged_prompt_file_is_garbage_collected(
     server_simple._gc_prompt_files(SESSION, AGENT, child_exited=False)
 
     assert not old.exists()
+
+
+@pytest.mark.asyncio
+async def test_an_orphaned_sidecar_is_collected_by_an_ordinary_follow_up(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The age GC has to be REACHABLE, not merely correct.
+
+    A sidecar written just before a spawn or resume raised is left with no
+    agent record naming it. `_gc_prompt_files` was called only from
+    `kill_agent`, so nothing could ever collect it: there is no agent left to
+    kill. The tests that call the helper directly prove the predicate, not that
+    any production path runs it.
+
+    The orphan here belongs to an agent name that does not exist, so a
+    per-agent sweep keyed on the agent being delivered to cannot reach it.
+    """
+    prompts = server_simple._prompts_dir(SESSION)
+    prompts.mkdir(parents=True, exist_ok=True)
+    orphan = prompts / f"vanished-agent.{'e' * 32}.prompt.txt"
+    orphan.write_text("body", encoding="utf-8")
+    ancient = 1.0
+    os.utime(orphan, (ancient, ancient))
+    monkeypatch.setattr(server_simple.time, "time", lambda: 1_000_000.0)
+
+    _dead_agent(monkeypatch)
+    _install(monkeypatch, _FakeResumeBackend())
+
+    await server_simple.follow_up_agent(AGENT, "next prompt", "k-gc")
+
+    assert not orphan.exists(), (
+        "no production path collects an orphaned sidecar; it lives forever"
+    )
