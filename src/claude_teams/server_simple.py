@@ -30,6 +30,7 @@ from claude_teams import delivery, delivery_store, hooks
 from claude_teams.agent_output import (
     BINDING_LEGACY,
     CORRELATION_FIELD,
+    PI_SESSION_DIR_FIELD,
     PROMPT_TRANSPORT_FIELD,
     PROMPT_TRANSPORT_SIDECAR,
     SPAWNED_BY_FIELD,
@@ -1580,7 +1581,7 @@ def _delivery_successors(agent: dict, backend_name: str, session_id: str):
     cwd = str(agent.get("cwd") or "")
 
     def _candidates() -> list[Path]:
-        binder = _make_binder(backend_name, spawned_at, cwd)
+        binder = _make_binder(backend_name, spawned_at, cwd, agent)
         if binder is None:
             return []
         try:
@@ -1607,6 +1608,7 @@ def _delivery_scanner(
             backend_name,
             _safe_float(agent.get("spawned_at")),
             str(agent.get("cwd") or ""),
+            agent,
         )
         if binder is not None:
             path = binder.resolve_by_session_id(backend_session_id)
@@ -1935,6 +1937,22 @@ def _materialize_prompt(
     return prompt, {"prompt_file_path": str(path)}
 
 
+def _pi_binding_extra(
+    backend_name: str, session_id: str, agent_name: str
+) -> dict[str, str]:
+    """Return the record field naming a pi agent's transcript directory.
+
+    Pi is the one backend whose storage location the server chooses, so the
+    reader cannot find the transcripts from ``cwd`` the way it can for Claude
+    and Codex. Persisting the path here (rather than re-deriving it at read
+    time) keeps the layout owned by one place and lets a record that predates
+    the field be refused instead of guessed. Empty for every other backend.
+    """
+    if backend_name != "pi":
+        return {}
+    return {PI_SESSION_DIR_FIELD: str(_pi_session_dir(session_id, agent_name))}
+
+
 def _correlation_extra(correlation_id: str | None) -> dict[str, str]:
     """Return the ``SpawnRequest.extra`` entry carrying the correlation id.
 
@@ -2192,6 +2210,7 @@ async def spawn_agent(
                     "create_token": create_token,
                     CORRELATION_FIELD: correlation_id,
                     PROMPT_TRANSPORT_FIELD: _prompt_transport(prompt_extra),
+                    **_pi_binding_extra(backend_name, session_id, agent_name),
                     # C1/R2 — who spawned this agent, captured here because
                     # this is the only moment it is observed rather than
                     # asserted. ``follow_up_agent`` refuses any other caller.
@@ -2669,6 +2688,10 @@ def _finalize_follow_up(
                 # Explicit even though ``update`` would preserve it: the id
                 # surviving resume is the property R8 depends on.
                 **_correlation_extra(plan.correlation_id),
+                # Same reasoning, and it also backfills a pi record spawned
+                # before the field existed, which would otherwise stay
+                # unbindable for the rest of its life.
+                **_pi_binding_extra(plan.backend_name, session_id, plan.agent_name),
                 # Explicit for the same reason as the correlation id: a resume
                 # must never launder away who spawned the agent, or the next
                 # follow-up would see ``parent_unknown``. ``update`` would

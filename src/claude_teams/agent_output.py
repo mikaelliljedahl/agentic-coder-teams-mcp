@@ -36,6 +36,14 @@ CORRELATION_UNVERIFIED = "unverified"
 
 CORRELATION_FIELD = "correlation_id"
 
+#: Where a pi agent's transcripts live. Pi is the one backend whose storage the
+#: server dictates (``--session-dir <session>/pi-sessions/<agent>``), so the
+#: candidate set is scoped by construction rather than by an mtime window. The
+#: path is persisted on the record at spawn because re-deriving it at read time
+#: would mean re-implementing the backend's layout inside the reader, and a
+#: record written before this field existed must be refused rather than guessed.
+PI_SESSION_DIR_FIELD = "pi_session_dir"
+
 #: R2/C1 — the agent-record field naming who spawned this agent. Written at
 #: spawn from the spawning server's ``IDENTITY`` and preserved verbatim across
 #: every resume. Its absence is meaningful: a record written before C1 shipped
@@ -1010,11 +1018,91 @@ class _CodexBinder(_TranscriptBinder):
         )
 
 
-def _make_binder(backend: str, spawned_at: float, cwd: str) -> _TranscriptBinder | None:
+class _PiBinder(_TranscriptBinder):
+    """Binder for pi, whose storage the server scopes to one agent.
+
+    Pi is the only backend whose transcript location we choose
+    (``--session-dir <session>/pi-sessions/<agent>``), so enumeration is a
+    single directory listing with no mtime window: every file in there belongs
+    to this agent name by construction.
+
+    That scoping is not a substitute for the correlation marker. Pi keys its
+    storage on the agent *name* (``--session-id <agent>``), and a killed
+    agent's name can be reused, so the directory can legitimately contain a
+    predecessor's transcript. The marker is what tells them apart — and when
+    two transcripts carry the same token, the ladder's count gate reports
+    ``ambiguous`` rather than picking the newer one.
+    """
+
+    def __init__(self, spawned_at: float, cwd: str, session_dir: str) -> None:
+        super().__init__(spawned_at, cwd)
+        self.session_dir = Path(session_dir).expanduser()
+
+    @property
+    def cache_scope(self) -> str:
+        return _normalize_path(str(self.session_dir))
+
+    def _transcripts(self) -> list[Path]:
+        """Every transcript in this agent's pi session dir.
+
+        A missing directory is genuine absence (pi has not written yet); a
+        failed listing raises ``OSError`` and the callers turn that into
+        ``indeterminate`` rather than laundering it into an empty set.
+        """
+        if not self.session_dir.exists():
+            return []
+        return sorted(self.session_dir.glob("*.jsonl"))
+
+    def resolve_by_session_id(self, session_id: str) -> Path | None:
+        for path in self._transcripts():
+            if _pi_session_id(path) == session_id:
+                return path
+        return None
+
+    def candidates(self, *, all_history: bool) -> list[Path]:
+        # The directory is already scoped to this agent, so there is no cheaper
+        # bounded tier to fall back from: both modes enumerate the same set.
+        _ = all_history
+        return self._transcripts()
+
+    def session_id(self, path: Path) -> str | None:
+        return _pi_session_id(path)
+
+    def last_message(self, path: Path) -> str | None:
+        return _last_pi_message(path)
+
+    def legacy_read(
+        self, backend_session_id: str | None, max_bytes: int
+    ) -> AgentOutput | None:
+        return read_pi_output(
+            str(self.session_dir),
+            max_bytes,
+            expected_session_id=backend_session_id,
+        )
+
+
+def _make_binder(
+    backend: str,
+    spawned_at: float,
+    cwd: str,
+    record: Mapping[str, object] | None = None,
+) -> _TranscriptBinder | None:
+    """Return the binder for ``backend``, or ``None`` when it has no reader.
+
+    ``record`` supplies backend-specific lookup metadata. Only pi needs it (its
+    storage dir is server-chosen and persisted rather than derivable from
+    ``cwd``), so the parameter is optional and the other backends ignore it.
+    """
     if backend == "claude-code":
         return _ClaudeBinder(spawned_at, cwd)
     if backend == "codex":
         return _CodexBinder(spawned_at, cwd)
+    if backend == "pi":
+        session_dir = _record_str((record or {}).get(PI_SESSION_DIR_FIELD))
+        # No stored dir means the record predates the field. Refused rather
+        # than reconstructed: guessing the layout here is exactly the kind of
+        # re-derivation that pins a wrong transcript.
+        return _PiBinder(spawned_at, cwd, session_dir) if session_dir else None
     return None
 
 
@@ -1116,7 +1204,11 @@ def resolve_agent_binding(  # noqa: PLR0911 - one return per named gate outcome.
     # ``None`` when the record lacks the lookup metadata a read needs, or names
     # a backend we have no reader for. That is a separate question from the
     # metadata gate below, which is why it does not short-circuit it.
-    binder = _make_binder(backend, spawned_at, cwd) if spawned_at > 0 and cwd else None
+    binder = (
+        _make_binder(backend, spawned_at, cwd, record)
+        if spawned_at > 0 and cwd
+        else None
+    )
 
     # Gate 1 — metadata. Evaluated before the data guards: a record predating
     # correlation is ``legacy`` whether or not it also predates the lookup

@@ -183,6 +183,18 @@ def _codex_receipt_texts(record: dict[str, object]) -> list[str]:
     return _texts_from_content(mapping.get("content"))
 
 
+def _pi_receipt_texts(record: dict[str, object]) -> list[str]:
+    if record.get("type") != "message":
+        return []
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return []
+    mapping = cast("dict[str, object]", message)
+    if mapping.get("role") != "user":
+        return []
+    return _texts_from_content(mapping.get("content"))
+
+
 def receipt_nonces(record: object, backend: str) -> set[str]:
     """Return the delivery nonces carried by ``record``'s receipt payload.
 
@@ -194,10 +206,18 @@ def receipt_nonces(record: object, backend: str) -> set[str]:
     - **codex** — the rollout record for user input, the same record class the
       correlation-token scanner reads, tightened here from a raw substring
       search to a parsed field.
+    - **pi** — the ``type: "message"`` record whose ``message.role`` is
+      ``user``. Pi's transcript names the role on every message, so the user
+      turn is identifiable by the same rule as the other two.
 
     Assistant output, tool invocations, and CLI diagnostics are deliberately
     not receipt records: a nonce appearing only there proves the text was
     echoed or logged, not that it entered the agent's context as a prompt.
+
+    An unrecognised backend returns the empty set, which means "no receipt",
+    which makes delivery ``unconfirmed`` rather than ``delivered``. That is the
+    intended failure direction: a backend nobody has taught this function about
+    must not be reported as having received anything.
     """
     if not isinstance(record, dict):
         return set()
@@ -206,6 +226,8 @@ def receipt_nonces(record: object, backend: str) -> set[str]:
         texts = _claude_receipt_texts(mapping)
     elif backend == "codex":
         texts = _codex_receipt_texts(mapping)
+    elif backend == "pi":
+        texts = _pi_receipt_texts(mapping)
     else:
         return set()
     found: set[str] = set()
