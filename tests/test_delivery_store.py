@@ -146,10 +146,64 @@ def test_records_survive_a_reload(tmp_path: Path) -> None:
     )
 
 
-def test_a_corrupt_store_reads_as_empty_rather_than_raising(tmp_path: Path) -> None:
+def test_a_missing_store_reads_as_empty(tmp_path: Path) -> None:
+    """Absence is the one legitimately-empty case, and stays empty."""
+    assert ds.load_records(tmp_path / ds.DELIVERIES_FILE_NAME) == {}
+
+
+def test_a_corrupt_store_is_unknown_state_and_not_an_empty_one(
+    tmp_path: Path,
+) -> None:
+    """An error is not an absence.
+
+    Reading corruption as ``{}`` let the next dirty transaction atomically
+    REPLACE the store — erasing every prior audit row — and let a key whose row
+    could not be read look unused, authorizing a second delivery under an
+    idempotency key that already had an attempt.
+    """
     path = tmp_path / ds.DELIVERIES_FILE_NAME
     path.write_text("{not json", encoding="utf-8")
-    assert ds.load_records(path) == {}
+
+    with pytest.raises(ds.DeliveryStoreUnreadableError):
+        ds.load_records(path)
+
+
+def test_a_corrupt_store_is_not_silently_overwritten_by_the_next_write(
+    tmp_path: Path,
+) -> None:
+    """The consequence the loader fix exists to prevent, asserted end to end."""
+    path = tmp_path / ds.DELIVERIES_FILE_NAME
+    original = "{not json but precious"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ds.DeliveryStoreError), ds.delivery_transaction(path) as txn:
+        txn.put(_record())
+
+    assert path.read_text(encoding="utf-8") == original, (
+        "a transaction over an unreadable store replaced the audit trail"
+    )
+
+
+def test_a_malformed_row_does_not_vanish_from_an_otherwise_readable_store(
+    tmp_path: Path,
+) -> None:
+    """Dropping the bad entry hides exactly the row a caller is deciding on."""
+    path = tmp_path / ds.DELIVERIES_FILE_NAME
+    path.write_text(json.dumps({"lead|k-1": "not-a-record"}), encoding="utf-8")
+
+    with pytest.raises(ds.DeliveryStoreUnreadableError):
+        ds.load_records(path)
+
+
+def test_an_unreadable_store_is_distinguished_from_an_absent_one(
+    tmp_path: Path,
+) -> None:
+    """Induced ``OSError`` on read, not a patched ``load_records``."""
+    path = tmp_path / ds.DELIVERIES_FILE_NAME
+    path.mkdir()  # a directory where the store should be: read raises OSError
+
+    with pytest.raises(ds.DeliveryStoreUnreadableError):
+        ds.load_records(path)
 
 
 def test_transaction_does_not_rewrite_the_file_when_nothing_changed(

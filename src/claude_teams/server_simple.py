@@ -44,7 +44,10 @@ from claude_teams.agent_output import (
 )
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends.contracts import SpawnRequest
-from claude_teams.backends.process_manager import process_manager
+from claude_teams.backends.process_manager import (
+    OWNERSHIP_OURS,
+    process_manager,
+)
 from claude_teams.backends.registry import registry
 from claude_teams.delivery import (
     DELIVERY_DELIVERED,
@@ -85,6 +88,8 @@ from claude_teams.delivery_store import (
 from claude_teams.filelock import FileLockTimeoutError, lock_handle, unlock_handle
 from claude_teams.leases import (
     LEASES_FILE_NAME,
+    LeaseStoreError,
+    active_lease,
     finalize_lease,
     reconcile_lease,
     release_lease,
@@ -1524,11 +1529,15 @@ def _bump_generation(agent: dict) -> int:
     return generation
 
 
-def _lease_holder_live(pid: int, token: str | None) -> bool:
-    """Fail-closed liveness for a lease holder, PID-reuse safe.
+def _lease_holder_probe(pid: int, token: str | None) -> str:
+    """Three-valued, PID-reuse-safe ownership for a lease/claim holder.
 
-    A holder PID with no creation token, or one whose live token no longer
-    matches, is NOT ours — the same model destructive PID operations use.
+    Returns one of ``OWNERSHIP_OURS`` / ``OWNERSHIP_NOT_OURS`` /
+    ``OWNERSHIP_INDETERMINATE``. Only the middle one means "provably gone", and
+    only that one may authorize reclaiming a lease or a delivery-record claim:
+    a creation token we failed to read against a PID that is still alive is
+    uncertainty, and resuming on uncertainty is the double delivery this whole
+    feature exists to prevent.
 
     There is deliberately no shortcut for ``pid == os.getpid()``. A lease left
     behind by an EARLIER incarnation of the server whose PID has since been
@@ -1538,7 +1547,16 @@ def _lease_holder_live(pid: int, token: str | None) -> bool:
     live token for our own PID, so the honest pairing check succeeds on every
     lease this process actually holds.
     """
-    return process_manager.owns_process(str(pid), token)
+    return process_manager.ownership_probe(str(pid), token)
+
+
+def _lease_holder_live(pid: int, token: str | None) -> bool:
+    """Whether a holder is provably ours. Display and operator paths only.
+
+    Reclaim decisions must use :func:`_lease_holder_probe`, because this
+    collapses "gone" and "could not tell" into one ``False``.
+    """
+    return _lease_holder_probe(pid, token) == OWNERSHIP_OURS
 
 
 def _delivery_successors(agent: dict, backend_name: str, session_id: str):
@@ -2836,7 +2854,7 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                 holder_create_token=process_manager.creation_token(str(os.getpid())),
                 deadline=time.time() + _LEASE_TTL_SECONDS,
                 now=time.time(),
-                holder_live=_lease_holder_live,
+                holder_probe=_lease_holder_probe,
                 ticket=ticket,
             )
             if changed:
@@ -2998,9 +3016,53 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             # serializing this target until reconciliation, so neither a
             # future delivery nor a kill is blocked by a lease nobody is
             # progressing.
-            release_lease(_leases_file(session_id), plan.agent_name, plan.operation_id)
+            #
+            # The result is checked because discarding it is the lease-side
+            # twin of the delivery-claim wedge: a release whose write is lost
+            # leaves the lease on disk naming THIS live server, so
+            # ``_lease_holder_probe`` reports it live for as long as the
+            # process runs, and every later caller queues — and every
+            # ``kill_agent`` refuses — behind a holder that will never come
+            # back to clear it. One retry costs nothing here and closes the
+            # transient case; a persistent failure is logged loudly and needs
+            # the CLI operator escape, which is what it is for.
+            _release_lease_or_warn(session_id, plan)
 
     return _do_follow_up()
+
+
+def _release_lease_or_warn(session_id: str, plan: _FollowUpPlan) -> bool:
+    """Release ``plan``'s lease, retrying once, and report whether it is gone.
+
+    ``release_lease`` returns ``False`` both when the lease was already gone
+    (finalize won the CAS — the normal case) and when the write was lost. Only
+    the second matters, so the store is re-read to tell them apart rather than
+    warning on every healthy delivery.
+    """
+    path = _leases_file(session_id)
+    for attempt in range(2):
+        try:
+            release_lease(path, plan.agent_name, plan.operation_id)
+            still_held = active_lease(path, plan.agent_name)
+        except LeaseStoreError:
+            logger.warning(
+                "Lease store unusable while releasing %s",
+                plan.agent_name,
+                exc_info=True,
+            )
+            continue
+        if still_held is None or still_held.operation_id != plan.operation_id:
+            return True
+        if attempt == 0:
+            continue
+    logger.error(
+        "Could not release the lease on %s held by operation %s. Until it is "
+        "cleared (`win-agent-teams lease force`), deliveries to this agent "
+        "queue and kill_agent refuses.",
+        plan.agent_name,
+        plan.operation_id,
+    )
+    return False
 
 
 def _mark_attempt_sent(session_id: str, record: dict, plan: _FollowUpPlan) -> None:
@@ -3824,6 +3886,9 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
                 "Delivery store write failed in deliver_pending", exc_info=True
             )
             return _store_unavailable("")
+        except LeaseStoreError:
+            logger.warning("Lease store unusable in deliver_pending", exc_info=True)
+            return _store_unavailable("")
 
     return _annotate(await run_blocking(_guarded))
 
@@ -3939,9 +4004,31 @@ async def kill_agent(name: str) -> dict:
             # and the kill proceeds. Ordinary kill NEVER bypasses a live
             # lease; the operator escape lives in the CLI, behind the session
             # recovery token.
-            lease = reconcile_lease(
-                _leases_file(session_id), name, holder_live=_lease_holder_live
-            )
+            try:
+                lease = reconcile_lease(
+                    _leases_file(session_id), name, holder_probe=_lease_holder_probe
+                )
+            except LeaseStoreError:
+                # Fail closed. We cannot read (or could not clear) the store
+                # that says whether a delivery to this agent is in flight, so
+                # we cannot claim there is none. Killing here could orphan an
+                # already-spawned resumed child. The operator escape exists
+                # for exactly this, and the reason names the store so it is
+                # obvious which one to repair.
+                logger.warning("Lease store unusable during kill", exc_info=True)
+                return {
+                    "success": False,
+                    "name": name,
+                    "reason": "lease_store_unavailable",
+                    "retriable": True,
+                    "detail": (
+                        "The operation-lease store could not be read or "
+                        "written, so whether a delivery to this agent is in "
+                        "flight is unknown. Nothing was killed. Retry, or use "
+                        "`win-agent-teams lease force` once the store is "
+                        "readable."
+                    ),
+                }
             if lease is not None:
                 return {
                     "success": False,
@@ -3975,7 +4062,11 @@ async def kill_agent(name: str) -> dict:
             remaining = [a for a in agents if a.get("name") != name]
             agents[:] = remaining
             _save_agents_transaction(session_id, agents)
-            _drop_agent_lease(_leases_file(session_id), name)
+            if not _drop_agent_lease(_leases_file(session_id), name):
+                # Not fatal — the agent is gone either way — but a surviving
+                # entry would be inherited by a same-named successor, so it is
+                # reported rather than silently discarded.
+                logger.warning("Could not drop the lease entry for %s", name)
             # The child is gone if we just killed it or it was already dead;
             # only then may its prompt sidecars be removed outright.
             _cleanup_agent_artifacts(

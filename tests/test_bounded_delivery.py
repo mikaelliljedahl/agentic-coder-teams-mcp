@@ -27,6 +27,10 @@ from claude_teams.agent_output import (
     BindingResult,
 )
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.backends.process_manager import (
+    OWNERSHIP_NOT_OURS,
+    OWNERSHIP_OURS,
+)
 from claude_teams.delivery import DELIVERY_MARKER_PREFIX
 
 SESSION = "session-id"
@@ -836,6 +840,13 @@ def _foreign_lease(env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> Non
     the queue only forms when a second valid caller wants a target somebody
     else has already reserved.
     """
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "ownership_probe",
+        lambda pid, token=None: (
+            OWNERSHIP_OURS if str(pid) == "4242" else OWNERSHIP_NOT_OURS
+        ),
+    )
     monkeypatch.setattr(
         server_simple.process_manager,
         "owns_process",

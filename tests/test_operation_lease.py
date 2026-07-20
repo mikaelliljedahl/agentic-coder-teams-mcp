@@ -13,11 +13,19 @@ from pathlib import Path
 import pytest
 
 from claude_teams import leases
+from claude_teams.backends.process_manager import (
+    OWNERSHIP_INDETERMINATE,
+    OWNERSHIP_NOT_OURS,
+    OWNERSHIP_OURS,
+)
 from claude_teams.leases import (
     LEASE_GRANTED,
     LEASE_QUEUED,
     Lease,
+    LeaseNotPersistedError,
+    LeaseStoreUnreadableError,
     active_lease,
+    drop_agent,
     finalize_lease,
     force_clear_lease,
     load_leases,
@@ -42,7 +50,7 @@ def _reserve(
     holder_create_token: str | None = "tok-111",
     deadline: float = 100.0,
     now: float = 0.0,
-    holder_live=lambda pid, token: True,
+    holder_probe=lambda pid, token: OWNERSHIP_OURS,
     ticket: str | None = None,
 ):
     return reserve_lease(
@@ -56,7 +64,7 @@ def _reserve(
         holder_create_token=holder_create_token,
         deadline=deadline,
         now=now,
-        holder_live=holder_live,
+        holder_probe=holder_probe,
         ticket=ticket,
     )
 
@@ -269,7 +277,9 @@ def test_a_dead_holder_is_reconciled_automatically(tmp_path: Path) -> None:
     path = _store(tmp_path)
     _reserve(path)
 
-    surviving = reconcile_lease(path, "worker", holder_live=lambda pid, token: False)
+    surviving = reconcile_lease(
+        path, "worker", holder_probe=lambda pid, token: OWNERSHIP_NOT_OURS
+    )
 
     assert surviving is None
     assert active_lease(path, "worker") is None
@@ -280,11 +290,12 @@ def test_a_token_mismatch_is_reconciled_automatically(tmp_path: Path) -> None:
     path = _store(tmp_path)
     _reserve(path, holder_pid=111, holder_create_token="tok-111")
 
-    def live(pid: int, token: str | None) -> bool:
+    def probe(pid: int, token: str | None) -> str:
         # The PID is live, but it is now a DIFFERENT process.
-        return pid == 111 and token == "tok-222"
+        ours = pid == 111 and token == "tok-222"
+        return OWNERSHIP_OURS if ours else OWNERSHIP_NOT_OURS
 
-    assert reconcile_lease(path, "worker", holder_live=live) is None
+    assert reconcile_lease(path, "worker", holder_probe=probe) is None
     assert active_lease(path, "worker") is None
 
 
@@ -292,7 +303,9 @@ def test_a_provably_live_holder_survives_reconciliation(tmp_path: Path) -> None:
     path = _store(tmp_path)
     _reserve(path)
 
-    surviving = reconcile_lease(path, "worker", holder_live=lambda pid, token: True)
+    surviving = reconcile_lease(
+        path, "worker", holder_probe=lambda pid, token: OWNERSHIP_OURS
+    )
 
     assert surviving is not None
     assert surviving.operation_id == "op-1"
@@ -310,7 +323,7 @@ def test_wall_clock_expiry_alone_never_reclaims_a_live_holder(tmp_path: Path) ->
 
     # Long past the deadline, but the holder is provably still ours.
     surviving = reconcile_lease(
-        path, "worker", holder_live=lambda pid, token: True, now=10_000.0
+        path, "worker", holder_probe=lambda pid, token: OWNERSHIP_OURS, now=10_000.0
     )
 
     assert surviving is not None, "an overdue but LIVE holder must not be reclaimed"
@@ -321,7 +334,7 @@ def test_an_expired_lease_with_a_dead_holder_is_reclaimed(tmp_path: Path) -> Non
     _reserve(path, deadline=10.0, now=0.0)
 
     surviving = reconcile_lease(
-        path, "worker", holder_live=lambda pid, token: False, now=10_000.0
+        path, "worker", holder_probe=lambda pid, token: OWNERSHIP_NOT_OURS, now=10_000.0
     )
 
     assert surviving is None
@@ -333,7 +346,13 @@ def test_a_tokenless_holder_is_treated_as_unprovable(tmp_path: Path) -> None:
     _reserve(path, holder_create_token=None)
 
     assert (
-        reconcile_lease(path, "worker", holder_live=lambda pid, token: bool(token))
+        reconcile_lease(
+            path,
+            "worker",
+            holder_probe=lambda pid, token: (
+                OWNERSHIP_OURS if token else OWNERSHIP_NOT_OURS
+            ),
+        )
         is None
     )
 
@@ -424,14 +443,75 @@ def test_lease_store_is_not_the_agents_registry_file() -> None:
     assert leases.LEASES_FILE_NAME != "agents.json"
 
 
-def test_a_corrupt_lease_store_does_not_raise(tmp_path: Path) -> None:
+def test_a_missing_lease_store_reads_as_empty(tmp_path: Path) -> None:
+    """No file yet is the legitimately-empty case."""
+    assert load_leases(_store(tmp_path)) == {}
+
+
+def test_a_corrupt_lease_store_never_reads_as_no_lease_held(tmp_path: Path) -> None:
+    """An error is not an absence.
+
+    Returning ``{}`` here reported every target as free, so a caller was granted
+    a lease over a live holder and resumed a conversation somebody else was
+    already resuming — the exact double delivery this module exists to prevent,
+    arriving through the loader rather than the writer.
+    """
     path = _store(tmp_path)
     path.write_text("{ not json", encoding="utf-8")
 
-    assert load_leases(path) == {}
-    assert active_lease(path, "worker") is None
-    # ...and a fresh reservation still succeeds.
-    assert _reserve(path).status == LEASE_GRANTED
+    with pytest.raises(LeaseStoreUnreadableError):
+        load_leases(path)
+    with pytest.raises(LeaseStoreUnreadableError):
+        active_lease(path, "worker")
+    with pytest.raises(LeaseStoreUnreadableError):
+        _reserve(path)
+
+
+def test_a_malformed_lease_payload_is_not_read_as_no_lease(tmp_path: Path) -> None:
+    """The same fail-open, one level in: a corrupt lease body is not 'free'."""
+    path = _store(tmp_path)
+    path.write_text(
+        json.dumps({"worker": {"lease": {"generation": "not-an-int"}, "waiters": []}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LeaseStoreUnreadableError):
+        active_lease(path, "worker")
+
+
+def _break_atomic_replace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the atomic replace raise a real ``OSError``, as a full disk would.
+
+    Deliberately at the OS boundary rather than on ``save_leases`` or the
+    function under test, so the test exercises the real failure path.
+    """
+    original = Path.replace
+
+    def _raise(self: Path, target):
+        if str(target).endswith(".json"):
+            raise OSError(28, "No space left on device")
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "replace", _raise)
+
+
+def test_reconcile_reports_a_reclaim_that_did_not_reach_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write leaves the lease held on disk; ``None`` would be a lie.
+
+    Returning ``None`` after a lost write told ``kill_agent`` there was no live
+    lease, so it killed the process and deleted the record while the on-disk
+    lease still named a live holder mid-delivery.
+    """
+    path = _store(tmp_path)
+    _reserve(path)
+    _break_atomic_replace(monkeypatch)
+
+    with pytest.raises(LeaseNotPersistedError):
+        reconcile_lease(
+            path, "worker", holder_probe=lambda pid, token: OWNERSHIP_NOT_OURS
+        )
 
 
 def test_a_lease_round_trips_through_disk(tmp_path: Path) -> None:
@@ -499,3 +579,68 @@ def test_force_clear_refuses_to_clobber_a_different_operation(tmp_path: Path) ->
     surviving = active_lease(path, "worker")
     assert surviving is not None
     assert surviving.operation_id == "op-new"
+
+
+# ==========================================================================
+# Critical 4 — the claim must not reclaim uncertainty as death
+# ==========================================================================
+
+
+def test_an_indeterminate_holder_is_never_reclaimed(tmp_path: Path) -> None:
+    """ "I could not check" is not "the holder is gone".
+
+    ``owns_process`` collapses "dead" and "token unreadable / access denied"
+    into one ``False``, which is right for a destructive gate and wrong for a
+    reclaim gate: acting on it lets a second caller take a live record and
+    resume the same conversation.
+    """
+    path = _store(tmp_path)
+    _reserve(path)
+
+    surviving = reconcile_lease(
+        path, "worker", holder_probe=lambda pid, token: OWNERSHIP_INDETERMINATE
+    )
+
+    assert surviving is not None, "an unprovable holder must not be reclaimed"
+    assert surviving.operation_id == "op-1"
+
+
+def test_an_indeterminate_holder_queues_a_second_caller_rather_than_granting(
+    tmp_path: Path,
+) -> None:
+    """The R1-safe answer: queued, never granted, never refused."""
+    path = _store(tmp_path)
+    _reserve(path)
+
+    second = _reserve(
+        path,
+        operation_id="op-2",
+        holder_probe=lambda pid, token: OWNERSHIP_INDETERMINATE,
+    )
+
+    assert second.status == LEASE_QUEUED
+    assert second.lease is not None
+    assert second.lease.operation_id == "op-1"
+
+
+def test_a_probe_that_raises_is_uncertainty_not_death(tmp_path: Path) -> None:
+    path = _store(tmp_path)
+    _reserve(path)
+
+    def _raises(pid: int, token: str | None) -> str:
+        raise OSError(13, "Access is denied")
+
+    assert reconcile_lease(path, "worker", holder_probe=_raises) is not None
+
+
+def test_drop_agent_reports_whether_the_entry_actually_went(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A surviving entry is inherited by a same-named successor."""
+    path = _store(tmp_path)
+    _reserve(path)
+    assert drop_agent(path, "worker") is True
+
+    _reserve(path)
+    _break_atomic_replace(monkeypatch)
+    assert drop_agent(path, "worker") is False

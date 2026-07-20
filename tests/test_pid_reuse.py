@@ -137,3 +137,55 @@ class TestTokenAwareHealthCheck:
         handle = str(os.getpid())
         alive, _ = pm.process_manager.health_check(handle)
         assert alive is True
+
+
+class TestOwnershipProbe:
+    """Round-2 critical 4: uncertainty must not be reclaimed as death.
+
+    ``owns_process`` collapses "provably gone" and "could not tell" into one
+    ``False``. That is correct for a destructive gate — never kill what you
+    cannot prove is yours — and wrong for a **reclaim** gate, where the same
+    ``False`` authorizes a second caller to resume a conversation the first is
+    still working. ``ownership_probe`` keeps the three answers apart.
+    """
+
+    def test_ours_when_the_live_token_matches(self) -> None:
+        pid = str(os.getpid())
+        assert (
+            pm.process_manager.ownership_probe(pid, pm.creation_token(pid))
+            == pm.OWNERSHIP_OURS
+        )
+
+    def test_not_ours_on_a_token_mismatch(self) -> None:
+        assert (
+            pm.process_manager.ownership_probe(str(os.getpid()), "not-the-token")
+            == pm.OWNERSHIP_NOT_OURS
+        )
+
+    def test_not_ours_for_a_dead_pid(self) -> None:
+        """A PID that is not alive is settled: the holder really is gone."""
+        assert (
+            pm.process_manager.ownership_probe(_DEAD_PID, "whatever")
+            == pm.OWNERSHIP_NOT_OURS
+        )
+
+    def test_indeterminate_when_a_live_pid_s_token_is_unreadable(
+        self, monkeypatch
+    ) -> None:
+        """Access denied against a LIVE process is uncertainty, not death.
+
+        This is the one case ``owns_process`` cannot express, and the one that
+        matters: reclaiming here hands a second caller a live delivery.
+        """
+        monkeypatch.setattr(pm, "creation_token", lambda handle: None)
+
+        assert (
+            pm.process_manager.ownership_probe(str(os.getpid()), "expected")
+            == pm.OWNERSHIP_INDETERMINATE
+        )
+
+    def test_owns_process_still_refuses_everything_but_ours(self, monkeypatch) -> None:
+        """The destructive gate is unchanged: indeterminate is still False."""
+        monkeypatch.setattr(pm, "creation_token", lambda handle: None)
+
+        assert pm.process_manager.owns_process(str(os.getpid()), "expected") is False

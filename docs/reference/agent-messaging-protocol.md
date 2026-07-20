@@ -547,14 +547,38 @@ handle on an in-flight message, so a lost write plus a lost response would leave
 neither a reliable status nor a recoverable key — the exact hole the
 caller-supplied idempotency key exists to close (R4/B0). The delivery tools
 answer `queued(phase="pending", reason="delivery_store_unavailable",
-retriable=true)` and send nothing. The one place the error is logged and
-swallowed is kill-time reconciliation: `kill_agent` is a lifecycle operation
-that must still terminate the process, and leaving the rows unsettled is honest
-— nothing *was* settled — and a later `delivery_status` reconciles them.
+retriable=true)` and send nothing.
 
-The same rule already applies one layer down in `leases.save_leases`: a lease
-that did not reach disk is not a lease, so `reserve_lease` reports `queued`
-rather than `granted`.
+**Reads fail closed too, and absence is not the same as an error.**
+`delivery_store.load_records` and `leases.load_leases` return `{}` only when the
+file does not exist yet — the legitimately-empty case. A store that exists but
+cannot be read or parsed raises (`DeliveryStoreUnreadableError`,
+`LeaseStoreUnreadableError`), because treating unknown state as empty would let
+the next dirty transaction atomically **replace** the audit trail, make a key
+whose row could not be read look unused (authorizing a duplicate delivery), and
+grant a fresh lease over a live holder. The same rule applies one level in: a
+malformed lease payload is not "no lease held". Callers inherit the fail-closed
+behaviour they already had for a lost write.
+
+Three writes are reached *after* something has already been mutated or decided,
+and each now reports rather than swallows:
+
+- **Kill-time reconciliation** still logs and continues — `kill_agent` is a
+  lifecycle operation that must terminate the process, and leaving the rows
+  unsettled is honest, nothing *was* settled. What changed is that the rescan
+  is still possible afterwards: see "Kill-time cleanup" below.
+- **`_release_delivery_claim`** returns whether the release reached disk, and
+  drops its in-process claim registration first and unconditionally, so a lost
+  write can no longer wedge the key (see `active_holder`, below).
+- **`_discard_delivery_record`** (the C2 refusal rollback) returns whether the
+  session really is byte-identical again. When it is not, the refusal says so
+  (`record_discarded: false`, plus a note that the idempotency key is consumed)
+  instead of promising that nothing changed while its row survives on disk.
+
+`leases.save_leases` follows the same rule: a lease that did not reach disk is
+not a lease, so `reserve_lease` reports `queued` rather than `granted`,
+`reconcile_lease` raises `LeaseNotPersistedError` rather than reporting the
+lease reclaimed, and `drop_agent` returns whether the entry actually went.
 
 ### Cursor semantics
 

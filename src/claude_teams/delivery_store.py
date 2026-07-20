@@ -102,6 +102,24 @@ class DeliveryStoreError(RuntimeError):
         )
 
 
+class DeliveryStoreUnreadableError(DeliveryStoreError):
+    """The store exists but its contents are unknown, so nothing may proceed.
+
+    A subclass of :class:`DeliveryStoreError` on purpose: every call site that
+    already fails closed on a lost *write* must fail closed on an unreadable
+    *read* for the same reason. Treating either as "the store is empty" lets a
+    duplicate delivery through and lets the next write erase the audit trail.
+    """
+
+    def __init__(self, path: object = "") -> None:
+        """Name the store that could not be read."""
+        RuntimeError.__init__(
+            self,
+            f"delivery store {path} exists but could not be read or parsed; "
+            "its contents are unknown and must not be treated as empty",
+        )
+
+
 def validate_idempotency_key(value: object) -> str | None:
     """Return the error code for ``value``, or ``None`` when it is usable.
 
@@ -228,18 +246,43 @@ def public_view(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_records(path: Path) -> dict[str, dict[str, Any]]:
-    """Load the store, tolerating absence and corruption."""
+    """Load the store. Absence is empty; unreadable or malformed is an error.
+
+    The distinction is the whole contract. "No file yet" is a legitimately empty
+    store and a first write may create it. "The file is there but I could not
+    read or parse it" is *unknown* state, and returning ``{}`` for it — which is
+    what this used to do — makes every caller act on a lie:
+
+    - the next dirty transaction atomically **replaces** the store, erasing
+      every prior audit row;
+    - a key whose row cannot be read looks unused, so a duplicate delivery is
+      authorized under an idempotency key that already has an attempt;
+    - a settled outcome the sender is entitled to recover simply disappears.
+
+    So an unreadable or malformed store raises, and every caller inherits the
+    fail-closed behaviour it already has for a failed *write*. An error is not
+    an absence.
+    """
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise DeliveryStoreUnreadableError(path) from exc
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise DeliveryStoreUnreadableError(path) from exc
     if not isinstance(raw, dict):
-        return {}
-    return {
-        key: cast("dict[str, Any]", value)
-        for key, value in cast("dict[str, Any]", raw).items()
-        if isinstance(key, str) and isinstance(value, dict)
-    }
+        raise DeliveryStoreUnreadableError(path)
+    rows: dict[str, dict[str, Any]] = {}
+    for key, value in cast("dict[str, Any]", raw).items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            # Dropping the malformed entry would hide exactly one row — most
+            # likely the one a caller is about to decide something about.
+            raise DeliveryStoreUnreadableError(path)
+        rows[key] = cast("dict[str, Any]", value)
+    return rows
 
 
 def save_records(path: Path, data: dict[str, dict[str, Any]]) -> bool:
@@ -365,6 +408,7 @@ __all__ = [
     "STATUS_FAILED",
     "STATUS_QUEUED",
     "DeliveryStoreError",
+    "DeliveryStoreUnreadableError",
     "DeliveryTransaction",
     "delivery_transaction",
     "is_terminal",

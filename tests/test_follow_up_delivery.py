@@ -22,6 +22,9 @@ from typer.testing import CliRunner
 from claude_teams import cli, leases, server_simple
 from claude_teams.agent_output import BINDING_BOUND, AgentOutput, BindingResult
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.backends.process_manager import (
+    OWNERSHIP_OURS,
+)
 from claude_teams.delivery import DELIVERY_MARKER_PREFIX
 
 SESSION = "session-id"
@@ -480,7 +483,7 @@ def _hold_lease(env, *, holder_pid: int, token: str | None, operation_id="op-hel
         holder_create_token=token,
         deadline=0.0,
         now=0.0,
-        holder_live=lambda pid, tok: True,
+        holder_probe=lambda pid, tok: OWNERSHIP_OURS,
     )
 
 

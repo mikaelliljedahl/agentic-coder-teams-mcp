@@ -205,6 +205,16 @@ def _codex_creation_epoch_ms(value: object) -> int:
     return int(digits) if digits else 0
 
 
+#: Provably this manager's process: in-memory ownership, or a matching token.
+OWNERSHIP_OURS = "ours"
+#: Provably NOT the process we mean: token mismatch, no token, or a dead PID.
+#: The only answer that may authorize reclaiming a lease or a record claim.
+OWNERSHIP_NOT_OURS = "not_ours"
+#: Alive, but ownership is unprovable (creation metadata unreadable). Never a
+#: licence to reclaim: "I could not check" is not "the holder is gone".
+OWNERSHIP_INDETERMINATE = "indeterminate"
+
+
 def creation_token(handle: str) -> str | None:
     """Return an opaque, PID-reuse-distinguishing creation token, or ``None``.
 
@@ -288,6 +298,40 @@ class _PidOwnershipMixin:
         info = self._processes.get(handle)
         return info is not None and self._tracked_alive(info)
 
+    def ownership_probe(self, handle: str, expected_token: str | None) -> str:
+        """Classify ``handle`` as :data:`OWNERSHIP_OURS`/``NOT_OURS``/``INDETERMINATE``.
+
+        ``owns_process`` collapses the last two into ``False``, which is right
+        for a **destructive** gate — never kill what you cannot prove is yours —
+        but wrong for a **reclaim** gate. Reclaiming a lease or a delivery-record
+        claim means "the holder is gone, so I may resume in its place", and an
+        unreadable creation token is not proof of that: it is most often a
+        transient access error against a process that is very much alive. Acting
+        on it authorizes a concurrent resume of one conversation.
+
+        So the three answers are kept apart:
+
+        - ``OURS`` — in-memory ownership of a live child, or a matching live
+          creation token.
+        - ``NOT_OURS`` — a token mismatch (PID reuse), a tokenless expectation,
+          or a PID that is not alive at all. Provably not the holder we mean.
+        - ``INDETERMINATE`` — the PID is alive but its creation token could not
+          be read, so we cannot tell ownership from reuse. Callers gating a
+          reclaim must treat this as "still held".
+        """
+        if self._has_live_registry_entry(handle):
+            return OWNERSHIP_OURS
+        if not expected_token:
+            return OWNERSHIP_NOT_OURS
+        live = creation_token(handle)
+        if live is not None:
+            return OWNERSHIP_OURS if live == expected_token else OWNERSHIP_NOT_OURS
+        # The token is unreadable. A PID that is not alive is settled: gone.
+        # A PID that IS alive with an unreadable token is genuinely unknown.
+        if self._pid_alive(handle):
+            return OWNERSHIP_INDETERMINATE
+        return OWNERSHIP_NOT_OURS
+
     def owns_process(self, handle: str, expected_token: str | None) -> bool:
         """Return whether ``handle`` is provably still our process (fail-closed).
 
@@ -296,13 +340,12 @@ class _PidOwnershipMixin:
         token equals ``expected_token``. A tokenless expectation, an unreadable
         live token (dead / access denied), or a mismatch all return ``False`` —
         so a reused or foreign PID is never gracefully-shut-down or killed.
+
+        Deliberately still a bool: this gates *destruction*, where "unproven"
+        and "not ours" must behave identically. Reclaim gates want
+        :meth:`ownership_probe`, which keeps the two apart.
         """
-        if self._has_live_registry_entry(handle):
-            return True
-        if not expected_token:
-            return False
-        live = creation_token(handle)
-        return live is not None and live == expected_token
+        return self.ownership_probe(handle, expected_token) == OWNERSHIP_OURS
 
     def _pid_health_with_token(
         self, handle: str, expected_token: str | None

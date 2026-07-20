@@ -133,7 +133,11 @@ def _authorize(session_id: str, token: str) -> None:
 
 
 def _lease_or_exit(session_id: str, agent: str):
-    lease = leases.active_lease(server_simple._leases_file(session_id), agent)
+    try:
+        lease = leases.active_lease(server_simple._leases_file(session_id), agent)
+    except leases.LeaseStoreError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=5) from exc
     if lease is None:
         console.print(f"[yellow]No lease held for {agent!r}.[/yellow]")
         raise typer.Exit(code=1)

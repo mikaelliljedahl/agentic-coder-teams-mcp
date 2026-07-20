@@ -50,6 +50,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from claude_teams.backends.process_manager import (
+    OWNERSHIP_NOT_OURS,
+)
+
 #: Deliberately not ``agents.json``: see the module docstring on torn writes.
 LEASES_FILE_NAME = "operation-leases.json"
 
@@ -90,19 +94,60 @@ class ReserveResult:
         return self.status == LEASE_GRANTED
 
 
+class LeaseStoreError(RuntimeError):
+    """The lease store could not be used, so no reservation may be trusted."""
+
+
+class LeaseNotPersistedError(LeaseStoreError):
+    """A lease mutation did not reach disk, so on-disk state is unchanged."""
+
+    def __init__(self, path: object = "", agent: object = "") -> None:
+        """Name the store and the agent whose lease is still held on disk."""
+        super().__init__(
+            f"lease store {path} could not be persisted while reclaiming "
+            f"{agent!r}; the lease is still held on disk"
+        )
+
+
+class LeaseStoreUnreadableError(LeaseStoreError):
+    """The lease store exists but its contents are unknown.
+
+    Same rule as ``delivery_store.load_records``: reading an unreadable or
+    corrupt lease file as an **empty** one reports every target as free, so a
+    caller is granted a lease over a live holder and resumes a conversation
+    somebody else is already resuming. That is the exact double delivery this
+    module exists to prevent, arriving through the loader instead of the
+    writer. Absence (no file yet) stays empty; anything else raises.
+    """
+
+    def __init__(self, path: object = "") -> None:
+        """Name the store that could not be read."""
+        super().__init__(
+            f"lease store {path} exists but could not be read or parsed; "
+            "its contents are unknown and must not be treated as empty"
+        )
+
+
 def load_leases(path: Path) -> dict[str, dict[str, Any]]:
-    """Load the lease store, tolerating absence and corruption."""
+    """Load the lease store. Absence is empty; unreadable/malformed raises."""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise LeaseStoreUnreadableError(path) from exc
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise LeaseStoreUnreadableError(path) from exc
     if not isinstance(raw, dict):
-        return {}
-    return {
-        key: value
-        for key, value in cast("dict[str, Any]", raw).items()
-        if isinstance(key, str) and isinstance(value, dict)
-    }
+        raise LeaseStoreUnreadableError(path)
+    entries: dict[str, dict[str, Any]] = {}
+    for key, value in cast("dict[str, Any]", raw).items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            raise LeaseStoreUnreadableError(path)
+        entries[key] = cast("dict[str, Any]", value)
+    return entries
 
 
 def save_leases(path: Path, data: dict[str, dict[str, Any]]) -> bool:
@@ -142,8 +187,17 @@ def _entry(data: dict[str, dict[str, Any]], agent: str) -> dict[str, Any]:
 
 
 def _to_lease(agent: str, payload: object) -> Lease | None:
-    if not isinstance(payload, dict):
+    """Parse a stored lease payload. ``None`` means *no lease*, never *unknown*.
+
+    ``None``/absent is the legitimate "nothing held" case. A payload that is
+    present but unparseable is corruption, and reading it as "no lease held"
+    is the same fail-open the loader just closed, one level in: it would let a
+    caller be granted a target that the unreadable bytes say is taken.
+    """
+    if payload is None:
         return None
+    if not isinstance(payload, dict):
+        raise LeaseStoreUnreadableError(agent)
     mapping = cast("dict[str, Any]", payload)
     try:
         return Lease(
@@ -161,8 +215,8 @@ def _to_lease(agent: str, payload: object) -> Lease | None:
             deadline=float(mapping.get("deadline") or 0.0),
             acquired_at=float(mapping.get("acquired_at") or 0.0),
         )
-    except (KeyError, TypeError, ValueError):
-        return None
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LeaseStoreUnreadableError(agent) from exc
 
 
 def active_lease(path: Path, agent: str) -> Lease | None:
@@ -177,33 +231,51 @@ def active_lease(path: Path, agent: str) -> Lease | None:
     return _to_lease(agent, entry.get("lease"))
 
 
-def _holder_provably_live(
-    lease: Lease, holder_live: Callable[[int, str | None], bool]
+def _holder_reclaimable(
+    lease: Lease, holder_probe: Callable[[int, str | None], str]
 ) -> bool:
-    """Fail-closed liveness for a lease holder.
+    """Whether ``lease``'s holder is **provably** gone, so it may be reclaimed.
 
-    Mirrors ``process_manager.owns_process``: an unreadable or mismatched
-    creation token means "not ours", never "probably fine".
+    Three-valued on purpose (``process_manager.ownership_probe``). Only
+    :data:`OWNERSHIP_NOT_OURS` — a dead PID, a reused PID, or a tokenless
+    expectation — releases the lease. A holder whose creation token could not be
+    read is alive-but-unprovable, and reclaiming on that authorizes a second
+    caller to resume a conversation the first is still working. A probe that
+    raises is likewise unknown, not gone.
+
+    This is deliberately NOT the mirror of the destructive gate: killing must
+    refuse on "unproven", and so must reclaiming — but they refuse in opposite
+    directions, so they cannot share one bool.
     """
     try:
-        return bool(holder_live(lease.holder_pid, lease.holder_create_token))
+        outcome = holder_probe(lease.holder_pid, lease.holder_create_token)
     except OSError:
         return False
+    # Whitelist, not blacklist: only a positive "provably not the holder"
+    # reclaims. Anything else — ``ours``, ``indeterminate``, or an outcome this
+    # version does not recognise — leaves the lease held.
+    return outcome == OWNERSHIP_NOT_OURS
 
 
 def reconcile_lease(
     path: Path,
     agent: str,
     *,
-    holder_live: Callable[[int, str | None], bool],
+    holder_probe: Callable[[int, str | None], str],
     now: float | None = None,
 ) -> Lease | None:
-    """Clear a lease whose holder is gone; return the surviving live lease.
+    """Clear a lease whose holder is provably gone; return the surviving lease.
 
     ``now`` is accepted (and deliberately unused for the reclaim decision) to
     make the rule explicit at every call site: **wall-clock expiry alone never
-    reclaims a lease.** Only a holder that is dead, or whose creation token no
-    longer matches, releases it.
+    reclaims a lease.** Only a holder that is provably dead, or whose creation
+    token no longer matches, releases it; one whose ownership merely could not
+    be established stays held.
+
+    Raises :class:`LeaseStoreError` when the reclaim could not be persisted. The
+    caller asked "is a live lease held here", and after a failed write the
+    answer on disk is still "yes" — returning ``None`` would let it kill or
+    resume against a lease every other process can still see.
     """
     _ = now
     data = load_leases(path)
@@ -213,11 +285,12 @@ def reconcile_lease(
     lease = _to_lease(agent, entry.get("lease"))
     if lease is None:
         return None
-    if _holder_provably_live(lease, holder_live):
+    if not _holder_reclaimable(lease, holder_probe):
         return lease
     entry["lease"] = None
     _drop_waiter(entry, lease.operation_id)
-    save_leases(path, data)
+    if not save_leases(path, data):
+        raise LeaseNotPersistedError(path, agent)
     return None
 
 
@@ -246,7 +319,7 @@ def reserve_lease(  # noqa: PLR0913 - the lease's stored fields are its argument
     holder_create_token: str | None,
     deadline: float,
     now: float,
-    holder_live: Callable[[int, str | None], bool],
+    holder_probe: Callable[[int, str | None], str],
     ticket: str | None = None,
 ) -> ReserveResult:
     """Reserve the right to resume ``agent``, or take a FIFO place in line.
@@ -262,7 +335,7 @@ def reserve_lease(  # noqa: PLR0913 - the lease's stored fields are its argument
     data = load_leases(path)
     entry = _entry(data, agent)
     current = _to_lease(agent, entry.get("lease"))
-    if current is not None and not _holder_provably_live(current, holder_live):
+    if current is not None and _holder_reclaimable(current, holder_probe):
         _drop_waiter(entry, current.operation_id)
         entry["lease"] = None
         current = None
@@ -424,12 +497,18 @@ def force_clear_lease(
     return lease, save_leases(path, data)
 
 
-def drop_agent(path: Path, agent: str) -> None:
-    """Remove an agent's whole lease entry (used when its record is removed)."""
+def drop_agent(path: Path, agent: str) -> bool:
+    """Remove an agent's whole lease entry (used when its record is removed).
+
+    Returns whether the store reflects the removal. A discarded ``False`` here
+    leaves a killed agent's entry on disk, which a same-named successor then
+    inherits — so the caller is given the result rather than a silent ``None``.
+    """
     data = load_leases(path)
-    if agent in data:
-        del data[agent]
-        save_leases(path, data)
+    if agent not in data:
+        return True
+    del data[agent]
+    return save_leases(path, data)
 
 
 __all__ = [
@@ -437,6 +516,9 @@ __all__ = [
     "LEASE_GRANTED",
     "LEASE_QUEUED",
     "Lease",
+    "LeaseNotPersistedError",
+    "LeaseStoreError",
+    "LeaseStoreUnreadableError",
     "ReserveResult",
     "active_lease",
     "drop_agent",
