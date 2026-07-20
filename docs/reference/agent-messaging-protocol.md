@@ -1225,8 +1225,9 @@ Two rules, both load-bearing:
    character — so the safety rule is respected, not bypassed. The sidecar branch
    appends the newline-delimited form. `_CLAUDE_PROMPT_FILE_CHARS` is unchanged.
 
-When the sidecar is used, the server writes the **marked** prompt to
-`prompts/{name}.prompt.txt`, passes `prompt_file_path` in `extra`, and the
+When the sidecar is used, the server writes the **marked** prompt to a
+per-attempt file, `prompts/{name}.<nonce>.prompt.txt` (`_attempt_prompt_file`),
+passes `prompt_file_path` in `extra`, and the
 backend puts only this fixed instruction on the command line
 (`src/claude_teams/backends/claude_code.py:258-271`):
 
@@ -1235,8 +1236,11 @@ backend puts only this fixed instruction on the command line
 **The worker must actually read that file.** The real prompt never reaches the
 model directly — and neither does the marker, until the read lands in context.
 
-This applies identically to `spawn_agent` and `follow_up_agent`, and the file
-path is the same for both — a follow-up **overwrites** the spawn prompt file.
+This applies identically to `spawn_agent` and `follow_up_agent`, and since A5
+each attempt gets its **own** path: the per-attempt nonce is in the filename, so
+a follow-up cannot overwrite the spawn prompt file and two concurrent calls to
+one agent cannot collide on a single path. Cleanup is by age or on confirmed
+child exit, never "delete the others because a new call started".
 
 Codex has no prompt-file path: `_materialize_prompt` returns the prompt
 unchanged for any non-`claude-code` backend. Codex relies on passing the prompt
@@ -1520,13 +1524,15 @@ waited for rather than resumed immediately.
 and not yet read is gone. Delivery records in `deliveries.json` are deliberately
 **not** touched: they are the sender's audit trail and must outlive the target.
 
-### A follow-up overwrites the spawn prompt file
+### A follow-up no longer overwrites the spawn prompt file
 
-`_prompt_file` is keyed by agent name only
-(`src/claude_teams/server_simple.py:228-230`), so a claude-code follow-up whose
-prompt contains a quote or newline rewrites the same
-`prompts/{name}.prompt.txt` the original spawn used. If the worker re-reads that
-path later, it sees the follow-up prompt, not the original.
+Historical, and recorded because the old behaviour was published here. Prompt
+sidecars used to be keyed by agent name alone, so a claude-code follow-up whose
+prompt contained a quote or newline rewrote the same file the original spawn
+used, and a worker re-reading that path saw the follow-up prompt instead of the
+original. Since A5 the path is `prompts/{name}.<nonce>.prompt.txt`
+(`_attempt_prompt_file`), unique per attempt, so neither a follow-up nor a
+concurrent second call can overwrite another attempt's prompt.
 
 ### A spawned agent may not have the name you requested
 
