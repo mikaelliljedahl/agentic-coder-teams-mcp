@@ -1182,6 +1182,42 @@ unmarked; no id is ever invented.
 `win-agent-teams watch <session_dir> [--timeout 60] [--pattern state-*.json] [--inbox/--no-inbox]`
 (`src/claude_teams/cli.py:182-199`).
 
+### The R3 delivery contract
+
+Upstream messaging has no push: `send_message` appends a line and returns. The
+recipient learns about it because its watcher wakes it. That makes the watcher a
+**protocol component with obligations**, not a convenience — and the three
+obligations below are load-bearing for every upstream message in the system.
+
+They describe behaviour that already holds. C4 states them and pins them with
+characterisation tests (`tests/test_watcher_contract.py`); it changed no watcher
+code. Wake priority and the settle window are explicitly out of scope.
+
+1. **Wake without consume.** A `reason="message"` wake reports which senders
+   have unread messages and advances **no cursor**. The message is still unread
+   afterwards, so the recipient — and only the recipient, via `read_messages` —
+   consumes it. A second watcher started before the read wakes for the same
+   message. Consequence: an unread message that is never drained re-wakes every
+   subsequent watch immediately.
+2. **Cursor clamping.** `unread_sender_counts` clamps a per-sender cursor to the
+   message count (`consumed = min(cursor, total)`,
+   `src/claude_teams/messaging.py`). A cursor ahead of the count — which
+   `kill_agent` can produce, since it purges a sender's inbox lines — yields
+   zero unread rather than a negative count or a phantom wake, and it is clamped
+   **per sender**, so one stale cursor cannot mute another sender. Messages
+   appended past the stale mark are reported normally.
+3. **Exit 2 does not strand.** A timeout is not a consumption. Whatever caused
+   the watcher to exit 2 — deadline, `--no-inbox`, an edge still inside its
+   settle window — the unread message and its cursor are untouched and the next
+   watch wakes for it. This is why "re-check status after exit 2" is a
+   correctness instruction and not just advice.
+
+**What the contract does not promise:** a *bounded* wake latency in the face of
+the settle window. An unread inbox message wakes within one poll (0.5 s), but a
+`waiting` marker waits out `_WATCH_SETTLE_SECONDS` (15 s default) first, and a
+watcher that is not running at all wakes nobody. The guarantee is "no message is
+lost between wakes", not "a wake is running".
+
 ### Reader identity
 
 The watcher determines whose inbox to watch from its **own process

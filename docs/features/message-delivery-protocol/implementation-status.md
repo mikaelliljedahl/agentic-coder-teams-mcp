@@ -34,12 +34,74 @@ Living handoff document. Update it as work lands; it is the source of truth for
 | `feat:` | **C1 + C2** — `spawned_by`/`spawned_by_source` on the record, the downstream-only direction guard ahead of every side effect, and `win-agent-teams adopt` (CLI-only, token + generation gated). |
 | `feat:` | **Phase B** — `filelock.py` (the registry's lock, extracted and shared) and `delivery_store.py` (the durable per-sender audit store). |
 | `feat:` | **Phase B** — the bounded wait (B2), the one-budget delivery loop (B0), the state machine (B1), `no_delivery_path` (B3), `delivery_status` + `deliver_pending`, kill-time reconciliation, and the reference update. |
+| `feat:` | **C3** — `_classify_recipient` (five classes), the downstream send routed through the shared `_guaranteed_send`, and the refusals that replace the reroute. |
+| `test:` | **C4** — the watcher contract (R3) characterised: wake-without-consume, cursor clamping, exit-2-does-not-strand. No watcher code changed. |
 
-## Next, in dependency order
+## Status: complete
 
-**Phase A, B and C1+C2 are complete.** Next: C3+C4.
+**Every phase has landed — Phase 0, A, B, C1+C2, and C3+C4.** All eleven
+findings from the Phase A adversarial review are in. There is no next step in
+this feature; open follow-ups are listed under "Offered, not done" below.
 
-Phase B notes for whoever picks up C3+C4:
+### What C3 changed, for anyone reading the diff later
+
+- `_message_recipient` is **gone**, replaced by `_classify_recipient`, which
+  returns one of `child` / `spawner` / `sibling` / `unrelated` / `unknown`. Only
+  the first two are deliverable. The old "unknown name is routed to the lead
+  with a warning" rule is what R5 forbids: nothing consumed the warning, so a
+  typo became a real-looking upstream message.
+- `send_message` gained an `idempotency_key` parameter, used only by the
+  downstream branch. Its **result shape now depends on the recipient**: upstream
+  returns `{success, to}`, downstream returns the full B1 delivery schema.
+- `follow_up_agent`'s body was extracted into `_guaranteed_send` and both tools
+  call it. They must not be two implementations that happen to agree.
+- `sibling` and `unrelated` are separate classes on purpose. Both refuse
+  identically, but reporting a grandchild as "sibling" would be a lie in a
+  client-visible field.
+- Four existing tests encoded the removed reroute and were updated, not
+  deleted: two `_message_recipient` unit tests, the `send_message` reroute test
+  in `test_agent_output.py`, and the tool-description test.
+
+### C4 is characterisation, and says so
+
+`tests/test_watcher_contract.py` passed on the first run by design — it pins
+behaviour that already held. No watcher code was touched: wake priority, the
+settle window, and the `before = after` output-edge coupling are all unchanged.
+Mutation testing was used instead of red to show the tests bite (below).
+
+### Mutation results (C3 + C4)
+
+Applied to a copy, run, restored from the copy — never `git checkout`.
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | named spawner no longer short-circuits before the parentage check | killed |
+| M2 | unknown recipient rerouted upstream (the old rule) | killed |
+| M3 | guaranteed send also appends to the inbox (B4 breach) | killed |
+| M4 | sibling/unrelated routed instead of refused | killed |
+| M5 | any record with a `spawned_by` counts as my child | killed |
+| M6 | wake advances the cursor (consumes) | killed |
+| M7 | cursor clamp (`min`) removed | killed |
+
+No survivors. `server_simple.py` was verified afterwards by **AST body
+comparison** against `HEAD` (127 → 129 symbols; only `_message_recipient`
+removed, `_classify_recipient`/`_guaranteed_send`/`_spawner_target` added,
+`send_message`/`follow_up_agent` changed) and by checking all 14 registered
+`@mcp.tool()` docstrings are present and non-empty.
+
+## Offered, not done
+
+- Converting `agent-messaging-protocol.md`'s ~113 `server_simple.py` line
+  citations to symbol-based references. Symbol names are already authoritative;
+  the line numbers drift within a few PRs.
+- Caller-identity enforcement on `kill_agent` — same hazard class as R2, but
+  lifecycle rather than delivery. Explicitly a non-goal here.
+- A recipient-visible, non-actionable history query for guaranteed-path
+  messages. R5 permits it only as a separate query, never as unread delivery.
+
+## Historical notes from earlier phases
+
+Phase B notes, kept because they explain why the code looks the way it does:
 
 - **`follow_up_agent` now takes a required `idempotency_key`.** Every existing
   test call site was updated; a new one that omits it gets a validation error
@@ -88,7 +150,7 @@ uv run pytest
 
 There is no `.venv` in a fresh worktree; `uv sync` first.
 
-All four gates are **green** as of the Phase B commits (855 passed, 1 skipped).
+All four gates are **green** as of the C3+C4 commits (902 passed, 1 skipped).
 
 Known intermittent, pre-existing and NOT caused by this work:
 `tests/test_cli_watch.py::test_watch_settle_wakes_persistent_waiting` fails
