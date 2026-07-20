@@ -180,3 +180,50 @@ TS suite = 58 passed.
 - `uv run ty check`: All checks passed.
 - pi-extensions/win-agent-teams-wake: `npx tsc --noEmit` clean; `npx vitest run`
   58 passed (5 files); `eslint .` clean; `prettier --check` all files conform.
+
+## Smoke test (2026-07-20)
+
+**Context.** Run on Linux with the `feature/pi-lead-autoload` branch checked out
+in the main worktree. Both the win-agent-teams MCP server and the wake extension
+were served from this branch. This is a **partial** smoke test: the live
+LLM-driven turn-injection wake is deferred (see below).
+
+**Verified without model quota:**
+
+1. **Auto-load registration.**
+   `pi install /home/mikael/code/agentic-coder-teams-mcp/pi-extensions/win-agent-teams-wake`
+   added the package to `~/.pi/agent/settings.json` `packages` (alongside
+   `npm:pi-mcp-adapter`), confirming the root-lead auto-load path.
+2. **Activation guard.** A fresh `WIN_AGENT_TEAMS_LEAD=1 pi` process carried the
+   guard env. `index.ts` activates the `WakeMachine` on `session_start` only when
+   `WIN_AGENT_TEAMS_SESSION_DIR` or `WIN_AGENT_TEAMS_LEAD=1` is present; plain
+   `pi` is a no-op.
+3. **Discovering loop is robust.** `src/state-machine.ts` `discovering()` polls
+   `session-dir` with backoff and never gives up when no live session exists yet;
+   it transitions to WATCHING only once a session is discovered.
+4. **F1 fix present.** The watch subprocess is invoked WITHOUT a hardcoded
+   `--reader team-lead`. The reader resolves from `AGENT_NAME or team-lead` (the
+   CLI default), and `activeReader()` binds the watched inbox to the reported
+   `discovery.identity` (the agent's own inbox). Contrast: the previously-merged
+   extension launched `win-agent-teams watch <dir> --reader team-lead` (observed
+   still running from a stale pre-branch Pi during the test); this branch omits
+   that flag.
+
+**Deferred (blocked on Pi model quota, not a defect).** The actual turn-injection
+wake was NOT observed live in this run. A root lead must spawn a worker to create
+a session before the watcher can arm, and spawning requires the Pi model, whose
+quota was exhausted. This is a chicken-and-egg gating, not a bug. The
+turn-injection mechanism itself was already proven live earlier for the root path
+in the prior `pi-lead-inbox-wake` feature's smoke test.
+
+**Remaining live checks to run once quota resets:**
+
+1. `pi install <ext-dir>` (once), then
+   `cd /home/mikael/code/agentic-coder-teams-mcp && WIN_AGENT_TEAMS_LEAD=1 pi`.
+2. From the root Pi, spawn a worker via win-agent-teams `spawn_agent`; confirm a
+   `win-agent-teams watch <session-dir>` subprocess arms WITHOUT
+   `--reader team-lead`, and the root lead is woken and reads the message.
+3. Nested: have a spawned **Pi** child spawn its OWN child; confirm the MID Pi is
+   woken on `inbox-<mid>.jsonl` (its own inbox), not `inbox-team-lead.jsonl`.
+   This is the core proof of the F1 / nested-lead fix.
+4. Only after these pass, take PR #34 out of draft.
