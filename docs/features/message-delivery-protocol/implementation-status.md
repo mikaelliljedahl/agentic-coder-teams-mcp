@@ -37,11 +37,26 @@ Living handoff document. Update it as work lands; it is the source of truth for
 | `feat:` | **C3** — `_classify_recipient` (five classes), the downstream send routed through the shared `_guaranteed_send`, and the refusals that replace the reroute. |
 | `test:` | **C4** — the watcher contract (R3) characterised: wake-without-consume, cursor clamping, exit-2-does-not-strand. No watcher code changed. |
 
-## Status: complete
+## Status: implemented, awaiting re-review
 
-**Every phase has landed — Phase 0, A, B, C1+C2, and C3+C4.** All eleven
-findings from the Phase A adversarial review are in. There is no next step in
-this feature; open follow-ups are listed under "Offered, not done" below.
+**Every phase has landed — Phase 0, A, B, C1+C2, and C3+C4**, plus all eleven
+findings from the Phase A review and all eight from the final review. The
+remaining step is a clean re-review, not more implementation; open follow-ups
+are listed under "Offered, not done" below.
+
+**Read this before trusting a green suite.** Three separate reviews found live
+critical defects while all four gates were green — six in Phase A, four in the
+final pass. The pattern is consistent and worth internalising: the defects live
+in concurrency, crash windows and error states, which unit tests on an injected
+clock do not reach. The final round needed a genuinely threaded test (two
+callers racing one idempotency key) and induced `OSError`s to go red at all.
+
+Two defect *classes* also recurred at new sites after being fixed once: a
+persistence helper swallowing `OSError` and reporting success (`save_leases`,
+then `save_records`), and an error collapsing into "absence" rather than
+staying uncertain (candidate enumeration, then `_scan_for_nonce`). When fixing
+either shape, grep for the other instances rather than assuming the one in
+front of you is the only one.
 
 ### What C3 changed, for anyone reading the diff later
 
@@ -150,7 +165,8 @@ uv run pytest
 
 There is no `.venv` in a fresh worktree; `uv sync` first.
 
-All four gates are **green** as of the C3+C4 commits (902 passed, 1 skipped).
+All four gates are **green** as of the final-review fix commits (924 passed,
+1 skipped).
 
 Known intermittent, pre-existing and NOT caused by this work:
 `tests/test_cli_watch.py::test_watch_settle_wakes_persistent_waiting` fails
