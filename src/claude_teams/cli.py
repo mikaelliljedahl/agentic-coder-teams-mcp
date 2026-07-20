@@ -250,30 +250,54 @@ def lease_force(
         raise typer.Exit(code=3)
 
     fenced_generation = None
-    child_pid = None
-    record: dict | None = None
+    terminated = False
+    cleared = None
+    persisted = False
+    # All three steps run inside ONE registry transaction, and the ordering
+    # inside it is the protocol.
+    #
+    # Splitting them was the defect: the operation id was revalidated only at
+    # the final compare-and-swap, so if the inspected operation finalized and a
+    # queued caller was granted the target in between — which ``reserve_lease``
+    # may legitimately do the moment the lock is free — this command fenced and
+    # killed THAT caller's live delivery and reported the mismatch afterwards,
+    # when nothing could be undone. Revalidating early is not enough on its own
+    # either: the handoff can happen between the check and the kill.
+    #
+    # ``reserve_lease`` grants only while holding this same lock, so holding it
+    # across the whole sequence is what makes the validation meaningful. The
+    # cost is that registry readers block for the duration; ``kill_process`` is
+    # a terminate, not the graceful-shutdown path, so that is bounded and short.
     with server_simple._agents_transaction(session_id) as agents:
+        current = leases.active_lease(lease_path, agent)
+        if current is None or current.operation_id != lease.operation_id:
+            console.print(
+                "[red]The lease moved to another operation "
+                f"({None if current is None else current.operation_id}) after "
+                "it was inspected. Nothing was fenced, killed or cleared. "
+                "Re-inspect and retry.[/red]"
+            )
+            raise typer.Exit(code=4)
+
+        # Step 1 — fence, so the holder can no longer win its finalize CAS and
+        # write a record describing a delivery that is about to not exist.
         record = next((a for a in agents if a.get("name") == agent), None)
+        child_pid = None
         if record is not None:
-            # Step 1 — fence, before anything irreversible happens.
             fenced_generation = server_simple._bump_generation(record)
             child_pid = record.get("pid")
             server_simple._save_agents_transaction(session_id, agents)
 
-    # Step 2 — terminate the resumed child, but only when ownership is provable.
-    terminated = False
-    if record is not None and child_pid is not None:
-        create_token = server_simple._agent_create_token(record)
-        if server_simple.process_manager.owns_process(str(child_pid), create_token):
-            server_simple.process_manager.kill_process(str(child_pid))
-            terminated = True
+        # Step 2 — terminate the resumed child, only when ownership is provable.
+        if record is not None and child_pid is not None:
+            create_token = server_simple._agent_create_token(record)
+            if server_simple.process_manager.owns_process(str(child_pid), create_token):
+                server_simple.process_manager.kill_process(str(child_pid))
+                terminated = True
 
-    # Step 3 — only now release the lease, under the registry lock and only if
-    # it is still the operation we fenced. Terminating a child takes real time,
-    # and a queued caller can legitimately be granted the target inside that
-    # window; clearing unconditionally would drop THAT caller's lease and let a
-    # third resume the same conversation underneath it.
-    with server_simple._agents_file_lock(session_id):
+        # Step 3 — release the lease. The CAS is kept even though nothing can
+        # have moved under the held lock: it is cheap, and it keeps the clear
+        # honest if this sequence is ever split again.
         cleared, persisted = leases.force_clear_lease(
             lease_path, agent, expect_operation_id=lease.operation_id
         )

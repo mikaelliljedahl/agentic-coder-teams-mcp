@@ -915,3 +915,53 @@ async def test_an_orphaned_sidecar_is_collected_by_an_ordinary_follow_up(
     assert not orphan.exists(), (
         "no production path collects an orphaned sidecar; it lives forever"
     )
+
+
+def test_force_revalidates_the_operation_before_fencing_or_killing(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CAS must protect the fence and the kill, not only the final clear.
+
+    ``lease force`` read the lease outside the registry lock, then fenced,
+    killed and only afterwards compared operation ids. If the inspected
+    operation finalized and a queued caller was legitimately granted the target
+    in between, the command destroyed THAT caller's live delivery and reported
+    the mismatch afterwards, when nothing could be undone.
+
+    The handoff is simulated at the only point it can happen — between the
+    out-of-lock read and the locked sequence — by replacing the stored lease.
+    """
+    _hold_lease(env, holder_pid=os.getpid(), token=_own_token(), operation_id="op-hung")
+    lease_path = server_simple._leases_file(SESSION)
+    generation_before = server_simple._record_generation(_record())
+    killed: list[str] = []
+    monkeypatch.setattr(
+        server_simple.process_manager, "owns_process", lambda h, t: True
+    )
+    monkeypatch.setattr(server_simple.process_manager, "kill_process", killed.append)
+
+    original_transaction = server_simple._agents_transaction
+
+    def _hand_off_then_enter(session_id: str):
+        # A successor is granted the target in the window the old ordering
+        # left unprotected.
+        data = leases.load_leases(lease_path)
+        data[AGENT]["lease"]["operation_id"] = "op-successor"
+        leases.save_leases(lease_path, data)
+        monkeypatch.setattr(server_simple, "_agents_transaction", original_transaction)
+        return original_transaction(session_id)
+
+    monkeypatch.setattr(server_simple, "_agents_transaction", _hand_off_then_enter)
+
+    result = CliRunner().invoke(
+        cli.app, ["lease", "force", SESSION, AGENT, "--token", _token()]
+    )
+
+    assert result.exit_code == 4, result.output
+    assert killed == [], "the successor's child was terminated before the CAS ran"
+    assert server_simple._record_generation(_record()) == generation_before, (
+        "the successor's delivery was fenced before the CAS ran"
+    )
+    surviving = leases.active_lease(lease_path, AGENT)
+    assert surviving is not None
+    assert surviving.operation_id == "op-successor"

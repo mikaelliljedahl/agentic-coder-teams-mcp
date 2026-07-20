@@ -1131,13 +1131,27 @@ reachable over MCP:
   does it terminate the resumed child (and only when ownership is provable);
   only then does it release the lease.
 
-Both `clear` and `force` release the lease **under the registry lock**, and as a
-compare-and-swap on the operation id they read. Terminating a child takes real
-time, and a queued caller can legitimately be granted the target inside that
-window; clearing unconditionally would drop *that* caller's lease and let a
-third resume the same conversation underneath it. A clear that does not match,
-or that fails to reach disk, exits 4 and reports which operation actually holds
-the lease — it never reports success for a lease it did not release.
+`force` runs **all three steps inside one registry transaction**, and
+revalidates the operation id against the store as its first act inside that
+lock. Validating only at the final clear was not enough: the lease is read
+before the lock is taken, and if the inspected operation finalized while a
+queued caller was legitimately granted the target in between, the command fenced
+and killed *that* caller's live delivery and reported the mismatch afterwards,
+when nothing could be undone. `reserve_lease` grants only while holding this
+same lock, so holding it across fence, kill and clear is what makes the
+validation meaningful. Registry readers block for the duration; `kill_process`
+is a terminate rather than the graceful-shutdown path, so that is bounded.
+
+Both `clear` and `force` release the lease under the registry lock, as a
+compare-and-swap on the operation id they read. A clear that does not match, or
+that fails to reach disk, exits 4 and reports which operation actually holds the
+lease — it never reports success for a lease it did not release. A lease store
+that cannot be read at all exits 5.
+
+`kill_agent` inherits the same fail-closed rule: if the lease store is unreadable
+or a reclaim could not be persisted, it refuses with
+`reason="lease_store_unavailable"` (retriable) and kills nothing, because it
+cannot claim there is no delivery in flight.
 
 ### 4c. Prompt-file lifecycle
 
