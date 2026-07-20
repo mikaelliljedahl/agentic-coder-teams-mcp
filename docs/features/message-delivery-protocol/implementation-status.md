@@ -58,6 +58,28 @@ staying uncertain (candidate enumeration, then `_scan_for_nonce`). When fixing
 either shape, grep for the other instances rather than assuming the one in
 front of you is the only one.
 
+**Round 3 found both classes again, and this is now the governing rule of the
+feature: *an error is not an absence, and a failed write is not a success.***
+The second re-review found the repair had stopped at the write primitive — the
+*loaders* still failed open (`load_records`, `load_leases`, `_to_lease`), three
+call sites still swallowed failed writes (`_release_delivery_claim`,
+`_discard_delivery_record`, `release_lease`'s discarded result), liveness
+collapsed "gone" and "could not tell" into one bool, and kill deleted the only
+metadata a later rescan needed. All are fixed; see
+`code-review-final-2.md` (untracked) and the commits.
+
+A full sweep of `src/` for both shapes was run and is recorded in the round-3
+report. Several further instances exist **outside** this feature's surface and
+were deliberately not changed here — notably `_ensure_lead_token` minting a
+fresh unpersisted token from a corrupt `session-meta.json` (which bricks the
+CLI operator escape), `session_info` reporting a corrupt registry as a healthy
+zero-agent session, `_session_has_live_agent` returning `False` on a read error
+immediately before `shutil.rmtree`, `_bind_path` mapping a read error to the
+terminal `BINDING_UNVERIFIED` instead of the retriable `BINDING_INDETERMINATE`,
+and `_follow_rotation` silently dropping an unreadable candidate below the
+`len(candidates) > 1 → ambiguous` guard. Each needs a policy decision the
+current specs do not settle. Do not "fix" them incidentally; plan them.
+
 ### What C3 changed, for anyone reading the diff later
 
 - `_message_recipient` is **gone**, replaced by `_classify_recipient`, which
@@ -103,6 +125,21 @@ comparison** against `HEAD` (127 → 129 symbols; only `_message_recipient`
 removed, `_classify_recipient`/`_guaranteed_send`/`_spawner_target` added,
 `send_message`/`follow_up_agent` changed) and by checking all 14 registered
 `@mcp.tool()` docstrings are present and non-empty.
+
+## Round-3 changes (second re-review)
+
+| Area | What changed |
+|---|---|
+| `delivery_store.load_records`, `leases.load_leases`, `leases._to_lease` | Absence (`FileNotFoundError`) still reads empty; unreadable or malformed now raises `DeliveryStoreUnreadableError` / `LeaseStoreUnreadableError`. `DeliveryStoreUnreadableError` subclasses `DeliveryStoreError` so every existing fail-closed handler inherits the behaviour. |
+| `process_manager.ownership_probe` | New three-valued ownership: `ours` / `not_ours` / `indeterminate`. `owns_process` is now a thin `== ours` wrapper, so destructive gates are unchanged. Only `not_ours` may authorize a reclaim. |
+| `leases._holder_reclaimable`, `reserve_lease`, `reconcile_lease` | Take `holder_probe` instead of `holder_live`. Indeterminate never reclaims. `reconcile_lease` raises `LeaseNotPersistedError` rather than reporting a reclaim it did not persist. `drop_agent` returns a bool. |
+| `server_simple._claim_is_held` (was `_holder_is_live`) | Per-call `claim_id` plus an in-process `_ACTIVE_CLAIM_IDS` registry. A claim stamped with our PID that we are no longer working is reclaimable — which closes the wedge — and reclaiming it cannot permit concurrent work. A foreign holder that is merely unprovable stays held. |
+| `_release_delivery_claim` | Deregisters in-process first and unconditionally, returns whether the write landed, logs at warning. |
+| `_discard_delivery_record` | Returns success; a failed C2 rollback annotates the refusal (`record_discarded: false`) instead of promising nothing changed. |
+| `_scan_target` / `target_snapshot` | The target's registry record is copied onto the durable row at attempt time and refreshed post-resume, so a rescan survives `kill_agent` deleting the agent. Scanning only — liveness still comes from the real record. |
+| `_release_lease_or_warn` | The lease-side twin of the claim wedge: `release_lease`'s result is no longer discarded. |
+| `kill_agent` | Fails closed with `lease_store_unavailable` when the lease store is unreadable or a reclaim is unpersisted. |
+| `cli.lease_force` | Revalidate → fence → kill → clear now run inside **one** registry transaction, with the operation-id check first. Validating only at the final CAS left the fence and the kill unprotected against a legitimate lease handoff. |
 
 ## Offered, not done
 

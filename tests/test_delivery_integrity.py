@@ -318,8 +318,22 @@ def test_a_second_caller_is_blocked_before_the_row_says_anything_was_sent(
     no receipt — live uncertainty, the normal case — B is promoted and resumes
     the same conversation a second time.
 
-    B is therefore released into the path at exactly that instant, and only the
-    delivery-record claim can stop it.
+    B is therefore released into the path at exactly that instant.
+
+    **What this test actually pins, stated honestly.** It asserts the claim's
+    public effect: B is answered ``delivery_in_progress``, by the claim, before
+    the row says anything was sent. It does NOT establish that the claim is the
+    only thing preventing a second resume. Removing the claim check alone was
+    re-tested independently and produced ``operation_in_progress`` instead —
+    the lease still serialized the two callers, and no second resume occurred.
+    The two guards are layered, not redundant-with-one-load-bearing: the lease
+    serializes on the target, the claim serializes on the row and answers
+    first, and the claim additionally covers the pre-``sent`` window above.
+
+    Do not upgrade this docstring back into an exclusivity claim without a
+    schedule that actually produces two backend resumes with the claim removed.
+    This whole feature exists because a status field once overstated what it
+    knew; a test docstring may not repeat the mistake.
     """
     b_opened = threading.Event()
     a_at_mark = threading.Event()
