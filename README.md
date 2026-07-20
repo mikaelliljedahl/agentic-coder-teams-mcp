@@ -1,6 +1,6 @@
 # agentic-coder-teams-mcp
 
-Minimal MCP server for spawning and communicating with Claude Code and Codex agents on Windows or Linux. Fire-and-forget agent spawning with bidirectional 1:1 messaging.
+Minimal MCP server for spawning and communicating with Claude Code, Codex, and Pi agents on Windows or Linux. Fire-and-forget agent spawning with bidirectional 1:1 messaging.
 
 ## Tools (10 total)
 
@@ -24,7 +24,7 @@ Minimal MCP server for spawning and communicating with Claude Code and Codex age
 - Windows 10/11 or Linux
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
-- Claude Code CLI (`claude`) and/or OpenAI Codex CLI (`codex`) on `PATH`
+- Claude Code CLI (`claude`), OpenAI Codex CLI (`codex`), and/or Pi CLI (`pi`) on `PATH`
 - `tmux` on Linux
 
 ### Setup — Claude Code as Lead
@@ -87,6 +87,39 @@ This is required in two scenarios:
 2. **Codex as spawned agent using MCP tools** — when Claude Code spawns a Codex agent and expects that agent to call tools such as `send_message`.
 
 The server auto-injects `AGENT_NAME` and `AGENT_SESSION_ID` into the Codex config env before each spawn so the MCP server knows agent identity.
+
+### Setup — Pi (as Lead or Spawned Agent)
+
+[Pi](https://github.com/earendil-works/pi) (`pi`) has, by design, no built-in MCP
+support, so it reaches the win-agent-teams tools through the official
+[`pi-mcp-adapter`](https://pi.dev/packages/pi-mcp-adapter) package. One-time setup:
+
+```bash
+# 1. Install pi and log into your model provider (e.g. ChatGPT Plus/Pro):
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+pi            # then run /login inside pi and pick your provider
+
+# 2. Install the MCP adapter so pi can call the win-agent-teams tools:
+pi install npm:pi-mcp-adapter
+```
+
+You do **not** hand-write any MCP config: the server writes `~/.pi/agent/mcp.json`
+(idempotently, on each pi spawn) with a `win-agent-teams` entry whose identity env
+uses `${AGENT_NAME}`/`${AGENT_SESSION_ID}`/`${AGENT_PARENT_NAME}` interpolation,
+resolved from each pi process's own environment. The adapter starts the server
+**lazily** (only when pi actually calls a tool), so a normal `pi` run you do
+yourself is unaffected apart from one ~200-token proxy tool.
+
+This covers both scenarios:
+1. **Pi as lead** — pi calls `spawn_agent` to start Claude Code, Codex, or other pi agents.
+2. **Pi as spawned agent using MCP tools** — a lead spawns a pi agent that calls `send_message` (etc.) back.
+
+A spawned pi agent reports lifecycle state through a small bundled extension
+(`pi-extensions/win-agent-teams-state`, loaded via `-e`) that writes the same
+`state-<agent>.json` marker the coordinator watches. Pi launches via `node` +
+its bundled `dist/cli.js` directly (bypassing the `pi.cmd` shim) so multi-line
+prompts survive verbatim; session binding uses `--session-id <agent>` for
+deterministic resume.
 
 ## How It Works
 
@@ -223,7 +256,12 @@ agents (`--settings <path>`, on by default; disable with
 plus `--dangerously-bypass-hook-trust` (Codex silently skips injected hooks
 without that flag); this is **on by default** — set
 `WIN_AGENT_TEAMS_STATE_HOOKS_CODEX=0` to disable it (or
-`WIN_AGENT_TEAMS_STATE_HOOKS=0` to disable hooks for both backends).
+`WIN_AGENT_TEAMS_STATE_HOOKS=0` to disable hooks for both backends). Pi has no
+hook CLI, so a spawned pi agent writes the same marker from a bundled extension
+(`pi-extensions/win-agent-teams-state`, loaded via `-e`): pi's `session_start`/
+`turn_start`/`tool_call` → `running` and `agent_settled` → `waiting`. It is
+also gated by `WIN_AGENT_TEAMS_STATE_HOOKS`; override the extension path with
+`WIN_AGENT_TEAMS_PI_EXTENSION`.
 When no marker exists yet (hooks disabled, or not fired), `state` falls back
 to an activity-recency heuristic: `running` if the agent produced output
 within the last `WIN_AGENT_TEAMS_IDLE_SECONDS` (default 60s), else `idle`. A
@@ -364,9 +402,9 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 |-----------|---------|-------------|
 | `prompt` | required | Task prompt for the agent |
 | `name` | auto (`agent-1`) | Agent name |
-| `backend` | `claude-code` | `claude-code` or `codex` |
-| `model` | backend default | Model to use |
-| `reasoning_effort` | none | `low`/`medium`/`high`/`xhigh` (codex), `low`/`medium`/`high`/`xhigh`/`max` (claude-code) |
+| `backend` | `claude-code` | `claude-code`, `codex`, or `pi` |
+| `model` | backend default | Model to use. For `codex`/`pi`, a capability tier (`low`/`medium`/`high`/`xhigh`/`ultra`) that bundles a model + effort. Pi tiers soft-fall-back to pi's default model when the tier's model is absent (e.g. after switching provider) rather than erroring. |
+| `reasoning_effort` | none | `low`/`medium`/`high`/`xhigh` (codex), `low`/`medium`/`high`/`xhigh`/`max` (claude-code). Ignored for `codex`/`pi` tiers (the tier owns the effort). |
 | `permission_mode` | `bypass` | `bypass`, `default`, or `require_approval` |
 | `cwd` | server cwd | Working directory for the agent |
 

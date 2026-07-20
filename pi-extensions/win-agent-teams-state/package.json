@@ -1,0 +1,8 @@
+{
+  "name": "win-agent-teams-state",
+  "version": "0.1.0",
+  "description": "Reports pi lifecycle state to win-agent-teams via a state-<agent>.json marker file.",
+  "type": "module",
+  "main": "index.ts",
+  "private": true
+}

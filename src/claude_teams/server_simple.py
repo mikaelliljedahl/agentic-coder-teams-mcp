@@ -36,6 +36,7 @@ from claude_teams.agent_output import (
     codex_correlation_token,
     read_claude_output,
     read_codex_output,
+    read_pi_output,
 )
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends.contracts import SpawnRequest
@@ -239,6 +240,11 @@ def _state_marker_file(session_id: str, name: str) -> Path:
 def _prompt_file(session_id: str, name: str) -> Path:
     """Return the per-agent prompt sidecar path for lossless Claude launches."""
     return _session_dir(session_id) / "prompts" / f"{name}.prompt.txt"
+
+
+def _pi_session_dir(session_id: str, name: str) -> Path:
+    """Return the per-agent pi session storage dir (see PiBackend/read_pi_output)."""
+    return _session_dir(session_id) / "pi-sessions" / name
 
 
 def _read_state_marker(session_id: str, name: str) -> dict | None:
@@ -988,6 +994,13 @@ def _read_agent_output(agent: dict):
             backend_session_id=backend_session_id,
             correlation_token=claude_correlation_token(agent_id),
         )
+    if backend == "pi":
+        name = str(agent.get("name") or "")
+        session_id = str(agent.get("session_id") or "")
+        return read_pi_output(
+            str(_pi_session_dir(session_id, name)),
+            expected_session_id=backend_session_id or name,
+        )
     return None
 
 
@@ -1176,15 +1189,81 @@ def _write_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Pat
 def _write_prompt_file_extra(
     session_id: str, agent_name: str, backend_name: str, prompt: str
 ) -> dict[str, str]:
-    """Write a lossless Claude prompt sidecar when argv transport is risky."""
-    if backend_name != "claude-code" or not any(
-        char in prompt for char in _CLAUDE_PROMPT_FILE_CHARS
-    ):
+    """Write a lossless prompt sidecar when argv transport is risky.
+
+    Claude Code only needs it for prompts with CLI-sensitive characters. Pi
+    always gets one so the backend can fall back to a ``@<file>`` include if it
+    is forced through the ``pi.cmd`` shim (see ``PiBackend._prompt_args``); on
+    the normal direct-``node`` launch the sidecar is written but unused.
+    """
+    needs_file = backend_name == "pi" or (
+        backend_name == "claude-code"
+        and any(char in prompt for char in _CLAUDE_PROMPT_FILE_CHARS)
+    )
+    if not needs_file:
         return {}
     path = _prompt_file(session_id, agent_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(prompt, encoding="utf-8")
     return {"prompt_file_path": str(path)}
+
+
+def _ensure_pi_mcp_config() -> None:
+    """Ensure ``~/.pi/agent/mcp.json`` exposes the win-agent-teams MCP server.
+
+    The ``pi-mcp-adapter`` package reads this file to learn which stdio MCP
+    servers to start. We write (idempotently, self-healing on interpreter
+    moves) a ``win-agent-teams`` entry whose ``env`` uses ``${AGENT_*}``
+    interpolation — resolved from each pi process's own environment
+    (``PiBackend.build_env``) — so one shared static file binds every agent to
+    its own identity with no per-spawn file and no race. Any other user-defined
+    ``mcpServers`` in the file are preserved.
+    """
+    desired = {
+        "command": sys.executable,
+        "args": ["-m", "claude_teams.server_simple"],
+        "env": {
+            "AGENT_SESSION_ID": "${AGENT_SESSION_ID}",
+            "AGENT_NAME": "${AGENT_NAME}",
+            "AGENT_PARENT_NAME": "${AGENT_PARENT_NAME}",
+            "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
+        },
+    }
+    path = Path.home() / ".pi" / "agent" / "mcp.json"
+    config: dict = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config = loaded
+        except (OSError, json.JSONDecodeError):
+            config = {}
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    if servers.get("win-agent-teams") == desired:
+        return
+    servers["win-agent-teams"] = desired
+    config["mcpServers"] = servers
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def _pi_state_extension_dir() -> Path | None:
+    """Return the bundled pi state-reporting extension dir, if present.
+
+    Overridable via ``WIN_AGENT_TEAMS_PI_EXTENSION`` (a file or directory pi's
+    ``-e`` accepts); otherwise resolved relative to the repo checkout at
+    ``pi-extensions/win-agent-teams-state``. Returns ``None`` when neither
+    exists so the spawn still proceeds (state degrades to liveness only).
+    """
+    override = os.environ.get("WIN_AGENT_TEAMS_PI_EXTENSION", "").strip()
+    if override:
+        candidate = Path(override)
+        return candidate if candidate.exists() else None
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate = repo_root / "pi-extensions" / "win-agent-teams-state"
+    return candidate if candidate.exists() else None
 
 
 def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str, str]:
@@ -1193,9 +1272,18 @@ def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str
     Claude Code gets a written settings-file path
     (``extra["hooks_settings_path"]``); Codex gets a JSON-encoded ``-c``
     override argv (``extra["hook_overrides"]``) evaluated only when
-    ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX`` is on (see ``CodexBackend``).
+    ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX`` is on (see ``CodexBackend``). Pi gets
+    the win-agent-teams MCP server registered for the ``pi-mcp-adapter`` and, if
+    state hooks are enabled, the path to its bundled state-reporting extension
+    (``extra["pi_state_extension_path"]``, loaded via ``-e``).
     """
     session_dir = _session_dir(session_id)
+    if backend_name == "pi":
+        _ensure_pi_mcp_config()
+        if os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS", "1").strip() == "0":
+            return {}
+        ext = _pi_state_extension_dir()
+        return {"pi_state_extension_path": str(ext)} if ext else {}
     if backend_name == "claude-code":
         settings_path = hooks.write_claude_settings(session_dir, agent_name)
         return {"hooks_settings_path": str(settings_path)}
@@ -1291,6 +1379,7 @@ async def spawn_agent(
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
+                "session_dir": str(_session_dir(session_id)),
                 **_write_prompt_file_extra(
                     session_id, agent_name, backend_name, prompt
                 ),
@@ -1734,6 +1823,7 @@ async def follow_up_agent(
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
+                "session_dir": str(_session_dir(session_id)),
                 **_write_prompt_file_extra(
                     session_id, agent_name, backend_name, prompt
                 ),
