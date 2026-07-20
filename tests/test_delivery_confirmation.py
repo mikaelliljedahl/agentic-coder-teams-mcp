@@ -108,14 +108,12 @@ def _scanner(
     backend: str = "claude-code",
     *,
     successors: Callable[[], list[Path]] | None = None,
-    correlation_token: str | None = None,
 ) -> ReceiptScanner:
     return ReceiptScanner(
         path,
         backend=backend,
         backend_session_id="sess",
         successors=successors,
-        correlation_token=correlation_token,
     )
 
 
@@ -379,7 +377,6 @@ def test_a_successor_that_does_not_replay_the_initial_marker_is_still_followed(
     scanner = _scanner(
         original,
         successors=_successors(successor),
-        correlation_token="wat-corr:deadbeef",
     )
     scanner.snapshot()
 
@@ -432,7 +429,19 @@ def test_two_candidate_successors_are_ambiguous_not_a_guess(tmp_path: Path) -> N
     assert scanner.poll(NONCE) == SCAN_AMBIGUOUS
 
 
-def test_correlation_token_disambiguates_two_successors(tmp_path: Path) -> None:
+def test_the_correlation_token_never_selects_between_two_successors(
+    tmp_path: Path,
+) -> None:
+    """Corroboration, never selection.
+
+    This test previously asserted the opposite — that a token carried by
+    exactly one of two candidates picks that one. That is a guess: the token
+    is written at spawn and a successor may or may not replay it, so its
+    presence in one file is not evidence that the OTHER file is not the live
+    conversation. Attributing a delivery on that basis is precisely the class
+    of false receipt the whole feature exists to eliminate, so more than one
+    candidate successor is unconditionally ``ambiguous``.
+    """
     original = tmp_path / "a.jsonl"
     _write(original, [{"sessionId": "sess", **_claude_user_text("earlier")}])
     marked = tmp_path / "b.jsonl"
@@ -448,12 +457,11 @@ def test_correlation_token_disambiguates_two_successors(tmp_path: Path) -> None:
     scanner = _scanner(
         original,
         successors=_successors(marked, unmarked),
-        correlation_token="wat-corr:deadbeef",
     )
     scanner.snapshot()
     original.unlink()
 
-    assert scanner.poll(NONCE) == SCAN_FOUND
+    assert scanner.poll(NONCE) == SCAN_AMBIGUOUS
 
 
 def test_a_successor_with_a_different_session_id_is_not_a_candidate(

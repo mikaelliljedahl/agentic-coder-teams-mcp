@@ -243,14 +243,6 @@ def _iter_head_records(path: Path, limit: int = 50) -> Iterable[dict[str, object
         return
 
 
-def _file_has_token(path: Path, token: str) -> bool:
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            return any(token in raw for raw in handle)
-    except OSError:
-        return False
-
-
 # ---------------------------------------------------------------------------
 # The scanner
 # ---------------------------------------------------------------------------
@@ -289,18 +281,18 @@ class ReceiptScanner:
         backend: str,
         backend_session_id: str,
         successors: Callable[[], list[Path]] | None = None,
-        correlation_token: str | None = None,
     ) -> None:
         """Build a scanner for one attempt against ``path``.
 
-        ``successors`` supplies rotation candidates lazily, and
-        ``correlation_token`` is corroboration only — never a precondition.
+        ``successors`` supplies rotation candidates lazily. There is
+        deliberately no correlation-token parameter: the token corroborates a
+        binding elsewhere, but inside rotation it could only ever act as a
+        selector between candidates, and selecting is guessing.
         """
         self.path = path
         self.backend = backend
         self.backend_session_id = backend_session_id
         self._successors = successors
-        self._correlation_token = correlation_token
         self._offset = 0
         self._identity: tuple[int, int] | None = None
         self._buffer = b""
@@ -375,15 +367,13 @@ class ReceiptScanner:
             return SCAN_PENDING
         if not candidates:
             return SCAN_PENDING
-        if len(candidates) > 1 and self._correlation_token:
-            corroborated = [
-                path
-                for path in candidates
-                if _file_has_token(path, self._correlation_token)
-            ]
-            if len(corroborated) == 1:
-                candidates = corroborated
         if len(candidates) > 1:
+            # Unconditionally ambiguous. The correlation token is NOT consulted
+            # here: it is written at spawn, and a successor may legitimately
+            # not replay it, so its presence in one candidate is no evidence
+            # that the other is not the live conversation. Reducing the set
+            # with it would attribute a delivery on a guess — the false-receipt
+            # failure this whole module exists to eliminate.
             return SCAN_AMBIGUOUS
         self.path = candidates[0]
         self._identity = _stat_identity(self.path)

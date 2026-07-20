@@ -39,7 +39,6 @@ from claude_teams.agent_output import (
     _make_binder,
     classify_correlation,
     correlated_prompt,
-    correlation_marker_token,
     new_correlation_id,
     resolve_agent_binding,
 )
@@ -1524,15 +1523,11 @@ def _delivery_scanner(
         )
         if binder is not None:
             path = binder.resolve_by_session_id(backend_session_id)
-    _, correlation_id = classify_correlation(agent)
     return ReceiptScanner(
         path,
         backend=backend_name,
         backend_session_id=backend_session_id,
         successors=_delivery_successors(agent, backend_name, session_id),
-        correlation_token=(
-            correlation_marker_token(correlation_id) if correlation_id else None
-        ),
     )
 
 
