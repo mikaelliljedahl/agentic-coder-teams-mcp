@@ -457,6 +457,17 @@ async def test_confirmation_does_not_hold_the_registry_lock(
 # ==========================================================================
 
 
+def _own_token() -> str | None:
+    """The live creation token for THIS process.
+
+    A lease held by us is identified by ``(pid, create_token)`` like any
+    other: there is no shortcut for our own PID, because a lease left by an
+    earlier incarnation whose PID was recycled onto us would otherwise be
+    unreclaimable forever. Reservation records exactly this token.
+    """
+    return server_simple.process_manager.creation_token(str(os.getpid()))
+
+
 def _hold_lease(env, *, holder_pid: int, token: str | None, operation_id="op-held"):
     return leases.reserve_lease(
         server_simple._leases_file(SESSION),
@@ -478,7 +489,7 @@ async def test_a_second_valid_caller_queues_and_does_not_resume(
     env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """It is queued, never refused — refusing would be R1's dead end."""
-    _hold_lease(env, holder_pid=os.getpid(), token=None)
+    _hold_lease(env, holder_pid=os.getpid(), token=_own_token())
     backend = _FakeResumeBackend()
     _install(monkeypatch, backend)
     _child_alive(monkeypatch, True)
@@ -537,7 +548,7 @@ async def test_concurrent_callers_never_resume_at_the_same_time(
 async def test_kill_agent_refuses_while_a_live_lease_exists(
     env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _hold_lease(env, holder_pid=os.getpid(), token=None)
+    _hold_lease(env, holder_pid=os.getpid(), token=_own_token())
     killed: list[str] = []
     monkeypatch.setattr(
         server_simple.process_manager, "owns_process", lambda h, t: True
@@ -614,7 +625,7 @@ def test_force_bumps_the_fencing_generation_before_anything_else(
     env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A late finalize by the original holder must be rejected afterwards."""
-    _hold_lease(env, holder_pid=os.getpid(), token=None, operation_id="op-hung")
+    _hold_lease(env, holder_pid=os.getpid(), token=_own_token(), operation_id="op-hung")
     generation_before = server_simple._record_generation(_record())
     monkeypatch.setattr(
         server_simple.process_manager, "owns_process", lambda h, t: False
@@ -629,17 +640,61 @@ def test_force_bumps_the_fencing_generation_before_anything_else(
     payload = json.loads(result.output)
     assert payload["attempt_nonce"] == "a" * 32
     assert payload["fenced_generation"] == generation_before + 1
-    # The original holder can no longer win its CAS, on either half of the key.
-    assert (
-        leases.finalize_lease(
-            server_simple._leases_file(SESSION), AGENT, "op-hung", generation_before
+    assert server_simple._record_generation(_record()) == generation_before + 1
+    # Deliberately NOT asserted here by calling ``finalize_lease`` directly:
+    # force has already cleared the lease, so such a call is rejected for
+    # absence rather than by the fence, which makes it a false positive. That
+    # the bumped generation is what actually fences a *late holder whose lease
+    # is still present* is proved end-to-end by
+    # ``test_a_generation_bump_fences_finalization_while_the_lease_still_exists``.
+    assert leases.active_lease(server_simple._leases_file(SESSION), AGENT) is None
+
+
+@pytest.mark.asyncio
+async def test_a_generation_bump_fences_finalization_while_the_lease_still_exists(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fence must be the CURRENT record generation, not the lease payload.
+
+    ``lease force`` bumps the generation (step 1), then terminates the child
+    and clears the lease (steps 2-3) — real work, with the registry lock
+    released in between. A holder that finalizes inside that window still finds
+    its own lease, at its own generation and operation id, so ``finalize_lease``
+    alone says yes. Unless finalization also CASes the *record's* current
+    generation, the fence loses its race and the holder rewrites a record
+    describing a delivery the operator has already torn down.
+    """
+    _dead_agent(monkeypatch)
+
+    def bump_generation_then_deliver(nonce: str) -> None:
+        # Exactly step 1 of ``lease force``: fence, lease untouched.
+        with server_simple._agents_transaction(SESSION) as agents:
+            server_simple._bump_generation(agents[0])
+            server_simple._save_agents_transaction(SESSION, agents)
+        _append(
+            env.transcript,
+            _claude_user_record(f"next {DELIVERY_MARKER_PREFIX}{nonce}"),
         )
-        is False
-    )
+
+    _install(monkeypatch, _FakeResumeBackend(bump_generation_then_deliver))
+    _child_alive(monkeypatch, True)
+
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k-fence")
+
+    assert result["success"] is False
+    assert result["reason"] == "operation_superseded"
+    assert _record()["pid"] == 123, "a fenced holder rewrote the agent record"
+    # The operator's bump is the last word on this record: a fenced attempt
+    # neither writes it nor advances the generation past the fence.
+    assert server_simple._record_generation(_record()) == 1
+    # The lease is still released, by the caller-loop ``finally`` rather than by
+    # the finalize CAS — a lease held by a process that has stopped working on
+    # it would block every later caller for nothing.
+    assert leases.active_lease(server_simple._leases_file(SESSION), AGENT) is None
 
 
 def test_force_requires_the_session_recovery_token(env) -> None:
-    _hold_lease(env, holder_pid=os.getpid(), token=None)
+    _hold_lease(env, holder_pid=os.getpid(), token=_own_token())
 
     result = CliRunner().invoke(
         cli.app, ["lease", "force", SESSION, AGENT, "--token", "wrong"]
@@ -651,7 +706,7 @@ def test_force_requires_the_session_recovery_token(env) -> None:
 
 def test_clear_refuses_a_provably_live_holder(env) -> None:
     """Clearing under a live holder would let a second caller resume into it."""
-    _hold_lease(env, holder_pid=os.getpid(), token=None)
+    _hold_lease(env, holder_pid=os.getpid(), token=_own_token())
 
     result = CliRunner().invoke(
         cli.app, ["lease", "clear", SESSION, AGENT, "--token", _token()]
@@ -678,7 +733,7 @@ def test_clear_removes_a_dead_holders_lease(
 
 
 def test_inspect_reports_the_attempt_nonce(env) -> None:
-    _hold_lease(env, holder_pid=os.getpid(), token=None)
+    _hold_lease(env, holder_pid=os.getpid(), token=_own_token())
 
     result = CliRunner().invoke(
         cli.app, ["lease", "inspect", SESSION, AGENT, "--token", _token()]

@@ -14,6 +14,7 @@ token path, i.e. the post-restart code path).
 import os
 from types import SimpleNamespace
 
+from claude_teams import server_simple
 from claude_teams.backends import process_manager as pm
 
 # A PID that is implausibly high and (essentially) never live on a test host.
@@ -97,6 +98,27 @@ class TestInMemoryOwnershipIsReuseSafe:
         )
         mgr._processes = {"launcher": live_launcher}
         assert mgr.owns_process("launcher", None) is True
+
+
+class TestLeaseHolderLivenessIsReuseSafe:
+    """A4b — the lease holder is identified by ``(pid, create_token)``.
+
+    A lease left behind by an EARLIER incarnation of the server whose PID has
+    since been recycled onto this process must not be treated as live just
+    because the numbers match. Skipping the token check for our own PID makes
+    that stale lease permanently unreclaimable: nothing else can ever prove the
+    holder is gone.
+    """
+
+    def test_our_own_pid_still_has_to_pair_with_a_matching_token(self) -> None:
+        handle = str(os.getpid())
+        token = pm.creation_token(handle)
+        assert server_simple._lease_holder_live(os.getpid(), token) is True
+        assert server_simple._lease_holder_live(os.getpid(), "wrong-token") is False
+        assert server_simple._lease_holder_live(os.getpid(), None) is False
+
+    def test_a_foreign_live_pid_with_a_stale_token_is_not_ours(self) -> None:
+        assert server_simple._lease_holder_live(int(_DEAD_PID), "whatever") is False
 
 
 class TestTokenAwareHealthCheck:

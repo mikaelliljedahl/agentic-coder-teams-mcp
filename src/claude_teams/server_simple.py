@@ -1471,12 +1471,15 @@ def _lease_holder_live(pid: int, token: str | None) -> bool:
 
     A holder PID with no creation token, or one whose live token no longer
     matches, is NOT ours — the same model destructive PID operations use.
+
+    There is deliberately no shortcut for ``pid == os.getpid()``. A lease left
+    behind by an EARLIER incarnation of the server whose PID has since been
+    recycled onto this process would otherwise be treated as live forever, and
+    nothing else can prove that holder is gone — which is precisely the
+    PID-reuse hazard the paired token exists to close. Reservation records the
+    live token for our own PID, so the honest pairing check succeeds on every
+    lease this process actually holds.
     """
-    if pid == os.getpid():
-        # This process is the holder and is obviously running. Asking the OS
-        # for our own creation token is both wasteful and, on a recovered
-        # record, unreliable.
-        return True
     return process_manager.owns_process(str(pid), token)
 
 
@@ -2322,7 +2325,18 @@ def _finalize_follow_up(
     """
     with _agents_transaction(session_id) as agents:
         agent = next((a for a in agents if a["name"] == plan.agent_name), None)
-        won = finalize_lease(
+        # The fence is the record's CURRENT generation, not the one frozen into
+        # the lease payload. ``lease force`` bumps the generation first and only
+        # then terminates the child and clears the lease, with the registry lock
+        # released in between; a holder finalizing inside that window still
+        # finds its own lease at its own generation, so ``finalize_lease``
+        # alone would say yes and the fence would lose its race.
+        #
+        # Checked BEFORE ``finalize_lease`` so a rejected finalize leaves the
+        # lease in place for the operator to inspect and clear, rather than
+        # having it dropped by the very attempt the fence just rejected.
+        fenced = agent is None or _record_generation(agent) != plan.generation
+        won = not fenced and finalize_lease(
             _leases_file(session_id),
             plan.agent_name,
             plan.operation_id,
