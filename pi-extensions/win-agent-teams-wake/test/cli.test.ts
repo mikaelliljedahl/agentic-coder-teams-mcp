@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_READER,
-  isLeadInboxPath,
-  leadInboxPath,
+  isOwnInboxPath,
+  ownInboxPath,
   parseInboxStatus,
   parseSessionDir,
   parseWatch,
@@ -128,33 +128,51 @@ describe("parseWatch", () => {
   });
 });
 
-describe("leadInboxPath", () => {
-  it("derives the reader inbox path from the session dir", () => {
-    expect(leadInboxPath("/base/sid-1")).toBe("/base/sid-1/inbox-team-lead.jsonl");
-    expect(leadInboxPath("/base/sid-1/")).toBe("/base/sid-1/inbox-team-lead.jsonl");
+describe("ownInboxPath", () => {
+  it("derives the own-identity inbox path from the session dir", () => {
+    expect(ownInboxPath("/base/sid-1", "team-lead")).toBe("/base/sid-1/inbox-team-lead.jsonl");
+    expect(ownInboxPath("/base/sid-1/", "team-lead")).toBe("/base/sid-1/inbox-team-lead.jsonl");
+    // A nested Pi lead watches its own AGENT_NAME inbox, not team-lead.
+    expect(ownInboxPath("/base/sid-1", "worker-1")).toBe("/base/sid-1/inbox-worker-1.jsonl");
     expect(DEFAULT_READER).toBe("team-lead");
   });
 });
 
-describe("isLeadInboxPath (cross-platform guard, blocker 1)", () => {
+describe("isOwnInboxPath (cross-platform guard, blocker 1)", () => {
   it("matches a POSIX wake path against its POSIX session dir", () => {
-    expect(isLeadInboxPath("/base/sid-1/inbox-team-lead.jsonl", "/base/sid-1")).toBe(true);
-    expect(isLeadInboxPath("/base/sid-1/inbox-other.jsonl", "/base/sid-1")).toBe(false);
+    expect(isOwnInboxPath("/base/sid-1/inbox-team-lead.jsonl", "/base/sid-1", "team-lead")).toBe(
+      true,
+    );
+    expect(isOwnInboxPath("/base/sid-1/inbox-other.jsonl", "/base/sid-1", "team-lead")).toBe(false);
+  });
+
+  it("matches a nested-lead AGENT_NAME inbox, not team-lead", () => {
+    expect(isOwnInboxPath("/base/sid-1/inbox-worker-1.jsonl", "/base/sid-1", "worker-1")).toBe(
+      true,
+    );
+    // team-lead's inbox is NOT this nested lead's own inbox.
+    expect(isOwnInboxPath("/base/sid-1/inbox-team-lead.jsonl", "/base/sid-1", "worker-1")).toBe(
+      false,
+    );
   });
 
   it("matches a Windows backslash wake path against its Windows session dir", () => {
-    // Python emits str(Path(session_dir)/"inbox-team-lead.jsonl"), which uses
+    // Python emits str(Path(session_dir)/"inbox-<identity>.jsonl"), which uses
     // backslashes on Windows; the guard must still accept it.
     const dir = "C:\\Users\\x\\.claude\\agent-sessions\\sid-1";
     const wake = "C:\\Users\\x\\.claude\\agent-sessions\\sid-1\\inbox-team-lead.jsonl";
-    expect(isLeadInboxPath(wake, dir)).toBe(true);
+    expect(isOwnInboxPath(wake, dir, "team-lead")).toBe(true);
     expect(
-      isLeadInboxPath("C:\\Users\\x\\.claude\\agent-sessions\\sid-1\\inbox-other.jsonl", dir),
+      isOwnInboxPath(
+        "C:\\Users\\x\\.claude\\agent-sessions\\sid-1\\inbox-other.jsonl",
+        dir,
+        "team-lead",
+      ),
     ).toBe(false);
   });
 
   it("is separator-agnostic across mixed styles and trailing separators", () => {
     const dir = "C:\\Users\\x\\sid-1\\";
-    expect(isLeadInboxPath("C:/Users/x/sid-1/inbox-team-lead.jsonl", dir)).toBe(true);
+    expect(isOwnInboxPath("C:/Users/x/sid-1/inbox-team-lead.jsonl", dir, "team-lead")).toBe(true);
   });
 });

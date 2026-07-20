@@ -186,6 +186,33 @@ class TestPiBuildCommand:
         cmd = PiBackend().build_command(req)
         assert cmd[cmd.index("-e") + 1] == r"C:\ext\wat-state"
 
+    def test_wake_extension_loaded_alongside_state(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        # A spawned Pi agent (worker or nested subagent-as-lead) must load BOTH
+        # the state extension and the wake extension, each via its own -e.
+        req = _make_request(
+            extra={
+                "session_dir": "S",
+                "pi_state_extension_path": r"C:\ext\wat-state",
+                "pi_wake_extension_path": r"C:\ext\wat-wake",
+            }
+        )
+        cmd = PiBackend().build_command(req)
+        e_values = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "-e"]
+        assert r"C:\ext\wat-state" in e_values
+        assert r"C:\ext\wat-wake" in e_values
+
+    def test_wake_extension_absent_when_not_provided(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        req = _make_request(
+            extra={"session_dir": "S", "pi_state_extension_path": r"C:\ext\wat-state"}
+        )
+        cmd = PiBackend().build_command(req)
+        e_values = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "-e"]
+        assert e_values == [r"C:\ext\wat-state"]
+
     def test_prompt_verbatim_last_arg(
         self, _make_request, _direct_launch, _tty, _models
     ):

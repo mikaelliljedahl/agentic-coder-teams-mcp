@@ -1266,6 +1266,24 @@ def _pi_state_extension_dir() -> Path | None:
     return candidate if candidate.exists() else None
 
 
+def _pi_wake_extension_dir() -> Path | None:
+    """Return the bundled pi inbox-wake extension dir, if present.
+
+    Overridable via ``WIN_AGENT_TEAMS_PI_WAKE_EXTENSION`` (a file or directory
+    pi's ``-e`` accepts); otherwise resolved relative to the repo checkout at
+    ``pi-extensions/win-agent-teams-wake``. Returns ``None`` when neither
+    exists so the spawn still proceeds (the lead simply is not auto-woken and
+    must poll its inbox instead).
+    """
+    override = os.environ.get("WIN_AGENT_TEAMS_PI_WAKE_EXTENSION", "").strip()
+    if override:
+        candidate = Path(override)
+        return candidate if candidate.exists() else None
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate = repo_root / "pi-extensions" / "win-agent-teams-wake"
+    return candidate if candidate.exists() else None
+
+
 def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str, str]:
     """Materialise per-backend hook wiring, added to ``SpawnRequest.extra``.
 
@@ -1274,16 +1292,23 @@ def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str
     override argv (``extra["hook_overrides"]``) evaluated only when
     ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX`` is on (see ``CodexBackend``). Pi gets
     the win-agent-teams MCP server registered for the ``pi-mcp-adapter`` and, if
-    state hooks are enabled, the path to its bundled state-reporting extension
-    (``extra["pi_state_extension_path"]``, loaded via ``-e``).
+    state hooks are enabled, the paths to its bundled state-reporting extension
+    (``extra["pi_state_extension_path"]``) and inbox-wake extension
+    (``extra["pi_wake_extension_path"]``), both loaded via ``-e``.
     """
     session_dir = _session_dir(session_id)
     if backend_name == "pi":
         _ensure_pi_mcp_config()
         if os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS", "1").strip() == "0":
             return {}
+        extra: dict[str, str] = {}
         ext = _pi_state_extension_dir()
-        return {"pi_state_extension_path": str(ext)} if ext else {}
+        if ext:
+            extra["pi_state_extension_path"] = str(ext)
+        wake = _pi_wake_extension_dir()
+        if wake:
+            extra["pi_wake_extension_path"] = str(wake)
+        return extra
     if backend_name == "claude-code":
         settings_path = hooks.write_claude_settings(session_dir, agent_name)
         return {"hooks_settings_path": str(settings_path)}

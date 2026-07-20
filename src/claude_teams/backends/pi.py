@@ -354,9 +354,25 @@ class PiBackend(BaseBackend):
 
     @staticmethod
     def _extension_args(request: SpawnRequest) -> list[str]:
-        """Build the ``-e <path>`` arg loading the state-reporting extension."""
-        ext = (request.extra or {}).get("pi_state_extension_path")
-        return ["-e", str(ext)] if ext else []
+        """Build the ``-e <path>`` args loading the bundled pi extensions.
+
+        Two extensions are loaded, each via its own ``-e``:
+
+        - the state-reporting extension (``pi_state_extension_path``), and
+        - the inbox-wake extension (``pi_wake_extension_path``), so a spawned Pi
+          agent that becomes a lead for level-2 children is woken when they post
+          to its own inbox (nested orchestration; guarded off the injected
+          ``WIN_AGENT_TEAMS_SESSION_DIR`` inside the extension).
+
+        Either is omitted when its path is absent from ``request.extra``.
+        """
+        extra = request.extra or {}
+        args: list[str] = []
+        for key in ("pi_state_extension_path", "pi_wake_extension_path"):
+            ext = extra.get(key)
+            if ext:
+                args.extend(["-e", str(ext)])
+        return args
 
     def _prompt_args(self, request: SpawnRequest) -> list[str]:
         """Return the initial-prompt argv for pi.

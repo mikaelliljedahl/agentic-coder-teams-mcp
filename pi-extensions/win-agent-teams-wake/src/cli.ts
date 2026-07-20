@@ -21,23 +21,26 @@ function normalizeSeparators(p: string): string {
   return p.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
-/** The reader inbox file the discovered session dir must own (path guard for watch). */
-export function leadInboxPath(sessionDir: string, reader: string = DEFAULT_READER): string {
-  return path.join(normalizeSeparators(sessionDir), `inbox-${reader}.jsonl`);
+/**
+ * The inbox file the discovered session owns for a given identity (path guard
+ * for watch). `identity` is the agent's own identity — `AGENT_NAME` for a
+ * spawned agent / nested lead, or `team-lead` for the root lead — as reported by
+ * `session-dir`. It is NOT hardcoded to `team-lead`.
+ */
+export function ownInboxPath(sessionDir: string, identity: string): string {
+  return path.join(normalizeSeparators(sessionDir), `inbox-${identity}.jsonl`);
 }
 
 /**
- * Cross-platform equality check for the watch wake `path` against the discovered
- * lead inbox. Both sides are separator-normalized so a Windows `session_dir`
- * (`C:\\Users\\x\\...\\<id>`) and its backslash wake path match the same way a
- * POSIX pair does. Prevents dropping a real wake on Windows (blocker 1).
+ * Cross-platform equality check for the watch wake `path` against the agent's
+ * own inbox for `identity`. Both sides are separator-normalized so a Windows
+ * `session_dir` (`C:\\Users\\x\\...\\<id>`) and its backslash wake path match the
+ * same way a POSIX pair does. Prevents dropping a real wake on Windows
+ * (blocker 1) and, driven by the reported identity, matches a nested lead's
+ * `inbox-<AGENT_NAME>.jsonl` rather than only `inbox-team-lead.jsonl`.
  */
-export function isLeadInboxPath(
-  candidate: string,
-  sessionDir: string,
-  reader: string = DEFAULT_READER,
-): boolean {
-  const expected = `${normalizeSeparators(sessionDir)}/inbox-${reader}.jsonl`;
+export function isOwnInboxPath(candidate: string, sessionDir: string, identity: string): boolean {
+  const expected = `${normalizeSeparators(sessionDir)}/inbox-${identity}.jsonl`;
   return normalizeSeparators(candidate) === expected;
 }
 
@@ -185,13 +188,23 @@ export function runSessionDir(exec: PiExec, signal: AbortSignal): Promise<Sessio
   return exec(CLI_COMMAND, ["session-dir"], { signal }).then(parseSessionDir);
 }
 
+/**
+ * `--reader NAME` args, or none. Omitting `--reader` lets the CLI apply its own
+ * ambient default (`AGENT_NAME` or `team-lead`) — the agent's own identity —
+ * which is what a spawned agent / nested lead needs. An explicit `reader` is
+ * only ever an opt-in override.
+ */
+function readerArgs(reader: string | undefined): string[] {
+  return reader ? ["--reader", reader] : [];
+}
+
 export function runInboxStatus(
   exec: PiExec,
   sessionDir: string,
-  reader: string,
+  reader: string | undefined,
   signal: AbortSignal,
 ): Promise<InboxStatusResult> {
-  return exec(CLI_COMMAND, ["inbox-status", sessionDir, "--reader", reader], { signal }).then(
+  return exec(CLI_COMMAND, ["inbox-status", sessionDir, ...readerArgs(reader)], { signal }).then(
     parseInboxStatus,
   );
 }
@@ -199,13 +212,13 @@ export function runInboxStatus(
 export function runWatch(
   exec: PiExec,
   sessionDir: string,
-  reader: string,
+  reader: string | undefined,
   timeoutSec: number,
   signal: AbortSignal,
 ): Promise<WatchResult> {
   return exec(
     CLI_COMMAND,
-    ["watch", sessionDir, "--reader", reader, "--timeout", String(timeoutSec)],
+    ["watch", sessionDir, ...readerArgs(reader), "--timeout", String(timeoutSec)],
     { signal },
   ).then(parseWatch);
 }
