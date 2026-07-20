@@ -181,6 +181,12 @@ class ClaudeCodeBackend(BaseBackend):
         cmd.extend(self._hooks_settings_args(request))
         cmd.extend(self._disallowed_tools_args())
         cmd.append("--")
+        # No correlation marker is appended here. The server owns prompt
+        # materialization for both transports (``server_simple._materialize_prompt``):
+        # the sidecar file is written before ``backend.spawn``, and
+        # ``_prompt_arg`` then replaces argv with a fixed "read this file"
+        # instruction, so a marker added here could not reach a sidecar launch
+        # and would double-mark an argv one.
         cmd.append(self._prompt_arg(request))
         return cmd
 

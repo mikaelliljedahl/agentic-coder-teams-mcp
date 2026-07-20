@@ -296,6 +296,97 @@ async def test_codex_spawn_prompt_is_not_marked_by_the_server(
 
 
 # --------------------------------------------------------------------------
+# A1c — the Claude path is as unambiguous as the Codex path
+#
+# Ported from main's `test_claude_build_command_embeds_correlation_token` /
+# `..._embeds_token_with_prompt_file`, which asserted the *backend* injected the
+# marker into argv. That injection is removed: the server owns materialization
+# for both transports, so the backend injecting too would double-mark. The
+# property those tests protected — a spawned Claude agent's prompt carries a
+# marker, exactly once, on both transports — is asserted here instead, at the
+# layer that now owns it.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "transport"),
+    [("plain prompt", "argv"), ("first 'line'\nsecond \"line\"", "sidecar")],
+)
+async def test_claude_spawn_prompt_carries_exactly_one_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompt: str, transport: str
+) -> None:
+    backend = _session(tmp_path, monkeypatch)
+
+    result = await server_simple.spawn_agent(
+        prompt, name="worker", backend="claude-code", cwd=str(tmp_path)
+    )
+
+    request = backend.last_request
+    assert request is not None
+    correlation_id = _record(result["session_id"])["correlation_id"]
+    assert correlation_id
+    prompt_file = (request.extra or {}).get("prompt_file_path")
+    assert (prompt_file is not None) == (transport == "sidecar")
+
+    # Whichever transport the agent actually reads must carry the marker once.
+    delivered = _read_text(prompt_file) if prompt_file else request.prompt
+    assert delivered.count(_CODEX_CORRELATION_PREFIX) == 1
+    assert correlation_marker_token(correlation_id) in delivered
+
+    # And argv, as built by the real backend, must not add a second one.
+    assert ClaudeCodeBackend().build_command(request)[-1].count(
+        _CODEX_CORRELATION_PREFIX
+    ) == (0 if prompt_file else 1)
+
+
+def test_claude_resume_prompt_is_correlated(tmp_path: Path) -> None:
+    """A resume is correlated too — inverted from main's assertion.
+
+    Main asserted the marker was **absent** from the resume command, on the
+    reasoning that resume already knows the backend session id. This branch
+    correlates resume deliberately (R8/A4): the stored session id is exactly
+    what may be wrong, and a resume whose transcript cannot be identified is
+    the false-``delivered`` receipt that R6 exists to prevent. Dropping the
+    marker on resume would also downgrade the agent to ``legacy`` at read time,
+    which per R8 means it could never be followed up again.
+    """
+    final_prompt, extra = server_simple._materialize_prompt(
+        "sess",
+        "worker",
+        "claude-code",
+        "follow up",
+        "corr-resume",
+        file_token="nonce-1",
+        delivery_nonce="nonce-1",
+    )
+
+    assert extra.get("prompt_file_path") is None
+    assert correlation_marker_token("corr-resume") in final_prompt
+    assert final_prompt.count(_CODEX_CORRELATION_PREFIX) == 1
+
+
+def test_claude_legacy_resume_mints_no_correlation_id(tmp_path: Path) -> None:
+    """A record that predates correlation stays legacy across resume.
+
+    The counterpart to the inversion above: correlating resume must not be
+    implemented by inventing an id for a conversation that never carried one,
+    which would bind against a marker no transcript can contain.
+    """
+    final_prompt, _ = server_simple._materialize_prompt(
+        "sess",
+        "worker",
+        "claude-code",
+        "follow up",
+        None,
+        file_token="nonce-1",
+        delivery_nonce="nonce-1",
+    )
+
+    assert _CODEX_CORRELATION_PREFIX not in final_prompt
+
+
+# --------------------------------------------------------------------------
 # A1b — persistence, restart, and classification
 # --------------------------------------------------------------------------
 

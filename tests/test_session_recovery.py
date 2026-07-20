@@ -250,3 +250,104 @@ class TestToolDescriptionsMentionRecovery:
             tool = await ss.mcp.get_tool(tool_name)
             assert tool is not None
             assert "session_info" in (tool.description or "")
+
+
+class TestSessionInfoSessionDir:
+    """T1 — ``session_info()`` exposes an additive ``session_dir`` field."""
+
+    def test_active_session_reports_session_dir(
+        self, workspace: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sid = "70000000-0000-0000-0000-000000000001"
+        _write_session(workspace.base, sid, [_agent()])
+        monkeypatch.setattr(ss, "_session_id", sid)
+
+        info = asyncio.run(ss.session_info())
+
+        assert info["session_dir"] == str(ss._session_dir(sid))
+        # Existing fields remain unchanged.
+        assert info["session_id"] == sid
+        assert info["identity"] == ss.IDENTITY
+        assert info["agent_count"] == 1
+        assert "cwd" in info
+        assert "lead_token" in info
+        assert "recoverable_sessions" in info
+
+    def test_no_session_reports_empty_session_dir(
+        self, workspace: SimpleNamespace
+    ) -> None:
+        info = asyncio.run(ss.session_info())
+
+        assert info["session_id"] == ""
+        assert info["session_dir"] == ""
+        assert info["identity"] == ss.IDENTITY
+        assert info["agent_count"] == 0
+
+
+class TestSessionDirCli:
+    """T2 — ``win-agent-teams session-dir`` discovery-only subcommand."""
+
+    def test_active_session_prints_tab_line(
+        self, workspace: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from typer.testing import CliRunner
+
+        from claude_teams.cli import app
+
+        sid = "71000000-0000-0000-0000-000000000001"
+        _write_session(workspace.base, sid, [_agent()])
+        monkeypatch.setattr(ss, "_session_id", sid)
+
+        result = CliRunner().invoke(app, ["session-dir"])
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
+        assert result.stdout == f"{sid}\t{ss._session_dir(sid)}\t{ss.IDENTITY}\n"
+
+    def test_recovered_session_prints_line(self, workspace: SimpleNamespace) -> None:
+        from typer.testing import CliRunner
+
+        from claude_teams.cli import app
+
+        sid = "72000000-0000-0000-0000-000000000002"
+        _write_session(workspace.base, sid, [_agent()])
+        _write_binding(workspace.base, "b", sid)
+
+        result = CliRunner().invoke(app, ["session-dir"])
+
+        assert result.exit_code == 0
+        assert result.stdout.startswith(f"{sid}\t")
+
+    def test_no_session_exits_3_empty_stdout_and_creates_nothing(
+        self, workspace: SimpleNamespace
+    ) -> None:
+        from typer.testing import CliRunner
+
+        from claude_teams.cli import app
+
+        before = set(workspace.base.iterdir())
+
+        result = CliRunner().invoke(app, ["session-dir"])
+
+        assert result.exit_code == 3
+        assert result.stdout == ""
+        # Discovery-only: no session directory is created under the base.
+        assert set(workspace.base.iterdir()) == before
+
+    def test_internal_error_exits_1_stderr_only(
+        self, workspace: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from typer.testing import CliRunner
+
+        from claude_teams.cli import app
+
+        def _boom(*_args, **_kwargs) -> str:
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(ss, "_active_session_id", _boom)
+
+        result = CliRunner().invoke(app, ["session-dir"])
+
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "kaboom" in result.stderr

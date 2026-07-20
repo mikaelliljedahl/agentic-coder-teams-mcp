@@ -376,6 +376,11 @@ def _deliveries_file(session_id: str) -> Path:
     return _session_dir(session_id) / DELIVERIES_FILE_NAME
 
 
+def _pi_session_dir(session_id: str, name: str) -> Path:
+    """Return the per-agent pi session storage dir (see PiBackend/read_pi_output)."""
+    return _session_dir(session_id) / "pi-sessions" / name
+
+
 def _read_state_marker(session_id: str, name: str) -> dict | None:
     """Read an agent's hook-written state marker, tolerating a missing/corrupt file."""
     path = _state_marker_file(session_id, name)
@@ -1951,15 +1956,82 @@ def _prompt_transport(prompt_extra: dict[str, str]) -> str:
     return PROMPT_TRANSPORT_SIDECAR if prompt_extra.get("prompt_file_path") else "argv"
 
 
+def _ensure_pi_mcp_config() -> None:
+    """Ensure ``~/.pi/agent/mcp.json`` exposes the win-agent-teams MCP server.
+
+    The ``pi-mcp-adapter`` package reads this file to learn which stdio MCP
+    servers to start. We write (idempotently, self-healing on interpreter
+    moves) a ``win-agent-teams`` entry whose ``env`` uses ``${AGENT_*}``
+    interpolation — resolved from each pi process's own environment
+    (``PiBackend.build_env``) — so one shared static file binds every agent to
+    its own identity with no per-spawn file and no race. Any other user-defined
+    ``mcpServers`` in the file are preserved.
+    """
+    desired = {
+        "command": sys.executable,
+        "args": ["-m", "claude_teams.server_simple"],
+        "env": {
+            "AGENT_SESSION_ID": "${AGENT_SESSION_ID}",
+            "AGENT_NAME": "${AGENT_NAME}",
+            "AGENT_PARENT_NAME": "${AGENT_PARENT_NAME}",
+            "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
+        },
+    }
+    path = Path.home() / ".pi" / "agent" / "mcp.json"
+    config: dict = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config = loaded
+        except (OSError, json.JSONDecodeError):
+            config = {}
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    if servers.get("win-agent-teams") == desired:
+        return
+    servers["win-agent-teams"] = desired
+    config["mcpServers"] = servers
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def _pi_state_extension_dir() -> Path | None:
+    """Return the bundled pi state-reporting extension dir, if present.
+
+    Overridable via ``WIN_AGENT_TEAMS_PI_EXTENSION`` (a file or directory pi's
+    ``-e`` accepts); otherwise resolved relative to the repo checkout at
+    ``pi-extensions/win-agent-teams-state``. Returns ``None`` when neither
+    exists so the spawn still proceeds (state degrades to liveness only).
+    """
+    override = os.environ.get("WIN_AGENT_TEAMS_PI_EXTENSION", "").strip()
+    if override:
+        candidate = Path(override)
+        return candidate if candidate.exists() else None
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate = repo_root / "pi-extensions" / "win-agent-teams-state"
+    return candidate if candidate.exists() else None
+
+
 def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str, str]:
     """Materialise per-backend hook wiring, added to ``SpawnRequest.extra``.
 
     Claude Code gets a written settings-file path
     (``extra["hooks_settings_path"]``); Codex gets a JSON-encoded ``-c``
     override argv (``extra["hook_overrides"]``) evaluated only when
-    ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX`` is on (see ``CodexBackend``).
+    ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX`` is on (see ``CodexBackend``). Pi gets
+    the win-agent-teams MCP server registered for the ``pi-mcp-adapter`` and, if
+    state hooks are enabled, the path to its bundled state-reporting extension
+    (``extra["pi_state_extension_path"]``, loaded via ``-e``).
     """
     session_dir = _session_dir(session_id)
+    if backend_name == "pi":
+        _ensure_pi_mcp_config()
+        if os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS", "1").strip() == "0":
+            return {}
+        ext = _pi_state_extension_dir()
+        return {"pi_state_extension_path": str(ext)} if ext else {}
     if backend_name == "claude-code":
         settings_path = hooks.write_claude_settings(session_dir, agent_name)
         return {"hooks_settings_path": str(settings_path)}
@@ -2073,6 +2145,7 @@ async def spawn_agent(
             extra = {
                 "mcp_config_path": str(mcp_config_path),
                 "agent_capability": "",
+                "session_dir": str(_session_dir(session_id)),
                 **_correlation_extra(correlation_id),
                 **prompt_extra,
                 **_hook_extra(session_id, agent_name, backend_name),
@@ -4283,8 +4356,10 @@ async def session_info() -> dict:
     """Report the current session and any recoverable prior sessions.
 
     Call this right after a restart if ``list_agents`` is unexpectedly empty:
-    it returns ``{session_id, identity, cwd, agent_count, lead_token,
-    recoverable_sessions}``. ``recoverable_sessions`` lists prior sessions for
+    it returns ``{session_id, session_dir, identity, cwd, agent_count,
+    lead_token, recoverable_sessions}``. ``session_dir`` is this session's
+    on-disk directory (``""`` when no session exists yet).
+    ``recoverable_sessions`` lists prior sessions for
     this workspace (``{session_id, agent_count, last_activity}``) that still
     hold resumable agents; adopt one with ``resume_session('<session_id>')``.
     ``lead_token`` is this session's stable recovery token.
@@ -4299,6 +4374,7 @@ async def session_info() -> dict:
         if not session_id:
             return {
                 "session_id": "",
+                "session_dir": "",
                 "identity": IDENTITY,
                 "cwd": cwd,
                 "agent_count": 0,
@@ -4311,6 +4387,7 @@ async def session_info() -> dict:
             agents = []
         return {
             "session_id": session_id,
+            "session_dir": str(_session_dir(session_id)),
             "identity": IDENTITY,
             "cwd": cwd,
             "agent_count": len(agents),

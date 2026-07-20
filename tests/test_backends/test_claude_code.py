@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_teams.agent_output import _CODEX_CORRELATION_PREFIX
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 
@@ -157,7 +158,13 @@ class TestClaudeCodeBuildCommand:
         assert cmd[idx + 1] == "worker"
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "sonnet"
+        # The backend no longer injects a correlation marker: the server owns
+        # prompt materialization for both transports, so build_command must pass
+        # the already-materialized prompt through untouched. That the marker
+        # does reach the transcript is covered by test_correlation_transport's
+        # test_marker_is_visible_in_claude_transcript_context.
         assert cmd[-1] == "do stuff"
+        assert _CODEX_CORRELATION_PREFIX not in cmd[-1]
 
     def test_includes_plan_mode_required_when_set(self, _make_request):
         backend = ClaudeCodeBackend()
@@ -202,6 +209,7 @@ class TestClaudeCodeBuildCommand:
         assert cmd[idx + 1] == "C:\\tmp\\worker.mcp.json"
         assert cmd[-2] == "--"
         assert cmd[-1] == "do stuff"
+        assert _CODEX_CORRELATION_PREFIX not in cmd[-1]
 
     def test_terminates_options_before_prompt(self, _make_request):
         backend = ClaudeCodeBackend()
@@ -209,7 +217,8 @@ class TestClaudeCodeBuildCommand:
 
         cmd = backend.build_command(request)
 
-        assert cmd[-2:] == ["--", "do stuff"]
+        assert cmd[-2] == "--"
+        assert cmd[-1].startswith("do stuff")
 
     def test_preserves_multiline_prompt_as_single_arg(self, _make_request):
         backend = ClaudeCodeBackend()
@@ -218,7 +227,7 @@ class TestClaudeCodeBuildCommand:
 
         cmd = backend.build_command(request)
 
-        assert cmd[-1] == prompt
+        assert cmd[-1].startswith(prompt)
         assert "Decode this JSON string" not in cmd[-1]
 
     def test_uses_prompt_file_instruction_when_provided(self, _make_request):
@@ -231,10 +240,19 @@ class TestClaudeCodeBuildCommand:
 
         cmd = backend.build_command(request)
 
-        assert cmd[-1] == (
+        assert cmd[-1].startswith(
             "Read your complete task prompt from UTF-8 file path "
             "C:\\sessions\\worker.prompt.txt then follow the file contents exactly."
         )
+        # Inverted from main's assertion. Main rode the marker on the file-read
+        # instruction because the *backend* injected it. The server now writes
+        # the marker into the sidecar file itself, so argv carries only the read
+        # instruction and must stay free of the marker — otherwise the sidecar
+        # transport would double-mark (once in argv, once in the file the agent
+        # reads). That the marker reaches the transcript via the file's
+        # tool_result is covered by test_correlation_transport's
+        # test_marker_is_visible_in_claude_transcript_context[sidecar].
+        assert _CODEX_CORRELATION_PREFIX not in cmd[-1]
         assert prompt not in cmd[-1]
         assert "'" not in cmd[-1]
         assert '"' not in cmd[-1]

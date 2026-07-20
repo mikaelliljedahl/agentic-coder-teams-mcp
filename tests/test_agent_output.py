@@ -600,6 +600,176 @@ def test_read_claude_output_can_match_known_session_started_before_resume(
     assert output.last_message == "follow-up answer"
 
 
+def _claude_user_prompt(text: str, *, session_id: str, timestamp: str) -> dict:
+    return {
+        "type": "user",
+        "timestamp": timestamp,
+        "sessionId": session_id,
+        "message": {"role": "user", "content": text},
+    }
+
+
+def test_read_claude_output_disambiguates_concurrent_agents_by_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    project_dir = _claude_project_dir(tmp_path, cwd)
+    # Ported from main's per-agent derived token to this branch's per-spawn
+    # random correlation id: a derived token collides when a killed agent's
+    # name is reused, so the id is minted once per spawn instead.
+    token_a = correlation_marker_token("corr-a")
+    token_b = correlation_marker_token("corr-b")
+
+    # Both agents spawned in the same cwd at ~the same time. transcript-b has
+    # the newer mtime, so plain max(mtime) would wrongly bind agent-a to
+    # session-b. The correlation token makes the binding deterministic.
+    _write_jsonl(
+        project_dir / "transcript-a.jsonl",
+        [
+            _claude_user_prompt(
+                f"do work\n\n{token_a}",
+                session_id="session-a",
+                timestamp=_timestamp_at(spawned_at),
+            ),
+            _claude_message(
+                [{"type": "text", "text": "from a"}], session_id="session-a"
+            ),
+        ],
+        spawned_at + 10,
+    )
+    _write_jsonl(
+        project_dir / "transcript-b.jsonl",
+        [
+            _claude_user_prompt(
+                f"do work\n\n{token_b}",
+                session_id="session-b",
+                timestamp=_timestamp_at(spawned_at),
+            ),
+            _claude_message(
+                [{"type": "text", "text": "from b"}], session_id="session-b"
+            ),
+        ],
+        spawned_at + 30,
+    )
+
+    output = read_claude_output(spawned_at, str(cwd), correlation_token=token_a)
+
+    assert output is not None
+    assert output.backend_session_id == "session-a"
+    assert output.last_message == "from a"
+    assert output.rollout_path.endswith("transcript-a.jsonl")
+
+
+def test_read_claude_output_falls_back_when_token_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    project_dir = _claude_project_dir(tmp_path, cwd)
+
+    # No transcript carries the token (e.g. Claude has not flushed the prompt
+    # yet, or the agent was spawned before this marker existed) -> newest mtime.
+    #
+    # This newest-mtime fallback survives ONLY in ``read_claude_output``, which
+    # on this branch is reached exclusively through ``_ClaudeBinder.legacy_read``
+    # for records that predate correlation. The A2 binding ladder deliberately
+    # does NOT fall back this way: zero token matches is ``unverified`` (or
+    # ``pending`` for an unread sidecar), never a guess at the newest file. That
+    # fallback is the original defect — it pins a wrong backend_session_id once
+    # and can never self-correct. See
+    # ``test_binding_zero_matches_is_unverified_not_max_mtime``.
+    _write_jsonl(
+        project_dir / "older.jsonl",
+        [_claude_message([{"type": "text", "text": "older"}], session_id="session-x")],
+        spawned_at + 10,
+    )
+    _write_jsonl(
+        project_dir / "latest.jsonl",
+        [_claude_message([{"type": "text", "text": "latest"}], session_id="session-y")],
+        spawned_at + 20,
+    )
+
+    output = read_claude_output(
+        spawned_at,
+        str(cwd),
+        correlation_token=correlation_marker_token("corr-ghost"),
+    )
+
+    assert output is not None
+    assert output.backend_session_id == "session-y"
+    assert output.last_message == "latest"
+
+
+def test_read_claude_output_ignores_token_when_session_id_known(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    spawned_at = 1_762_969_000.0
+    project_dir = _claude_project_dir(tmp_path, cwd)
+    other_token = correlation_marker_token("corr-other")
+
+    # A newer transcript carries a *different* agent's token, but the exact
+    # backend_session_id is known -> match by session id, ignore the token.
+    _write_jsonl(
+        project_dir / "known.jsonl",
+        [
+            _claude_message(
+                [{"type": "text", "text": "known answer"}],
+                session_id="known-session",
+            )
+        ],
+        spawned_at + 10,
+    )
+    _write_jsonl(
+        project_dir / "decoy.jsonl",
+        [
+            _claude_user_prompt(
+                f"do work\n\n{other_token}",
+                session_id="decoy-session",
+                timestamp=_timestamp_at(spawned_at),
+            ),
+            _claude_message(
+                [{"type": "text", "text": "decoy"}], session_id="decoy-session"
+            ),
+        ],
+        spawned_at + 30,
+    )
+
+    output = read_claude_output(
+        spawned_at,
+        str(cwd),
+        backend_session_id="known-session",
+        correlation_token=other_token,
+    )
+
+    assert output is not None
+    assert output.backend_session_id == "known-session"
+    assert output.last_message == "known answer"
+
+
+# Main's `test_claude_build_command_embeds_correlation_token` and
+# `test_claude_build_command_embeds_token_with_prompt_file` lived here. Both
+# asserted that `ClaudeCodeBackend.build_command` injects the marker into argv.
+# That injection is removed on this branch — the server materializes the prompt
+# for both transports, so a backend-side injection would double-mark the argv
+# path and could not reach the sidecar path at all.
+#
+# Replacements, by name:
+#   - marker present exactly once, both transports:
+#       test_correlation_transport.test_claude_spawn_prompt_carries_exactly_one_marker
+#   - marker reaches the recorded user turn, both transports:
+#       test_correlation_transport.test_marker_is_visible_in_claude_transcript_context
+#   - resume assertion, deliberately inverted (see R8/A4):
+#       test_correlation_transport.test_claude_resume_prompt_is_correlated
+#   - argv stays marker-free under the sidecar transport:
+#       test_backends/test_claude_code.py's
+#       test_uses_prompt_file_instruction_when_provided
+
+
 def test_codex_resume_command_preserves_permissions_and_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
