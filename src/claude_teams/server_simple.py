@@ -2725,7 +2725,13 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
     def _do_follow_up() -> dict:
         if not session_id:
             return _follow_up_failure("session_not_found", name)
-        ticket: str | None = None
+        # A4b — the FIFO ticket is DERIVED from the durable delivery record, so
+        # it survives the end of this call. The cooperative tail promises the
+        # caller that its place in the per-target queue is preserved; a fresh
+        # MCP call starting from ``None`` would append a second waiter behind
+        # its own orphaned head and never advance. The idempotency key is the
+        # handle the caller already holds, so it is the natural durable ticket.
+        ticket: str | None = _queue_ticket(record)
         waited_for = ""
         position = 0
         while True:
@@ -2913,6 +2919,21 @@ _TAIL_OBLIGATION = (
     "idempotency_key) to finish it. The message stays durably queryable via "
     "delivery_status(idempotency_key) until it settles."
 )
+
+
+def _queue_ticket(record: dict) -> str:
+    """Return the durable per-target FIFO ticket for one delivery record.
+
+    ``(sender, idempotency_key)`` is the only identity that both survives the
+    end of an MCP call and is still in the caller's hands when it retries, so
+    it — not a per-call uuid — is what keeps the queue place recoverable.
+    Hashed rather than concatenated so an agent name containing the separator
+    cannot collide with another sender's key.
+    """
+    sender = str(record.get("sender") or "")
+    key = str(record.get("idempotency_key") or "")
+    digest = hashlib.sha256(f"{sender}\x00{key}".encode())
+    return digest.hexdigest()[:32]
 
 
 def _pending_tail(

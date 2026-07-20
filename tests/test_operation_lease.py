@@ -110,6 +110,63 @@ def test_queued_callers_are_promoted_in_fifo_order(tmp_path: Path) -> None:
     assert promoted.lease.operation_id == "op-2"
 
 
+def test_a_promoted_waiter_leaves_no_stale_ticket_for_the_next_caller(
+    tmp_path: Path,
+) -> None:
+    """Three callers, because the defect is invisible with two.
+
+    ``_prepare`` mints a **fresh** ``operation_id`` on every polling iteration,
+    so the retry that finally wins the lease never carries the id its ticket was
+    created with. If the waiter record keeps the original id, the
+    ``_drop_waiter`` inside ``finalize_lease`` misses it and the promoted
+    caller stays at position 0 forever — every later valid caller then queues
+    behind an orphan with no active lease, which is exactly the dead end R1
+    forbids.
+    """
+    path = _store(tmp_path)
+    _reserve(path, operation_id="op-1")
+    second = _reserve(path, operation_id="op-2a", holder_pid=222)
+    third = _reserve(path, operation_id="op-3a", holder_pid=333)
+    assert (second.position, third.position) == (1, 2)
+
+    release_lease(path, "worker", "op-1")
+
+    promoted = _reserve(
+        path, operation_id="op-2b", holder_pid=222, ticket=second.ticket
+    )
+    assert promoted.status == LEASE_GRANTED
+    assert finalize_lease(path, "worker", "op-2b", 1) is True
+    assert active_lease(path, "worker") is None
+
+    after = _reserve(path, operation_id="op-3b", holder_pid=333, ticket=third.ticket)
+    assert after.status == LEASE_GRANTED, (
+        "caller 3 queued behind an orphaned head ticket with no active lease"
+    )
+    assert load_leases(path)["worker"]["waiters"] == [
+        {"ticket": third.ticket, "operation_id": "op-3b", "enqueued_at": 0.0}
+    ]
+
+
+def test_a_released_waiter_leaves_no_stale_ticket_for_the_next_caller(
+    tmp_path: Path,
+) -> None:
+    """Same defect through ``release_lease`` — the ``finally`` path."""
+    path = _store(tmp_path)
+    _reserve(path, operation_id="op-1")
+    second = _reserve(path, operation_id="op-2a", holder_pid=222)
+    third = _reserve(path, operation_id="op-3a", holder_pid=333)
+
+    release_lease(path, "worker", "op-1")
+    promoted = _reserve(
+        path, operation_id="op-2b", holder_pid=222, ticket=second.ticket
+    )
+    assert promoted.status == LEASE_GRANTED
+    assert release_lease(path, "worker", "op-2b") is True
+
+    after = _reserve(path, operation_id="op-3b", holder_pid=333, ticket=third.ticket)
+    assert after.status == LEASE_GRANTED
+
+
 def test_releasing_drops_the_holders_ticket_from_the_queue(tmp_path: Path) -> None:
     path = _store(tmp_path)
     first = _reserve(path)

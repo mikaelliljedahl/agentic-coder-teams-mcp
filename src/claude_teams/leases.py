@@ -258,19 +258,31 @@ def reserve_lease(  # noqa: PLR0913 - the lease's stored fields are its argument
     waiters = cast("list[Any]", entry["waiters"])
     if ticket is None:
         ticket = uuid.uuid4().hex
+    existing = next(
+        (
+            cast("dict[str, Any]", waiter)
+            for waiter in waiters
+            if isinstance(waiter, dict)
+            and cast("dict[str, Any]", waiter).get("ticket") == ticket
+        ),
+        None,
+    )
+    if existing is None:
+        # Either a brand-new ticket, or one we no longer know about (store
+        # reset, or already promoted and released): enter at the tail rather
+        # than silently jumping the queue.
         waiters.append(
             {"ticket": ticket, "operation_id": operation_id, "enqueued_at": now}
         )
-    elif not any(
-        isinstance(waiter, dict)
-        and cast("dict[str, Any]", waiter).get("ticket") == ticket
-        for waiter in waiters
-    ):
-        # A ticket we no longer know about (store reset, or already promoted
-        # and released): re-enter the queue rather than silently jumping it.
-        waiters.append(
-            {"ticket": ticket, "operation_id": operation_id, "enqueued_at": now}
-        )
+    else:
+        # The ticket is the durable identity; ``operation_id`` is per-attempt
+        # and a retrying caller mints a fresh one on every poll. Re-pointing
+        # the waiter at the id this attempt will actually be granted (and later
+        # finalized/released) under is what keeps ``_drop_waiter`` able to find
+        # it. Leaving the original id here strands the promoted waiter at
+        # position 0 forever, and every later valid caller queues behind an
+        # orphan with no active lease.
+        existing["operation_id"] = operation_id
 
     order = [
         cast("dict[str, Any]", waiter).get("ticket")

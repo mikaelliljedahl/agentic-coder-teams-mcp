@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from claude_teams import delivery_store as ds
-from claude_teams import server_simple
+from claude_teams import leases, server_simple
 from claude_teams.agent_output import (
     BINDING_AMBIGUOUS,
     BINDING_BOUND,
@@ -827,6 +827,101 @@ async def test_deliver_pending_completes_the_cooperative_tail(
     assert result["success"] is True
     assert _record()["status"] == ds.STATUS_DELIVERED
     assert len(backend.resume_calls) == 1
+
+
+def _foreign_lease(env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Park a live lease held by ANOTHER process on the target.
+
+    That is the only way to reach the FIFO tail rather than the busy-wait tail:
+    the queue only forms when a second valid caller wants a target somebody
+    else has already reserved.
+    """
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "owns_process",
+        lambda pid, token=None: str(pid) == "4242",
+    )
+    leases.save_leases(
+        server_simple._leases_file(SESSION),
+        {
+            AGENT: {
+                "lease": {
+                    "generation": 0,
+                    "operation_id": "foreign-op",
+                    "backend_session_id": BACKEND_SESSION,
+                    "nonce": "f" * 32,
+                    "holder_pid": 4242,
+                    "holder_create_token": "tok-4242",
+                    "deadline": 1e12,
+                    "acquired_at": 0.0,
+                },
+                "waiters": [
+                    {
+                        "ticket": "foreign-ticket",
+                        "operation_id": "foreign-op",
+                        "enqueued_at": 0.0,
+                    }
+                ],
+            }
+        },
+    )
+
+
+def _waiters() -> list[dict]:
+    store = leases.load_leases(server_simple._leases_file(SESSION))
+    return list(store.get(AGENT, {}).get("waiters", []))
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_call_reclaims_its_place_in_the_per_target_queue(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cooperative tail must not orphan the ticket it is queued under.
+
+    The tail tells the caller "your place in the per-target queue is
+    preserved". A genuinely fresh MCP call starts with ``ticket = None``, so
+    unless the ticket is derived from something the caller still holds, the
+    retry appends a SECOND waiter behind an orphaned head it can never reclaim
+    — the queue grows by one on every retry and the caller never advances.
+    That is a dead end, which R1 forbids.
+    """
+    _write_waiting_marker(env)
+    _install(monkeypatch, _FakeResumeBackend())
+    _child_alive(monkeypatch, True)
+    _foreign_lease(env, monkeypatch)
+
+    first = await server_simple.follow_up_agent(AGENT, "next prompt", KEY)
+    assert first["reason"] == "operation_in_progress"
+    assert first["queue_position"] == 1
+    assert len(_waiters()) == 2
+
+    # A genuinely fresh call: nothing is carried over in memory, only the
+    # idempotency key the caller chose and still has.
+    env.clock.now = 0.0
+    second = await server_simple.follow_up_agent(AGENT, "next prompt", KEY)
+
+    assert second["queue_position"] == 1, (
+        "a retry must reclaim its FIFO place, not queue behind its own orphan"
+    )
+    assert len(_waiters()) == 2, "the retry appended a second waiter for one caller"
+
+
+@pytest.mark.asyncio
+async def test_two_distinct_senders_keep_distinct_queue_places(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable ticket must be per-message, not per-target."""
+    _write_waiting_marker(env)
+    _install(monkeypatch, _FakeResumeBackend())
+    _child_alive(monkeypatch, True)
+    _foreign_lease(env, monkeypatch)
+
+    await server_simple.follow_up_agent(AGENT, "next prompt", KEY)
+    env.clock.now = 0.0
+    other = await server_simple.follow_up_agent(AGENT, "other prompt", "k-2")
+
+    assert other["queue_position"] == 2
+    assert len(_waiters()) == 3
 
 
 # ==========================================================================
