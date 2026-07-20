@@ -51,6 +51,11 @@ A plain `pi` run for unrelated work sets neither and stays a true no-op.
   `win-agent-teams` MCP server stays project-scoped in the repo's `.mcp.json`
   (not global) — see the design doc for why.
 
+- **Kill switch**: `WIN_AGENT_TEAMS_STATE_HOOKS=0` disables the pi *state*
+  extension **and** this wake extension together — the server's `_hook_extra`
+  returns early before adding either `-e` path, so the two share one switch.
+  There is no separate flag to disable wake while keeping state reporting.
+
 ## Requirements
 
 - Node.js 20+ (developed on Node 24).

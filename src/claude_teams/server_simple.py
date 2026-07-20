@@ -1295,6 +1295,10 @@ def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str
     state hooks are enabled, the paths to its bundled state-reporting extension
     (``extra["pi_state_extension_path"]``) and inbox-wake extension
     (``extra["pi_wake_extension_path"]``), both loaded via ``-e``.
+
+    Note: ``WIN_AGENT_TEAMS_STATE_HOOKS=0`` is a single kill switch for BOTH pi
+    extensions — it disables state reporting AND the inbox-wake extension,
+    since the early return happens before either path is added.
     """
     session_dir = _session_dir(session_id)
     if backend_name == "pi":

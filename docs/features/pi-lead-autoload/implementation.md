@@ -110,3 +110,73 @@ Python (`pytest`, `tests/test_backends/test_pi.py`):
   `parseInboxStatus` JSON-field fallback; it no longer drives any `--reader`
   flag or gate.
 - Independent cross-family (Codex) reviews deferred — Codex unavailable.
+
+## Review-fix round (post-implementation review by Fable)
+
+The independent review (`implementation-review.md`) raised one blocker plus four
+follow-ups. All addressed on a second commit (the original `9659bf0` was left
+untouched).
+
+### F1 — BLOCKER (fixed): `inbox-status --reader` hardcoded `team-lead`
+
+`cli.py`'s `inbox-status` declared `reader: str = typer.Option("team-lead", ...)`,
+so the wake extension (which shells out WITHOUT `--reader`) made a nested lead
+probe `inbox-team-lead.jsonl` instead of its own inbox — defeating the whole
+nested-lead generalization and risking a hot subprocess loop. Fixed by mirroring
+`watch`/`session-dir`: `reader: str | None = None`, resolved to
+`AGENT_NAME.strip() or "team-lead"` when omitted, with `_require_safe_reader`
+still applied to an explicit override. `--reader team-lead` is now hardcoded
+nowhere. Verified no other subcommand the extension calls has the same hardcode
+(`watch` was already env-based; `session-dir` reports `IDENTITY`).
+
+- RED: `test_inbox_status_uses_nested_agent_identity` (new) failed
+  `assert 'team-lead' == 'worker-1'` against the pre-fix CLI.
+- GREEN: after the fix, the same test plus
+  `test_inbox_status_defaults_to_team_lead_without_agent_name` pass; full
+  `test_cli_watch.py` = 39 passed.
+
+### F2 — SHOULD-FIX (fixed): pin the CLI default the extension depends on
+
+Added the two Python CLI tests above (`tests/test_cli_watch.py`). The TS harness
+modelled `inbox-status` as identity-aware (returning canned payloads regardless
+of reader), so it could not catch F1; the new Python tests pin the real
+cross-language contract. `test_inbox_status_uses_nested_agent_identity` is the
+test that goes RED against the pre-fix code and GREEN after — evidence above.
+
+### F3 — SHOULD-FIX (fixed): server-wiring coverage
+
+Added to `tests/test_server_simple_guards.py`:
+`test_pi_wake_extension_dir_override_existing`,
+`_override_missing_returns_none`, `test_hook_extra_pi_emits_both_extension_keys`,
+`test_hook_extra_pi_missing_wake_dir_omits_key`, and
+`test_hook_extra_pi_state_hooks_off_disables_both` (also documents F4). 5 passed.
+
+### F4 — NIT (documented): `WIN_AGENT_TEAMS_STATE_HOOKS=0` also disables wake
+
+No behavior change. Documented the single-kill-switch coupling in the
+`_hook_extra` docstring and the extension README, and pinned it with
+`test_hook_extra_pi_state_hooks_off_disables_both`.
+
+### F5 — NIT (fixed): empty/whitespace reader override normalized to unset
+
+`WakeMachine` now trims `opts.reader` and treats empty/whitespace as `undefined`,
+so `readerArgs` (omits the flag) and `activeReader` (falls back to the discovered
+identity) stay consistent. New TS test
+`§6: an empty/whitespace reader override is normalized to unset (no --reader)`.
+TS suite = 58 passed.
+
+### Gate results (whole-repo, review-fix round, Linux)
+
+- `uv run pytest -q`: **672 passed, 3 skipped, 0 failed.** The 3 previously
+  reported `test_watch_command_discovery.py` subprocess tests
+  (`test_watch_argv_executes_and_times_out_quietly`,
+  `test_watch_command_bash_executes_and_times_out_quietly`,
+  `test_watch_argv_runs_from_unrelated_cwd_without_pythonpath`) PASS on this run
+  — they are timing-sensitive real-subprocess tests, unrelated to this change,
+  and were the only previously-red items. No other failures.
+- `uv run ruff check .`: All checks passed.
+- `uv run ruff format --check .`: 52 files already formatted (after formatting
+  the new test file).
+- `uv run ty check`: All checks passed.
+- pi-extensions/win-agent-teams-wake: `npx tsc --noEmit` clean; `npx vitest run`
+  58 passed (5 files); `eslint .` clean; `prettier --check` all files conform.

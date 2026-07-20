@@ -349,4 +349,29 @@ describe("WakeMachine — discovery / rebinding", () => {
     expect(watchCall?.args).toContain("--reader");
     expect(watchCall?.args).toContain("team-lead");
   });
+
+  it("§6: an empty/whitespace reader override is normalized to unset (no --reader)", async () => {
+    const h = new Harness({
+      sessionDir: [okSessionDir("sid-1", "/base/sid-1", "worker-1")],
+      watch: [watchMessage(["alice"], "/base/sid-1/inbox-worker-1.jsonl"), watchTimeout()],
+      inboxStatus: [status({ alice: sender(1, 0) }), status({ alice: sender(1, 1) })],
+      maxCalls: 12,
+    });
+    const m = new WakeMachine({
+      exec: h.exec,
+      sendMessage: h.sendMessage,
+      sleep: h.sleep,
+      reader: "   ",
+      watchTimeoutSec: 5,
+      ackBudget: 3,
+    });
+    await m.run(h.controller.signal);
+    const relevant = h.calls.filter((c) => c.sub === "watch" || c.sub === "inbox-status");
+    expect(relevant.length).toBeGreaterThanOrEqual(1);
+    for (const c of relevant) {
+      expect(c.args).not.toContain("--reader");
+    }
+    // The guard binds to the session-dir identity, so injection still happens.
+    expect(h.sends).toHaveLength(1);
+  });
 });

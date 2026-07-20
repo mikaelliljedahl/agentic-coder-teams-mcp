@@ -373,8 +373,13 @@ def session_dir() -> None:
 @app.command(name="inbox-status")
 def inbox_status(
     session_dir: str = typer.Argument(..., help="Session directory to probe."),
-    reader: str = typer.Option(
-        "team-lead", "--reader", help="Inbox reader identity to probe."
+    reader: str | None = typer.Option(
+        None,
+        "--reader",
+        help=(
+            "Inbox reader identity to probe. Overrides AGENT_NAME/team-lead; "
+            "omit for the current env-based behavior (matching `watch`)."
+        ),
     ),
 ) -> None:
     """Emit a non-consuming inbox generation snapshot as one JSON object.
@@ -386,11 +391,18 @@ def inbox_status(
     a message on stderr and no stdout; an internal error exits 1 with stderr
     only.
     """
-    try:
-        _require_safe_reader(reader)
-    except ValueError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=1) from exc
+    # Resolve the reader identically to `watch`: an explicit --reader wins,
+    # otherwise the ambient AGENT_NAME (else the root team-lead). Never hardcode
+    # team-lead — a nested lead must probe its OWN inbox.
+    if reader is not None:
+        try:
+            _require_safe_reader(reader)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        reader_name = reader
+    else:
+        reader_name = os.environ.get("AGENT_NAME", "").strip() or "team-lead"
 
     directory = Path(session_dir)
     base = _ss._SESSION_BASE.resolve()
@@ -399,8 +411,8 @@ def inbox_status(
         raise typer.Exit(code=4)
 
     try:
-        inbox_path = directory / f"inbox-{reader}.jsonl"
-        cursor_path = directory / f"inbox-{reader}.pos.json"
+        inbox_path = directory / f"inbox-{reader_name}.jsonl"
+        cursor_path = directory / f"inbox-{reader_name}.pos.json"
         by_sender = read_inbox_by_sender(inbox_path)
         cursors = load_inbox_cursors(cursor_path)
         senders: dict[str, dict[str, int]] = {}
@@ -409,7 +421,11 @@ def inbox_status(
             cursor = cursors.get(sender, 0)
             unread = total - min(cursor, total)
             senders[sender] = {"total": total, "cursor": cursor, "unread": unread}
-        payload = {"schema": "inbox-status/1", "reader": reader, "senders": senders}
+        payload = {
+            "schema": "inbox-status/1",
+            "reader": reader_name,
+            "senders": senders,
+        }
     except Exception as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc

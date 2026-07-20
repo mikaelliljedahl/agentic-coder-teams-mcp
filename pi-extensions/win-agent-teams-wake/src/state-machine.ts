@@ -71,7 +71,12 @@ export class WakeMachine {
     this.exec = opts.exec;
     this.sendMessage = opts.sendMessage;
     this.sleep = opts.sleep;
-    this.readerOverride = opts.reader;
+    // Normalize an empty/whitespace override to unset so `readerArgs` (which
+    // omits `--reader` for a falsy value) and `activeReader` (which would
+    // otherwise bind the guard to `inbox-.jsonl`) stay consistent: both fall
+    // back to the CLI's ambient default (`AGENT_NAME` or `team-lead`).
+    const reader = opts.reader?.trim();
+    this.readerOverride = reader ? reader : undefined;
     this.watchTimeoutSec = opts.watchTimeoutSec ?? 55;
     this.ackBudget = opts.ackBudget ?? 5;
     const base = opts.backoffBaseMs ?? 500;
