@@ -985,6 +985,18 @@ Timeout exit 2 means no actionable edge settled; re-check status before
 starting the next watch because an agent may already be waiting due to the
 small status-check/watch-baseline race, or a genuine waiting edge may have
 arrived inside the final unfinished settle window.
+
+Claude Code lead wake: a `Stop` hook now verifies watcher arming from the
+harness's own `background_tasks` on every lead turn end. When a worker reply is
+already unread it blocks instructing you to call `read_messages`; when no
+watcher is armed it blocks instructing you to run the `watch_command_bash` /
+`watch_argv` as a BACKGROUND task, so an idle lead is woken deterministically
+rather than relying on the model to re-arm. The hook writes a small
+`wake-progress-<reader>.json` file under the session dir to bound a no-progress
+block loop and is always fail-open (never makes the lead unstoppable). Disable
+it at runtime with `WIN_AGENT_TEAMS_LEAD_WAKE=0`. Server-spawned agents get this
+wiring automatically; a top-level lead wires it with the `install_lead_wake`
+tool.
 """.strip()
 
 
@@ -2433,6 +2445,98 @@ async def list_backends() -> list[dict]:
         return result
 
     return await run_blocking(_do_list)
+
+
+def _group_has_wake_token(group: object) -> bool:
+    """Return whether a Stop matcher group invokes the lead-wake module."""
+    if not isinstance(group, dict):
+        return False
+    entries = group.get("hooks")
+    if not isinstance(entries, list):
+        return False
+    return any(
+        isinstance(h, dict) and hooks._WAKE_MODULE in str(h.get("command", ""))
+        for h in entries
+    )
+
+
+def _install_wake_hook(config: dict, wake_matcher: dict, *, remove: bool) -> dict:
+    """Return ``config`` with the lead-wake ``Stop`` matcher upserted or removed.
+
+    Idempotent and non-destructive: any existing lead-wake group is dropped
+    first (so a re-install never duplicates), then the fresh matcher is appended
+    unless ``remove``. Unrelated events and unrelated ``Stop`` groups (e.g. a
+    hand-written ``emit`` group) are preserved verbatim.
+    """
+    result = dict(config)
+    hooks_map = dict(result.get("hooks") or {})
+    stop = [g for g in (hooks_map.get("Stop") or []) if not _group_has_wake_token(g)]
+    if not remove:
+        stop.append(wake_matcher)
+    if stop:
+        hooks_map["Stop"] = stop
+    else:
+        hooks_map.pop("Stop", None)
+    if hooks_map:
+        result["hooks"] = hooks_map
+    else:
+        result.pop("hooks", None)
+    return result
+
+
+def _lead_wake_settings_path(scope: str) -> Path:
+    """Return the settings path for ``scope`` (``project`` cwd or ``user`` home)."""
+    base = Path.home() if scope == "user" else Path.cwd()
+    return base / ".claude" / "settings.json"
+
+
+@mcp.tool()
+async def install_lead_wake(remove: bool = False, scope: str = "project") -> dict:
+    """Install (or remove) the Claude Code lead inbox-wake ``Stop`` hook.
+
+    Wires the deterministic wake hook into a settings file so an idle lead is
+    reliably woken when a worker replies. On every lead turn end the hook
+    verifies — from the harness's own ``background_tasks`` — that an inbox
+    watcher is armed, and blocks with an operational instruction to run the
+    ``watch_command_bash``/``watch_argv`` as a BACKGROUND task (or to call
+    ``read_messages`` when a reply is already unread) rather than trusting the
+    model to remember. Server-spawned agents get this wiring automatically; use
+    this tool to wire a **top-level** lead you started yourself (e.g. an
+    interactive ``claude`` in a repo).
+
+    - ``scope="project"`` (default) writes the project ``.claude/settings.json``
+      in the current working directory; ``scope="user"`` writes
+      ``~/.claude/settings.json``.
+    - Writes ONLY the ``Stop`` wake group (never the state-marker ``emit`` hooks,
+      which are for server-spawned agents). Idempotent: re-running replaces the
+      existing wake group in place and never duplicates it; unrelated hooks are
+      preserved. ``remove=True`` drops only the wake group.
+    - The hook writes a small ``wake-progress-<reader>.json`` file under the
+      session dir to bound a no-progress block loop. Disable at runtime with the
+      kill switch ``WIN_AGENT_TEAMS_LEAD_WAKE=0`` (no reinstall needed).
+    """
+    if scope not in {"project", "user"}:
+        return {"error": f"scope must be 'project' or 'user', got {scope!r}"}
+
+    def _do_install() -> dict:
+        identity = IDENTITY
+        session_id = _active_session_id(create=False)
+        session_dir = _session_dir(session_id) if session_id else _SESSION_BASE
+        wake_matcher = hooks._wake_hook_matcher(session_dir, identity)
+        path = _lead_wake_settings_path(scope)
+        updated = _install_wake_hook(
+            _read_json_object(path), wake_matcher, remove=remove
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+        return {
+            "action": "removed" if remove else "installed",
+            "path": str(path),
+            "reader": identity,
+            "scope": scope,
+        }
+
+    return await run_blocking(_do_install)
 
 
 def main() -> None:
