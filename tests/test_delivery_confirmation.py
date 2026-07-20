@@ -407,6 +407,42 @@ def test_truncation_is_detected_and_rescanned_from_the_start(tmp_path: Path) -> 
     assert scanner.poll(NONCE) == SCAN_FOUND
 
 
+def test_an_in_place_rewrite_that_recovered_its_size_is_still_detected(
+    tmp_path: Path,
+) -> None:
+    """Size regression is not the only shape a replacement takes.
+
+    ``_shrank`` only compared ``st_size`` against the offset, and identity was
+    only ``(st_dev, st_ino)``. A transcript truncated and rewritten in place
+    keeps its inode, and if it is back to (or past) its old size before the
+    next poll it is not smaller either — so the scanner resumes at the old
+    offset, reads whatever now happens to sit there, and never sees the
+    receipt. The regression therefore rewrites to a file that has ALREADY
+    recovered its size.
+    """
+    path = tmp_path / "a.jsonl"
+    _write(
+        path,
+        [{"sessionId": "sess", **_claude_user_text("earlier")} for _ in range(6)],
+    )
+    scanner = _scanner(path, successors=_successors(path))
+    scanner.snapshot()
+    original_size = path.stat().st_size
+
+    # Same path, same inode, different content, and no smaller than before.
+    _write(
+        path,
+        [{"sessionId": "sess", **_claude_user_text(f"go {delivery_marker(NONCE)}")}]
+        + [
+            {"sessionId": "sess", **_claude_user_text("padding " * 12)}
+            for _ in range(6)
+        ],
+    )
+    assert path.stat().st_size >= original_size, "test must not rely on a shrink"
+
+    assert scanner.poll(NONCE) == SCAN_FOUND
+
+
 def test_two_candidate_successors_are_ambiguous_not_a_guess(tmp_path: Path) -> None:
     original = tmp_path / "a.jsonl"
     _write(original, [{"sessionId": "sess", **_claude_user_text("earlier")}])

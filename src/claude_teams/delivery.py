@@ -295,6 +295,7 @@ class ReceiptScanner:
         self._successors = successors
         self._offset = 0
         self._identity: tuple[int, int] | None = None
+        self._prefix = b""
         self._buffer = b""
 
     # -- snapshotting -------------------------------------------------------
@@ -309,10 +310,12 @@ class ReceiptScanner:
         self._buffer = b""
         self._offset = 0
         self._identity = None
+        self._prefix = b""
         if self.path is None:
             return
         self._identity = _stat_identity(self.path)
         self._offset = _last_complete_offset(self.path)
+        self._prefix = _stable_prefix(self.path, self._offset)
 
     def rewind(self) -> None:
         """Anchor at the START of the file, to scan history rather than growth.
@@ -324,6 +327,7 @@ class ReceiptScanner:
         self._buffer = b""
         self._offset = 0
         self._identity = _stat_identity(self.path) if self.path else None
+        self._prefix = b""
 
     # -- polling ------------------------------------------------------------
 
@@ -332,7 +336,7 @@ class ReceiptScanner:
         if self.path is None:
             return SCAN_PENDING
         identity = _stat_identity(self.path)
-        if identity is None or identity != self._identity or self._shrank():
+        if identity is None or identity != self._identity or self._replaced():
             rotated = self._follow_rotation()
             if rotated == SCAN_AMBIGUOUS:
                 return SCAN_AMBIGUOUS
@@ -340,11 +344,27 @@ class ReceiptScanner:
                 return SCAN_PENDING
         return self._scan_new_bytes(nonce)
 
-    def _shrank(self) -> bool:
+    def _replaced(self) -> bool:
+        """Whether the anchored file is no longer the one we snapshotted.
+
+        Two signals, because ``(st_dev, st_ino)`` plus a size regression misses
+        the common in-place case. A transcript truncated and rewritten in place
+        keeps its inode, and if it is back to (or past) its old size before the
+        next poll it is not smaller either — so the offset would be honoured
+        against unrelated bytes and the receipt never seen. The snapshotted
+        prefix closes that: appends leave it byte-identical, rewrites do not.
+        """
+        if self.path is None:
+            return False
         try:
-            return self.path is not None and self.path.stat().st_size < self._offset
+            if self.path.stat().st_size < self._offset:
+                return True
         except OSError:
             return True
+        # Deliberately ``len(self._prefix)`` and not the CURRENT offset: the
+        # offset advances as bytes are consumed, and re-reading a longer window
+        # each poll would compare appended bytes against a shorter snapshot.
+        return _read_prefix(self.path, len(self._prefix)) != self._prefix
 
     def _follow_rotation(self) -> str:
         """Re-anchor on a successor transcript, or report why we cannot.
@@ -378,6 +398,7 @@ class ReceiptScanner:
         self.path = candidates[0]
         self._identity = _stat_identity(self.path)
         self._offset = 0
+        self._prefix = b""
         self._buffer = b""
         return SCAN_FOUND
 
@@ -414,6 +435,32 @@ class ReceiptScanner:
             if nonce in receipt_nonces(record, self.backend):
                 return SCAN_FOUND
         return SCAN_PENDING
+
+
+#: How many leading bytes are hashed to detect an in-place rewrite. Large
+#: enough to cover a transcript header and its first records, small enough that
+#: re-reading it on every poll is free.
+_PREFIX_BYTES = 4096
+
+
+def _stable_prefix(path: Path, offset: int) -> bytes:
+    """Return the leading bytes an APPEND to ``path`` would leave untouched.
+
+    Empty when there is nothing anchored yet (``offset == 0``), which is not a
+    weakness: with no offset to honour the next scan starts from the beginning
+    anyway, so a rewrite cannot hide anything.
+    """
+    return _read_prefix(path, min(offset, _PREFIX_BYTES))
+
+
+def _read_prefix(path: Path, window: int) -> bytes:
+    if window <= 0:
+        return b""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(window)
+    except OSError:
+        return b""
 
 
 def _stat_identity(path: Path) -> tuple[int, int] | None:
