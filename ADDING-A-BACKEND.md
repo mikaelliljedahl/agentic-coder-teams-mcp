@@ -27,6 +27,8 @@ agent participates by honoring two files:
 Identity is carried in three env vars the agent's process must expose so the MCP
 server binds it to the right inbox/session: `AGENT_NAME`, `AGENT_SESSION_ID`,
 `AGENT_PARENT_NAME`. `AGENT_NAME` falls back to `team-lead` when absent.
+Because any agent can spawn children, "lead" is a per-level role, not `team-lead`
+specifically — see the nested-orchestration section in `CLAUDE.md`.
 
 Two capability levels:
 

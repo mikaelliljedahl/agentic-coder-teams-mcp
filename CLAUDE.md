@@ -64,6 +64,25 @@ spawning and messaging Claude Code, Codex, and Pi agents on Windows/Linux).
 - **Test on Linux too**: run the suite on the Lubuntu VM before calling a branch
   green — Windows-only runs hide path/quoting bugs.
 
+## Nested orchestration: lead is a role, not an identity
+
+- **"Lead" is a role at every nesting level, not a fixed agent.** Any spawned
+  agent can itself spawn children, so a subagent is the lead for the level
+  below it. This is nested orchestration — the equivalent of Claude Code's
+  built-in subagents, which **Pi lacks natively**, so win-agent-teams supplies
+  the hierarchy for **all** backends (claude-code, codex, pi).
+- **Identity & inboxes.** Each agent's own inbox is `inbox-<identity>.jsonl`,
+  where identity is the `AGENT_NAME` env when set, else `team-lead` (the
+  root/human-launched coordinator). Children `send_message` to their parent's
+  inbox; a parent `read_messages` from its own. So the root lead watches
+  `inbox-team-lead`; a mid-level lead watches `inbox-<its AGENT_NAME>`.
+- **Consequence for tooling.** Anything acting on "the lead" (the
+  `watch`/`inbox-status` CLI, the Pi wake extension) must use the agent's OWN
+  identity — never assume `team-lead`. Identity flows via
+  `AGENT_NAME`/`AGENT_SESSION_ID`/`AGENT_PARENT_NAME` (+
+  `WIN_AGENT_TEAMS_SESSION_DIR` for spawned agents). Designed follow-up:
+  `docs/features/pi-lead-autoload/design.md`.
+
 ## Adding or changing a backend
 
 Full guide: **[ADDING-A-BACKEND.md](ADDING-A-BACKEND.md)**. The essentials to keep
