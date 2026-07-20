@@ -2255,6 +2255,49 @@ def test_binding_scan_oserror_is_indeterminate(
     assert result.output is None
 
 
+@pytest.mark.parametrize("backend", ["claude-code", "codex"])
+def test_binding_candidate_enumeration_oserror_is_indeterminate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    """Gate 2 is about ENUMERATION as much as reading.
+
+    A directory listing that fails (permissions, a disconnected network share,
+    a racing rotation) tells us nothing about whether a matching transcript
+    exists. Collapsing it to an empty candidate list turns "we could not look"
+    into "there is nothing there", which the count gate then reports as
+    ``unverified`` — a terminal, non-retriable outcome derived from a scan that
+    never happened.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / "work"
+    project_dir = _claude_project_dir(tmp_path, cwd)
+    _write_claude_transcript(
+        project_dir,
+        "mine.jsonl",
+        session_id="mine",
+        mtime=_LADDER_SPAWNED_AT + 10,
+        correlation_id="corr-own",
+    )
+
+    def boom(self, *args, **kwargs):
+        raise OSError
+
+    monkeypatch.setattr(Path, "glob", boom)
+    monkeypatch.setattr(Path, "iterdir", boom)
+
+    result = _bind(_claude_record(cwd, backend=backend))
+
+    assert result.outcome == ao.BINDING_INDETERMINATE
+    assert result.retriable is True
+
+    # Tier 1 enumerates too: the name-as-session-id convention is not a
+    # contract, so a miss falls back to a directory walk.
+    tier_one = _bind(
+        _claude_record(cwd, backend=backend, backend_session_id="stored-sess")
+    )
+    assert tier_one.outcome == ao.BINDING_INDETERMINATE
+
+
 def test_binding_legacy_record_reports_legacy_and_still_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

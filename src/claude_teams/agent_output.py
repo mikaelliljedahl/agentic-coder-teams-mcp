@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import os
@@ -348,14 +347,26 @@ def _file_contains_token(
 
 
 def _matching_jsonl_files(
-    directory: Path, spawned_at: float, *, pattern: str = "*.jsonl"
+    directory: Path,
+    spawned_at: float,
+    *,
+    pattern: str = "*.jsonl",
+    strict: bool = False,
 ) -> list[tuple[float, Path]]:
+    """Return ``(mtime, path)`` for transcripts inside the spawn's mtime window.
+
+    ``strict`` propagates an enumeration ``OSError`` instead of swallowing it.
+    The validation ladder needs that distinction: a directory listing that
+    failed tells us nothing about whether a matching transcript exists, and
+    reporting it as an empty candidate set turns "we could not look" into a
+    terminal "there is nothing there".
+    """
     if not directory.exists():
         return []
 
     cutoff = spawned_at - _MTIME_SLACK_SECONDS
     matches: list[tuple[float, Path]] = []
-    with contextlib.suppress(OSError):
+    try:
         for path in directory.glob(pattern):
             try:
                 mtime = path.stat().st_mtime
@@ -363,11 +374,14 @@ def _matching_jsonl_files(
                 continue
             if mtime >= cutoff:
                 matches.append((mtime, path))
+    except OSError:
+        if strict:
+            raise
     return matches
 
 
 def _codex_candidate_dirs(
-    spawned_at: float, *, include_all: bool = False
+    spawned_at: float, *, include_all: bool = False, strict: bool = False
 ) -> list[Path]:
     try:
         utc_time = datetime.fromtimestamp(spawned_at, tz=UTC)
@@ -384,8 +398,11 @@ def _codex_candidate_dirs(
         for day in sorted(days)
     ]
     if include_all:
-        with contextlib.suppress(OSError):
+        try:
             directories.extend(path for path in base.glob("*/*/*") if path.is_dir())
+        except OSError:
+            if strict:
+                raise
     return list(dict.fromkeys(directories))
 
 
@@ -732,7 +749,13 @@ class _TranscriptBinder:
         ``incomplete`` short-circuits the count gate: a match count computed
         from a partially failed scan is not a count we are entitled to use.
         """
-        paths = list(self.candidates(all_history=all_history))
+        try:
+            paths = list(self.candidates(all_history=all_history))
+        except OSError:
+            # Enumeration failed, so there is no candidate set to count. Gate 2
+            # short-circuits on ``incomplete`` precisely so that a count is
+            # never computed from a scan that did not finish.
+            return [], True
         if extra is not None:
             paths.append(extra)
         matches: list[Path] = []
@@ -766,11 +789,14 @@ class _ClaudeBinder(_TranscriptBinder):
         return self._scope
 
     def _all_transcripts(self) -> list[Path]:
+        """Every transcript in the project dir. Raises ``OSError`` if unlistable.
+
+        A missing project dir is genuine absence; a failed listing is not, and
+        the callers turn the latter into ``indeterminate``.
+        """
         if self.project_dir is None or not self.project_dir.exists():
             return []
-        with contextlib.suppress(OSError):
-            return sorted(self.project_dir.glob("*.jsonl"))
-        return []
+        return sorted(self.project_dir.glob("*.jsonl"))
 
     def resolve_by_session_id(self, session_id: str) -> Path | None:
         if self.project_dir is None:
@@ -793,7 +819,9 @@ class _ClaudeBinder(_TranscriptBinder):
             return self._all_transcripts()
         return [
             path
-            for _mtime, path in _matching_jsonl_files(self.project_dir, self.spawned_at)
+            for _mtime, path in _matching_jsonl_files(
+                self.project_dir, self.spawned_at, strict=True
+            )
         ]
 
     def session_id(self, path: Path) -> str | None:
@@ -835,20 +863,24 @@ class _CodexBinder(_TranscriptBinder):
         return cast("dict[str, Any]", payload)
 
     def _rollouts(self, *, all_history: bool) -> list[Path]:
+        """Candidate rollouts. Raises ``OSError`` if a listing fails.
+
+        See ``_ClaudeBinder._all_transcripts``: a failed enumeration must not
+        be laundered into an empty candidate set.
+        """
         paths: list[Path] = []
         for directory in _codex_candidate_dirs(
-            self.spawned_at, include_all=all_history
+            self.spawned_at, include_all=all_history, strict=True
         ):
             if all_history:
                 if not directory.exists():
                     continue
-                with contextlib.suppress(OSError):
-                    paths.extend(sorted(directory.glob("rollout-*.jsonl")))
+                paths.extend(sorted(directory.glob("rollout-*.jsonl")))
                 continue
             paths.extend(
                 path
                 for _mtime, path in _matching_jsonl_files(
-                    directory, self.spawned_at, pattern="rollout-*.jsonl"
+                    directory, self.spawned_at, pattern="rollout-*.jsonl", strict=True
                 )
             )
         return list(dict.fromkeys(paths))
@@ -1025,9 +1057,17 @@ def resolve_agent_binding(  # noqa: PLR0911 - one return per named gate outcome.
     # Gate 2, tier 1 — resolve the stored binding to a concrete path, with no
     # mtime cutoff, so a long-running session older than the window is still
     # revalidated by a single open rather than excluded.
-    stored_path = (
-        binder.resolve_by_session_id(stored_session_id) if stored_session_id else None
-    )
+    try:
+        stored_path = (
+            binder.resolve_by_session_id(stored_session_id)
+            if stored_session_id
+            else None
+        )
+    except OSError:
+        # Tier 1 enumerates too (the name-as-session-id convention is not a
+        # contract, so it falls back to a directory walk). A failed walk is
+        # "we could not look", not "the stored transcript is gone".
+        return BindingResult(BINDING_INDETERMINATE)
 
     # Gate 2, tier 2 — correction scan: window first, then all history.
     matches, incomplete = binder.scan(token, all_history=False, extra=stored_path)
