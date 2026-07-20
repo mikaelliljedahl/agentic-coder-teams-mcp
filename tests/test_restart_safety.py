@@ -103,7 +103,7 @@ def _idle_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ss,
         "_resolve_agent_binding",
-        lambda agent: BindingResult(
+        lambda agent, **_: BindingResult(
             BINDING_BOUND,
             AgentOutput(
                 last_activity_at=900.0,
@@ -184,7 +184,7 @@ def _busy_by_timer_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ss,
         "_resolve_agent_binding",
-        lambda agent: BindingResult(
+        lambda agent, **_: BindingResult(
             BINDING_BOUND,
             AgentOutput(
                 last_activity_at=990.0,

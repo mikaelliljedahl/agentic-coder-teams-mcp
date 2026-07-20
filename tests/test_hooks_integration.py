@@ -27,7 +27,7 @@ def _binding(output: AgentOutput | None = None, outcome: str | None = None):
     before the validation ladder, so pre-ladder expectations still hold.
     """
     resolved = outcome or (BINDING_BOUND if output is not None else BINDING_LEGACY)
-    return lambda agent: BindingResult(resolved, output)
+    return lambda agent, **_: BindingResult(resolved, output)
 
 
 class _FakeClaudeBackend:

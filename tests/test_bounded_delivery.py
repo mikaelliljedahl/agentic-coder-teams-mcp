@@ -543,7 +543,7 @@ async def test_a_dead_agent_without_a_backend_session_names_the_state(
     monkeypatch.setattr(
         server_simple,
         "_resolve_agent_binding",
-        lambda agent: BindingResult(
+        lambda agent, **_: BindingResult(
             BINDING_BOUND,
             AgentOutput(
                 last_activity_at=900.0,
@@ -607,7 +607,7 @@ async def test_an_unprovable_binding_refuses_rather_than_waiting(
     monkeypatch.setattr(
         server_simple,
         "_resolve_agent_binding",
-        lambda agent: BindingResult(outcome, None),
+        lambda agent, **_: BindingResult(outcome, None),
     )
     backend = _FakeResumeBackend()
     _install(monkeypatch, backend)

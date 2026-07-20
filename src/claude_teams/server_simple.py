@@ -1077,14 +1077,19 @@ def _stored_backend_session_id(agent: dict) -> str | None:
     return None
 
 
-def _resolve_agent_binding(agent: dict) -> BindingResult:
+def _resolve_agent_binding(agent: dict, *, bounded_only: bool = False) -> BindingResult:
     """Resolve an agent record to its transcript via the A2 validation ladder.
 
     ``child_alive`` is passed lazily: liveness is only consulted by gate 0
     (the sidecar-pending branch of the count gate), so the common path never
     pays for a process probe.
+
+    ``bounded_only`` is A6's "stay cheap" mode: the mtime window only, with no
+    all-history fallback behind it.
     """
-    return resolve_agent_binding(agent, child_alive=lambda: _agent_alive(agent))
+    return resolve_agent_binding(
+        agent, child_alive=lambda: _agent_alive(agent), bounded_only=bounded_only
+    )
 
 
 def _agent_create_token(agent: dict) -> str | None:
@@ -3610,9 +3615,11 @@ def _agent_status_row(session_id: str, agent: dict) -> dict:
     unbound = False
     if last_activity_ts is None:
         # No marker timestamp: fall back to the transcript, but stay cheap.
-        # This is exactly one binding resolution — no second scan and no
-        # all-history rescan layered on top of it.
-        binding = _resolve_agent_binding(agent)
+        # This is exactly one binding resolution AND a genuinely bounded one:
+        # ``bounded_only`` drops the resolver's own all-history fallback, which
+        # A6 forbids here. Without it "one call" was still unbounded work, and
+        # a test that mocks the whole resolver cannot tell the difference.
+        binding = _resolve_agent_binding(agent, bounded_only=True)
         output = binding.output
         last_activity_ts = output.last_activity_at if output else None
         unbound = not binding.bound and binding.outcome != BINDING_LEGACY

@@ -1074,7 +1074,7 @@ async def test_check_agent_persists_backend_session_id_from_rollout(
     monkeypatch.setattr(
         server_simple,
         "_resolve_agent_binding",
-        lambda agent: BindingResult(
+        lambda agent, **_: BindingResult(
             BINDING_BOUND,
             AgentOutput(
                 last_activity_at=10.0,
@@ -1165,7 +1165,7 @@ def _pin_binding(
     monkeypatch.setattr(
         server_simple,
         "_resolve_agent_binding",
-        lambda agent: BindingResult(outcome, output),
+        lambda agent, **_: BindingResult(outcome, output),
     )
 
 
@@ -2628,7 +2628,7 @@ def _force_binding(monkeypatch: pytest.MonkeyPatch, outcome: str) -> None:
     monkeypatch.setattr(
         server_simple,
         "_resolve_agent_binding",
-        lambda record: ao.BindingResult(outcome, output),
+        lambda record, **_: ao.BindingResult(outcome, output),
     )
 
 
@@ -2723,7 +2723,12 @@ async def test_agent_status_fallback_stays_cheap_on_non_success(
     _setup_consumer_session(tmp_path, monkeypatch)
     calls: list[object] = []
 
-    def counting(record):
+    def counting(record, *, bounded_only: bool = False):
+        # Call COUNT alone is not "cheap": the resolver's own zero-match path
+        # can escalate to an all-history scan inside a single call. The mode is
+        # asserted here, and the resolver's honouring of it is proved without a
+        # mock in tests/test_agent_status.py.
+        assert bounded_only is True, "the cheap fallback must ask for bounded work"
         calls.append(record)
         output = (
             ao.AgentOutput(900.0, "legacy text", "x.jsonl", "sid")

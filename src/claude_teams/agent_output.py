@@ -947,6 +947,7 @@ def resolve_agent_binding(  # noqa: PLR0911 - one return per named gate outcome.
     now: float | None = None,
     sidecar_pending_window_s: float = DEFAULT_SIDECAR_PENDING_WINDOW_S,
     max_bytes: int = _LAST_MESSAGE_BUDGET,
+    bounded_only: bool = False,
 ) -> BindingResult:
     """Bind an agent record to its transcript through explicit, ordered gates.
 
@@ -972,10 +973,19 @@ def resolve_agent_binding(  # noqa: PLR0911 - one return per named gate outcome.
     Candidate enumeration is two-tier. Tier 1 resolves the stored session id
     to its transcript directly and ignores the mtime cutoff, so a long-running
     session older than the window is still revalidated with a single file
-    open. Tier 2 is a correction scan, used only when tier 1 is absent or the
-    stored transcript does not carry the token; it tries the mtime window
-    first and falls back to all history. Successful bindings are cached;
+    open. Tier 1 does **not** short-circuit tier 2: the stored transcript joins
+    the candidate set as an extra, cutoff-free candidate, because a tier-1 hit
+    alone cannot answer the count gate — a second transcript may also carry the
+    token, and that is ``ambiguous`` rather than a licence to keep the stored
+    binding. Tier 2 tries the mtime window first and falls back to all history.
+    Successful bindings are cached;
     ``pending``/``unverified``/``ambiguous``/``indeterminate`` never are.
+
+    ``bounded_only`` drops the all-history fallback, so the cost of a call is
+    capped by the mtime window. It exists for A6's "stay cheap" consumers
+    (``agent_status``'s no-marker fallback), which are required to answer from
+    a bounded amount of work and to say ``unknown`` rather than pay for a full
+    history walk.
     """
     backend = str(record.get("backend") or "")
     spawned_at = _record_float(record.get("spawned_at"))
@@ -1023,7 +1033,7 @@ def resolve_agent_binding(  # noqa: PLR0911 - one return per named gate outcome.
     matches, incomplete = binder.scan(token, all_history=False, extra=stored_path)
     if incomplete:
         return BindingResult(BINDING_INDETERMINATE)
-    if not matches:
+    if not matches and not bounded_only:
         matches, incomplete = binder.scan(token, all_history=True, extra=stored_path)
         if incomplete:
             return BindingResult(BINDING_INDETERMINATE)

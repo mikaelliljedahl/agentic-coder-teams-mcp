@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_teams import server_simple
+from claude_teams import agent_output, server_simple
 from claude_teams.agent_output import (
     BINDING_BOUND,
     BINDING_LEGACY,
@@ -23,7 +23,7 @@ def _binding(output: AgentOutput | None = None, outcome: str | None = None):
     before the validation ladder, so pre-ladder expectations still hold.
     """
     resolved = outcome or (BINDING_BOUND if output is not None else BINDING_LEGACY)
-    return lambda agent: BindingResult(resolved, output)
+    return lambda agent, **_: BindingResult(resolved, output)
 
 
 @pytest.fixture
@@ -529,6 +529,51 @@ class TestAgentStatus:
         result = asyncio.run(server_simple.agent_status(names=["worker"]))
 
         assert result[0]["state"] == "running"
+
+    def test_the_no_marker_fallback_never_scans_all_history(
+        self, session: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A6: "stay cheap" means no second scan AND no all-history scan.
+
+        Deliberately does NOT mock ``_resolve_agent_binding``: the defect lives
+        *inside* the resolver, whose zero-window-match path falls back to
+        ``binder.scan(..., all_history=True)``. A test that replaces the whole
+        resolver and counts calls cannot see it.
+        """
+        _add_agent(session, correlation_id="corr-1", backend_session_id="sess-1")
+        monkeypatch.setattr(
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
+        )
+
+        calls: list[bool] = []
+
+        class _SpyBinder:
+            cache_scope = "scope"
+
+            def resolve_by_session_id(self, session_id: str) -> None:
+                return None
+
+            def candidates(self, *, all_history: bool) -> list[Path]:
+                return []
+
+            def scan(self, token: str, *, all_history: bool, extra=None):
+                calls.append(all_history)
+                return [], False
+
+            def session_id(self, path: Path) -> None:
+                return None
+
+        monkeypatch.setattr(agent_output, "_make_binder", lambda *a, **k: _SpyBinder())
+
+        result = asyncio.run(server_simple.agent_status(names=["worker"]))
+
+        assert calls, "the fallback did not reach the transcript binder at all"
+        assert all(flag is False for flag in calls), (
+            f"an all-history scan ran on the cheap path: {calls}"
+        )
+        assert result[0]["state"] == "unknown"
 
 
 class TestKillAgentDeletesMarker:

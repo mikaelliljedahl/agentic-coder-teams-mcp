@@ -156,7 +156,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(
         server_simple,
         "_resolve_agent_binding",
-        lambda agent: BindingResult(
+        lambda agent, **_: BindingResult(
             BINDING_BOUND,
             AgentOutput(
                 last_activity_at=900.0,
