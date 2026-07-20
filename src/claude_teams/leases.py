@@ -286,7 +286,7 @@ def reserve_lease(  # noqa: PLR0913 - the lease's stored fields are its argument
         waiters.append(
             {"ticket": ticket, "operation_id": operation_id, "enqueued_at": now}
         )
-    else:
+    elif current is None or existing.get("operation_id") != current.operation_id:
         # The ticket is the durable identity; ``operation_id`` is per-attempt
         # and a retrying caller mints a fresh one on every poll. Re-pointing
         # the waiter at the id this attempt will actually be granted (and later
@@ -294,6 +294,15 @@ def reserve_lease(  # noqa: PLR0913 - the lease's stored fields are its argument
         # it. Leaving the original id here strands the promoted waiter at
         # position 0 forever, and every later valid caller queues behind an
         # orphan with no active lease.
+        #
+        # The guard above is the other half of that rule: a waiter entry whose
+        # id is the ACTIVE HOLDER's is not a waiter at all, it is the holder
+        # keeping its place at the head while it works. Two callers sharing a
+        # ticket (same sender and idempotency key) would otherwise let the
+        # second re-point the holder's own entry at an id the holder knows
+        # nothing about, after which the holder's release/finalize can no
+        # longer drop it — the queue is then permanently headed by an orphan
+        # and the holder's serialization guarantee is gone.
         existing["operation_id"] = operation_id
 
     order = [

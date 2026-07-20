@@ -167,6 +167,32 @@ def test_a_released_waiter_leaves_no_stale_ticket_for_the_next_caller(
     assert after.status == LEASE_GRANTED
 
 
+def test_a_waiter_sharing_the_active_holders_ticket_is_not_repointed(
+    tmp_path: Path,
+) -> None:
+    """Two callers under one ``(sender, key)`` derive ONE ticket (A4b).
+
+    The waiter entry at the head of the queue while a lease is held IS the
+    holder keeping its place. Re-pointing it at the second caller's per-attempt
+    id leaves the holder unable to drop its own entry on release, so the queue
+    is permanently headed by an orphan and the per-target serialization the
+    lease provides is gone.
+    """
+    path = _store(tmp_path)
+    first = _reserve(path, operation_id="op-holder")
+    assert first.granted
+    ticket = first.ticket
+
+    second = _reserve(path, operation_id="op-second", ticket=ticket)
+
+    assert second.status == LEASE_QUEUED
+    entry = load_leases(path)["worker"]
+    assert [w["operation_id"] for w in entry["waiters"]] == ["op-holder"]
+    # ...and the holder can therefore still drop its own entry.
+    assert release_lease(path, "worker", "op-holder") is True
+    assert load_leases(path)["worker"]["waiters"] == []
+
+
 def test_releasing_drops_the_holders_ticket_from_the_queue(tmp_path: Path) -> None:
     path = _store(tmp_path)
     first = _reserve(path)

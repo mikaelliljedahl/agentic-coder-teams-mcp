@@ -70,6 +70,14 @@ SCAN_FOUND = "found"
 SCAN_PENDING = "pending"
 #: More than one candidate successor transcript; guessing is not allowed.
 SCAN_AMBIGUOUS = "ambiguous"
+#: The whole transcript was read and the nonce is provably not in it. This is
+#: the ONLY negative that may become a terminal ``failed``: it is a complete
+#: authoritative negative, not "nothing yet".
+SCAN_ABSENT = "absent"
+#: The transcript could not be read completely — missing, unreadable, or
+#: carrying a record that would not parse. The nonce's fate is unknown, which
+#: R6 distinguishes sharply from absent: an error must never become absence.
+SCAN_INDETERMINATE = "indeterminate"
 
 #: Recipient-confirmed (R6). The only status that may be reported as success.
 DELIVERY_DELIVERED = "delivered"
@@ -344,6 +352,60 @@ class ReceiptScanner:
                 return SCAN_PENDING
         return self._scan_new_bytes(nonce)
 
+    def full_scan(self, nonce: str) -> str:  # noqa: PLR0911 - four outcomes, several ways to reach each.
+        """Read the whole anchored transcript and say what was established.
+
+        Distinct from :meth:`poll`, which is an incremental growth scan whose
+        ``SCAN_PENDING`` deliberately means "nothing *yet*". Reconciliation asks
+        a different question — has this nonce landed, yes or no — and answering
+        it with a bool collapses "I read everything and it is not there" into
+        "I could not read", which is how an unreadable scan became a terminal
+        ``failed``.
+
+        Four outcomes, and each one is load-bearing:
+
+        - :data:`SCAN_FOUND` — the nonce is in a named receipt record.
+        - :data:`SCAN_ABSENT` — every record parsed, none carried the nonce.
+        - :data:`SCAN_INDETERMINATE` — the file is missing, unreadable, has a
+          record that would not parse, or ends mid-record.
+        - :data:`SCAN_AMBIGUOUS` — the transcript rotated into more than one
+          candidate successor, so attribution is not provable.
+        """
+        if self.path is None:
+            return SCAN_INDETERMINATE
+        if _stat_identity(self.path) is None:
+            rotated = self._follow_rotation()
+            if rotated == SCAN_AMBIGUOUS:
+                return SCAN_AMBIGUOUS
+            if rotated != SCAN_FOUND:
+                return SCAN_INDETERMINATE
+        path = self.path
+        if path is None:
+            return SCAN_INDETERMINATE
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return SCAN_INDETERMINATE
+        last_newline = data.rfind(b"\n")
+        # Bytes after the final newline are a partial write. They may be the
+        # very record we came for, so their presence blocks a clean negative.
+        truncated = last_newline + 1 != len(data)
+        unreadable = False
+        for line in data[: last_newline + 1].split(b"\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                unreadable = True
+                continue
+            if nonce in receipt_nonces(record, self.backend):
+                return SCAN_FOUND
+        if truncated or unreadable:
+            return SCAN_INDETERMINATE
+        return SCAN_ABSENT
+
     def _replaced(self) -> bool:
         """Whether the anchored file is no longer the one we snapshotted.
 
@@ -579,8 +641,10 @@ __all__ = [
     "DELIVERY_FAILED",
     "DELIVERY_MARKER_PREFIX",
     "DELIVERY_UNCONFIRMED",
+    "SCAN_ABSENT",
     "SCAN_AMBIGUOUS",
     "SCAN_FOUND",
+    "SCAN_INDETERMINATE",
     "SCAN_PENDING",
     "DeliveryOutcome",
     "ReceiptScanner",

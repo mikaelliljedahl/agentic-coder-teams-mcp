@@ -359,9 +359,11 @@ file.
 Without that, response-loss recovery would keep reporting `unconfirmed` forever
 after the nonce had actually landed — a false status in the other direction.
 
-Passing `to` instead returns a convenience list. It deliberately cannot serve
-response-loss recovery: with several messages to one agent, nothing identifies
-which row is the one whose response was lost.
+Passing `to` instead returns a convenience list, reconciling **every** unsettled
+row it is about to return, so the two views can never publish different
+statuses for one message. It still cannot serve response-loss recovery: with
+several messages to one agent, nothing identifies which row is the one whose
+response was lost.
 
 ### `deliver_pending(idempotency_key="")`
 
@@ -537,6 +539,23 @@ It takes the same cross-process file-lock transaction model as the registry
 the single writer of its own cursor. Several per-agent MCP servers share one
 session dir, so the delivery store needs the real thing.
 
+**Persistence fails closed.** `delivery_store.save_records` returns whether the
+atomic replace actually reached disk, and `delivery_transaction` raises
+`DeliveryStoreError` when a dirty transaction was lost. **No resume may begin
+unless the pre-wait row is durably visible**: that row is the sender's only
+handle on an in-flight message, so a lost write plus a lost response would leave
+neither a reliable status nor a recoverable key — the exact hole the
+caller-supplied idempotency key exists to close (R4/B0). The delivery tools
+answer `queued(phase="pending", reason="delivery_store_unavailable",
+retriable=true)` and send nothing. The one place the error is logged and
+swallowed is kill-time reconciliation: `kill_agent` is a lifecycle operation
+that must still terminate the process, and leaving the rows unsettled is honest
+— nothing *was* settled — and a later `delivery_status` reconciles them.
+
+The same rule already applies one layer down in `leases.save_leases`: a lease
+that did not reach disk is not a lease, so `reserve_lease` reports `queued`
+rather than `granted`.
+
 ### Cursor semantics
 
 `inbox-{name}.pos.json` is a **per-sender consumed-count**, not a byte or line
@@ -673,12 +692,25 @@ Three rules that are easy to get wrong:
   silently expired. Only definite non-delivery is terminal.
 - **A retry rescans for the prior attempt's nonce before re-sending.** This, not
   receiver-side dedupe, is what prevents a duplicate prompt: the recipient is a
-  backend conversation, not a consumer with a dedupe table.
+  backend conversation, not a consumer with a dedupe table. A row still at
+  `sent`/`unconfirmed` when a same-key call arrives is reconciled and then
+  **reported, not resent**: if the receipt landed it answers `delivered`, if the
+  child is provably gone with a complete negative scan it answers `failed`, and
+  otherwise it answers `queued(unconfirmed)` with `reason="attempt_unresolved"`.
+  Only a row genuinely back at `pending` is sent again.
+- **One key is worked by one call at a time.** The FIFO ticket is derived from
+  `(sender, key)`, so two concurrent identical calls share it and the lease
+  queue cannot tell them apart from one caller retrying. The delivery record
+  therefore carries an `active_holder` claim, taken under the store lock. A
+  second concurrent call gets `queued(phase="pending",
+  reason="delivery_in_progress")` and sends nothing; a claim whose holder
+  process is provably gone is reclaimed, so a crashed call cannot wedge a key.
 
 The lease is **not** held across `unconfirmed`. It converts to the durable
-pending-delivery record on the agent, which keeps serializing that target until
-reconciliation, so neither a future delivery nor a kill is blocked by a lease
-nobody is progressing.
+pending-delivery record on the agent, and the sender-side row stays at
+`unconfirmed` — so a later delivery under that key reconciles rather than
+resending, while neither a future delivery to that target nor a kill is blocked
+by a lease nobody is progressing.
 
 ### Kill-time cleanup reconciles before concluding
 
@@ -686,8 +718,20 @@ nobody is progressing.
 for the nonce first** and records `delivered` if it landed. An in-flight
 attempt may already have an unread receipt on disk; marking that message failed
 because the target is being killed would reintroduce exactly the false-status
-problem this protocol exists to remove. Only a genuinely receipt-less attempt
-becomes `failed(not_delivered)`. Nothing is deleted.
+problem this protocol exists to remove.
+
+The scan reports one of four outcomes and they are **not** collapsed to a bool
+(`_scan_for_nonce`, `ReceiptScanner.full_scan`):
+
+| Outcome | Meaning | Result |
+|---|---|---|
+| `found` | the nonce is in a named receipt record | `delivered` |
+| `absent` | every record parsed, none carried it | `failed(not_delivered)` |
+| `indeterminate` | missing/unreadable transcript, a record that would not parse, or a partial trailing write | stays `queued(unconfirmed)` |
+| `ambiguous` | the transcript rotated into more than one candidate successor | stays `queued(unconfirmed)` |
+
+Only `absent` — a **complete authoritative negative** — may become terminal. An
+error is not an absence, exactly as in the binding ladder. Nothing is deleted.
 
 ### It starts a NEW OS PROCESS
 
@@ -781,8 +825,19 @@ records `spawned_by_source: "operator_asserted"` so a later reader can tell an
 asserted parentage from an observed one.
 
 A refusal at 2a/2b **changes nothing**: no PID, no regenerated MCP config, no
-prompt sidecar, no lease acquired and no generation bump. That is why the check
-sits ahead of every side effect rather than alongside the other gates.
+prompt sidecar, no lease acquired, no generation bump — and no delivery record.
+That is why the check sits ahead of every side effect rather than alongside the
+other gates.
+
+The two evaluations are joined by a **parentage snapshot**, not just re-run.
+The read-only pre-flight returns the `(spawned_by, spawned_by_source)` it
+authorized against, and the under-lock check refuses with
+`reason="stale_authorization"` when the record no longer matches it. Without
+that the two can legitimately disagree — the pre-flight passes, the durable row
+is created, and the locked check then refuses — leaving an audit row behind for
+a call that was refused. A row created by a call that then hits `parent_unknown`,
+`not_spawner` or `stale_authorization` is discarded, and only ever when this
+call created it and nothing has been sent under it, so no evidence can be lost.
 
 Checks 5–7 all sit **behind** the marker resolution. An earlier revision of this
 document listed 5 and 6 as unconditional on `alive`, and carried an extra row for

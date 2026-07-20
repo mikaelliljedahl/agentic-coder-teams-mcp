@@ -50,7 +50,9 @@ from claude_teams.delivery import (
     DELIVERY_DELIVERED,
     DELIVERY_FAILED,
     DELIVERY_UNCONFIRMED,
+    SCAN_ABSENT,
     SCAN_FOUND,
+    SCAN_INDETERMINATE,
     DeliveryOutcome,
     ReceiptScanner,
     confirm_delivery,
@@ -70,10 +72,12 @@ from claude_teams.delivery_store import (
     STATUS_DELIVERED,
     STATUS_FAILED,
     STATUS_QUEUED,
+    DeliveryStoreError,
     delivery_transaction,
     is_terminal,
     mark_phase,
     public_view,
+    record_key,
     request_fingerprint,
     settle,
     validate_idempotency_key,
@@ -1618,15 +1622,24 @@ def _reconcile_pending_delivery(
     # rewind(), not snapshot(): reconciliation must see the WHOLE transcript,
     # because the record it is looking for was written before this call began.
     scanner.rewind()
-    return scanner.poll(nonce) == SCAN_FOUND
+    return scanner.full_scan(nonce) == SCAN_FOUND
 
 
-def _scan_for_nonce(session_id: str, agent: dict | None, nonce: str) -> bool:
+def _scan_for_nonce(session_id: str, agent: dict | None, nonce: str) -> str:
     """Search the whole of ``agent``'s bound transcript for ``nonce``.
 
-    ``rewind()``, not ``snapshot()``: the record being looked for was written
-    before this call began, so anchoring at the current tail — which is what a
-    fresh attempt does — would deliberately skip exactly what we came for.
+    Returns one of :data:`SCAN_FOUND`, :data:`SCAN_ABSENT`,
+    :data:`SCAN_INDETERMINATE` or :data:`SCAN_AMBIGUOUS`. **Not a bool.**
+    Collapsing these into "delivered / not delivered" is what let an unreadable
+    or ambiguous scan become a terminal ``failed``, and R6's whole point is that
+    only a *definite* non-delivery may be terminal. It is the same distinction
+    the binding ladder enforces: an error must not become an absence.
+
+    ``full_scan()`` after ``rewind()``, not ``poll()``: the record being looked
+    for was written before this call began, so anchoring at the current tail —
+    which is what a fresh attempt does — would deliberately skip exactly what we
+    came for, and ``poll``'s ``SCAN_PENDING`` cannot tell "read it all, not
+    there" from "could not read".
 
     Takes the agent **record**, never a name, so it can run inside a registry
     transaction. Re-entering ``_load_agents`` there would try to take the
@@ -1634,7 +1647,10 @@ def _scan_for_nonce(session_id: str, agent: dict | None, nonce: str) -> bool:
     which blocks on POSIX and times out on Windows.
     """
     if not nonce or agent is None:
-        return False
+        # No nonce means nothing was ever sent under this row, and no record
+        # means its transcript is unreachable from here. Neither is evidence
+        # that a prompt did not land, so neither may read as absence.
+        return SCAN_INDETERMINATE
     backend_name = str(agent.get("backend") or "")
     binding = _resolve_agent_binding(agent)
     output = binding.output
@@ -1644,12 +1660,12 @@ def _scan_for_nonce(session_id: str, agent: dict | None, nonce: str) -> bool:
         or ""
     )
     if not backend_session_id:
-        return False
+        return SCAN_INDETERMINATE
     scanner = _delivery_scanner(
         agent, backend_name, backend_session_id, binding, session_id
     )
     scanner.rewind()
-    return scanner.poll(nonce) == SCAN_FOUND
+    return scanner.full_scan(nonce)
 
 
 def _find_agent(agents: list[dict], name: str) -> dict | None:
@@ -1679,7 +1695,8 @@ def _reconcile_delivery_record(
     }:
         return False
     nonce = str(record.get("nonce") or "")
-    if _scan_for_nonce(session_id, agent, nonce):
+    outcome = _scan_for_nonce(session_id, agent, nonce)
+    if outcome == SCAN_FOUND:
         settle(record, STATUS_DELIVERED, reason="", now=now if now else time.time())
         remove_prompt_file(_optional_path(record.get("prompt_file")))
         return True
@@ -1687,6 +1704,14 @@ def _reconcile_delivery_record(
         # Live uncertainty (R6). Not delivered, and emphatically not failed.
         mark_phase(record, PHASE_UNCONFIRMED)
         return record.get("phase") == PHASE_UNCONFIRMED
+    if outcome != SCAN_ABSENT:
+        # The child is gone, but the scan did not establish that the nonce is
+        # not there: the transcript was unreadable, incomplete, or rotated into
+        # candidates we may not choose between. R6 permits a terminal ``failed``
+        # only on a COMPLETE authoritative negative, so this stays uncertain
+        # rather than being reported as definite non-delivery.
+        mark_phase(record, PHASE_UNCONFIRMED)
+        return False
     attempted_at = _safe_float(record.get("attempted_at"))
     current = now if now is not None else time.time()
     if attempted_at and current - attempted_at < _UNCONFIRMED_FLUSH_GRACE_SECONDS:
@@ -1711,20 +1736,43 @@ def _reconcile_deliveries_for_target(
 
     Nothing is deleted. Kill purges inbox lines; the audit trail is what the
     sender comes back to *after* the target is gone.
+
+    A store write that cannot be persisted is logged and swallowed **here and
+    only here**: kill is a lifecycle operation that must still terminate the
+    process. The rows simply stay where they were, which is honest — nothing
+    was settled — and a later ``delivery_status`` reconciles them.
     """
+    try:
+        _reconcile_deliveries_unchecked(session_id, agent_name, agent)
+    except DeliveryStoreError:
+        logger.debug("Delivery store write failed during kill", exc_info=True)
+
+
+def _reconcile_deliveries_unchecked(
+    session_id: str, agent_name: str, agent: dict | None
+) -> None:
+    """Body of :func:`_reconcile_deliveries_for_target`."""
     with delivery_transaction(_deliveries_file(session_id)) as txn:
         for record in list(txn.data.values()):
             if record.get("to") != agent_name or is_terminal(record):
                 continue
-            if _scan_for_nonce(session_id, agent, str(record.get("nonce") or "")):
+            outcome = _scan_for_nonce(session_id, agent, str(record.get("nonce") or ""))
+            if outcome == SCAN_FOUND:
                 settle(record, STATUS_DELIVERED, reason="", now=time.time())
-            else:
+            elif outcome == SCAN_ABSENT:
+                # A complete authoritative negative against a target that is
+                # being killed: definite non-delivery, and terminal.
                 settle(
                     record,
                     STATUS_FAILED,
                     reason=REASON_NOT_DELIVERED,
                     now=time.time(),
                 )
+            else:
+                # Unreadable or ambiguous. Killing the target does not turn a
+                # scan we could not complete into proof the prompt never
+                # arrived; that is the false status this feature removes.
+                mark_phase(record, PHASE_UNCONFIRMED)
             txn.touch()
 
 
@@ -2555,6 +2603,7 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
     replace_if_idle: bool,
     record: dict,
     deadline: float,
+    parentage: tuple | None = None,
 ) -> dict:
     """B0 — deliver ``prompt`` to ``name`` inside one bounded budget.
 
@@ -2603,6 +2652,27 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             refusal = _direction_refusal(agent, name)
             if refusal is not None:
                 return _FollowUpPrep(refusal=refusal)
+
+            # ...and the parentage the pre-flight authorized against must still
+            # be the parentage now. The guard above only asks "is the CURRENT
+            # spawner me"; that can still pass while the record has been
+            # re-parented since the write that created the audit row was
+            # authorized. Rejecting the stale authorization explicitly is what
+            # lets the caller discard that row instead of keeping it as
+            # evidence of a call C2 says changed nothing.
+            if parentage is not None and _parentage(agent) != parentage:
+                return _FollowUpPrep(
+                    refusal=_follow_up_failure(
+                        REASON_STALE_AUTHORIZATION,
+                        name,
+                        detail=(
+                            f"The recorded spawner of {name!r} changed while this "
+                            "call was starting, so the check that authorized it "
+                            "no longer describes the record. Nothing was sent and "
+                            "nothing was changed. Re-read the agent and retry."
+                        ),
+                    )
+                )
 
             backend_name = str(agent.get("backend") or "")
             try:
@@ -2867,14 +2937,17 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             _delivery_sleep(_DELIVERY_POLL_SECONDS)
 
         plan = prep.plan
-        # Crash-recovery window "after spawn, before sent": the nonce is
-        # durable BEFORE the resume, so a crash here still leaves a searchable
-        # receipt marker rather than an attempt nobody can attribute.
-        _mark_attempt_sent(session_id, record, plan)
         # Phase 2 — the registry lock is NOT held here. Shutdown, resume and
         # confirmation all take real time, and holding a cross-process lock
         # across them would block every registry reader on the machine.
         try:
+            # Crash-recovery window "after spawn, before sent": the nonce is
+            # durable BEFORE the resume, so a crash here still leaves a
+            # searchable receipt marker rather than an attempt nobody can
+            # attribute. Inside the ``try`` so a lost write releases the lease
+            # on its way out instead of stranding the target behind it.
+            _mark_attempt_sent(session_id, record, plan)
+
             # Fail closed: only signal a PID we can prove is still ours.
             if (
                 plan.alive
@@ -2937,6 +3010,11 @@ def _mark_attempt_sent(session_id: str, record: dict, plan: _FollowUpPlan) -> No
     spawn and the confirmation, the nonce is already on disk, so lease expiry
     can reconcile the attempt by searching for it. Writing the nonce *after*
     the resume would leave a delivered prompt no one could attribute.
+
+    Raises :class:`DeliveryStoreError` when that write is lost, and the caller
+    must abandon the attempt: a resume whose nonce never reached disk is a
+    prompt nobody can attribute afterwards — exactly the case this ordering
+    exists to prevent.
     """
     with delivery_transaction(_deliveries_file(session_id)) as txn:
         stored = txn.get(
@@ -3077,10 +3155,232 @@ def _pending_tail(
     )
 
 
+#: Field holding the process currently working one delivery record. This is the
+#: delivery-record-level serialization the FIFO ticket alone cannot provide: two
+#: concurrent calls under one ``(sender, key)`` derive the SAME ticket, so the
+#: lease queue treats them as one caller retrying rather than as two callers.
+ACTIVE_HOLDER_FIELD = "active_holder"
+
+#: A same-key call arrived while another is still working the record.
+REASON_DELIVERY_IN_PROGRESS = "delivery_in_progress"
+#: A same-key call arrived while the previous attempt's fate is still unknown.
+REASON_ATTEMPT_UNRESOLVED = "attempt_unresolved"
+#: The durable row could not be written, so nothing may proceed on it.
+REASON_STORE_UNAVAILABLE = "delivery_store_unavailable"
+#: The parentage the read-only pre-flight authorized is no longer the parentage
+#: under the registry lock.
+REASON_STALE_AUTHORIZATION = "stale_authorization"
+
+
+def _holder_is_live(holder: object) -> bool:
+    """Whether ``holder`` names a process that provably still exists.
+
+    Fail-closed in the same shape as the lease's holder check: an unreadable or
+    mismatched creation token means "not ours", never "probably fine". A dead
+    holder's claim must be reclaimable or one crashed call would wedge a key
+    forever, which is itself a dead end (R1).
+    """
+    if not isinstance(holder, dict):
+        return False
+    mapping = cast("dict[str, Any]", holder)
+    try:
+        pid = int(mapping.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    token = mapping.get("create_token")
+    return _lease_holder_live(pid, str(token) if token else None)
+
+
+def _claim_holder() -> dict:
+    return {
+        "pid": os.getpid(),
+        "create_token": process_manager.creation_token(str(os.getpid())),
+        "claimed_at": time.time(),
+    }
+
+
+def _release_delivery_claim(session_id: str, record: dict) -> None:
+    """Drop this process's claim on ``record`` so the next caller may work it."""
+    sender = str(record.get("sender") or "")
+    key = str(record.get("idempotency_key") or "")
+    if not key:
+        return
+    try:
+        with delivery_transaction(_deliveries_file(session_id)) as txn:
+            stored = txn.get(sender, key)
+            if stored is not None:
+                holder = stored.get(ACTIVE_HOLDER_FIELD)
+                # Someone else's claim means it was reclaimed after we were
+                # presumed dead; dropping it would undo their serialization.
+                if not isinstance(holder, dict) or holder.get("pid") == os.getpid():
+                    stored.pop(ACTIVE_HOLDER_FIELD, None)
+                    txn.touch()
+    except DeliveryStoreError:
+        logger.debug("Failed releasing the delivery claim", exc_info=True)
+    record.pop(ACTIVE_HOLDER_FIELD, None)
+
+
+def _claim_delivery_record(session_id: str, record: dict) -> bool:
+    """Take the active claim on an existing row. Returns whether we got it.
+
+    Used by ``deliver_pending``, which reaches ``_guaranteed_delivery`` without
+    going through ``_open_delivery_record``. Without this a drain and a
+    ``follow_up_agent`` under the same key would derive the same FIFO ticket,
+    be indistinguishable from one caller retrying, and both resume.
+    """
+    sender = str(record.get("sender") or "")
+    key = str(record.get("idempotency_key") or "")
+    if not key:
+        return False
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        stored = txn.get(sender, key)
+        if stored is None or is_terminal(stored):
+            return False
+        if _holder_is_live(stored.get(ACTIVE_HOLDER_FIELD)):
+            return False
+        stored[ACTIVE_HOLDER_FIELD] = _claim_holder()
+        txn.touch()
+        record.update(stored)
+    return True
+
+
+def _discard_delivery_record(session_id: str, record: dict) -> None:
+    """Remove a row this call created for a request that was then refused.
+
+    C2 requires an authoritative refusal to change **nothing**. The row is only
+    ever discarded when this call created it and nothing was sent under it, so
+    no audit evidence can be destroyed: there is nothing yet to be evidence of.
+    """
+    if int(record.get("attempts") or 0) > 0 or record.get("nonce"):
+        return
+    key = record_key(
+        str(record.get("sender") or ""),
+        str(record.get("idempotency_key") or ""),
+    )
+    try:
+        with delivery_transaction(_deliveries_file(session_id)) as txn:
+            stored = txn.data.get(key)
+            if stored is not None and not int(stored.get("attempts") or 0):
+                del txn.data[key]
+                txn.touch()
+    except DeliveryStoreError:
+        logger.debug("Failed discarding a refused delivery row", exc_info=True)
+
+
+def _store_unavailable(name: str) -> dict:
+    """Refuse because the durable row is not on disk (R4/B0)."""
+    return {
+        "success": False,
+        "name": name,
+        "status": STATUS_QUEUED,
+        "phase": PHASE_PENDING,
+        "reason": REASON_STORE_UNAVAILABLE,
+        "retriable": True,
+        "detail": (
+            "The durable delivery record could not be written, so nothing was "
+            "sent. That row is the only thing that would let you recover this "
+            "message's outcome if you lost the response, so proceeding without "
+            "it would leave you with neither a status nor a usable key. Fix the "
+            "session directory (disk full, permissions, read-only mount) and "
+            "retry with the same idempotency_key."
+        ),
+    }
+
+
+def _delivery_in_progress(session_id: str, name: str, record: dict) -> dict:
+    """Refuse a second concurrent call on one key, without sending anything.
+
+    Not a dead end (R1): the record is durable, the caller holds the key, and
+    the tail is completed by the call that already owns it or by a later
+    ``deliver_pending``. What it prevents is two callers resuming one backend
+    conversation under a single idempotency key — the recipient has no dedupe
+    table, so a second resume is a second real prompt.
+    """
+    return _with_delivery_identity(
+        {
+            "success": False,
+            "name": name,
+            "status": STATUS_QUEUED,
+            "phase": PHASE_PENDING,
+            "reason": REASON_DELIVERY_IN_PROGRESS,
+            "retriable": True,
+            "session_id": session_id,
+            "sender_obligation": _TAIL_OBLIGATION,
+            "detail": (
+                "Another call is already working this idempotency_key. Nothing "
+                "was sent by this call. Query delivery_status(idempotency_key) "
+                "for the outcome, or retry once the other call has returned."
+            ),
+        },
+        record,
+    )
+
+
+def _unresolved_attempt_result(session_id: str, name: str, record: dict) -> dict:
+    """Report an in-flight attempt whose fate is still unknown, without resending.
+
+    The plan's rule is explicit: a retry must check whether the prior attempt's
+    nonce already landed **before** re-sending. When that check comes back
+    "still unknown" the answer is to wait, not to send again — the recipient is
+    a backend conversation, not a consumer with a dedupe table, so a second
+    resume delivers the same instruction twice.
+    """
+    return _with_public_status(
+        {
+            "success": False,
+            "name": name,
+            "reason": REASON_ATTEMPT_UNRESOLVED,
+            "retriable": True,
+            "session_id": session_id,
+            "sender_obligation": _TAIL_OBLIGATION,
+            "detail": (
+                "A previous attempt under this idempotency_key was sent and its "
+                "receipt has not appeared yet. It was rescanned just now and is "
+                "still unresolved, so it was NOT sent again. Retry with the same "
+                "key: once the receipt lands this reports delivered, and once "
+                "the child is provably gone with a complete negative scan it "
+                "reports failed."
+            ),
+        },
+        record,
+    )
+
+
+def _reconcile_before_resend(session_id: str, name: str, record: dict) -> dict | None:
+    """Re-read and reconcile the durable row before any resend is considered.
+
+    Returns the answer when the row must NOT be sent again, or ``None`` when it
+    is genuinely at ``pending`` — nothing in flight — and a fresh attempt is
+    correct. ``_prepare``'s ``_reconcile_pending_delivery`` is the same rule at
+    the agent-record level; this is the sender-side row, and both are needed
+    because they answer for different objects.
+    """
+    if record.get("phase") not in {PHASE_SENT, PHASE_UNCONFIRMED}:
+        return None
+    agents = _load_agents(session_id)
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        stored = (
+            txn.get(str(record.get("sender") or ""), str(record["idempotency_key"]))
+            or record
+        )
+        if _reconcile_delivery_record(
+            session_id, stored, _find_agent(agents, str(stored.get("to") or ""))
+        ):
+            txn.touch()
+        record.update(stored)
+    if is_terminal(record):
+        return _settled_result(session_id, name, record)
+    return _unresolved_attempt_result(session_id, name, record)
+
+
 def _open_delivery_record(
     session_id: str, name: str, prompt: str, idempotency_key: str, options: dict
-) -> tuple[dict | None, dict | None]:
-    """Create or reuse this sender's durable record. Returns ``(record, refusal)``.
+) -> tuple[dict | None, dict | None, bool]:
+    """Create or reuse this sender's durable record.
+
+    Returns ``(record, refusal, created)``.
 
     Runs **before any waiting**, under the store's cross-process lock, so the
     check-then-create sequence is atomic against another MCP server doing the
@@ -3096,29 +3396,52 @@ def _open_delivery_record(
     - a record with ANY differing field → ``idempotency_conflict``, and
       nothing is mutated. Silently delivering the new text under the old key
       would make the audit trail lie about what was sent.
+
+    On top of that it takes the record's **active claim**, which is the
+    serialization the FIFO ticket cannot provide. The ticket is derived from
+    ``(sender, key)``, so two concurrent identical calls share it and the lease
+    queue cannot tell them apart from one caller retrying. Claiming the row
+    under the store lock can: whoever gets the claim works the record, and
+    everyone else is told so and sends nothing.
     """
     fingerprint = request_fingerprint(to=name, prompt=prompt, options=options)
     with delivery_transaction(_deliveries_file(session_id)) as txn:
         existing = txn.get(IDENTITY, idempotency_key)
         if existing is not None:
             if existing.get("fingerprint") != fingerprint:
-                return None, _with_delivery_identity(
-                    {
-                        "success": False,
-                        "name": name,
-                        "reason": IDEMPOTENCY_CONFLICT,
-                        "retriable": False,
-                        "detail": (
-                            f"idempotency_key {idempotency_key!r} was already "
-                            f"used for a different message (recipient, prompt "
-                            "or options differ). Nothing was sent and nothing "
-                            "was changed. Use a new key, or repeat the "
-                            "original request byte-for-byte."
-                        ),
-                    },
-                    existing,
+                return (
+                    None,
+                    _with_delivery_identity(
+                        {
+                            "success": False,
+                            "name": name,
+                            "reason": IDEMPOTENCY_CONFLICT,
+                            "retriable": False,
+                            "detail": (
+                                f"idempotency_key {idempotency_key!r} was already "
+                                f"used for a different message (recipient, prompt "
+                                "or options differ). Nothing was sent and nothing "
+                                "was changed. Use a new key, or repeat the "
+                                "original request byte-for-byte."
+                            ),
+                        },
+                        existing,
+                    ),
+                    False,
                 )
-            return dict(existing), None
+            if is_terminal(existing):
+                # Nothing left to work; the caller gets the settled answer and
+                # no claim is taken, so a terminal key is never serialized.
+                return dict(existing), None, False
+            if _holder_is_live(existing.get(ACTIVE_HOLDER_FIELD)):
+                return (
+                    None,
+                    _delivery_in_progress(session_id, name, existing),
+                    False,
+                )
+            existing[ACTIVE_HOLDER_FIELD] = _claim_holder()
+            txn.touch()
+            return dict(existing), None, False
         record = delivery_store.new_record(
             sender=IDENTITY,
             idempotency_key=idempotency_key,
@@ -3128,21 +3451,40 @@ def _open_delivery_record(
         )
         record["prompt"] = prompt
         record["options"] = options
+        record[ACTIVE_HOLDER_FIELD] = _claim_holder()
         txn.put(record)
-        return dict(record), None
+        return dict(record), None, True
 
 
-def _preflight_refusal(session_id: str, name: str) -> dict | None:
+def _parentage(agent: dict) -> tuple[str, str]:
+    """Return the parentage snapshot a C2 authorization is granted against."""
+    return (
+        str(agent.get(SPAWNED_BY_FIELD) or ""),
+        str(agent.get(SPAWNED_BY_SOURCE_FIELD) or ""),
+    )
+
+
+def _preflight_refusal(session_id: str, name: str) -> tuple[dict | None, tuple | None]:
     """Refusals that must leave the session byte-identical (read-only).
 
-    Only the two that carry that promise live here: an absent record, and the
-    R2/C2 downstream-only direction guard. Everything else is decided under
-    the registry lock in ``_prepare``, where it belongs.
+    Returns ``(refusal, parentage)``. The parentage is the snapshot this
+    pre-flight actually authorized against, and it is carried to the
+    authoritative under-lock check so a refusal cannot be split across a change.
+    Without it the two checks can legitimately disagree — the pre-flight passes,
+    the durable record is created, and the locked check then refuses, leaving an
+    audit row behind for a call C2 says must change nothing.
+
+    Only the two refusals that carry the byte-identical promise live here: an
+    absent record, and the R2/C2 downstream-only direction guard. Everything
+    else is decided under the registry lock in ``_prepare``, where it belongs.
     """
     agent = _find_agent(_load_agents(session_id), name)
     if agent is None:
-        return _no_delivery_path(name, "record_removed")
-    return _direction_refusal(agent, name)
+        return _no_delivery_path(name, "record_removed"), None
+    refusal = _direction_refusal(agent, name)
+    if refusal is not None:
+        return refusal, None
+    return None, _parentage(agent)
 
 
 def _settled_result(session_id: str, name: str, record: dict) -> dict:
@@ -3166,7 +3508,7 @@ def _settled_result(session_id: str, name: str, record: dict) -> dict:
     )
 
 
-def _guaranteed_send(
+def _guaranteed_send(  # noqa: PLR0911 - each return is a distinct refusal contract.
     session_id: str,
     name: str,
     prompt: str,
@@ -3210,23 +3552,54 @@ def _guaranteed_send(
     # of the store, as a read-only pre-flight. ``_prepare`` still checks it
     # again under the registry lock — that one is authoritative; this one
     # only decides whether we may touch disk at all.
-    preflight = _preflight_refusal(session_id, name)
+    preflight, parentage = _preflight_refusal(session_id, name)
     if preflight is not None:
         return preflight
 
     options = {"replace_if_idle": replace_if_idle}
-    record, refusal = _open_delivery_record(
-        session_id, name, prompt, idempotency_key, options
-    )
+    try:
+        record, refusal, created = _open_delivery_record(
+            session_id, name, prompt, idempotency_key, options
+        )
+    except DeliveryStoreError:
+        logger.debug("Delivery store write failed while opening", exc_info=True)
+        return _store_unavailable(name)
     if refusal is not None or record is None:
         return refusal or _follow_up_failure("session_not_found", name)
     if is_terminal(record):
         return _settled_result(session_id, name, record)
 
-    deadline = _delivery_clock() + _DELIVERY_CALL_BUDGET_SECONDS
-    return _guaranteed_delivery(
-        session_id, name, prompt, replace_if_idle, record, deadline
-    )
+    try:
+        # Re-read and reconcile BEFORE anything can be granted or resent. A row
+        # still at ``sent``/``unconfirmed`` has an attempt whose fate is not
+        # settled, and sending again on top of it delivers one instruction
+        # twice into a conversation that cannot deduplicate it.
+        unresolved = _reconcile_before_resend(session_id, name, record)
+        if unresolved is not None:
+            return unresolved
+
+        deadline = _delivery_clock() + _DELIVERY_CALL_BUDGET_SECONDS
+        result = _guaranteed_delivery(
+            session_id, name, prompt, replace_if_idle, record, deadline, parentage
+        )
+    except DeliveryStoreError:
+        logger.debug("Delivery store write failed mid-delivery", exc_info=True)
+        return _store_unavailable(name)
+    finally:
+        _release_delivery_claim(session_id, record)
+    if created and result.get("reason") in _C2_REFUSAL_REASONS:
+        # C2: an authoritative refusal changes nothing. The row exists only
+        # because this call created it, and nothing has been sent under it.
+        _discard_delivery_record(session_id, record)
+    return result
+
+
+#: Refusals that must leave the session byte-identical. A row created by the
+#: same call that then hit one of these is rolled back rather than kept as
+#: evidence of a request that was refused.
+_C2_REFUSAL_REASONS = frozenset(
+    {"not_spawner", "parent_unknown", REASON_STALE_AUTHORIZATION}
+)
 
 
 @mcp.tool()
@@ -3294,56 +3667,82 @@ async def delivery_status(idempotency_key: str = "", to: str = "") -> dict:
     prompt that landed after the original call returned reports as delivered
     rather than staying unconfirmed forever.
 
-    Passing `to` instead lists every message you sent that agent. That is a
-    convenience view only: with several messages to one agent it cannot tell
-    you which one you lost the response for, so it is not a substitute for the
-    key.
+    Passing `to` instead lists every message you sent that agent, reconciling
+    each unsettled row the same way. That is a convenience view only: with
+    several messages to one agent it cannot tell you which one you lost the
+    response for, so it is not a substitute for the key.
     """
     session_id = _active_session_id()
 
     def _run() -> dict:
-        if not session_id:
-            return {"success": False, "reason": "session_not_found"}
-        if not idempotency_key:
-            if to:
-                return {
-                    "success": True,
-                    "to": to,
-                    "deliveries": delivery_store.list_for_sender(
-                        _deliveries_file(session_id), IDENTITY, to
-                    ),
-                    "note": (
-                        "Convenience list. Use delivery_status(idempotency_key) "
-                        "to identify one specific message."
-                    ),
-                }
-            return {
-                "success": False,
-                "reason": delivery_store.KEY_REQUIRED,
-                "detail": "Pass either an idempotency_key or a `to` agent name.",
-            }
-        agents = _load_agents(session_id)
-        with delivery_transaction(_deliveries_file(session_id)) as txn:
-            record = txn.get(IDENTITY, idempotency_key)
-            if record is None:
-                # Deliberately indistinguishable from another sender's key:
-                # the namespace is per-sender, so from here it does not exist.
-                return {
-                    "success": False,
-                    "reason": "delivery_not_found",
-                    "idempotency_key": idempotency_key,
-                    "detail": (
-                        "No message with that idempotency_key was sent by you "
-                        "in this session."
-                    ),
-                }
-            if _reconcile_delivery_record(
-                session_id, record, _find_agent(agents, str(record.get("to") or ""))
-            ):
-                txn.touch()
-            return {"success": True, **public_view(record)}
+        try:
+            return _delivery_status(session_id, idempotency_key, to)
+        except DeliveryStoreError:
+            logger.debug(
+                "Delivery store write failed in delivery_status", exc_info=True
+            )
+            return _store_unavailable(to or idempotency_key)
 
     return _annotate(await run_blocking(_run))
+
+
+def _delivery_status(session_id: str, idempotency_key: str, to: str) -> dict:
+    """Body of :func:`delivery_status`, so the store failure has one handler."""
+    if not session_id:
+        return {"success": False, "reason": "session_not_found"}
+    if not idempotency_key:
+        if to:
+            # Reconciled, not a stale snapshot. The tool contract promises
+            # active reconciliation, and a `to` view that answered
+            # ``unconfirmed`` for a row the keyed view would immediately
+            # call ``delivered`` publishes two different truths about one
+            # message. Every unsettled row this sender has for ``to`` is
+            # rescanned before the list is returned.
+            agents = _load_agents(session_id)
+            with delivery_transaction(_deliveries_file(session_id)) as txn:
+                rows = txn.for_sender(IDENTITY, to)
+                for row in rows:
+                    if _reconcile_delivery_record(
+                        session_id,
+                        row,
+                        _find_agent(agents, str(row.get("to") or "")),
+                    ):
+                        txn.touch()
+                deliveries = [public_view(row) for row in rows]
+            return {
+                "success": True,
+                "to": to,
+                "deliveries": deliveries,
+                "note": (
+                    "Convenience list. Use delivery_status(idempotency_key) "
+                    "to identify one specific message."
+                ),
+            }
+        return {
+            "success": False,
+            "reason": delivery_store.KEY_REQUIRED,
+            "detail": "Pass either an idempotency_key or a `to` agent name.",
+        }
+    agents = _load_agents(session_id)
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        record = txn.get(IDENTITY, idempotency_key)
+        if record is None:
+            # Deliberately indistinguishable from another sender's key:
+            # the namespace is per-sender, so from here it does not exist.
+            return {
+                "success": False,
+                "reason": "delivery_not_found",
+                "idempotency_key": idempotency_key,
+                "detail": (
+                    "No message with that idempotency_key was sent by you "
+                    "in this session."
+                ),
+            }
+        if _reconcile_delivery_record(
+            session_id, record, _find_agent(agents, str(record.get("to") or ""))
+        ):
+            txn.touch()
+        return {"success": True, **public_view(record)}
 
 
 @mcp.tool()
@@ -3387,17 +3786,29 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
 
         results: list[dict] = []
         for record in pending:
-            deadline = _delivery_clock() + _DELIVERY_CALL_BUDGET_SECONDS
-            results.append(
-                _guaranteed_delivery(
-                    session_id,
-                    str(record.get("to") or ""),
-                    str(record.get("prompt") or ""),
-                    bool((record.get("options") or {}).get("replace_if_idle", True)),
-                    record,
-                    deadline,
+            target = str(record.get("to") or "")
+            # Same delivery-record serialization the originating call takes.
+            # A drain racing a ``follow_up_agent`` under one key would
+            # otherwise resume the conversation twice.
+            if not _claim_delivery_record(session_id, record):
+                results.append(_delivery_in_progress(session_id, target, record))
+                continue
+            try:
+                deadline = _delivery_clock() + _DELIVERY_CALL_BUDGET_SECONDS
+                results.append(
+                    _guaranteed_delivery(
+                        session_id,
+                        target,
+                        str(record.get("prompt") or ""),
+                        bool(
+                            (record.get("options") or {}).get("replace_if_idle", True)
+                        ),
+                        record,
+                        deadline,
+                    )
                 )
-            )
+            finally:
+                _release_delivery_claim(session_id, record)
 
         return {
             "success": True,
@@ -3405,7 +3816,16 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
             "deliveries": delivery_store.list_for_sender(store, IDENTITY),
         }
 
-    return _annotate(await run_blocking(_run))
+    def _guarded() -> dict:
+        try:
+            return _run()
+        except DeliveryStoreError:
+            logger.debug(
+                "Delivery store write failed in deliver_pending", exc_info=True
+            )
+            return _store_unavailable("")
+
+    return _annotate(await run_blocking(_guarded))
 
 
 def _cleanup_agent_artifacts(

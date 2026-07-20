@@ -83,6 +83,25 @@ _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@=+-]*$")
 _KEY_SEPARATOR = "|"
 
 
+class DeliveryStoreError(RuntimeError):
+    """The store could not be persisted, so nothing may rely on it.
+
+    Raised — never swallowed — because the durable row is the whole recovery
+    story. A caller that also loses its response has no status and no
+    recoverable key when this write is lost, which is precisely the hole the
+    caller-supplied idempotency key exists to close (R4/B0). Returning
+    normally here would report a delivery as underway while the only handle on
+    it was thrown away.
+    """
+
+    def __init__(self, path: object = "") -> None:
+        """Name the store that could not be written."""
+        super().__init__(
+            f"delivery store {path} could not be persisted; "
+            "the in-memory changes were discarded"
+        )
+
+
 def validate_idempotency_key(value: object) -> str | None:
     """Return the error code for ``value``, or ``None`` when it is usable.
 
@@ -223,9 +242,20 @@ def load_records(path: Path) -> dict[str, dict[str, Any]]:
     }
 
 
-def save_records(path: Path, data: dict[str, dict[str, Any]]) -> None:
-    """Atomically persist the store (temp file + replace)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+def save_records(path: Path, data: dict[str, dict[str, Any]]) -> bool:
+    """Atomically persist the store (temp file + replace).
+
+    Returns whether the store actually reached disk. Swallowing the failure
+    here was the defect: the row written *before* any waiting is the sender's
+    only handle on an in-flight message, so a lost write plus a lost response
+    leaves neither a reliable status nor a recoverable key. Mirrors
+    ``leases.save_leases``, for the same reason and with the same obligation on
+    callers: fail closed.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -233,6 +263,8 @@ def save_records(path: Path, data: dict[str, dict[str, Any]]) -> None:
     except OSError:
         with suppress(OSError):
             tmp.unlink(missing_ok=True)
+        return False
+    return True
 
 
 class DeliveryTransaction:
@@ -289,13 +321,17 @@ def delivery_transaction(path: Path) -> Iterator[DeliveryTransaction]:
     the same thing in another process. The file is rewritten only when
     something actually changed, so a pure read — which ``deliver_pending`` and
     ``delivery_status`` both perform — does not churn the store.
+
+    Raises :class:`DeliveryStoreError` when a dirty transaction could not be
+    written. Callers must treat that as "this did not happen": the row a
+    delivery is about to rely on is not on disk, so no resume may begin.
     """
     lock_path = path.with_name(DELIVERIES_LOCK_NAME)
     with file_lock(lock_path):
         txn = DeliveryTransaction(load_records(path))
         yield txn
-        if txn.dirty:
-            save_records(path, txn.data)
+        if txn.dirty and not save_records(path, txn.data):
+            raise DeliveryStoreError(path)
 
 
 def list_for_sender(
@@ -328,6 +364,7 @@ __all__ = [
     "STATUS_DELIVERED",
     "STATUS_FAILED",
     "STATUS_QUEUED",
+    "DeliveryStoreError",
     "DeliveryTransaction",
     "delivery_transaction",
     "is_terminal",
