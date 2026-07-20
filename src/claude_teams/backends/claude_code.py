@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from typing import ClassVar
 
+from claude_teams.agent_output import claude_correlation_token
 from claude_teams.backends._agent_discovery import discover_claude_agents
 from claude_teams.backends.base import (
     AgentProfile,
@@ -181,8 +182,25 @@ class ClaudeCodeBackend(BaseBackend):
         cmd.extend(self._hooks_settings_args(request))
         cmd.extend(self._disallowed_tools_args())
         cmd.append("--")
-        cmd.append(self._prompt_arg(request))
+        cmd.append(self._prompt_arg(request) + self._correlation_suffix(request))
         return cmd
+
+    @staticmethod
+    def _correlation_suffix(request: SpawnRequest) -> str:
+        """Return the per-agent correlation marker for the initial prompt.
+
+        The marker lets ``read_claude_output`` bind this agent's transcript
+        file deterministically when two agents are spawned in the same ``cwd``
+        at nearly the same time (before Claude's own backend session id is
+        known). It is appended to the argv prompt so it lands in the first
+        recorded user message even when the real prompt travels via a file.
+        Only used for the initial spawn; resume already has the session id.
+        """
+        token = claude_correlation_token(request.agent_id)
+        return (
+            f"\n\n[win-agent-teams correlation id: {token} "
+            "— internal marker, ignore this line]"
+        )
 
     def build_resume_command(
         self, request: SpawnRequest, backend_session_id: str

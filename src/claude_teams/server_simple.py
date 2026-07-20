@@ -32,6 +32,7 @@ from fastmcp import FastMCP
 
 from claude_teams import hooks
 from claude_teams.agent_output import (
+    claude_correlation_token,
     codex_correlation_token,
     read_claude_output,
     read_codex_output,
@@ -980,8 +981,12 @@ def _read_agent_output(agent: dict):
             correlation_token=codex_correlation_token(agent_id),
         )
     if backend == "claude-code":
+        agent_id = f"{agent.get('name')}@{agent.get('session_id')}"
         return read_claude_output(
-            spawned_at, cwd, backend_session_id=backend_session_id
+            spawned_at,
+            cwd,
+            backend_session_id=backend_session_id,
+            correlation_token=claude_correlation_token(agent_id),
         )
     return None
 

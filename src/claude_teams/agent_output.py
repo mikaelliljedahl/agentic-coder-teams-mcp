@@ -14,7 +14,7 @@ from typing import Any, cast
 
 _MTIME_SLACK_SECONDS = 2.0
 _REVERSE_READ_CHUNK_SIZE = 64 * 1024
-_CODEX_CORRELATION_PREFIX = "wat-corr:"
+_CORRELATION_PREFIX = "wat-corr:"
 _CORRELATION_SCAN_MAX_LINES = 500
 _LAST_MESSAGE_BUDGET = 1000  # max chars returned for last_message (marker included)
 
@@ -28,7 +28,20 @@ def codex_correlation_token(agent_id: str) -> str:
     appends this token to the initial prompt so the agent's rollout file can
     be bound deterministically to the right logical agent.
     """
-    return f"{_CODEX_CORRELATION_PREFIX}{agent_id}"
+    return f"{_CORRELATION_PREFIX}{agent_id}"
+
+
+def claude_correlation_token(agent_id: str) -> str:
+    """Return the stable per-agent marker embedded in the Claude Code prompt.
+
+    Two Claude Code agents spawned in the same ``cwd`` at nearly the same time
+    are otherwise indistinguishable before Claude's own backend session id is
+    known (discovery falls back to cwd + start-time + newest mtime, so racing
+    agents latch onto the same transcript). The claude-code backend appends
+    this token to the initial prompt so the agent's transcript file can be
+    bound deterministically to the right logical agent.
+    """
+    return f"{_CORRELATION_PREFIX}{agent_id}"
 
 
 @dataclass(frozen=True)
@@ -82,8 +95,17 @@ def read_claude_output(
     max_bytes: int = _LAST_MESSAGE_BUDGET,
     *,
     backend_session_id: str | None = None,
+    correlation_token: str | None = None,
 ) -> AgentOutput | None:
-    """Read the latest Claude Code assistant output for a spawned agent."""
+    """Read the latest Claude Code assistant output for a spawned agent.
+
+    When ``backend_session_id`` is not yet known, cwd + start-time matching
+    cannot tell two concurrently-spawned agents apart. If ``correlation_token``
+    was injected into the prompt, transcripts that actually contain it are
+    preferred so the binding is deterministic; the unfiltered set is used as a
+    fallback when no transcript carries the token yet (e.g. Claude has not
+    flushed the prompt, or the agent predates the marker).
+    """
     if spawned_at <= 0 or not cwd:
         return None
 
@@ -104,6 +126,15 @@ def read_claude_output(
             candidates.append((mtime, path))
     if not candidates:
         return None
+
+    if backend_session_id is None and correlation_token:
+        token_matched = [
+            item
+            for item in candidates
+            if _rollout_contains_token(item[1], correlation_token)
+        ]
+        if token_matched:
+            candidates = token_matched
 
     mtime, path = max(candidates, key=lambda item: item[0])
     backend_session_id = _claude_session_id(path)
