@@ -105,9 +105,19 @@ def load_leases(path: Path) -> dict[str, dict[str, Any]]:
     }
 
 
-def save_leases(path: Path, data: dict[str, dict[str, Any]]) -> None:
-    """Atomically persist the lease store (temp file + replace)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+def save_leases(path: Path, data: dict[str, dict[str, Any]]) -> bool:
+    """Atomically persist the lease store (temp file + replace).
+
+    Returns whether the store actually reached disk. Callers **must** fail
+    closed on ``False``: a lease nobody else can read is not a lease, and
+    reporting ``granted`` after a failed write would let another process
+    reserve the same target and resume the same conversation — the exact
+    double delivery this module exists to prevent.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -115,6 +125,8 @@ def save_leases(path: Path, data: dict[str, dict[str, Any]]) -> None:
     except OSError:
         with suppress(OSError):
             tmp.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def _entry(data: dict[str, dict[str, Any]], agent: str) -> dict[str, Any]:
@@ -293,6 +305,8 @@ def reserve_lease(  # noqa: PLR0913 - the lease's stored fields are its argument
 
     if current is not None or position > 0:
         save_leases(path, data)
+        # A queue place that failed to persist is still not a grant, so the
+        # caller's next attempt simply re-enters the queue. Nothing to fail.
         # ``position`` is how many callers are ahead of this one. The current
         # holder keeps its own ticket at the head of the queue while it works,
         # so a holder plus one waiter puts that waiter at position 1.
@@ -314,7 +328,13 @@ def reserve_lease(  # noqa: PLR0913 - the lease's stored fields are its argument
     stored = asdict(lease)
     stored.pop("agent")
     entry["lease"] = stored
-    save_leases(path, data)
+    if not save_leases(path, data):
+        # Fail closed. The on-disk store is unchanged, so the target still
+        # reads as free to everyone including us; granting here would hand two
+        # callers the same conversation. Queueing is not a dead end (R1): the
+        # caller retries within its budget and gets the cooperative tail if the
+        # disk problem persists.
+        return ReserveResult(LEASE_QUEUED, lease=None, ticket=ticket, position=position)
     return ReserveResult(LEASE_GRANTED, lease=lease, ticket=ticket, position=0)
 
 
@@ -330,8 +350,7 @@ def release_lease(path: Path, agent: str, operation_id: str) -> bool:
         return False
     mapping["lease"] = None
     _drop_waiter(mapping, operation_id)
-    save_leases(path, data)
-    return True
+    return save_leases(path, data)
 
 
 def finalize_lease(path: Path, agent: str, operation_id: str, generation: int) -> bool:
@@ -354,8 +373,10 @@ def finalize_lease(path: Path, agent: str, operation_id: str, generation: int) -
         return False
     mapping["lease"] = None
     _drop_waiter(mapping, operation_id)
-    save_leases(path, data)
-    return True
+    # A finalize that did not reach disk did not win: the lease is still held
+    # on disk, and reporting success would let this attempt write the agent
+    # record while another caller could still be granted the same target.
+    return save_leases(path, data)
 
 
 def force_clear_lease(path: Path, agent: str) -> Lease | None:

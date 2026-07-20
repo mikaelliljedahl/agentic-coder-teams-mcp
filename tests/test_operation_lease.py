@@ -344,6 +344,56 @@ def test_leases_are_written_atomically_via_temp_and_replace(
     assert final_name == path.name
 
 
+def _break_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the atomic replace fail the way a full or read-only disk would."""
+
+    def boom(self: Path, target) -> Path:
+        raise OSError
+
+    monkeypatch.setattr(Path, "replace", boom)
+
+
+def test_a_reservation_that_cannot_be_persisted_is_not_granted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: a lease nobody can read is not a lease.
+
+    ``save_leases`` swallowed the ``OSError``, so a caller could be told
+    ``granted`` while the store on disk still showed the target free — and
+    another process would then reserve the same target and resume the same
+    conversation, which is the exact double-delivery the lease exists to
+    prevent. Reporting ``queued`` instead costs a retry and loses nothing.
+    """
+    path = _store(tmp_path)
+    _break_writes(monkeypatch)
+
+    result = _reserve(path)
+
+    assert result.status == LEASE_QUEUED
+    assert result.lease is None
+    assert active_lease(path, "worker") is None
+
+
+def test_a_finalize_that_cannot_be_persisted_does_not_report_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _store(tmp_path)
+    _reserve(path, generation=7, operation_id="op-1")
+    _break_writes(monkeypatch)
+
+    assert finalize_lease(path, "worker", "op-1", 7) is False
+    assert release_lease(path, "worker", "op-1") is False
+
+
+def test_save_leases_reports_whether_it_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _store(tmp_path)
+    assert save_leases(path, {"worker": {"lease": None, "waiters": []}}) is True
+    _break_writes(monkeypatch)
+    assert save_leases(path, {"worker": {"lease": None, "waiters": []}}) is False
+
+
 def test_lease_store_is_not_the_agents_registry_file() -> None:
     assert leases.LEASES_FILE_NAME != "agents.json"
 
