@@ -206,8 +206,9 @@ Add a per-backend branch to `server_simple._hook_extra` for any spawn-time setup
 
 So `check_agent`/`follow_up_agent` can recover `last_message` and
 `backend_session_id` even when the agent never messaged, add a
-`read_<name>_output(...)` in `src/claude_teams/agent_output.py` and a branch in
-`server_simple._read_agent_output` (today it handles `codex`, `claude-code`, `pi`).
+`read_<name>_output(...)` in `src/claude_teams/agent_output.py` and return it
+from your binder's `legacy_read` (see §6b). There is no longer a
+`server_simple._read_agent_output` dispatch — the binding ladder replaced it.
 The reader parses the CLI's own session/rollout log. When you control the storage
 location and session id (as pi does via `--session-dir`/`--session-id`), enumeration
 is a single directory listing (`agent_output.read_pi_output`). When you don't
