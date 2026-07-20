@@ -409,13 +409,33 @@ internal detail.
 |---|---|---|---|---|---|
 | `check_agent` (`:1540-1548`) | report `pending`, **do not persist** an id | report state, **do not persist** an id | same | current behaviour, flag in payload | report, no persist |
 | `follow_up_agent` (`:1600-1605`) | refuse, **retriable** — the binding may yet appear | refuse — cannot confirm delivery | refuse | **refuse** — see below | refuse, retriable |
-| `list_agents` compact/full (`:1904-1913`, `:1949-1966`) | show `pending`, no id | show state, no id | same | show state, id marked unverified | show state |
+| `list_agents` **full** (`:1949-1966`) | show `pending`, no id | show state, no id | same | show state, id marked unverified | show state |
+| `list_agents` **compact** (`:1904-1913`) | `binding: null` on the marker fast path, otherwise as full | same | same | same | same |
 | `agent_status` no-marker fallback (`:1973-1984`) | `state="unknown"`, **stay cheap** | `state="unknown"`, **stay cheap** — no extra scan | same | current behaviour | `state="unknown"` |
 
 `pending` and `indeterminate` are both retriable and must be distinguishable
 from the three terminal outcomes: a caller that retries on `unverified` would
 spin forever, and one that gives up on `pending` would fail a spawn that was
 about to bind normally.
+
+**Compact `list_agents` is exempt on the marker fast path**, and the row above
+was split to say so. An earlier single row required all five outcomes from both
+forms, which the A2 review correctly found unimplementable alongside the fast
+path: answering from a hook-written marker means *not* opening a transcript, so
+producing a binding outcome there would delete the fast path's only reason to
+exist — on the highest-traffic tool, reintroducing exactly the per-agent-scan
+cost that motivated two-tier enumeration. Resolving it in a window-bounded mode
+was considered and rejected as the worst of both: still ≥1 scan per agent per
+call, and outcomes limited by the mtime window rather than authoritative.
+
+This is not a weakening, because the same table already states cheapness as an
+A6 value in its own right (`agent_status`: "stay cheap — no extra scan"). A rule
+cannot demand cheapness in one cell and defeat it in another. `binding: null`
+means **"not evaluated on this call"** — it is not a sixth outcome and must
+never be reported as one. Every authoritative outcome remains one call away via
+`agent_status`, `check_agent`, `list_agents(full=True)`, or `follow_up_agent`,
+and the two consumers that can *act* destructively — `follow_up_agent` and
+`check_agent`'s persist path — are never answered from a marker.
 
 **`legacy` refuses follow-up.** An earlier draft of this table said "proceed,
 current behaviour"; that contradicted A2 and R8 and is superseded. A legacy
@@ -810,10 +830,16 @@ poll interval — no real sleeps.
 - Expired lease → recovery finds the nonce before retrying; no duplicate prompt.
 
 **A — consumers (A6)**
-- Each of `check_agent`, `list_agents` compact/full, `agent_status` no-marker
+- Each of `check_agent`, `list_agents(full=True)`, `agent_status` no-marker
   fallback, follow-up × each of the **five** outcomes (`pending`, `unverified`,
   `ambiguous`, `legacy`, `indeterminate`). `check_agent` must not persist an
-  unverified or pending id; `agent_status` must not add a scan.
+  unverified or pending id; `agent_status` must not add a scan, and its
+  fallback must resolve in a bounded mode — asserting `all_history=False`, not
+  merely counting resolver calls, since a mocked resolver cannot see its own
+  internal all-history fallback.
+- Compact `list_agents` on the marker fast path returns `binding: null` and
+  performs **no** transcript scan. Assert both: the null and the absence of the
+  scan. `null` is "not evaluated", never a sixth outcome.
 - `pending` and `indeterminate` are reported as retriable; the three terminal
   outcomes are not. A consumer must not retry `unverified` nor give up on
   `pending`.
