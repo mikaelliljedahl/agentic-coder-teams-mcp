@@ -448,6 +448,31 @@ def test_a_missing_lease_store_reads_as_empty(tmp_path: Path) -> None:
     assert load_leases(_store(tmp_path)) == {}
 
 
+def test_an_unreadable_lease_store_is_distinguished_from_an_absent_one(
+    tmp_path: Path,
+) -> None:
+    """The ``OSError`` branch, which corrupt JSON does not reach.
+
+    Induced at the OS boundary — a directory where the store should be — not by
+    patching ``load_leases``. This mirrors the delivery store's equivalent test,
+    which existed while this one did not: a review found that reverting
+    ``load_leases``' ``OSError`` branch to ``return {}`` survived the **entire**
+    suite, because the corrupt-JSON test below covers only the decode branch.
+
+    The gap mattered most on the platform this runs on. Corrupt JSON needs a
+    torn write; an ``OSError`` here is the everyday Windows case — a sharing
+    violation from a concurrent MCP server, or an ACL denial — and failing open
+    on it grants a lease over a live holder.
+    """
+    path = _store(tmp_path)
+    path.mkdir(parents=True)  # read() raises OSError, not FileNotFoundError
+
+    with pytest.raises(LeaseStoreUnreadableError):
+        load_leases(path)
+    with pytest.raises(LeaseStoreUnreadableError):
+        active_lease(path, "worker")
+
+
 def test_a_corrupt_lease_store_never_reads_as_no_lease_held(tmp_path: Path) -> None:
     """An error is not an absence.
 
