@@ -113,6 +113,7 @@ class TestDecisionCore:
 
         assert result.action == "block"
         assert result.code == "D3"
+        assert result.reason is not None  # a block always carries a reason
         assert "alice" in result.reason
         assert "read_messages" in result.reason
 
@@ -133,6 +134,7 @@ class TestDecisionCore:
 
         assert result.action == "block"
         assert result.code == "D5"
+        assert result.reason is not None  # a block always carries a reason
         # The rendered real watch command is embedded (persistent-false-negative
         # guard: the model must be able to run exactly what the match recognises).
         assert "claude_teams.cli" in result.reason
@@ -243,6 +245,7 @@ class TestIdentityAndArming:
 
         assert result.action == "block"
         assert result.code == "D3"
+        assert result.reason is not None  # a block always carries a reason
         assert "bob" in result.reason
         assert "zoe" not in result.reason
 

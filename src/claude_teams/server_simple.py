@@ -2451,16 +2451,19 @@ def _group_has_wake_token(group: object) -> bool:
     """Return whether a Stop matcher group invokes the lead-wake module."""
     if not isinstance(group, dict):
         return False
-    entries = group.get("hooks")
+    entries = cast("dict[str, Any]", group).get("hooks")
     if not isinstance(entries, list):
         return False
     return any(
-        isinstance(h, dict) and hooks._WAKE_MODULE in str(h.get("command", ""))
+        isinstance(h, dict)
+        and hooks._WAKE_MODULE in str(cast("dict[str, Any]", h).get("command", ""))
         for h in entries
     )
 
 
-def _install_wake_hook(config: dict, wake_matcher: dict, *, remove: bool) -> dict:
+def _install_wake_hook(
+    config: dict[str, Any], wake_matcher: dict[str, Any], *, remove: bool
+) -> dict[str, Any]:
     """Return ``config`` with the lead-wake ``Stop`` matcher upserted or removed.
 
     Idempotent and non-destructive: any existing lead-wake group is dropped
