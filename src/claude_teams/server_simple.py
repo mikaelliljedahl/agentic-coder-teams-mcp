@@ -1463,6 +1463,10 @@ class _FollowUpPlan:
     agent_cwd: str
     spawned_by: str
     spawned_by_source: str
+    #: Copy of the target's registry record as phase 1 saw it. Stored on the
+    #: durable row so a rescan survives the record's removal (see
+    #: :func:`_scan_target`).
+    agent_snapshot: dict
 
 
 @dataclass(frozen=True)
@@ -1692,6 +1696,38 @@ def _find_agent(agents: list[dict], name: str) -> dict | None:
     return next((a for a in agents if a.get("name") == name), None)
 
 
+#: Copy of the target's registry record, stored on the delivery row when an
+#: attempt is made. See :func:`_scan_target`.
+TARGET_SNAPSHOT_FIELD = "target_snapshot"
+
+
+def _scan_snapshot(agent: dict | None) -> dict | None:
+    """Freeze what a later rescan needs to find this attempt's receipt."""
+    return dict(agent) if agent is not None else None
+
+
+def _scan_target(record: dict, agent: dict | None) -> dict | None:
+    """Return the record to scan for ``record``'s nonce, agent gone or not.
+
+    ``kill_agent`` deletes the target from ``agents.json``, and ``_scan_for_nonce``
+    answers ``indeterminate`` for a missing record — so before this existed, an
+    attempt whose settlement write was lost at kill time could never be
+    reconciled again by anything. Kill still terminates the process even when
+    that write fails (it is a lifecycle operation, and hanging on a disk error
+    would be worse), but the evidence path must survive it, so the transcript
+    binding is copied onto the durable row at attempt time and outlives the
+    registry record.
+
+    Liveness is deliberately NOT taken from the snapshot: it is a frozen copy,
+    and a recycled PID inside it would read as a live child. Callers pass the
+    real (possibly ``None``) record for that, and this only for scanning.
+    """
+    if agent is not None:
+        return agent
+    snapshot = record.get(TARGET_SNAPSHOT_FIELD)
+    return cast("dict[str, Any]", snapshot) if isinstance(snapshot, dict) else None
+
+
 def _reconcile_delivery_record(
     session_id: str, record: dict, agent: dict | None, *, now: float | None = None
 ) -> bool:
@@ -1714,7 +1750,7 @@ def _reconcile_delivery_record(
     }:
         return False
     nonce = str(record.get("nonce") or "")
-    outcome = _scan_for_nonce(session_id, agent, nonce)
+    outcome = _scan_for_nonce(session_id, _scan_target(record, agent), nonce)
     if outcome == SCAN_FOUND:
         settle(record, STATUS_DELIVERED, reason="", now=now if now else time.time())
         remove_prompt_file(_optional_path(record.get("prompt_file")))
@@ -1775,7 +1811,11 @@ def _reconcile_deliveries_unchecked(
         for record in list(txn.data.values()):
             if record.get("to") != agent_name or is_terminal(record):
                 continue
-            outcome = _scan_for_nonce(session_id, agent, str(record.get("nonce") or ""))
+            outcome = _scan_for_nonce(
+                session_id,
+                _scan_target(record, agent),
+                str(record.get("nonce") or ""),
+            )
             if outcome == SCAN_FOUND:
                 settle(record, STATUS_DELIVERED, reason="", now=time.time())
             elif outcome == SCAN_ABSENT:
@@ -2916,6 +2956,7 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                     spawned_by_source=str(
                         agent.get(SPAWNED_BY_SOURCE_FIELD) or SPAWNED_BY_SOURCE_SPAWN
                     ),
+                    agent_snapshot=dict(agent),
                 ),
                 ticket=reservation.ticket,
             )
@@ -3089,6 +3130,10 @@ def _mark_attempt_sent(session_id: str, record: dict, plan: _FollowUpPlan) -> No
         target["attempts"] = int(target.get("attempts") or 0) + 1
         target["attempted_at"] = time.time()
         target["prompt_file"] = str(plan.prompt_file) if plan.prompt_file else ""
+        # Pre-resume binding, so a crash between here and the resume still
+        # leaves a rescannable row even if the registry record is later
+        # removed. ``_record_outcome`` refreshes it with the post-resume one.
+        target[TARGET_SNAPSHOT_FIELD] = _scan_snapshot(plan.agent_snapshot)
         mark_phase(target, PHASE_SENT)
         txn.put(target)
         record.update(target)
@@ -3113,11 +3158,19 @@ def _record_outcome(
     - any other failure → terminal ``failed``. The child is provably gone with
       no receipt: definite non-delivery.
     """
+    # Post-resume binding: the resume can mint a new backend session id and PID,
+    # and the snapshot a later rescan uses must describe the child the nonce was
+    # actually delivered to, not the one phase 1 saw. Read outside the store
+    # lock; a record that has since been removed simply leaves the pre-resume
+    # snapshot in place, which is still better than nothing to scan at all.
+    refreshed = _scan_snapshot(_find_agent(_load_agents(session_id), plan.agent_name))
     with delivery_transaction(_deliveries_file(session_id)) as txn:
         stored = txn.get(
             str(record.get("sender") or ""), str(record["idempotency_key"])
         )
         target = stored if stored is not None else record
+        if refreshed is not None:
+            target[TARGET_SNAPSHOT_FIELD] = refreshed
         if result.get("status") == "delivered":
             settle(target, STATUS_DELIVERED, reason="", now=time.time())
         elif result.get("phase") == PHASE_UNCONFIRMED:
@@ -3133,7 +3186,6 @@ def _record_outcome(
             )
         txn.put(target)
         record.update(target)
-    _ = plan
     return _with_public_status(result, record)
 
 

@@ -777,6 +777,21 @@ The scan reports one of four outcomes and they are **not** collapsed to a bool
 Only `absent` — a **complete authoritative negative** — may become terminal. An
 error is not an absence, exactly as in the binding ladder. Nothing is deleted.
 
+**The rescan survives the kill.** `kill_agent` removes the agent from
+`agents.json`, and `_scan_for_nonce` answers `indeterminate` for a missing
+record — so if the kill-time settlement write is lost (the one place a store
+write is logged and swallowed), the row would previously have been stranded at
+`unconfirmed` with nothing able to move it, because the only evidence path had
+just been deleted. The transcript binding is therefore copied onto the durable
+row at attempt time (`target_snapshot`, written by `_mark_attempt_sent` and
+refreshed post-resume by `_record_outcome`), and `_scan_target` falls back to it
+when the registry record is gone. A later `delivery_status` can then still find
+the receipt and settle honestly.
+
+The snapshot supplies **scanning only, never liveness**: it is a frozen copy,
+and a recycled PID inside it would read as a live child. Callers pass the real
+(possibly absent) record for the liveness question.
+
 ### It starts a NEW OS PROCESS
 
 This is the single most important fact about this tool. `follow_up_agent` does

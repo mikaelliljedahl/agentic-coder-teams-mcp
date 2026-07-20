@@ -853,6 +853,71 @@ def test_a_claim_with_a_provably_gone_holder_is_reclaimed(
 
 
 # ==========================================================================
+# Round-2 critical 3 — kill must leave the rescan possible
+# ==========================================================================
+
+
+def test_an_unsettled_row_can_still_be_rescanned_after_the_agent_is_gone(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kill deletes the agent record; the evidence path must outlive it.
+
+    ``_scan_for_nonce`` answers ``indeterminate`` for a missing agent, so once
+    kill removed the record an attempt whose settlement write had been lost
+    could never settle again — ``unconfirmed`` forever, with nothing able to
+    move it. The transcript binding is now copied onto the durable row at
+    attempt time, so a later ``delivery_status`` can still find the receipt.
+    """
+    nonce = new_delivery_nonce()
+    record = _delivery_record(nonce)
+    record[server_simple.TARGET_SNAPSHOT_FIELD] = _agent_record()
+    with ds.delivery_transaction(env.deliveries) as txn:
+        txn.put(record)
+
+    # The receipt landed, but the agent record is gone (killed).
+    _append(env.transcript, _claude_user_record(f"x {DELIVERY_MARKER_PREFIX}{nonce}"))
+    server_simple._save_agents(SESSION, [])
+    assert server_simple._find_agent(server_simple._load_agents(SESSION), AGENT) is None
+
+    stored = _record()
+    moved = server_simple._reconcile_delivery_record(
+        SESSION, stored, None, now=10_000.0
+    )
+
+    assert moved is True
+    assert stored["status"] == ds.STATUS_DELIVERED, (
+        "a receipt on disk must still be findable after the agent record is "
+        "purged, or the row is stranded at unconfirmed forever"
+    )
+
+
+def test_without_a_snapshot_a_purged_agent_leaves_the_row_uncertain(env) -> None:
+    """The complement: no snapshot, no scan — and still never a false failure."""
+    record = _delivery_record(new_delivery_nonce())
+    with ds.delivery_transaction(env.deliveries) as txn:
+        txn.put(record)
+    server_simple._save_agents(SESSION, [])
+
+    stored = _record()
+    server_simple._reconcile_delivery_record(SESSION, stored, None, now=10_000.0)
+
+    assert stored["status"] == ds.STATUS_QUEUED
+    assert stored["phase"] == ds.PHASE_UNCONFIRMED
+
+
+def test_the_scan_target_never_supplies_liveness(env) -> None:
+    """A frozen snapshot's PID must not be mistaken for a live child."""
+    record = _delivery_record(new_delivery_nonce())
+    record[server_simple.TARGET_SNAPSHOT_FIELD] = _agent_record()
+
+    assert server_simple._scan_target(record, None) is not None
+    # ...but the caller passes the real (absent) record for liveness, so a
+    # complete negative after the grace window still settles.
+    server_simple._reconcile_delivery_record(SESSION, record, None, now=10_000.0)
+    assert record["status"] == ds.STATUS_FAILED
+
+
+# ==========================================================================
 # Round-2 warning 1 — the C2 rollback must not lie on disk failure
 # ==========================================================================
 
