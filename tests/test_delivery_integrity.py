@@ -37,6 +37,10 @@ from claude_teams.agent_output import (
     BindingResult,
 )
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.backends.process_manager import (
+    OWNERSHIP_INDETERMINATE,
+    OWNERSHIP_NOT_OURS,
+)
 from claude_teams.delivery import (
     DELIVERY_MARKER_PREFIX,
     SCAN_ABSENT,
@@ -751,3 +755,149 @@ async def test_a_reparented_record_is_rejected_even_when_the_spawner_still_match
     assert result["reason"] == "stale_authorization"
     assert backend.resume_calls == []
     assert _maybe_record() is None, "a refused call left an audit row behind"
+
+
+# ==========================================================================
+# Round-2 critical 2 — a failed claim release must not wedge a valid delivery
+# ==========================================================================
+
+
+def _break_atomic_replace(monkeypatch: pytest.MonkeyPatch, suffix: str):
+    """Induce a real ``OSError`` at the atomic replace, as a full disk would.
+
+    Deliberately at the OS boundary and not on the function under test, so the
+    production failure path runs for real. Returns a toggle so the disk can be
+    "repaired" mid-test without ``monkeypatch.undo()``, which would also unwind
+    the ``env`` fixture's session redirection.
+    """
+    original = Path.replace
+    broken = {"on": True}
+
+    def _raise(self: Path, target):
+        if broken["on"] and str(target).endswith(suffix):
+            raise OSError(28, "No space left on device")
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "replace", _raise)
+    return broken
+
+
+def test_a_claim_release_that_fails_to_persist_does_not_wedge_the_key(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live-process claim nobody can clear is an R1 dead end.
+
+    Before the fix, ``_release_delivery_claim`` swallowed the failed write and
+    left ``active_holder`` on disk naming THIS still-live server. Every later
+    call under the key — and every ``deliver_pending`` drain — then refused
+    ``delivery_in_progress`` against a claim that only this process could clear
+    and that this process would never try to clear again.
+    """
+    record = ds.new_record(
+        sender="team-lead",
+        idempotency_key=KEY,
+        to=AGENT,
+        fingerprint="f",
+        created_at=0.0,
+    )
+    record[server_simple.ACTIVE_HOLDER_FIELD] = server_simple._claim_holder()
+    with ds.delivery_transaction(env.deliveries) as txn:
+        txn.put(dict(record))
+
+    broken = _break_atomic_replace(monkeypatch, ds.DELIVERIES_FILE_NAME)
+    assert server_simple._release_delivery_claim(SESSION, dict(record)) is False
+    broken["on"] = False
+
+    stranded = _record()[server_simple.ACTIVE_HOLDER_FIELD]
+    assert stranded["pid"] == server_simple.os.getpid(), (
+        "precondition: the stale claim still names this live process"
+    )
+    assert server_simple._claim_is_held(stranded) is False, (
+        "a claim this process has finished must not block the next caller "
+        "just because its release write was lost"
+    )
+
+
+def test_a_claim_this_process_is_still_working_does_block(env) -> None:
+    """The reclaim must not become a free-for-all: a working claim still holds."""
+    holder = server_simple._claim_holder()
+
+    assert server_simple._claim_is_held(holder) is True
+
+
+def test_a_claim_with_an_unprovable_foreign_holder_is_not_reclaimed(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 critical 4, at the record claim: indeterminate is not death."""
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "ownership_probe",
+        lambda handle, token=None: OWNERSHIP_INDETERMINATE,
+    )
+    foreign = {"pid": 4242, "create_token": "tok-4242", "claim_id": "other"}
+
+    assert server_simple._claim_is_held(foreign) is True
+
+
+def test_a_claim_with_a_provably_gone_holder_is_reclaimed(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "ownership_probe",
+        lambda handle, token=None: OWNERSHIP_NOT_OURS,
+    )
+    foreign = {"pid": 4242, "create_token": "tok-4242", "claim_id": "other"}
+
+    assert server_simple._claim_is_held(foreign) is False
+
+
+# ==========================================================================
+# Round-2 warning 1 — the C2 rollback must not lie on disk failure
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_cannot_remove_its_row_says_so(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C2 promises "nothing changed"; a swallowed rollback made that false.
+
+    If row creation succeeds and the disk fails during refusal rollback, the
+    API used to return ``stale_authorization`` and claim nothing changed while
+    the row it promised to remove was still there — and the idempotency key was
+    silently consumed. Nothing was sent either way, so the refusal stands; what
+    changes is that the response no longer overstates what it knows.
+    """
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    original = server_simple._open_delivery_record
+    broken: dict[str, bool] = {}
+
+    def _reparent_then_break_the_disk(*args, **kwargs):
+        opened = original(*args, **kwargs)
+        with server_simple._agents_transaction(SESSION) as agents:
+            record = server_simple._find_agent(agents, AGENT)
+            assert record is not None
+            record[SPAWNED_BY_FIELD] = "someone-else"
+            server_simple._save_agents_transaction(SESSION, agents)
+        broken.update(_break_atomic_replace(monkeypatch, ds.DELIVERIES_FILE_NAME))
+        return opened
+
+    monkeypatch.setattr(
+        server_simple, "_open_delivery_record", _reparent_then_break_the_disk
+    )
+
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", KEY)
+    broken["on"] = False
+
+    assert result["success"] is False
+    assert result["reason"] in {"not_spawner", "stale_authorization"}
+    assert backend.resume_calls == [], "a refusal must still send nothing"
+    assert result.get("record_discarded") is False, (
+        "the refusal claimed nothing changed while its row survived on disk"
+    )
+    assert "could not be removed" in result["detail"]
+    assert _maybe_record() is not None, "precondition: the row really did survive"

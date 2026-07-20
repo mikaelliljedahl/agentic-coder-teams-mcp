@@ -727,8 +727,28 @@ Three rules that are easy to get wrong:
   queue cannot tell them apart from one caller retrying. The delivery record
   therefore carries an `active_holder` claim, taken under the store lock. A
   second concurrent call gets `queued(phase="pending",
-  reason="delivery_in_progress")` and sends nothing; a claim whose holder
-  process is provably gone is reclaimed, so a crashed call cannot wedge a key.
+  reason="delivery_in_progress")` and sends nothing.
+
+  **When a claim may be reclaimed** — a crashed or wedged call must not hold a
+  key forever (itself an R1 dead end), but reclaiming on a guess authorizes a
+  second resume of one conversation. There are three cases, not two:
+
+  - *Our own process.* `_ACTIVE_CLAIM_IDS` is exact: this process knows which
+    per-call `claim_id`s it is working. A claim stamped with our PID whose id is
+    not in that set is one we already finished — most often because its release
+    write was lost — and is reclaimable. Reclaiming it cannot permit concurrent
+    work, because the only process that could be doing that work is us.
+  - *Another process, provably gone.* Reclaimable.
+  - *Another process, ownership unprovable.* **Not** reclaimable.
+
+  That third case is why liveness is three-valued.
+  `process_manager.ownership_probe` returns `ours` / `not_ours` /
+  `indeterminate`, and only `not_ours` authorizes a reclaim. `owns_process`
+  remains a bool and remains the gate for *destructive* operations, where
+  "unproven" and "not ours" must behave identically — but a reclaim gate refuses
+  in the opposite direction, so the two cannot share one bool. An unreadable
+  creation token against a live PID is uncertainty, not proof of death; the
+  operation lease applies the same rule via `leases._holder_reclaimable`.
 
 The lease is **not** held across `unconfirmed`. It converts to the durable
 pending-delivery record on the agent, and the sender-side row stays at

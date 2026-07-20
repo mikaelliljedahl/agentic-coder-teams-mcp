@@ -45,6 +45,7 @@ from claude_teams.agent_output import (
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.process_manager import (
+    OWNERSHIP_NOT_OURS,
     OWNERSHIP_OURS,
     process_manager,
 )
@@ -3234,13 +3235,38 @@ REASON_STORE_UNAVAILABLE = "delivery_store_unavailable"
 REASON_STALE_AUTHORIZATION = "stale_authorization"
 
 
-def _holder_is_live(holder: object) -> bool:
-    """Whether ``holder`` names a process that provably still exists.
+#: Claim ids this process is *currently* working, i.e. between
+#: :func:`_claim_holder` and :func:`_release_delivery_claim`. This is what makes
+#: a claim reclaimable without inventing an expiry policy: for our own PID we do
+#: not have to infer anything from the OS, we simply know. Guarded by a lock
+#: because ``run_blocking`` runs delivery work on a thread pool.
+_ACTIVE_CLAIM_IDS: set[str] = set()
+_ACTIVE_CLAIM_LOCK = threading.Lock()
 
-    Fail-closed in the same shape as the lease's holder check: an unreadable or
-    mismatched creation token means "not ours", never "probably fine". A dead
-    holder's claim must be reclaimable or one crashed call would wedge a key
-    forever, which is itself a dead end (R1).
+#: Per-call identity of a claim, distinct from the holder PID. Two calls in one
+#: server process share a PID; only this tells them apart.
+CLAIM_ID_FIELD = "claim_id"
+
+
+def _claim_is_held(holder: object) -> bool:  # noqa: PLR0911 - each return is a distinct liveness verdict.
+    """Whether ``holder``'s claim is still being worked, so nobody else may.
+
+    Three inputs, and keeping them apart is the point:
+
+    - **Our own PID.** ``_ACTIVE_CLAIM_IDS`` is authoritative and exact: this
+      process knows which claims it is working. A claim stamped with our PID
+      whose id is NOT in that set is one we already finished — most often
+      because its release write failed. Previously such a claim read as "live
+      holder" forever, so every later valid caller under that key queued behind
+      a claim that only this process could clear and that this process would
+      never try to clear again: a permanent R1 dead end from one transient disk
+      error. It is now reclaimable, and reclaiming it cannot permit concurrent
+      work, because the one process that could be doing that work is us.
+    - **Another process, provably gone.** Reclaimable, as before.
+    - **Another process, ownership unprovable.** NOT reclaimable. An unreadable
+      creation token against a live PID is uncertainty; treating it as death
+      authorizes a second resume of one conversation (the same "an error is not
+      an absence" shape as the store loaders).
     """
     if not isinstance(holder, dict):
         return False
@@ -3252,23 +3278,59 @@ def _holder_is_live(holder: object) -> bool:
     if pid <= 0:
         return False
     token = mapping.get("create_token")
-    return _lease_holder_live(pid, str(token) if token else None)
+    outcome = _lease_holder_probe(pid, str(token) if token else None)
+    if outcome == OWNERSHIP_NOT_OURS:
+        return False
+    if pid == os.getpid():
+        claim_id = mapping.get(CLAIM_ID_FIELD)
+        if not isinstance(claim_id, str) or not claim_id:
+            # A claim from before this field existed, or a torn write. We
+            # cannot say it is ours-and-finished, so it stays held.
+            return True
+        with _ACTIVE_CLAIM_LOCK:
+            return claim_id in _ACTIVE_CLAIM_IDS
+    # Another process: live, or unprovable. Both stay held.
+    return True
 
 
 def _claim_holder() -> dict:
+    """Stamp a claim for this call and register it as in-progress."""
+    claim_id = uuid.uuid4().hex
+    with _ACTIVE_CLAIM_LOCK:
+        _ACTIVE_CLAIM_IDS.add(claim_id)
     return {
         "pid": os.getpid(),
         "create_token": process_manager.creation_token(str(os.getpid())),
         "claimed_at": time.time(),
+        CLAIM_ID_FIELD: claim_id,
     }
 
 
-def _release_delivery_claim(session_id: str, record: dict) -> None:
-    """Drop this process's claim on ``record`` so the next caller may work it."""
+def _forget_claim(record: dict) -> None:
+    """Deregister the in-process claim id, whatever happens to the disk write."""
+    holder = record.get(ACTIVE_HOLDER_FIELD)
+    if isinstance(holder, dict):
+        claim_id = cast("dict[str, Any]", holder).get(CLAIM_ID_FIELD)
+        if isinstance(claim_id, str) and claim_id:
+            with _ACTIVE_CLAIM_LOCK:
+                _ACTIVE_CLAIM_IDS.discard(claim_id)
+
+
+def _release_delivery_claim(session_id: str, record: dict) -> bool:
+    """Drop this process's claim on ``record`` so the next caller may work it.
+
+    Returns whether the release reached disk. A ``False`` is no longer a wedge:
+    the in-process registration is dropped **first and unconditionally**, so
+    even a stranded on-disk claim is now recognised as finished by the only
+    process that could still be working it (:func:`_claim_is_held`). Callers get
+    the result so they can say so rather than implying a clean handover.
+    """
+    _forget_claim(record)
     sender = str(record.get("sender") or "")
     key = str(record.get("idempotency_key") or "")
     if not key:
-        return
+        return True
+    released = True
     try:
         with delivery_transaction(_deliveries_file(session_id)) as txn:
             stored = txn.get(sender, key)
@@ -3280,8 +3342,15 @@ def _release_delivery_claim(session_id: str, record: dict) -> None:
                     stored.pop(ACTIVE_HOLDER_FIELD, None)
                     txn.touch()
     except DeliveryStoreError:
-        logger.debug("Failed releasing the delivery claim", exc_info=True)
+        logger.warning(
+            "Failed releasing the delivery claim for %s; the on-disk claim is "
+            "stale but no longer blocks this process",
+            key,
+            exc_info=True,
+        )
+        released = False
     record.pop(ACTIVE_HOLDER_FIELD, None)
+    return released
 
 
 def _claim_delivery_record(session_id: str, record: dict) -> bool:
@@ -3300,7 +3369,7 @@ def _claim_delivery_record(session_id: str, record: dict) -> bool:
         stored = txn.get(sender, key)
         if stored is None or is_terminal(stored):
             return False
-        if _holder_is_live(stored.get(ACTIVE_HOLDER_FIELD)):
+        if _claim_is_held(stored.get(ACTIVE_HOLDER_FIELD)):
             return False
         stored[ACTIVE_HOLDER_FIELD] = _claim_holder()
         txn.touch()
@@ -3308,15 +3377,21 @@ def _claim_delivery_record(session_id: str, record: dict) -> bool:
     return True
 
 
-def _discard_delivery_record(session_id: str, record: dict) -> None:
+def _discard_delivery_record(session_id: str, record: dict) -> bool:
     """Remove a row this call created for a request that was then refused.
 
     C2 requires an authoritative refusal to change **nothing**. The row is only
     ever discarded when this call created it and nothing was sent under it, so
     no audit evidence can be destroyed: there is nothing yet to be evidence of.
+
+    Returns whether the session really is back to byte-identical. Swallowing a
+    failure here made the refusal *say* nothing changed while leaving on disk
+    exactly the row the promise was about — the caller now gets the truth and
+    reports it (:func:`_annotate_residual_row`), because a status that
+    overstates is the defect this whole feature exists to remove.
     """
     if int(record.get("attempts") or 0) > 0 or record.get("nonce"):
-        return
+        return True
     key = record_key(
         str(record.get("sender") or ""),
         str(record.get("idempotency_key") or ""),
@@ -3328,7 +3403,22 @@ def _discard_delivery_record(session_id: str, record: dict) -> None:
                 del txn.data[key]
                 txn.touch()
     except DeliveryStoreError:
-        logger.debug("Failed discarding a refused delivery row", exc_info=True)
+        logger.warning("Failed discarding a refused delivery row", exc_info=True)
+        return False
+    return True
+
+
+def _annotate_residual_row(result: dict, idempotency_key: str) -> dict:
+    """Tell the caller a refused request left its audit row behind after all."""
+    result["record_discarded"] = False
+    result["detail"] = (
+        f"{result.get('detail', '')} NOTE: nothing was sent, but the durable "
+        f"row created for this call could not be removed (the delivery store "
+        f"could not be written). idempotency_key {idempotency_key!r} is "
+        f"therefore consumed: reuse it only for this exact request, or pick a "
+        f"new one."
+    ).strip()
+    return result
 
 
 def _store_unavailable(name: str) -> dict:
@@ -3495,7 +3585,7 @@ def _open_delivery_record(
                 # Nothing left to work; the caller gets the settled answer and
                 # no claim is taken, so a terminal key is never serialized.
                 return dict(existing), None, False
-            if _holder_is_live(existing.get(ACTIVE_HOLDER_FIELD)):
+            if _claim_is_held(existing.get(ACTIVE_HOLDER_FIELD)):
                 return (
                     None,
                     _delivery_in_progress(session_id, name, existing),
@@ -3647,12 +3737,23 @@ def _guaranteed_send(  # noqa: PLR0911 - each return is a distinct refusal contr
     except DeliveryStoreError:
         logger.debug("Delivery store write failed mid-delivery", exc_info=True)
         return _store_unavailable(name)
+    except LeaseStoreError:
+        # The lease store is the serialization that stops two callers resuming
+        # one conversation. Unknown or unwritable, it cannot serialize anything,
+        # so this fails closed exactly like the delivery store: nothing was
+        # sent, the durable row still holds the key, and the tail is retriable.
+        logger.warning("Lease store unusable mid-delivery", exc_info=True)
+        return _store_unavailable(name)
     finally:
         _release_delivery_claim(session_id, record)
-    if created and result.get("reason") in _C2_REFUSAL_REASONS:
-        # C2: an authoritative refusal changes nothing. The row exists only
-        # because this call created it, and nothing has been sent under it.
-        _discard_delivery_record(session_id, record)
+    # C2: an authoritative refusal changes nothing. The row exists only because
+    # this call created it, and nothing has been sent under it.
+    if (
+        created
+        and result.get("reason") in _C2_REFUSAL_REASONS
+        and not _discard_delivery_record(session_id, record)
+    ):
+        return _annotate_residual_row(result, idempotency_key)
     return result
 
 
