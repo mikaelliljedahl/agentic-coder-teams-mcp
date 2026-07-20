@@ -452,8 +452,10 @@ this tool is entitled to report, and guessing `running`/`idle` from an unrelated
 transcript's mtime is exactly the bug the ladder exists to prevent. Liveness and
 an authoritative marker still win — a dead process is `"dead"`, and a
 hook-written `waiting`/`running` is a direct observation. The fallback stays
-cheap: exactly one binding resolution, never a second scan and never an
-all-history rescan layered on top of it.
+cheap: exactly one binding resolution, and a genuinely bounded one. It asks the
+resolver for `bounded_only` mode, which drops the resolver's own all-history
+fallback — without it a single call could still escalate to a full history walk
+internally, so "one resolution" was not the same thing as "cheap".
 
 ### `agent_watch_paths(names=None)`
 
@@ -879,11 +881,18 @@ Four scanner rules are load-bearing:
   than skipped, because the readers drop malformed lines **permanently** and a
   fragment consumed at EOF would never be reconsidered once its remainder
   arrived.
-- **Identity/size regression means rotation, not absence.** Continuity is
-  re-established by backend session id **plus** file identity. The correlation
-  token corroborates when several candidates survive that test, but is never a
-  precondition — a successor may legitimately not replay the spawn marker.
-  More than one candidate is `ambiguous`, never a guess.
+- **Replacement means rotation, not absence.** Continuity is re-established by
+  backend session id **plus** file identity. More than one candidate successor
+  is `ambiguous`, unconditionally — the correlation token is **never** consulted
+  to choose between candidates. It is written at spawn and a successor may
+  legitimately not replay it, so its presence in one file is no evidence that
+  the other is not the live conversation; selecting on it would be a guess.
+  The scanner takes no correlation token at all.
+- **Replacement detection is not size alone.** A transcript truncated and
+  rewritten in place keeps its inode, and can be back to its old size before
+  the next poll. Alongside `(st_dev, st_ino)` and a size regression, the leading
+  bytes captured at snapshot time are re-checked: an append leaves them
+  byte-identical, a rewrite does not.
 
 #### The three non-delivery outcomes (R6)
 
@@ -918,15 +927,36 @@ losing CAS cannot undo an irreversible side effect. So a caller **atomically
 reserves a per-agent lease while the registry lock is still held**
 (`src/claude_teams/leases.py`). The lease holds `{generation, operation_id,
 backend_session_id, nonce, holder_pid, holder_create_token, deadline}` and does
-not itself resume. Finalization CASes on generation **and** `operation_id` —
-generation alone is not enough, because a name reused after removal starts a
-fresh record that can legitimately be back at the same generation.
+not itself resume. Finalization CASes on `operation_id` **and the agent
+record's CURRENT generation**, read under the registry lock — not the
+generation frozen into the lease payload, which is written at reservation time
+and therefore always agrees with itself. `operation_id` is in the key because
+generation alone is not enough: a name reused after removal starts a fresh
+record that can legitimately be back at the same generation. The record
+generation is in the key because that is what the operator force path bumps,
+and the fence has to survive the window between the bump and the lease being
+cleared. A fenced finalize writes nothing and leaves the lease alone.
 
 - **A second valid caller queues** behind per-target FIFO with a ticket; it is
   **not** refused. Refusing a valid caller would hand back exactly the dead end
   R1 forbids. Once the wait budget is spent it gets the honest cooperative tail
   `{status: "queued", phase: "pending", reason: "operation_in_progress",
   retriable: true, queue_position}` — and nothing was sent.
+- **The ticket is durable, and derived — not returned.** It is a hash of
+  `(sender, idempotency_key)`, so a genuinely fresh `follow_up_agent` call with
+  the same key reclaims the same queue place. Nothing has to be carried across
+  calls beyond the key the caller already chose. A per-call ticket would leave
+  every retry appending a new waiter behind its own orphaned head, and the
+  queue would grow by one per attempt while the caller never advanced.
+- **Promotion re-points the ticket at the granted `operation_id`.** A retrying
+  caller mints a fresh `operation_id` on every poll, so the waiter record is
+  updated to the id the lease is actually granted (and later finalized or
+  released) under. Otherwise the promoted waiter is never dropped from the
+  queue and later valid callers wait behind an orphan indefinitely.
+- **Persistence failure fails closed.** A reservation whose atomic replace
+  failed returns `queued`, never `granted`: the on-disk store still shows the
+  target free, so granting would let another process resume the same
+  conversation. A finalize or release that did not reach disk did not win.
 - **Storage is crash-atomic and outside the registry.** `agents.json` is
   overwritten with a plain write, so a crash mid-write could destroy the
   registry *and* the lease. Leases live in `operation-leases.json`, written with
@@ -937,7 +967,10 @@ fresh record that can legitimately be back at the same generation.
   flight. Reclaiming therefore checks holder liveness; **wall-clock expiry alone
   never justifies a resend.** Because a dead holder's PID can be reused,
   `holder_pid` is paired with `holder_create_token` and validated fail-closed,
-  exactly as `owns_process` does.
+  exactly as `owns_process` does — **including when the PID equals the server's
+  own**. There is no self-PID shortcut: a lease left by an earlier incarnation
+  whose PID was recycled onto this process would otherwise read as live
+  forever, and nothing else can prove that holder gone.
 
 #### The operator escape (CLI only)
 
