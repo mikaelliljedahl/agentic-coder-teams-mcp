@@ -34,6 +34,10 @@ a unit test, because timing is uncontrolled.
   receipt-record shape, and session-id discovery.
 - A **fresh session directory**. A recovered session carries other agents'
   records and will corrupt the parentage assertions.
+- For a Claude lead, decide up front whether `install_lead_wake()` is active
+  (S3b) — it changes how upstream replies reach the lead, and every case that
+  waits on a worker reply behaves differently depending on it. Record which
+  mode each run used; a result without that context is not reproducible.
 - Nothing else spawning into the same session — `list_agents` must be empty at
   the start. All agents in a session share one flat `agents.json`.
 
@@ -92,6 +96,34 @@ lead's inbox and `read_messages` returns it. Run `win-agent-teams watch
 <session_dir>` **before** the send and confirm it wakes with
 `reason="message"`. R3 makes this path load-bearing; it must not have been
 disturbed by the downstream rework.
+
+**S3b. Deterministic lead wake.**
+Upstream wake is no longer only the manual watcher recipe above. A Claude lead
+installs a `Stop` hook via `install_lead_wake()`; on every turn end the hook
+verifies from the harness's own `background_tasks` that a watcher is armed, and
+**blocks** with an instruction to arm it (or to `read_messages` when a reply is
+already unread) rather than trusting the model to remember. Pi has its own wake
+extension, auto-loaded for spawned agents.
+
+This is the mechanism a real end-to-end run depends on, so exercise it as
+itself, not as a precondition:
+
+- `install_lead_wake()`, then let a worker reply while the lead is idle, and
+  confirm the lead actually wakes and reads — the whole point is that this no
+  longer depends on the model remembering.
+- Confirm the hook **blocks** when no watcher is armed, rather than silently
+  passing. A wake mechanism that fails open is indistinguishable from the
+  original defect: the reply sits unread and nobody is told.
+- `install_lead_wake(remove=True)` restores the previous state.
+- `WIN_AGENT_TEAMS_LEAD_WAKE` is the kill switch; verify the mechanism is
+  genuinely inert when it is set, since that is the fallback if the hook
+  misbehaves on your machine.
+- **Nested leads**: a worker that spawns its own workers is itself a lead. Wake
+  must resolve per-identity, not assume the root. `Claude → Claude → Codex` is
+  the shape main's own tests cover, so it is the shape most worth running.
+
+If S3b fails, S3's manual watcher is the fallback and the upstream path is
+still functional — report them separately rather than as one verdict.
 
 ---
 
