@@ -179,6 +179,66 @@ def test_hook_extra_unknown_backend_returns_empty():
     assert ss._hook_extra("sid", "agent", "mystery-backend") == {}
 
 
+def test_pi_wake_extension_dir_override_existing(isolated, monkeypatch, tmp_path):
+    ext = tmp_path / "custom-wake"
+    ext.mkdir()
+    monkeypatch.setenv("WIN_AGENT_TEAMS_PI_WAKE_EXTENSION", str(ext))
+    assert ss._pi_wake_extension_dir() == ext
+
+
+def test_pi_wake_extension_dir_override_missing_returns_none(
+    isolated, monkeypatch, tmp_path
+):
+    monkeypatch.setenv(
+        "WIN_AGENT_TEAMS_PI_WAKE_EXTENSION", str(tmp_path / "does-not-exist")
+    )
+    assert ss._pi_wake_extension_dir() is None
+
+
+def test_hook_extra_pi_emits_both_extension_keys(isolated, monkeypatch, tmp_path):
+    # Do not touch real ~/.pi state.
+    monkeypatch.setattr(ss, "_ensure_pi_mcp_config", lambda: None)
+    state_dir = tmp_path / "wat-state"
+    wake_dir = tmp_path / "wat-wake"
+    monkeypatch.setattr(ss, "_pi_state_extension_dir", lambda: state_dir)
+    monkeypatch.setattr(ss, "_pi_wake_extension_dir", lambda: wake_dir)
+
+    extra = ss._hook_extra("sid", "agent", "pi")
+
+    # The per-agent literal --mcp-config file is always written (identity fix);
+    # the two -e extension keys accompany it when state hooks are enabled.
+    assert extra.pop("pi_mcp_config_path").endswith("agent.pi.mcp.json")
+    assert extra == {
+        "pi_state_extension_path": str(state_dir),
+        "pi_wake_extension_path": str(wake_dir),
+    }
+
+
+def test_hook_extra_pi_state_hooks_off_disables_both(isolated, monkeypatch):
+    # WIN_AGENT_TEAMS_STATE_HOOKS=0 is a single kill switch for BOTH pi
+    # extensions (state reporting AND inbox-wake) -- but NOT the per-agent
+    # --mcp-config identity file, which is written before the kill switch.
+    monkeypatch.setattr(ss, "_ensure_pi_mcp_config", lambda: None)
+    monkeypatch.setattr(ss, "_pi_state_extension_dir", lambda: Path("/x/state"))
+    monkeypatch.setattr(ss, "_pi_wake_extension_dir", lambda: Path("/x/wake"))
+    monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS", "0")
+
+    extra = ss._hook_extra("sid", "agent", "pi")
+    assert extra.pop("pi_mcp_config_path").endswith("agent.pi.mcp.json")
+    assert extra == {}
+
+
+def test_hook_extra_pi_missing_wake_dir_omits_key(isolated, monkeypatch, tmp_path):
+    monkeypatch.setattr(ss, "_ensure_pi_mcp_config", lambda: None)
+    monkeypatch.setattr(ss, "_pi_state_extension_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(ss, "_pi_wake_extension_dir", lambda: None)
+
+    extra = ss._hook_extra("sid", "agent", "pi")
+
+    assert "pi_wake_extension_path" not in extra
+    assert extra["pi_state_extension_path"] == str(tmp_path / "state")
+
+
 def test_marker_timestamp_non_numeric():
     assert ss._marker_timestamp({"ts": "x"}) is None
     assert ss._marker_timestamp({"ts": True}) is None  # bool is rejected

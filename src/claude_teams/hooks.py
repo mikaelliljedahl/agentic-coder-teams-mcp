@@ -23,6 +23,16 @@ _WAITING_EVENTS: frozenset[str] = frozenset({"Stop", "SubagentStop"})
 
 _HOOK_MODULE = "claude_teams.hooks"
 
+# The lead-wake decision hook lives in its own module (it needs session/inbox
+# discovery from ``server_simple``/``messaging`` that ``hooks.py`` deliberately
+# does not import, to avoid an import cycle). Only the settings-wiring helpers
+# for it live here, co-located with the ``emit`` wiring.
+_WAKE_MODULE = "claude_teams.lead_wake"
+
+# Safety ceiling for the Stop wake hook. The hook never sleeps by default (pure
+# Design B), so this is only an upper bound; it matches the Stop hook default.
+_WAKE_HOOK_TIMEOUT_SECONDS = 600
+
 # Mirror of process_manager's safe-name invariant. Enforced here BEFORE an agent
 # name is interpolated into an on-disk launcher path/content, rather than relying
 # on the later (post-file-write) validation in the process manager.
@@ -123,6 +133,37 @@ def _hook_matcher(session_dir: Path, agent: str) -> dict:
     }
 
 
+def _wake_command(session_dir: Path, reader: str) -> list[str]:
+    """Return the argv for the lead-wake decision hook for ``reader``.
+
+    Mirrors :func:`_emit_command`'s ``as_posix()`` rendering so the command is
+    JSON/TOML-safe on Windows. ``--reader`` bakes the reader identity into the
+    settings file at spawn time; the runtime still honours ``AGENT_NAME`` as the
+    authoritative identity when both are present (see ``claude_teams.lead_wake``).
+    """
+    return [
+        Path(sys.executable).as_posix(),
+        "-m",
+        _WAKE_MODULE,
+        "--session-dir",
+        Path(session_dir).as_posix(),
+        "--reader",
+        reader,
+    ]
+
+
+def _wake_hook_matcher(session_dir: Path, reader: str) -> dict:
+    return {
+        "hooks": [
+            {
+                "type": "command",
+                "command": _shell_quote_command(_wake_command(session_dir, reader)),
+                "timeout": _WAKE_HOOK_TIMEOUT_SECONDS,
+            }
+        ]
+    }
+
+
 def _shell_quote_command(argv: list[str]) -> str:
     """Render ``argv`` as a single shell command string.
 
@@ -141,9 +182,14 @@ def write_claude_settings(session_dir: Path, agent_name: str) -> Path:
     """
     session_dir = Path(session_dir)
     events = _RUNNING_EVENTS | _WAITING_EVENTS
-    config = {
-        "hooks": {event: [_hook_matcher(session_dir, agent_name)] for event in events}
-    }
+    hooks_config = {event: [_hook_matcher(session_dir, agent_name)] for event in events}
+    # Only the ``Stop`` event carries a SECOND matcher group: the lead-wake
+    # decision hook, alongside the existing state-marker ``emit`` group. Both
+    # run on every Stop; a ``block`` from either wins and order is irrelevant
+    # (spike probe d), so no merge is needed. Every other event keeps the single
+    # ``emit`` group unchanged.
+    hooks_config["Stop"].append(_wake_hook_matcher(session_dir, agent_name))
+    config = {"hooks": hooks_config}
     path = session_dir / f"hooks-{agent_name}.settings.json"
     path.write_text(json.dumps(config, indent=2), encoding="utf-8")
     return path

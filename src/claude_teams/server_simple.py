@@ -125,7 +125,39 @@ _AGENT_PARENT_NAME: str = os.environ.get("AGENT_PARENT_NAME", "").strip()
 # the right inbox out of the box. ("lead" and friends remain aliases below for
 # backward compatibility.)
 ROOT_LEAD_NAME: str = "team-lead"
-IDENTITY: str = _AGENT_NAME if _AGENT_NAME else ROOT_LEAD_NAME
+
+# Sentinel identity used when a spawned subagent's MCP server starts with an
+# empty ``AGENT_NAME`` (identity was clobbered — see ``_resolve_identity``). It
+# can never be a valid inbox/lead name (contains a NUL), so any tool that keys
+# off ``IDENTITY`` while unresolved fails to match a real inbox/session and, per
+# the guards below, refuses outright rather than masquerading as the lead.
+_UNRESOLVED_IDENTITY: str = "\x00unresolved-identity"
+
+
+def _resolve_identity(environ: "os._Environ[str] | dict[str, str]") -> tuple[str, bool]:
+    """Resolve ``(IDENTITY, unresolved)`` from an environment mapping.
+
+    - A non-empty ``AGENT_NAME`` is always authoritative → ``(name, False)``.
+    - Empty ``AGENT_NAME`` **with** a spawned-subagent signal
+      (``WIN_AGENT_TEAMS_SESSION_DIR``, set only by ``PiBackend.build_env`` and
+      inherited by children, never carried in any ``mcp.json`` ``env`` block) →
+      identity is UNRESOLVED: ``(_UNRESOLVED_IDENTITY, True)``. This means the
+      literal ``AGENT_*`` values were clobbered (e.g. an ``AGENT_*`` env block in
+      a project ``.mcp.json`` / ``.pi/mcp.json`` shallow-overrides the inherited
+      values). We refuse to default to ``team-lead`` and hijack the lead.
+    - Empty ``AGENT_NAME`` with **no** signal is a legitimate human-launched root
+      lead → ``(ROOT_LEAD_NAME, False)``.
+    """
+    name = environ.get("AGENT_NAME", "").strip()
+    if name:
+        return name, False
+    spawned_signal = bool(environ.get("WIN_AGENT_TEAMS_SESSION_DIR", "").strip())
+    if spawned_signal:
+        return _UNRESOLVED_IDENTITY, True
+    return ROOT_LEAD_NAME, False
+
+
+IDENTITY, _IDENTITY_UNRESOLVED = _resolve_identity(os.environ)
 
 # Names a subagent might reasonably use to mean "whoever spawned me". All of
 # these resolve to the lead/parent so a message is never lost to a typo'd
@@ -197,6 +229,17 @@ _delivery_sleep = time.sleep
 PENDING_DELIVERY_FIELD = "pending_delivery"
 _CLAUDE_PROMPT_FILE_CHARS: frozenset[str] = frozenset({"'", '"', "\n", "\r"})
 logger = logging.getLogger(__name__)
+
+if _IDENTITY_UNRESOLVED:
+    logger.error(
+        "win-agent-teams identity is UNRESOLVED: AGENT_NAME is empty but this "
+        "process was spawned as a subagent (WIN_AGENT_TEAMS_SESSION_DIR is set). "
+        "The literal AGENT_* identity was clobbered -- most likely an AGENT_* env "
+        "block in a project .mcp.json / .pi/mcp.json shallow-overrides the "
+        "inherited values. Team tools (send_message/read_messages/resume_session) "
+        "will refuse until identity is fixed; never put AGENT_* in a project MCP "
+        "config env block."
+    )
 
 # Outcome of the most recent session recovery attempt, surfaced to the lead as
 # a nudge on dict-returning tools: either ``{"adopted_session": {...}}`` (a
@@ -692,6 +735,31 @@ def _autoadopt_enabled() -> bool:
     }
 
 
+def _require_resolved_identity() -> dict | None:
+    """Return a structured refusal when identity is unresolved, else ``None``.
+
+    Applied to every identity-bearing tool so a mis-configured spawned subagent
+    (empty ``AGENT_NAME`` + subagent signal) refuses loudly instead of operating
+    as ``team-lead`` (spoofing ``from:``, consuming the lead's inbox, or adopting
+    the lead's session). In the healthy path (Claude/Codex always carry a literal
+    name; a correctly-configured pi worker gets one via the per-agent
+    ``--mcp-config`` file) this never fires.
+    """
+    if _IDENTITY_UNRESOLVED:
+        return {
+            "success": False,
+            "reason": "identity_unresolved",
+            "hint": (
+                "This agent's AGENT_NAME is empty but it was spawned as a "
+                "subagent, so its MCP identity was clobbered (likely an AGENT_* "
+                "env block in a project .mcp.json / .pi/mcp.json). Team tools are "
+                "disabled to avoid hijacking the lead. Report this via your final "
+                "output and ask the lead to fix the MCP config."
+            ),
+        }
+    return None
+
+
 def _recover_session_id() -> str:
     """Recover the persisted lead session for this MCP parent/workspace.
 
@@ -706,6 +774,12 @@ def _recover_session_id() -> str:
     _pending_recovery = {}
     if _AGENT_SESSION_ID:
         return _AGENT_SESSION_ID
+    if _IDENTITY_UNRESOLVED:
+        # A mis-identified spawned child must NEVER adopt a workspace session:
+        # not via the exact binding-key match, not via silent single-candidate
+        # auto-adopt (the dangerous no-tool-call path), and not via the recovery
+        # nudge. Return unresolved with an empty nudge before any candidate scan.
+        return ""
     key = _binding_key()
     binding = _read_json_object(_binding_file())
     session_id = binding.get("session_id")
@@ -1084,6 +1158,18 @@ Timeout exit 2 means no actionable edge settled; re-check status before
 starting the next watch because an agent may already be waiting due to the
 small status-check/watch-baseline race, or a genuine waiting edge may have
 arrived inside the final unfinished settle window.
+
+Claude Code lead wake: a `Stop` hook now verifies watcher arming from the
+harness's own `background_tasks` on every lead turn end. When a worker reply is
+already unread it blocks instructing you to call `read_messages`; when no
+watcher is armed it blocks instructing you to run the `watch_command_bash` /
+`watch_argv` as a BACKGROUND task, so an idle lead is woken deterministically
+rather than relying on the model to re-arm. The hook writes a small
+`wake-progress-<reader>.json` file under the session dir to bound a no-progress
+block loop and is always fail-open (never makes the lead unstoppable). Disable
+it at runtime with `WIN_AGENT_TEAMS_LEAD_WAKE=0`. Server-spawned agents get this
+wiring automatically; a top-level lead wires it with the `install_lead_wake`
+tool.
 """.strip()
 
 
@@ -1872,6 +1958,44 @@ def _write_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Pat
     return path
 
 
+def _write_pi_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Path:
+    """Write per-agent pi MCP config with LITERAL identity (via ``--mcp-config``).
+
+    Mirrors :func:`_write_mcp_config` but (a) uses a distinct filename
+    (``<agent>.pi.mcp.json``) so it can never collide with the Claude file, and
+    (b) adds the pi-adapter-specific keys the interpolated ``~/.pi/agent/mcp.json``
+    used: a server-entry ``directTools`` (per review F4 the adapter reads it at
+    the server-entry level) and ``CLAUDE_TEAMS_PERMISSION_MODE=bypass``.
+
+    The env values are written as literals (no ``${...}`` interpolation) so a
+    spawned pi worker's identity survives the pi-mcp-adapter config merge even if
+    a lower-precedence source carries an empty ``AGENT_*`` env block. Note this
+    file only reliably owns keys that higher-precedence project sources
+    (``<cwd>/.mcp.json``, ``<cwd>/.pi/mcp.json``) do not themselves declare; an
+    ``AGENT_*`` env block in those sources would still shallow-override it (that
+    is what the fail-loud identity guard defends against).
+    """
+    config = {
+        "mcpServers": {
+            "win-agent-teams": {
+                "command": sys.executable,
+                "args": ["-m", "claude_teams.server_simple"],
+                "env": {
+                    "AGENT_SESSION_ID": session_id,
+                    "AGENT_NAME": agent_name,
+                    "AGENT_PARENT_NAME": parent_name,
+                    "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
+                },
+                "directTools": True,
+            }
+        }
+    }
+    path = _session_dir(session_id) / "mcp" / f"{agent_name}.pi.mcp.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return path
+
+
 def _needs_prompt_file(prompt: str) -> bool:
     """Return whether a Claude prompt is too CLI-sensitive for argv transport.
 
@@ -2032,6 +2156,24 @@ def _pi_state_extension_dir() -> Path | None:
     return candidate if candidate.exists() else None
 
 
+def _pi_wake_extension_dir() -> Path | None:
+    """Return the bundled pi inbox-wake extension dir, if present.
+
+    Overridable via ``WIN_AGENT_TEAMS_PI_WAKE_EXTENSION`` (a file or directory
+    pi's ``-e`` accepts); otherwise resolved relative to the repo checkout at
+    ``pi-extensions/win-agent-teams-wake``. Returns ``None`` when neither
+    exists so the spawn still proceeds (the lead simply is not auto-woken and
+    must poll its inbox instead).
+    """
+    override = os.environ.get("WIN_AGENT_TEAMS_PI_WAKE_EXTENSION", "").strip()
+    if override:
+        candidate = Path(override)
+        return candidate if candidate.exists() else None
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate = repo_root / "pi-extensions" / "win-agent-teams-wake"
+    return candidate if candidate.exists() else None
+
+
 def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str, str]:
     """Materialise per-backend hook wiring, added to ``SpawnRequest.extra``.
 
@@ -2040,16 +2182,34 @@ def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str
     override argv (``extra["hook_overrides"]``) evaluated only when
     ``WIN_AGENT_TEAMS_STATE_HOOKS_CODEX`` is on (see ``CodexBackend``). Pi gets
     the win-agent-teams MCP server registered for the ``pi-mcp-adapter`` and, if
-    state hooks are enabled, the path to its bundled state-reporting extension
-    (``extra["pi_state_extension_path"]``, loaded via ``-e``).
+    state hooks are enabled, the paths to its bundled state-reporting extension
+    (``extra["pi_state_extension_path"]``) and inbox-wake extension
+    (``extra["pi_wake_extension_path"]``), both loaded via ``-e``.
+
+    Note: ``WIN_AGENT_TEAMS_STATE_HOOKS=0`` is a single kill switch for BOTH pi
+    extensions — it disables state reporting AND the inbox-wake extension,
+    since the early return happens before either path is added.
     """
     session_dir = _session_dir(session_id)
     if backend_name == "pi":
         _ensure_pi_mcp_config()
+        # Written BEFORE the state-hooks kill switch so identity is never gated
+        # behind it: the per-agent literal --mcp-config file is the primary fix
+        # for the identity clobber and must exist even with state hooks off.
+        extra: dict[str, str] = {
+            "pi_mcp_config_path": str(
+                _write_pi_mcp_config(session_id, agent_name, IDENTITY)
+            )
+        }
         if os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS", "1").strip() == "0":
-            return {}
+            return extra
         ext = _pi_state_extension_dir()
-        return {"pi_state_extension_path": str(ext)} if ext else {}
+        if ext:
+            extra["pi_state_extension_path"] = str(ext)
+        wake = _pi_wake_extension_dir()
+        if wake:
+            extra["pi_wake_extension_path"] = str(wake)
+        return extra
     if backend_name == "claude-code":
         settings_path = hooks.write_claude_settings(session_dir, agent_name)
         return {"hooks_settings_path": str(settings_path)}
@@ -2125,6 +2285,11 @@ async def spawn_agent(
     """
 
     def _do_spawn() -> dict:
+        refusal = _require_resolved_identity()
+        if refusal is not None:
+            # An unresolved child must never create an orphan session or launch
+            # a subprocess with the sentinel identity in its env.
+            return refusal
         session_id = _active_session_id(create=True)
         with _agents_transaction(session_id) as agents:
             agent_name = _unique_agent_name(name, agents)
@@ -2201,6 +2366,12 @@ async def spawn_agent(
                     "pid": pid,
                     "backend": backend_name,
                     "session_id": session_id,
+                    # The spawning lead's identity. Mirrors the AGENT_PARENT_NAME
+                    # env propagated into the child's MCP config (which is also
+                    # this server's IDENTITY at spawn time); recorded here so the
+                    # lead-wake hook can scope "live subagents" to a caller's own
+                    # children instead of every agent in the shared session.
+                    "parent": IDENTITY,
                     "status": "running",
                     "spawned_at": time.time(),
                     "cwd": agent_cwd,
@@ -2263,6 +2434,9 @@ async def send_message(
     used to be re-routed to your lead with a warning; it no longer is, because
     that turned a typo into a real-looking upstream message.
     """
+    refusal = _require_resolved_identity()
+    if refusal is not None:
+        return {**refusal, "to": to}
     session_id = _active_session_id()
 
     def _do_send() -> dict:
@@ -2356,6 +2530,12 @@ async def read_messages(
     if limit is not None and limit < 0:
         msg = "limit must not be negative"
         raise ValueError(msg)
+
+    refusal = _require_resolved_identity()
+    if refusal is not None:
+        # Refuse before any inbox read/cursor advance so a mis-identified child
+        # never consumes (marks read) the lead's inbox.
+        return refusal
 
     session_id = _active_session_id()
 
@@ -4342,6 +4522,10 @@ async def resume_session(session_id: str) -> dict:
 
     def _do_resume() -> dict:
         global _session_id  # noqa: PLW0603 - module-level lead session state.
+        refusal = _require_resolved_identity()
+        if refusal is not None:
+            # An unresolved child must never adopt (hijack) a workspace session.
+            return refusal
         sid = session_id.strip()
         if not sid:
             return {"success": False, "reason": "session_id_required"}
@@ -4670,6 +4854,101 @@ async def list_backends() -> list[dict]:
         return result
 
     return await run_blocking(_do_list)
+
+
+def _group_has_wake_token(group: object) -> bool:
+    """Return whether a Stop matcher group invokes the lead-wake module."""
+    if not isinstance(group, dict):
+        return False
+    entries = cast("dict[str, Any]", group).get("hooks")
+    if not isinstance(entries, list):
+        return False
+    return any(
+        isinstance(h, dict)
+        and hooks._WAKE_MODULE in str(cast("dict[str, Any]", h).get("command", ""))
+        for h in entries
+    )
+
+
+def _install_wake_hook(
+    config: dict[str, Any], wake_matcher: dict[str, Any], *, remove: bool
+) -> dict[str, Any]:
+    """Return ``config`` with the lead-wake ``Stop`` matcher upserted or removed.
+
+    Idempotent and non-destructive: any existing lead-wake group is dropped
+    first (so a re-install never duplicates), then the fresh matcher is appended
+    unless ``remove``. Unrelated events and unrelated ``Stop`` groups (e.g. a
+    hand-written ``emit`` group) are preserved verbatim.
+    """
+    result = dict(config)
+    hooks_map = dict(result.get("hooks") or {})
+    stop = [g for g in (hooks_map.get("Stop") or []) if not _group_has_wake_token(g)]
+    if not remove:
+        stop.append(wake_matcher)
+    if stop:
+        hooks_map["Stop"] = stop
+    else:
+        hooks_map.pop("Stop", None)
+    if hooks_map:
+        result["hooks"] = hooks_map
+    else:
+        result.pop("hooks", None)
+    return result
+
+
+def _lead_wake_settings_path(scope: str) -> Path:
+    """Return the settings path for ``scope`` (``project`` cwd or ``user`` home)."""
+    base = Path.home() if scope == "user" else Path.cwd()
+    return base / ".claude" / "settings.json"
+
+
+@mcp.tool()
+async def install_lead_wake(remove: bool = False, scope: str = "project") -> dict:
+    """Install (or remove) the Claude Code lead inbox-wake ``Stop`` hook.
+
+    Wires the deterministic wake hook into a settings file so an idle lead is
+    reliably woken when a worker replies. On every lead turn end the hook
+    verifies — from the harness's own ``background_tasks`` — that an inbox
+    watcher is armed, and blocks with an operational instruction to run the
+    ``watch_command_bash``/``watch_argv`` as a BACKGROUND task (or to call
+    ``read_messages`` when a reply is already unread) rather than trusting the
+    model to remember. Server-spawned agents get this wiring automatically; use
+    this tool to wire a **top-level** lead you started yourself (e.g. an
+    interactive ``claude`` in a repo).
+
+    - ``scope="project"`` (default) writes the project ``.claude/settings.json``
+      in the current working directory; ``scope="user"`` writes
+      ``~/.claude/settings.json``.
+    - Writes ONLY the ``Stop`` wake group (never the state-marker ``emit`` hooks,
+      which are for server-spawned agents). Idempotent: re-running replaces the
+      existing wake group in place and never duplicates it; unrelated hooks are
+      preserved. ``remove=True`` drops only the wake group.
+    - The hook writes a small ``wake-progress-<reader>.json`` file under the
+      session dir to bound a no-progress block loop. Disable at runtime with the
+      kill switch ``WIN_AGENT_TEAMS_LEAD_WAKE=0`` (no reinstall needed).
+    """
+    if scope not in {"project", "user"}:
+        return {"error": f"scope must be 'project' or 'user', got {scope!r}"}
+
+    def _do_install() -> dict:
+        identity = IDENTITY
+        session_id = _active_session_id(create=False)
+        session_dir = _session_dir(session_id) if session_id else _SESSION_BASE
+        wake_matcher = hooks._wake_hook_matcher(session_dir, identity)
+        path = _lead_wake_settings_path(scope)
+        updated = _install_wake_hook(
+            _read_json_object(path), wake_matcher, remove=remove
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+        return {
+            "action": "removed" if remove else "installed",
+            "path": str(path),
+            "reader": identity,
+            "scope": scope,
+        }
+
+    return await run_blocking(_do_install)
 
 
 def main() -> None:

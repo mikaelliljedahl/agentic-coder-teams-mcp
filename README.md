@@ -2,7 +2,7 @@
 
 Minimal MCP server for spawning and communicating with Claude Code, Codex, and Pi agents on Windows or Linux. Fire-and-forget agent spawning with bidirectional 1:1 messaging.
 
-## Tools (10 total)
+## Tools (11 total)
 
 | Tool | Description |
 |------|-------------|
@@ -16,6 +16,7 @@ Minimal MCP server for spawning and communicating with Claude Code, Codex, and P
 | `agent_status` | Cheap per-agent state/watermark/stall rows (no bodies) |
 | `agent_watch_paths` | Session watch envelope plus minimal `{name, state_marker_path}` agent rows |
 | `list_backends` | List available backends |
+| `install_lead_wake` | Install/remove the Claude Code lead inbox-wake `Stop` hook for a top-level lead |
 
 ## Quick Start
 
@@ -103,12 +104,35 @@ pi            # then run /login inside pi and pick your provider
 pi install npm:pi-mcp-adapter
 ```
 
-You do **not** hand-write any MCP config: the server writes `~/.pi/agent/mcp.json`
-(idempotently, on each pi spawn) with a `win-agent-teams` entry whose identity env
-uses `${AGENT_NAME}`/`${AGENT_SESSION_ID}`/`${AGENT_PARENT_NAME}` interpolation,
-resolved from each pi process's own environment. The adapter starts the server
-**lazily** (only when pi actually calls a tool), so a normal `pi` run you do
-yourself is unaffected apart from one ~200-token proxy tool.
+You do **not** hand-write any MCP config. Identity is delivered differently for
+the two pi scenarios:
+
+- **Human-launched pi *lead*** — the server writes `~/.pi/agent/mcp.json`
+  (idempotently, on each pi spawn) with a `win-agent-teams` entry whose identity
+  env uses `${AGENT_NAME}`/`${AGENT_SESSION_ID}`/`${AGENT_PARENT_NAME}`
+  interpolation, resolved from the pi process's own environment. With no
+  `AGENT_*` set, identity resolves to `team-lead` (the project `.mcp.json` may
+  also apply — see the warning below).
+- **Spawned pi *worker*** — the server writes a **per-agent MCP config** with
+  **literal** `AGENT_*` values at `<session_dir>/mcp/<agent>.pi.mcp.json` and the
+  pi backend passes it to pi via `--mcp-config`. This mirrors the Claude path and
+  does not rely on `${AGENT_*}` interpolation, so a spawned worker's identity is
+  never left to the environment (which lower-precedence MCP config sources can
+  clobber).
+
+The adapter starts the server **lazily** (only when pi actually calls a tool), so
+a normal `pi` run you do yourself is unaffected apart from one ~200-token proxy
+tool.
+
+> **WARNING — never put `AGENT_*` in a project MCP config.** Do not add an
+> `AGENT_NAME` / `AGENT_SESSION_ID` / `AGENT_PARENT_NAME` `env` block to a project
+> `.mcp.json` or `.pi/mcp.json` `win-agent-teams` entry. The pi-mcp-adapter merges
+> config sources **later-wins** and replaces the whole `env` map per server entry,
+> so an empty (or literal) `AGENT_*` value there overwrites the correct per-agent
+> identity delivered via `--mcp-config`. This now causes the win-agent-teams MCP
+> server to **refuse** identity-bearing tools (`send_message` / `read_messages` /
+> `resume_session` return `{"success": false, "reason": "identity_unresolved"}`)
+> rather than silently masquerade as `team-lead` and hijack the lead's session.
 
 This covers both scenarios:
 1. **Pi as lead** — pi calls `spawn_agent` to start Claude Code, Codex, or other pi agents.
@@ -344,6 +368,78 @@ Inbox wake is now enabled even when `--pattern` is supplied. Existing scripts
 that used a custom pattern exclusively to await an artifact should add
 `--no-inbox` to preserve that behavior.
 
+### Claude Code lead wake
+
+The watch recipe above depends on the lead actually *arming* a background
+watcher before it goes idle. A `Stop` hook makes that deterministic instead of
+trusting the model to remember: on every lead turn end it inspects the harness's
+own `background_tasks` array (delivered in the `Stop` payload) and decides, in a
+single read-only inbox scan:
+
+- **unread reply already waiting** → block, naming the sender(s), instructing the
+  lead to call `read_messages` and keep draining while `has_more` is true;
+- **no unread and no watcher armed** → block with the operational instruction to
+  start the rendered `watch_command_bash` as a background task (`run_in_background`);
+- **watcher armed** (a running `background_tasks` entry whose command is this
+  session's `claude_teams.cli watch <session-dir>`) → allow; the tracked watcher
+  carries the wait and the harness wakes the lead when it exits;
+- **nothing to wait for** (no live subagents, or no session) → allow immediately.
+
+The hook is **zero-token** (it returns instantly in every branch; the long wait
+lives in the tracked watcher, not the hook) and always **fail-open** — it never
+emits `{"continue":false}` and never exits non-zero, so it can never make a lead
+unstoppable. A per-lead progress guard (`wake-progress-<reader>.json` under the
+session dir, keyed on inbox **cursor** advance) caps a no-progress block loop at
+`WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS` (default `3`, well under the harness's
+8-block ceiling). Identity is per-lead: a spawned nested lead resolves its own
+`inbox-<AGENT_NAME>.jsonl`, never a hardcoded `team-lead`.
+
+Server-spawned Claude Code agents get this wiring automatically (it is added as a
+second `Stop` matcher group alongside the state-marker `emit` hook). For a
+**top-level** lead you start yourself, wire it in one step with the
+`install_lead_wake` MCP tool:
+
+- `install_lead_wake()` writes the wake `Stop` hook into the project
+  `.claude/settings.json` in the lead's cwd (`scope="user"` targets
+  `~/.claude/settings.json`). It writes only the wake group, is idempotent, and
+  preserves unrelated hooks.
+- `install_lead_wake(remove=true)` removes only the wake group.
+
+Environment tunables:
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `WIN_AGENT_TEAMS_LEAD_WAKE` | `1` | Kill switch. `0` disables the hook at runtime (even for already-wired sessions). |
+| `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS` | `3` | Consecutive no-progress blocks before the guard fails open. |
+| `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_WAIT` | `0` | Optional in-hook grace-wait seconds (reserved; default `0` = no in-hook wait). |
+
+#### Manual smoke test (interactive; not run in CI)
+
+This is the end-to-end delivery check. It has **not** been run in CI or this
+repo's automated suite (the automated proof is `tests/test_lead_wake.py`, which
+drives the decision function with faked payloads). Run it with your own Claude
+Code and model configuration; record harness version, model, sender, and wake
+content per run — do not treat this document as evidence the run occurred.
+
+1. In a repo cwd, run `install_lead_wake` and confirm `.claude/settings.json` has
+   the `Stop` wake group and `win-agent-teams session-dir` reports the lead
+   identity.
+2. Start an interactive `claude` lead; `spawn_agent` a worker; go idle.
+3. Observe the hook blocks once with the arm instruction and the lead starts
+   `watch …` as a background task.
+4. Confirm arming detection's happy path: after the lead starts the watcher via
+   the real `watch_command_bash` rendering, the next `Stop` is **allowed** (the
+   `background_tasks` entry is recognised) rather than re-blocking the arm
+   instruction — this closes the persistent-false-negative mode that unit token
+   tests cannot reach.
+5. Have the worker `send_message`; confirm the harness re-invokes the idle lead
+   when the background watcher exits, and the lead calls `read_messages` and
+   drains while `has_more` is true.
+6. Confirm one wake per generation (no storm), re-arm after each wake, the cursor
+   never double-advances, and the lead stays interruptible/typeable. Repeat on
+   Opus `--effort low` for ≥ 10 idle turns for a 100% wake rate, and run on both
+   Linux and Windows.
+
 ### Follow-up / Resume
 
 `follow_up_agent(name, prompt, replace_if_idle=true)` continues the same logical agent by starting a new backend process with the CLI's native resume mechanism. Codex uses `codex resume` with the same permission/cwd/reasoning settings as spawn; Claude Code uses `claude --resume`. If the old process is still alive but idle, the tool replaces it by default; pass `replace_if_idle=false` to instead refuse with `agent_idle_but_alive`. A live, busy process is always refused with `agent_busy`.
@@ -362,7 +458,7 @@ Recommended follow-up pattern:
 ### Identity
 
 The server detects its role from environment variables:
-- **Lead mode**: No `AGENT_NAME` set → identity = `"lead"`
+- **Lead mode**: No `AGENT_NAME` set → identity = `"team-lead"`
 - **Agent mode**: `AGENT_NAME` + `AGENT_SESSION_ID` set → identity = agent name
 
 ### Example Flow

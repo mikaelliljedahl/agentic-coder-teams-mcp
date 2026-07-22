@@ -9,8 +9,17 @@ import type { SenderStatus } from "../src/cli";
 import type { CustomMessageInput, ExecOptions, ExecResult, SendMessageOptions } from "../src/types";
 import { AbortError } from "../src/util";
 
-export function okSessionDir(sessionId: string, sessionDir: string): ExecResult {
-  return { stdout: `${sessionId}\t${sessionDir}\tteam-lead\n`, stderr: "", code: 0, killed: false };
+export function okSessionDir(
+  sessionId: string,
+  sessionDir: string,
+  identity = "team-lead",
+): ExecResult {
+  return {
+    stdout: `${sessionId}\t${sessionDir}\t${identity}\n`,
+    stderr: "",
+    code: 0,
+    killed: false,
+  };
 }
 
 export function noSession(): ExecResult {

@@ -274,11 +274,67 @@ class TestWriteClaudeSettings:
 
         config = json.loads(path.read_text(encoding="utf-8"))
         stop_entry = config["hooks"]["Stop"]
-        command = stop_entry[0]["hooks"][0]["command"]
+        emit_group = next(g for g in stop_entry if "emit" in g["hooks"][0]["command"])
+        command = emit_group["hooks"][0]["command"]
         assert "claude_teams.hooks" in command
         assert "emit" in command
         assert "worker" in command
         assert tmp_path.as_posix() in command
+
+    def test_write_claude_settings_stop_has_two_matcher_groups(
+        self, tmp_path: Path
+    ) -> None:
+        path = hooks.write_claude_settings(tmp_path, "worker")
+
+        config = json.loads(path.read_text(encoding="utf-8"))
+        stop_groups = config["hooks"]["Stop"]
+        # Stop is the ONE event that carries a second (wake) matcher group.
+        assert len(stop_groups) == 2
+        commands = [g["hooks"][0]["command"] for g in stop_groups]
+        assert any("claude_teams.hooks" in c and "emit" in c for c in commands), (
+            commands
+        )
+        assert any("claude_teams.lead_wake" in c for c in commands), commands
+        # Every other lifecycle event keeps exactly the single emit group.
+        for event in (
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "SubagentStop",
+        ):
+            assert len(config["hooks"][event]) == 1, event
+            assert (
+                "lead_wake" not in config["hooks"][event][0]["hooks"][0]["command"]
+            ), event
+
+    def test_wake_command_references_lead_wake_module_and_reader(
+        self, tmp_path: Path
+    ) -> None:
+        path = hooks.write_claude_settings(tmp_path, "worker")
+
+        config = json.loads(path.read_text(encoding="utf-8"))
+        wake_group = next(
+            g
+            for g in config["hooks"]["Stop"]
+            if "claude_teams.lead_wake" in g["hooks"][0]["command"]
+        )
+        command = wake_group["hooks"][0]["command"]
+        assert "claude_teams.lead_wake" in command
+        assert "--reader" in command
+        assert "worker" in command
+        assert tmp_path.as_posix() in command
+
+    def test_wake_command_argv_shape(self) -> None:
+        argv = hooks._wake_command(Path("C:/sessions/abc"), "worker")
+
+        assert argv[0] == Path(sys.executable).as_posix()
+        assert "-m" in argv
+        assert "claude_teams.lead_wake" in argv
+        assert "--session-dir" in argv
+        assert argv[argv.index("--session-dir") + 1] == "C:/sessions/abc"
+        assert "--reader" in argv
+        assert argv[argv.index("--reader") + 1] == "worker"
 
 
 class TestCodexHookOverrides:

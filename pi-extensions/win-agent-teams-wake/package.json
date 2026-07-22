@@ -5,6 +5,9 @@
   "description": "Pi extension that wakes a team-lead Pi session when a worker posts to its win-agent-teams inbox, via a cursor-aware single-flight state machine.",
   "type": "module",
   "main": "index.ts",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

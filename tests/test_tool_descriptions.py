@@ -110,6 +110,24 @@ def test_disk_contract_note_documents_one_shot_rearming() -> None:
     assert "re-arm" in note
 
 
+def test_disk_contract_note_documents_lead_wake_hook() -> None:
+    note = server_simple._DISK_CONTRACT_NOTE
+
+    assert "background_tasks" in note
+    assert "wake-progress-" in note
+    assert "WIN_AGENT_TEAMS_LEAD_WAKE" in note
+    assert "read_messages" in note
+
+
+def test_install_lead_wake_description_documents_contract() -> None:
+    description = server_simple.install_lead_wake.__doc__ or ""
+
+    assert ".claude/settings.json" in description
+    assert "Idempotent" in description
+    assert "remove=True" in description
+    assert "WIN_AGENT_TEAMS_LEAD_WAKE=0" in description
+
+
 async def _registered_description(tool_name: str) -> str:
     """Return the client-visible ``Tool.description`` FastMCP registered.
 

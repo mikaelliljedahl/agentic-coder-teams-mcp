@@ -8,8 +8,7 @@
  * every backoff wait so `session_shutdown` tears the loop down promptly.
  */
 import {
-  DEFAULT_READER,
-  isLeadInboxPath,
+  isOwnInboxPath,
   runInboxStatus,
   runSessionDir,
   runWatch,
@@ -30,6 +29,13 @@ export interface WakeMachineOptions {
   exec: PiExec;
   sendMessage: PiSendMessage;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /**
+   * Optional explicit reader override. When omitted (the normal case) the
+   * extension watches the agent's OWN identity: it shells out WITHOUT `--reader`
+   * so the CLI applies its ambient default (`AGENT_NAME` or `team-lead`), and
+   * binds the watched inbox to the identity `session-dir` reports. Set this only
+   * to force a specific reader; do NOT default it to `team-lead`.
+   */
   reader?: string;
   /** `watch --timeout` value, seconds. */
   watchTimeoutSec?: number;
@@ -47,7 +53,7 @@ export class WakeMachine {
   private readonly exec: PiExec;
   private readonly sendMessage: PiSendMessage;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
-  private readonly reader: string;
+  private readonly readerOverride: string | undefined;
   private readonly watchTimeoutSec: number;
   private readonly ackBudget: number;
 
@@ -65,7 +71,12 @@ export class WakeMachine {
     this.exec = opts.exec;
     this.sendMessage = opts.sendMessage;
     this.sleep = opts.sleep;
-    this.reader = opts.reader ?? DEFAULT_READER;
+    // Normalize an empty/whitespace override to unset so `readerArgs` (which
+    // omits `--reader` for a falsy value) and `activeReader` (which would
+    // otherwise bind the guard to `inbox-.jsonl`) stay consistent: both fall
+    // back to the CLI's ambient default (`AGENT_NAME` or `team-lead`).
+    const reader = opts.reader?.trim();
+    this.readerOverride = reader ? reader : undefined;
     this.watchTimeoutSec = opts.watchTimeoutSec ?? 55;
     this.ackBudget = opts.ackBudget ?? 5;
     const base = opts.backoffBaseMs ?? 500;
@@ -104,28 +115,41 @@ export class WakeMachine {
     }
   }
 
+  /**
+   * The identity whose inbox this machine watches: the explicit override when
+   * set, else the identity the current discovery reports (the agent's OWN
+   * identity — `AGENT_NAME` for a spawned agent / nested lead, `team-lead` for
+   * the root lead).
+   */
+  private activeReader(): string {
+    return this.readerOverride ?? this.discovery!.identity;
+  }
+
   private async discovering(signal: AbortSignal): Promise<State> {
     const r = await runSessionDir(this.exec, signal);
-    if (r.kind === "ok" && r.discovery.identity === this.reader) {
+    if (r.kind === "ok") {
+      // A live session exists. Bind to the reported identity (own inbox) rather
+      // than comparing against a hardcoded `team-lead`: a spawned agent / nested
+      // lead reports identity=<AGENT_NAME> and must be watched too (§6).
       this.discovery = r.discovery;
       this.generation = null;
       this.discoverBackoff.reset();
       return "WATCHING";
     }
-    // No session yet, internal error, or a non-team-lead identity: fail closed
-    // and keep polling — never watch or inject against a non-lead session.
+    // No session yet or an internal error: keep polling — never watch or inject
+    // without a live session.
     await this.sleep(this.discoverBackoff.next(), signal);
     return "DISCOVERING";
   }
 
   /**
-   * Re-run discovery. Rebinds `this.discovery` when the same lead session is
-   * still present; reports `changed` when the session id moved (or the session
-   * became unavailable / non-lead), which the caller turns into DISCOVERING.
+   * Re-run discovery. Rebinds `this.discovery` when the same session is still
+   * present; reports `changed` when the session id moved (or the session became
+   * unavailable), which the caller turns into DISCOVERING.
    */
   private async refresh(signal: AbortSignal): Promise<RefreshOutcome> {
     const r = await runSessionDir(this.exec, signal);
-    if (r.kind === "ok" && r.discovery.identity === this.reader) {
+    if (r.kind === "ok") {
       const changed = this.discovery === null || r.discovery.sessionId !== this.discovery.sessionId;
       this.discovery = r.discovery;
       return changed ? "changed" : "same";
@@ -135,7 +159,7 @@ export class WakeMachine {
 
   private async watching(signal: AbortSignal): Promise<State> {
     const dir = this.discovery!.sessionDir;
-    const w = await runWatch(this.exec, dir, this.reader, this.watchTimeoutSec, signal);
+    const w = await runWatch(this.exec, dir, this.readerOverride, this.watchTimeoutSec, signal);
 
     // Refresh discovery after every watch exit (plan §3.3).
     const ref = await this.refresh(signal);
@@ -144,8 +168,8 @@ export class WakeMachine {
       return "DISCOVERING";
     }
 
-    if (w.kind === "message" && isLeadInboxPath(w.path, dir, this.reader)) {
-      const st = await runInboxStatus(this.exec, dir, this.reader, signal);
+    if (w.kind === "message" && isOwnInboxPath(w.path, dir, this.activeReader())) {
+      const st = await runInboxStatus(this.exec, dir, this.readerOverride, signal);
       if (st.kind !== "ok") {
         await this.sleep(this.watchBackoff.next(), signal);
         return "WATCHING";
@@ -185,7 +209,12 @@ export class WakeMachine {
       this.generation = null;
       return "DISCOVERING";
     }
-    const st = await runInboxStatus(this.exec, this.discovery!.sessionDir, this.reader, signal);
+    const st = await runInboxStatus(
+      this.exec,
+      this.discovery!.sessionDir,
+      this.readerOverride,
+      signal,
+    );
     if (st.kind !== "ok") {
       await this.sleep(this.ackBackoff.next(), signal);
       return "ACK_WAIT";
@@ -218,7 +247,12 @@ export class WakeMachine {
       this.generation = null;
       return "DISCOVERING";
     }
-    const st = await runInboxStatus(this.exec, this.discovery!.sessionDir, this.reader, signal);
+    const st = await runInboxStatus(
+      this.exec,
+      this.discovery!.sessionDir,
+      this.readerOverride,
+      signal,
+    );
     if (st.kind !== "ok") {
       await this.sleep(this.stalledBackoff.next(), signal);
       return "ACK_STALLED";
