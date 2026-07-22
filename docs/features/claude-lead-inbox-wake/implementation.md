@@ -274,3 +274,34 @@ self-count / signature, and the six existing tests that monkeypatch
 `_live_subagent_names` failed on the new two-arg signature — `15 failed, 4
 passed`. Green (fix restored): `19 passed`. Full suite: `713 passed, 3 skipped`
 → **718 passed, 3 skipped** after the fix.
+
+## Manual smoke tests (interactive — recorded, not CI evidence)
+
+Run on the shared Claude Code CLI harness (the same harness Claude Desktop
+embeds), server launched from this worktree venv via `--mcp-config`.
+
+**Single-level (main → worker), PASS.** The top-level lead was woken
+automatically when the worker replied and re-armed the one-shot watcher after
+the wake — no manual polling. Confirmed the wake fires from the Stop-hook
+watcher, not model discretion. This run also first exposed the leaf-self-arm
+bug (Fynd 1), fixed above.
+
+**Nested 2-level (main → build-orch [Claude] → reviewer1 [Codex]), PASS.**
+Verified from the live session dir
+(`~/.claude/agent-sessions/70a4f480-…`):
+- `agents.json`: `build-orch parent=team-lead`, `reviewer1 parent=build-orch`
+  — parent recorded correctly at level 2; no identity clobber to `team-lead`.
+- inboxes: `inbox-build-orch.jsonl` ← `reviewer1`, `inbox-team-lead.jsonl` ←
+  `build-orch` — 3-level message propagation routed to each real parent.
+- wake-progress: `wake-progress-team-lead.json` + `wake-progress-build-orch.json`
+  present; **`wake-progress-reviewer1.json` absent** — the Codex leaf never
+  self-armed; both real leads armed for their own children. Fynd 1 fix holds at
+  two levels.
+- The mid-level `build-orch` was simultaneously woken (as main's child) and a
+  waker (arming for its reviewer) — two watchers on distinct inboxes in one
+  session, no collision. Every wake came from the re-armed Stop-hook watcher;
+  no level polled. ~131 s spawn→final-wake wall-clock.
+
+This effectively closes GC1 (the CLI harness that Desktop embeds honors the
+`Stop` wake hook and runs the arm command) and M3 (the harness re-invokes an
+idle lead on watcher exit) empirically.

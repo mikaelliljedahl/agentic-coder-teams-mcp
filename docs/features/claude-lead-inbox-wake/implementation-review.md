@@ -96,3 +96,45 @@ Matches the implementer's claim. No red anywhere; no pre-existing breakage.
   watch recipe already relies on.
 
 Approved to commit and open the PR.
+
+---
+
+## Addendum — post-merge rebase + Fynd 1 fix (reviewed after interactive test)
+
+The interactive smoke test surfaced a real bug the headless spikes and the
+single-session unit fakes structurally could not (a coverage gap I own): the
+wake hook, auto-wired onto every spawned agent, let a **leaf worker count its
+own registry record as a live subagent** → it hit D5 and armed a watcher for
+its own inbox. Confirmed from live disk state (agents.json held only `worker1`;
+`wake-progress-worker1.json` was written).
+
+Also rebased the branch onto `origin/main` = `cf2748a` (PR #34, "auto-load Pi
+wake + fix nested-lead targeting & worker identity"), which had squash-merged
+after our branch was cut.
+
+Verified independently on HEAD `6311fea`:
+
+- **Rebase clean, nothing dropped.** History: `cf2748a` → `e5f9078` →
+  `5ab60f7` → `6311fea`. Both features' symbols coexist in server_simple.py
+  (`_write_pi_mcp_config`/`_AGENT_PARENT_NAME` from #34; `install_lead_wake`/
+  `_group_has_wake_token` from us) and README (both the Pi-setup and the
+  Claude-lead-wake sections). #34 did not touch `_DISK_CONTRACT_NOTE`.
+- **Fynd 1 fix correct** (`_live_subagent_names(session_dir, identity)`,
+  lead_wake.py): excludes self (`name == identity`), excludes terminal, and
+  when any record carries a `parent` scopes to `parent == identity`; legacy
+  fallback (no parent anywhere) still self-excludes. Traced: worker1 → `live=[]`
+  → D2 allow (bug gone); top-level team-lead → `live=[worker1]` → proceeds to
+  arm for its real child (correct). Parent recorded as `"parent": IDENTITY` on
+  the spawn record (server_simple.py:1591), consistent with #34's `parent_name`
+  convention.
+- **Regression tests** added (`TestLiveSubagentScoping`): only-self→D2,
+  self+sibling→D2, self+live-child→not-D2, terminal-child→D2, legacy-leaf→D2 —
+  closing the coverage gap.
+- **Gates green independently:** ty clean, ruff clean, 718 passed / 3 skipped.
+
+Fynd 2 (top-level lead hook was never installed in the first test) was a
+test-setup gap, not a code defect; the retest pre-installs the hook. Fynd 3
+(worker's reply never reached any inbox) is orthogonal to this feature and is
+re-checked in the retest now that #34's worker-identity fix is in the branch.
+
+Fynd 1 fix approved.
