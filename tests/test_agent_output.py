@@ -905,6 +905,7 @@ async def test_spawn_agent_persists_output_lookup_metadata(
             "pid": 456,
             "backend": "codex",
             "session_id": result["session_id"],
+            "parent": server_simple.IDENTITY,
             "status": "running",
             "spawned_at": before,
             "cwd": str(cwd),
