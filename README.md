@@ -103,12 +103,35 @@ pi            # then run /login inside pi and pick your provider
 pi install npm:pi-mcp-adapter
 ```
 
-You do **not** hand-write any MCP config: the server writes `~/.pi/agent/mcp.json`
-(idempotently, on each pi spawn) with a `win-agent-teams` entry whose identity env
-uses `${AGENT_NAME}`/`${AGENT_SESSION_ID}`/`${AGENT_PARENT_NAME}` interpolation,
-resolved from each pi process's own environment. The adapter starts the server
-**lazily** (only when pi actually calls a tool), so a normal `pi` run you do
-yourself is unaffected apart from one ~200-token proxy tool.
+You do **not** hand-write any MCP config. Identity is delivered differently for
+the two pi scenarios:
+
+- **Human-launched pi *lead*** — the server writes `~/.pi/agent/mcp.json`
+  (idempotently, on each pi spawn) with a `win-agent-teams` entry whose identity
+  env uses `${AGENT_NAME}`/`${AGENT_SESSION_ID}`/`${AGENT_PARENT_NAME}`
+  interpolation, resolved from the pi process's own environment. With no
+  `AGENT_*` set, identity resolves to `team-lead` (the project `.mcp.json` may
+  also apply — see the warning below).
+- **Spawned pi *worker*** — the server writes a **per-agent MCP config** with
+  **literal** `AGENT_*` values at `<session_dir>/mcp/<agent>.pi.mcp.json` and the
+  pi backend passes it to pi via `--mcp-config`. This mirrors the Claude path and
+  does not rely on `${AGENT_*}` interpolation, so a spawned worker's identity is
+  never left to the environment (which lower-precedence MCP config sources can
+  clobber).
+
+The adapter starts the server **lazily** (only when pi actually calls a tool), so
+a normal `pi` run you do yourself is unaffected apart from one ~200-token proxy
+tool.
+
+> **WARNING — never put `AGENT_*` in a project MCP config.** Do not add an
+> `AGENT_NAME` / `AGENT_SESSION_ID` / `AGENT_PARENT_NAME` `env` block to a project
+> `.mcp.json` or `.pi/mcp.json` `win-agent-teams` entry. The pi-mcp-adapter merges
+> config sources **later-wins** and replaces the whole `env` map per server entry,
+> so an empty (or literal) `AGENT_*` value there overwrites the correct per-agent
+> identity delivered via `--mcp-config`. This now causes the win-agent-teams MCP
+> server to **refuse** identity-bearing tools (`send_message` / `read_messages` /
+> `resume_session` return `{"success": false, "reason": "identity_unresolved"}`)
+> rather than silently masquerade as `team-lead` and hijack the lead's session.
 
 This covers both scenarios:
 1. **Pi as lead** — pi calls `spawn_agent` to start Claude Code, Codex, or other pi agents.
@@ -362,7 +385,7 @@ Recommended follow-up pattern:
 ### Identity
 
 The server detects its role from environment variables:
-- **Lead mode**: No `AGENT_NAME` set → identity = `"lead"`
+- **Lead mode**: No `AGENT_NAME` set → identity = `"team-lead"`
 - **Agent mode**: `AGENT_NAME` + `AGENT_SESSION_ID` set → identity = agent name
 
 ### Example Flow

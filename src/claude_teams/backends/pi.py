@@ -288,6 +288,7 @@ class PiBackend(BaseBackend):
             self._pi_session_dir(request),
             "--session-id",
             request.name,
+            *self._mcp_config_args(request),
             *self._model_args(request),
             *self._extension_args(request),
         ]
@@ -315,11 +316,28 @@ class PiBackend(BaseBackend):
             "--session-id",
             request.name,
             "--continue",
+            *self._mcp_config_args(request),
             *self._model_args(request),
             *self._extension_args(request),
         ]
         cmd.extend(self._prompt_args(request))
         return cmd
+
+    @staticmethod
+    def _mcp_config_args(request: SpawnRequest) -> list[str]:
+        """Build the ``--mcp-config <path>`` args for the per-agent pi MCP file.
+
+        The server writes ``<session_dir>/mcp/<agent>.pi.mcp.json`` with LITERAL
+        ``AGENT_*`` identity (see ``server_simple._write_pi_mcp_config``) and
+        passes its path in ``extra["pi_mcp_config_path"]``. Passing it via
+        ``--mcp-config`` redirects the pi-mcp-adapter's pi-global config source
+        to this file, so identity is not left to ``${AGENT_*}`` interpolation
+        (which a lower-precedence empty ``env`` block can clobber). Emitted as a
+        discrete argv token so a Windows path with spaces survives the launch.
+        Omitted entirely when the path is absent.
+        """
+        path = (request.extra or {}).get("pi_mcp_config_path")
+        return ["--mcp-config", str(path)] if path else []
 
     def _pi_session_dir(self, request: SpawnRequest) -> str:
         """Return the per-agent pi session storage dir under the team session dir.
@@ -354,9 +372,25 @@ class PiBackend(BaseBackend):
 
     @staticmethod
     def _extension_args(request: SpawnRequest) -> list[str]:
-        """Build the ``-e <path>`` arg loading the state-reporting extension."""
-        ext = (request.extra or {}).get("pi_state_extension_path")
-        return ["-e", str(ext)] if ext else []
+        """Build the ``-e <path>`` args loading the bundled pi extensions.
+
+        Two extensions are loaded, each via its own ``-e``:
+
+        - the state-reporting extension (``pi_state_extension_path``), and
+        - the inbox-wake extension (``pi_wake_extension_path``), so a spawned Pi
+          agent that becomes a lead for level-2 children is woken when they post
+          to its own inbox (nested orchestration; guarded off the injected
+          ``WIN_AGENT_TEAMS_SESSION_DIR`` inside the extension).
+
+        Either is omitted when its path is absent from ``request.extra``.
+        """
+        extra = request.extra or {}
+        args: list[str] = []
+        for key in ("pi_state_extension_path", "pi_wake_extension_path"):
+            ext = extra.get(key)
+            if ext:
+                args.extend(["-e", str(ext)])
+        return args
 
     def _prompt_args(self, request: SpawnRequest) -> list[str]:
         """Return the initial-prompt argv for pi.

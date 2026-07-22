@@ -706,6 +706,53 @@ def test_inbox_status_respects_reader_flag(tmp_path: Path, monkeypatch) -> None:
     assert payload["senders"] == {"worker": {"total": 1, "cursor": 0, "unread": 1}}
 
 
+def test_inbox_status_uses_nested_agent_identity(tmp_path: Path, monkeypatch) -> None:
+    """Without --reader, inbox-status resolves the reader from AGENT_NAME.
+
+    This pins the cross-language contract the Pi wake extension relies on: it
+    calls ``inbox-status`` WITHOUT ``--reader`` for a nested lead, so the CLI
+    must apply the same ambient default as ``watch`` (AGENT_NAME, else
+    team-lead) rather than hardcoding team-lead.
+    """
+    monkeypatch.setenv("AGENT_NAME", "worker-1")
+    base = _session_base(tmp_path, monkeypatch)
+    sdir = base / "nested"
+    sdir.mkdir()
+    # team-lead's inbox has traffic that MUST NOT be reported for a nested lead.
+    (sdir / "inbox-team-lead.jsonl").write_text(
+        json.dumps({"from": "noise", "text": "ignore"}) + "\n"
+    )
+    (sdir / "inbox-worker-1.jsonl").write_text(
+        json.dumps({"from": "boss", "text": "x"}) + "\n"
+    )
+
+    result = runner.invoke(app, ["inbox-status", str(sdir)])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["reader"] == "worker-1"
+    assert payload["senders"] == {"boss": {"total": 1, "cursor": 0, "unread": 1}}
+
+
+def test_inbox_status_defaults_to_team_lead_without_agent_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With no AGENT_NAME and no --reader, the reader falls back to team-lead."""
+    base = _session_base(tmp_path, monkeypatch)
+    sdir = base / "root"
+    sdir.mkdir()
+    (sdir / "inbox-team-lead.jsonl").write_text(
+        json.dumps({"from": "worker", "text": "x"}) + "\n"
+    )
+
+    result = runner.invoke(app, ["inbox-status", str(sdir)])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["reader"] == "team-lead"
+    assert payload["senders"] == {"worker": {"total": 1, "cursor": 0, "unread": 1}}
+
+
 def test_inbox_status_outside_base_exits_4(tmp_path: Path, monkeypatch) -> None:
     _session_base(tmp_path, monkeypatch)
     outside = tmp_path / "elsewhere"

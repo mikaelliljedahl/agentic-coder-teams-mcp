@@ -13,11 +13,13 @@ import {
 const LEAD_INBOX = "/base/sid-1/inbox-team-lead.jsonl";
 
 function machine(h: Harness): WakeMachine {
+  // No explicit reader override: the machine binds to the identity that
+  // session-dir reports (team-lead for the default harness), and shells out to
+  // the CLI WITHOUT --reader so it applies its own ambient default.
   return new WakeMachine({
     exec: h.exec,
     sendMessage: h.sendMessage,
     sleep: h.sleep,
-    reader: "team-lead",
     watchTimeoutSec: 5,
     ackBudget: 3,
   });
@@ -285,15 +287,91 @@ describe("WakeMachine — discovery / rebinding", () => {
     expect(rebound).toBe(true);
   });
 
-  it("fails closed when identity is not team-lead (never watches or injects)", async () => {
+  it("§6: a nested lead (identity=<AGENT_NAME>) reaches WATCHING and wakes on its own inbox", async () => {
+    // Regression for the over-constrained team-lead-only gate: a spawned Pi
+    // subagent-as-lead reports identity=worker-1 and must watch
+    // inbox-worker-1.jsonl, not inbox-team-lead.jsonl.
+    const nestedInbox = "/base/sid-1/inbox-worker-1.jsonl";
     const h = new Harness({
-      sessionDir: [
-        { stdout: "sid-x\t/base/sid-x\tworker-1\n", stderr: "", code: 0, killed: false },
-      ],
-      maxCalls: 6,
+      sessionDir: [okSessionDir("sid-1", "/base/sid-1", "worker-1")],
+      watch: [watchMessage(["alice"], nestedInbox), watchTimeout()],
+      inboxStatus: [status({ alice: sender(2, 0) }), status({ alice: sender(2, 2) })],
+      maxCalls: 20,
     });
     await machine(h).run(h.controller.signal);
-    expect(h.count("watch")).toBe(0);
+    expect(h.sends).toHaveLength(1);
+    expect(h.count("watch")).toBeGreaterThanOrEqual(2);
+  });
+
+  it("§6: a nested lead ignores a message on the team-lead inbox (not its own)", async () => {
+    const h = new Harness({
+      sessionDir: [okSessionDir("sid-1", "/base/sid-1", "worker-1")],
+      watch: [watchMessage(["alice"], "/base/sid-1/inbox-team-lead.jsonl"), watchTimeout()],
+      inboxStatus: [status({ alice: sender(1, 0) })],
+      maxCalls: 12,
+    });
+    await machine(h).run(h.controller.signal);
     expect(h.sends).toHaveLength(0);
+    expect(h.count("inbox-status")).toBe(0);
+  });
+
+  it("§6: shells out WITHOUT --reader (lets the CLI apply its ambient default)", async () => {
+    const h = new Harness({
+      sessionDir: [okSessionDir("sid-1", "/base/sid-1", "worker-1")],
+      watch: [watchMessage(["alice"], "/base/sid-1/inbox-worker-1.jsonl"), watchTimeout()],
+      inboxStatus: [status({ alice: sender(1, 0) }), status({ alice: sender(1, 1) })],
+      maxCalls: 12,
+    });
+    await machine(h).run(h.controller.signal);
+    const watchCalls = h.calls.filter((c) => c.sub === "watch");
+    const statusCalls = h.calls.filter((c) => c.sub === "inbox-status");
+    expect(watchCalls.length).toBeGreaterThanOrEqual(1);
+    for (const c of [...watchCalls, ...statusCalls]) {
+      expect(c.args).not.toContain("--reader");
+    }
+  });
+
+  it("§6: an explicit reader override is passed through as --reader", async () => {
+    const h = new Harness({
+      sessionDir: [okSessionDir("sid-1", "/base/sid-1", "team-lead")],
+      watch: [watchTimeout()],
+      maxCalls: 4,
+    });
+    const m = new WakeMachine({
+      exec: h.exec,
+      sendMessage: h.sendMessage,
+      sleep: h.sleep,
+      reader: "team-lead",
+      watchTimeoutSec: 5,
+    });
+    await m.run(h.controller.signal);
+    const watchCall = h.calls.find((c) => c.sub === "watch");
+    expect(watchCall?.args).toContain("--reader");
+    expect(watchCall?.args).toContain("team-lead");
+  });
+
+  it("§6: an empty/whitespace reader override is normalized to unset (no --reader)", async () => {
+    const h = new Harness({
+      sessionDir: [okSessionDir("sid-1", "/base/sid-1", "worker-1")],
+      watch: [watchMessage(["alice"], "/base/sid-1/inbox-worker-1.jsonl"), watchTimeout()],
+      inboxStatus: [status({ alice: sender(1, 0) }), status({ alice: sender(1, 1) })],
+      maxCalls: 12,
+    });
+    const m = new WakeMachine({
+      exec: h.exec,
+      sendMessage: h.sendMessage,
+      sleep: h.sleep,
+      reader: "   ",
+      watchTimeoutSec: 5,
+      ackBudget: 3,
+    });
+    await m.run(h.controller.signal);
+    const relevant = h.calls.filter((c) => c.sub === "watch" || c.sub === "inbox-status");
+    expect(relevant.length).toBeGreaterThanOrEqual(1);
+    for (const c of relevant) {
+      expect(c.args).not.toContain("--reader");
+    }
+    // The guard binds to the session-dir identity, so injection still happens.
+    expect(h.sends).toHaveLength(1);
   });
 });

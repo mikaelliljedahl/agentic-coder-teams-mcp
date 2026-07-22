@@ -1,13 +1,60 @@
 # win-agent-teams-wake
 
-A [Pi](https://github.com/earendil-works/pi) extension that wakes a **team-lead**
-Pi session when a worker posts to its `win-agent-teams` inbox. It runs a
-single-flight, cursor-aware state machine that shells out to the read-only
-`win-agent-teams` CLI (`session-dir` / `inbox-status` / `watch`) and injects one
-steering turn per message generation, telling the lead to call `read_messages`.
+A [Pi](https://github.com/earendil-works/pi) extension that wakes **any Pi lead**
+— at any nesting level — when a child posts to its `win-agent-teams` inbox. It
+runs a single-flight, cursor-aware state machine that shells out to the
+read-only `win-agent-teams` CLI (`session-dir` / `inbox-status` / `watch`) and
+injects one steering turn per message generation, telling the lead to call
+`read_messages`.
+
+"Lead" is a role at every nesting level, not a fixed identity: a spawned Pi
+subagent can itself spawn children and must be woken when *they* post to *its*
+inbox. The extension watches the agent's **own** identity — `AGENT_NAME` when
+set (a spawned agent / nested lead → `inbox-<AGENT_NAME>.jsonl`), else
+`team-lead` (a human-launched root lead → `inbox-team-lead.jsonl`). It shells out
+to the CLI **without** `--reader`, letting the CLI apply that same ambient
+default; a `WakeMachineOptions.reader` override exists only for explicit cases.
 
 The extension never consumes the inbox itself — the lead remains the only cursor
-writer. See `docs/features/pi-lead-inbox-wake/plan.md` for the full design.
+writer. See `docs/features/pi-lead-inbox-wake/plan.md` for the wake-loop design
+and `docs/features/pi-lead-autoload/design.md` for auto-load + the nested-lead
+generalization.
+
+## Activation guard (no-op unless in a win-agent-teams session)
+
+`activate()` returns immediately — no handlers, no loop, no dependency on the
+CLI being on `PATH` — unless one of these is present in the environment:
+
+- `WIN_AGENT_TEAMS_SESSION_DIR` — injected by the pi backend into every spawned
+  agent (worker or nested subagent-as-lead). This is the normal activation path.
+- `WIN_AGENT_TEAMS_LEAD=1` — the explicit opt-in for a bare human-launched root
+  lead, set by a launcher such as `alias pi-lead='WIN_AGENT_TEAMS_LEAD=1 pi'`.
+
+A plain `pi` run for unrelated work sets neither and stays a true no-op.
+
+## Auto-load
+
+- **Spawned Pi agents**: the pi backend loads this extension via `-e`
+  automatically (alongside `win-agent-teams-state`), so nested leads are covered
+  with no per-agent setup. The injected `WIN_AGENT_TEAMS_SESSION_DIR` activates
+  it.
+- **Root lead**: register the package once so `pi` auto-loads it from
+  `~/.pi/agent/settings.json` `packages` (the `package.json` here carries the
+  `"pi": { "extensions": ["./index.ts"] }` field that makes the directory a
+  loadable pi package):
+
+  ```bash
+  pi install /path/to/agentic-coder-teams-mcp/pi-extensions/win-agent-teams-wake
+  ```
+
+  Then launch the root lead with the opt-in flag (`pi-lead` alias above). The
+  `win-agent-teams` MCP server stays project-scoped in the repo's `.mcp.json`
+  (not global) — see the design doc for why.
+
+- **Kill switch**: `WIN_AGENT_TEAMS_STATE_HOOKS=0` disables the pi *state*
+  extension **and** this wake extension together — the server's `_hook_extra`
+  returns early before adding either `-e` path, so the two share one switch.
+  There is no separate flag to disable wake while keeping state reporting.
 
 ## Requirements
 
