@@ -193,9 +193,21 @@ win-agent-teams tools:
   carrying the identity (`codex._mcp_identity_args`); avoids racing on the shared
   `~/.codex/config.toml`.
 - **pi** — pi has no built-in MCP, so it uses the official `pi-mcp-adapter`
-  package + a generated `~/.pi/agent/mcp.json` (`server_simple._ensure_pi_mcp_config`)
-  whose `env` uses `${AGENT_NAME}` interpolation, resolved from each pi process's
-  own env (`pi.build_env`). One shared static file, race-free.
+  package. A **human-launched pi lead** reads a generated `~/.pi/agent/mcp.json`
+  (`server_simple._ensure_pi_mcp_config`) whose `env` uses `${AGENT_NAME}`
+  interpolation, resolved from the pi process's own env (`pi.build_env`); one
+  shared static file, race-free. A **spawned pi worker** additionally gets a
+  per-agent `--mcp-config <session_dir>/mcp/<agent>.pi.mcp.json` file
+  (`server_simple._write_pi_mcp_config`) with **literal** `AGENT_*` identity, so a
+  worker's identity does not depend on `${AGENT_*}` interpolation.
+
+  > **WARNING — never hardcode `AGENT_*` in a project MCP config.** Do not add an
+  > `AGENT_NAME` / `AGENT_SESSION_ID` / `AGENT_PARENT_NAME` `env` block to a
+  > project `.mcp.json` / `.pi/mcp.json` `win-agent-teams` entry. The
+  > pi-mcp-adapter merges config sources later-wins and replaces the whole `env`
+  > map per server entry, so an empty/literal `AGENT_*` there clobbers the correct
+  > per-agent identity and forces the server to refuse identity-bearing tools
+  > (`identity_unresolved`).
 
 Add a per-backend branch to `server_simple._hook_extra` for any spawn-time setup
 (pi's branch ensures the mcp.json and points at the state extension).

@@ -67,7 +67,39 @@ _AGENT_PARENT_NAME: str = os.environ.get("AGENT_PARENT_NAME", "").strip()
 # the right inbox out of the box. ("lead" and friends remain aliases below for
 # backward compatibility.)
 ROOT_LEAD_NAME: str = "team-lead"
-IDENTITY: str = _AGENT_NAME if _AGENT_NAME else ROOT_LEAD_NAME
+
+# Sentinel identity used when a spawned subagent's MCP server starts with an
+# empty ``AGENT_NAME`` (identity was clobbered — see ``_resolve_identity``). It
+# can never be a valid inbox/lead name (contains a NUL), so any tool that keys
+# off ``IDENTITY`` while unresolved fails to match a real inbox/session and, per
+# the guards below, refuses outright rather than masquerading as the lead.
+_UNRESOLVED_IDENTITY: str = "\x00unresolved-identity"
+
+
+def _resolve_identity(environ: "os._Environ[str] | dict[str, str]") -> tuple[str, bool]:
+    """Resolve ``(IDENTITY, unresolved)`` from an environment mapping.
+
+    - A non-empty ``AGENT_NAME`` is always authoritative → ``(name, False)``.
+    - Empty ``AGENT_NAME`` **with** a spawned-subagent signal
+      (``WIN_AGENT_TEAMS_SESSION_DIR``, set only by ``PiBackend.build_env`` and
+      inherited by children, never carried in any ``mcp.json`` ``env`` block) →
+      identity is UNRESOLVED: ``(_UNRESOLVED_IDENTITY, True)``. This means the
+      literal ``AGENT_*`` values were clobbered (e.g. an ``AGENT_*`` env block in
+      a project ``.mcp.json`` / ``.pi/mcp.json`` shallow-overrides the inherited
+      values). We refuse to default to ``team-lead`` and hijack the lead.
+    - Empty ``AGENT_NAME`` with **no** signal is a legitimate human-launched root
+      lead → ``(ROOT_LEAD_NAME, False)``.
+    """
+    name = environ.get("AGENT_NAME", "").strip()
+    if name:
+        return name, False
+    spawned_signal = bool(environ.get("WIN_AGENT_TEAMS_SESSION_DIR", "").strip())
+    if spawned_signal:
+        return _UNRESOLVED_IDENTITY, True
+    return ROOT_LEAD_NAME, False
+
+
+IDENTITY, _IDENTITY_UNRESOLVED = _resolve_identity(os.environ)
 
 # Names a subagent might reasonably use to mean "whoever spawned me". All of
 # these resolve to the lead/parent so a message is never lost to a typo'd
@@ -103,6 +135,17 @@ _RETENTION_DAYS_ENV = "WIN_AGENT_TEAMS_RETENTION_DAYS"
 _CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60.0
 _CLAUDE_PROMPT_FILE_CHARS: frozenset[str] = frozenset({"'", '"', "\n", "\r"})
 logger = logging.getLogger(__name__)
+
+if _IDENTITY_UNRESOLVED:
+    logger.error(
+        "win-agent-teams identity is UNRESOLVED: AGENT_NAME is empty but this "
+        "process was spawned as a subagent (WIN_AGENT_TEAMS_SESSION_DIR is set). "
+        "The literal AGENT_* identity was clobbered -- most likely an AGENT_* env "
+        "block in a project .mcp.json / .pi/mcp.json shallow-overrides the "
+        "inherited values. Team tools (send_message/read_messages/resume_session) "
+        "will refuse until identity is fixed; never put AGENT_* in a project MCP "
+        "config env block."
+    )
 
 # Outcome of the most recent session recovery attempt, surfaced to the lead as
 # a nudge on dict-returning tools: either ``{"adopted_session": {...}}`` (a
@@ -569,6 +612,31 @@ def _autoadopt_enabled() -> bool:
     }
 
 
+def _require_resolved_identity() -> dict | None:
+    """Return a structured refusal when identity is unresolved, else ``None``.
+
+    Applied to every identity-bearing tool so a mis-configured spawned subagent
+    (empty ``AGENT_NAME`` + subagent signal) refuses loudly instead of operating
+    as ``team-lead`` (spoofing ``from:``, consuming the lead's inbox, or adopting
+    the lead's session). In the healthy path (Claude/Codex always carry a literal
+    name; a correctly-configured pi worker gets one via the per-agent
+    ``--mcp-config`` file) this never fires.
+    """
+    if _IDENTITY_UNRESOLVED:
+        return {
+            "success": False,
+            "reason": "identity_unresolved",
+            "hint": (
+                "This agent's AGENT_NAME is empty but it was spawned as a "
+                "subagent, so its MCP identity was clobbered (likely an AGENT_* "
+                "env block in a project .mcp.json / .pi/mcp.json). Team tools are "
+                "disabled to avoid hijacking the lead. Report this via your final "
+                "output and ask the lead to fix the MCP config."
+            ),
+        }
+    return None
+
+
 def _recover_session_id() -> str:
     """Recover the persisted lead session for this MCP parent/workspace.
 
@@ -583,6 +651,12 @@ def _recover_session_id() -> str:
     _pending_recovery = {}
     if _AGENT_SESSION_ID:
         return _AGENT_SESSION_ID
+    if _IDENTITY_UNRESOLVED:
+        # A mis-identified spawned child must NEVER adopt a workspace session:
+        # not via the exact binding-key match, not via silent single-candidate
+        # auto-adopt (the dangerous no-tool-call path), and not via the recovery
+        # nudge. Return unresolved with an empty nudge before any candidate scan.
+        return ""
     key = _binding_key()
     binding = _read_json_object(_binding_file())
     session_id = binding.get("session_id")
@@ -1186,6 +1260,44 @@ def _write_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Pat
     return path
 
 
+def _write_pi_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Path:
+    """Write per-agent pi MCP config with LITERAL identity (via ``--mcp-config``).
+
+    Mirrors :func:`_write_mcp_config` but (a) uses a distinct filename
+    (``<agent>.pi.mcp.json``) so it can never collide with the Claude file, and
+    (b) adds the pi-adapter-specific keys the interpolated ``~/.pi/agent/mcp.json``
+    used: a server-entry ``directTools`` (per review F4 the adapter reads it at
+    the server-entry level) and ``CLAUDE_TEAMS_PERMISSION_MODE=bypass``.
+
+    The env values are written as literals (no ``${...}`` interpolation) so a
+    spawned pi worker's identity survives the pi-mcp-adapter config merge even if
+    a lower-precedence source carries an empty ``AGENT_*`` env block. Note this
+    file only reliably owns keys that higher-precedence project sources
+    (``<cwd>/.mcp.json``, ``<cwd>/.pi/mcp.json``) do not themselves declare; an
+    ``AGENT_*`` env block in those sources would still shallow-override it (that
+    is what the fail-loud identity guard defends against).
+    """
+    config = {
+        "mcpServers": {
+            "win-agent-teams": {
+                "command": sys.executable,
+                "args": ["-m", "claude_teams.server_simple"],
+                "env": {
+                    "AGENT_SESSION_ID": session_id,
+                    "AGENT_NAME": agent_name,
+                    "AGENT_PARENT_NAME": parent_name,
+                    "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
+                },
+                "directTools": True,
+            }
+        }
+    }
+    path = _session_dir(session_id) / "mcp" / f"{agent_name}.pi.mcp.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return path
+
+
 def _write_prompt_file_extra(
     session_id: str, agent_name: str, backend_name: str, prompt: str
 ) -> dict[str, str]:
@@ -1303,9 +1415,16 @@ def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str
     session_dir = _session_dir(session_id)
     if backend_name == "pi":
         _ensure_pi_mcp_config()
+        # Written BEFORE the state-hooks kill switch so identity is never gated
+        # behind it: the per-agent literal --mcp-config file is the primary fix
+        # for the identity clobber and must exist even with state hooks off.
+        extra: dict[str, str] = {
+            "pi_mcp_config_path": str(
+                _write_pi_mcp_config(session_id, agent_name, IDENTITY)
+            )
+        }
         if os.environ.get("WIN_AGENT_TEAMS_STATE_HOOKS", "1").strip() == "0":
-            return {}
-        extra: dict[str, str] = {}
+            return extra
         ext = _pi_state_extension_dir()
         if ext:
             extra["pi_state_extension_path"] = str(ext)
@@ -1388,6 +1507,11 @@ async def spawn_agent(
     """
 
     def _do_spawn() -> dict:
+        refusal = _require_resolved_identity()
+        if refusal is not None:
+            # An unresolved child must never create an orphan session or launch
+            # a subprocess with the sentinel identity in its env.
+            return refusal
         session_id = _active_session_id(create=True)
         with _agents_transaction(session_id) as agents:
             agent_name = _unique_agent_name(name, agents)
@@ -1488,6 +1612,9 @@ async def send_message(text: str, to: str = "team-lead") -> dict:
     message if it calls read_messages after the message is sent. If the agent
     is not polling, use follow_up_agent instead.
     """
+    refusal = _require_resolved_identity()
+    if refusal is not None:
+        return {**refusal, "to": to}
     session_id = _active_session_id()
 
     def _do_send() -> dict:
@@ -1555,6 +1682,12 @@ async def read_messages(
     if limit is not None and limit < 0:
         msg = "limit must not be negative"
         raise ValueError(msg)
+
+    refusal = _require_resolved_identity()
+    if refusal is not None:
+        # Refuse before any inbox read/cursor advance so a mis-identified child
+        # never consumes (marks read) the lead's inbox.
+        return refusal
 
     session_id = _active_session_id()
 
@@ -1999,6 +2132,10 @@ async def resume_session(session_id: str) -> dict:
 
     def _do_resume() -> dict:
         global _session_id  # noqa: PLW0603 - module-level lead session state.
+        refusal = _require_resolved_identity()
+        if refusal is not None:
+            # An unresolved child must never adopt (hijack) a workspace session.
+            return refusal
         sid = session_id.strip()
         if not sid:
             return {"success": False, "reason": "session_id_required"}

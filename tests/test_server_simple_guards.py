@@ -199,6 +199,9 @@ def test_hook_extra_pi_emits_both_extension_keys(isolated, monkeypatch, tmp_path
 
     extra = ss._hook_extra("sid", "agent", "pi")
 
+    # The per-agent literal --mcp-config file is always written (identity fix);
+    # the two -e extension keys accompany it when state hooks are enabled.
+    assert extra.pop("pi_mcp_config_path").endswith("agent.pi.mcp.json")
     assert extra == {
         "pi_state_extension_path": str(state_dir),
         "pi_wake_extension_path": str(wake_dir),
@@ -207,13 +210,16 @@ def test_hook_extra_pi_emits_both_extension_keys(isolated, monkeypatch, tmp_path
 
 def test_hook_extra_pi_state_hooks_off_disables_both(isolated, monkeypatch):
     # WIN_AGENT_TEAMS_STATE_HOOKS=0 is a single kill switch for BOTH pi
-    # extensions (state reporting AND inbox-wake).
+    # extensions (state reporting AND inbox-wake) -- but NOT the per-agent
+    # --mcp-config identity file, which is written before the kill switch.
     monkeypatch.setattr(ss, "_ensure_pi_mcp_config", lambda: None)
     monkeypatch.setattr(ss, "_pi_state_extension_dir", lambda: Path("/x/state"))
     monkeypatch.setattr(ss, "_pi_wake_extension_dir", lambda: Path("/x/wake"))
     monkeypatch.setenv("WIN_AGENT_TEAMS_STATE_HOOKS", "0")
 
-    assert ss._hook_extra("sid", "agent", "pi") == {}
+    extra = ss._hook_extra("sid", "agent", "pi")
+    assert extra.pop("pi_mcp_config_path").endswith("agent.pi.mcp.json")
+    assert extra == {}
 
 
 def test_hook_extra_pi_missing_wake_dir_omits_key(isolated, monkeypatch, tmp_path):
