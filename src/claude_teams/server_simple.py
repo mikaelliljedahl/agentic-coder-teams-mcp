@@ -1583,6 +1583,12 @@ async def spawn_agent(
                     "pid": pid,
                     "backend": backend_name,
                     "session_id": session_id,
+                    # The spawning lead's identity. Mirrors the AGENT_PARENT_NAME
+                    # env propagated into the child's MCP config (which is also
+                    # this server's IDENTITY at spawn time); recorded here so the
+                    # lead-wake hook can scope "live subagents" to a caller's own
+                    # children instead of every agent in the shared session.
+                    "parent": IDENTITY,
                     "status": "running",
                     "spawned_at": time.time(),
                     "cwd": agent_cwd,

@@ -108,22 +108,50 @@ def _resolve_session_dir(session_dir_arg: str | None) -> Path | None:
     return None
 
 
-def _live_subagent_names(session_dir: Path) -> list[str]:
-    """Return names of non-terminal subagents in the session's agents registry.
+def _live_subagent_names(session_dir: Path, identity: str) -> list[str]:
+    """Return names of this agent's live (non-terminal) CHILD subagents.
 
-    Empty (no agents, or all terminal) means the lead has nothing to wait for
-    (D2 fast allow). Fail-open: any error yields ``[]``.
+    Scoped to the caller's own children so a leaf worker never counts itself
+    (or a sibling) as something it must wait for: a record counts only when its
+    ``parent`` field equals ``identity`` AND its ``name`` differs from
+    ``identity`` (self is always excluded). Empty means the agent leads no live
+    children, so it has nothing to wait for (D2 fast allow) — exactly what a
+    leaf worker must hit.
+
+    Backward tolerance: agent records written before the ``parent`` field
+    existed carry no parent at all. When NOT ONE record in the registry has a
+    ``parent`` key, we cannot scope by parentage, so we fall back to "every
+    non-terminal agent except self". That fallback still excludes self, so a
+    legacy leaf session (its own single record) can never regress into the
+    self-count bug, while a legacy lead still sees its (unscoped) live agents.
+    In a mixed session (some records have ``parent``, some don't) the scoped
+    predicate applies and parentless records simply do not match. Fail-open:
+    any error yields ``[]``.
     """
     try:
         session_id = session_dir.name
-        return [
-            str(agent.get("name") or "")
+        records = [
+            agent
             for agent in server_simple._load_agents(session_id)
             if isinstance(agent, dict)
-            and agent.get("status") not in server_simple._TERMINAL_STATUSES
         ]
     except Exception:
         return []
+
+    any_parent = any("parent" in rec for rec in records)
+    live: list[str] = []
+    for rec in records:
+        name = str(rec.get("name") or "")
+        if name == identity:
+            continue  # never count self
+        if rec.get("status") in server_simple._TERMINAL_STATUSES:
+            continue  # terminal (e.g. killed) is not live
+        if any_parent:
+            if rec.get("parent") == identity:
+                live.append(name)
+        else:
+            live.append(name)
+    return live
 
 
 def _scan_senders(session_dir: Path, identity: str) -> dict[str, dict[str, int]]:
@@ -327,7 +355,7 @@ def evaluate(
         log.update(decision="allow", why="no-session")
         return WakeDecision("allow", "D1", log=log)
 
-    live = _live_subagent_names(session_dir)
+    live = _live_subagent_names(session_dir, identity)
     log["live_subagents"] = len(live)
     if not live:
         log.update(decision="allow", why="no-live-subagents")

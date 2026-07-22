@@ -202,3 +202,75 @@ No red anywhere in the tree; no pre-existing breakage encountered or absorbed.
 - **GC1 (Claude Desktop honours the settings `Stop` hook)** remains the 1-minute
   manual check (spike M1); every headless signal points to it holding on harness
   2.1.215.
+
+---
+
+## Post-merge fix (Fynd 1): leaf agents wrongly self-counting as live subagents
+
+Surfaced by the interactive test after this branch was rebased onto
+`origin/main` (which had absorbed PR #34's Pi-wake auto-loading, wiring the wake
+hook onto *every* spawned Claude Code agent, not just top-level leads).
+
+### The bug
+
+`lead_wake._live_subagent_names(session_dir)` returned **all** non-terminal
+agents in the shared session's `agents.json`. It did not exclude the agent's
+own record, nor scope to the agent's own children. Observed on live disk: a
+leaf worker `worker1` — the only record in `agents.json`, `parent=None` — saw
+itself as a "live subagent", so it skipped D2 (no-live-subagents → allow),
+reached D5, and armed a watcher for **its own** inbox. A leaf agent with no
+children must hit D2 and allow immediately; only an agent that actually leads
+live children should arm/block.
+
+### Root cause
+
+Two gaps: (1) the agent record written at spawn
+(`server_simple._do_spawn`) carried no parent linkage, so there was no way to
+tell a caller's children from unrelated agents; #34 propagated
+`AGENT_PARENT_NAME` into the child's *env/MCP config* but never onto the
+*record*. (2) `_live_subagent_names` had no self-exclusion and no child
+scoping, and the only existing test faked an empty list — so the self-count
+path was never exercised.
+
+### The fix
+
+1. **Record the parent at spawn.** The spawn record now stores
+   `"parent": IDENTITY` — the spawning lead's identity, the same value #34
+   propagates as `AGENT_PARENT_NAME` into the child's MCP config
+   (`_write_mcp_config`/`_write_pi_mcp_config` `parent_name=IDENTITY`). Naming
+   follows #34's parent convention rather than inventing a parallel one.
+2. **Scope + self-exclude in `_live_subagent_names(session_dir, identity)`.** It
+   now returns only records whose `parent == identity`, always excluding the
+   record whose `name == identity` (self). `identity` is the value `evaluate`
+   already resolved via `_resolve_identity` (AGENT_NAME else `--reader`
+   fallback). A leaf → empty → D2 allow; a sibling (same parent, parent != me)
+   is not a child → still D2; a real live child → non-empty → proceeds.
+3. **Legacy fallback.** When **no** record in the registry carries a `parent`
+   key (pre-fix sessions), scoping by parentage is impossible, so it falls back
+   to "every non-terminal agent except self" — still self-excluding, so a
+   legacy leaf can never regress into the self-count bug, while a legacy lead
+   still sees its (unscoped) live agents. In a mixed session the scoped
+   predicate applies and parentless records simply do not match.
+
+### Red → green evidence
+
+New `TestLiveSubagentScoping` in `tests/test_lead_wake.py` drives the real
+`_live_subagent_names` through `evaluate()` with `server_simple._load_agents`
+monkeypatched to faked `agents.json` content:
+
+- `test_leaf_agent_only_self_record_allows` — only-self record (the exact
+  observed bug) → D2 allow.
+- `test_sibling_is_not_counted_as_child` — self + sibling (same parent) → D2
+  allow.
+- `test_real_live_child_proceeds_past_d2` — self + a live child (parent==me) →
+  NOT D2 (lands on D5 arm instruction).
+- `test_terminal_child_is_not_live` — a killed child → treated as not-live →
+  D2 allow.
+- `test_legacy_records_without_parent_still_exclude_self` — pre-fix record with
+  no parent field → fallback still excludes self → D2 allow.
+
+Red (fix stashed, source reverted): the four scoping tests failed on the
+self-count / signature, and the six existing tests that monkeypatch
+`_live_subagent_names` failed on the new two-arg signature — `15 failed, 4
+passed`. Green (fix restored): `19 passed`. Full suite: `713 passed, 3 skipped`
+→ **718 passed, 3 skipped** after the fix.

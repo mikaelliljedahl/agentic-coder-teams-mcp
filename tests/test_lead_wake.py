@@ -76,7 +76,126 @@ class TestKillSwitchAndFailOpen:
     ) -> None:
         # D2: session resolved but no live subagents -> allow.
         monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
-        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda _sd: [])
+        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda _sd, _id: [])
+
+        result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
+
+        assert result.action == "allow"
+        assert result.code == "D2"
+
+
+class TestLiveSubagentScoping:
+    """Fynd 1: the live-subagent check must scope to the caller's own children.
+
+    Drives the real ``_live_subagent_names`` through ``evaluate`` by faking the
+    session's agents.json via ``server_simple._load_agents``. A leaf worker (its
+    own single record) must hit D2 (allow) and never arm a watcher for its own
+    inbox; only an agent that actually leads live children proceeds past D2.
+    """
+
+    def _resolve_with_agents(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        agents: list[dict],
+    ) -> None:
+        from claude_teams import server_simple
+
+        monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
+        monkeypatch.setattr(server_simple, "_load_agents", lambda _sid: agents)
+
+    def test_leaf_agent_only_self_record_allows(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # The exact observed bug: worker1 is the ONLY record (parent unset) and
+        # must not treat itself as a live subagent -> D2 allow, no self-arm.
+        monkeypatch.setenv("AGENT_NAME", "worker1")
+        self._resolve_with_agents(
+            monkeypatch,
+            tmp_path,
+            [{"name": "worker1", "status": "running", "parent": None}],
+        )
+
+        result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
+
+        assert result.action == "allow"
+        assert result.code == "D2"
+        assert result.log["live_subagents"] == 0
+
+    def test_sibling_is_not_counted_as_child(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # worker1 and worker2 share parent "team-lead"; a sibling is not a
+        # child, so worker1 still allows at D2.
+        monkeypatch.setenv("AGENT_NAME", "worker1")
+        self._resolve_with_agents(
+            monkeypatch,
+            tmp_path,
+            [
+                {"name": "worker1", "status": "running", "parent": "team-lead"},
+                {"name": "worker2", "status": "running", "parent": "team-lead"},
+            ],
+        )
+
+        result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
+
+        assert result.action == "allow"
+        assert result.code == "D2"
+        assert result.log["live_subagents"] == 0
+
+    def test_real_live_child_proceeds_past_d2(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # "mid" leads a live child "leaf" (parent == mid) -> NOT D2; with no
+        # unread and no armed watcher it lands on the D5 arm instruction.
+        monkeypatch.setenv("AGENT_NAME", "mid")
+        self._resolve_with_agents(
+            monkeypatch,
+            tmp_path,
+            [
+                {"name": "mid", "status": "running", "parent": "team-lead"},
+                {"name": "leaf", "status": "running", "parent": "mid"},
+            ],
+        )
+
+        result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
+
+        assert result.code != "D2"
+        assert result.action == "block"
+        assert result.code == "D5"
+        assert result.log["live_subagents"] == 1
+
+    def test_terminal_child_is_not_live(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # "mid"'s only child is killed -> no live children -> D2 allow.
+        monkeypatch.setenv("AGENT_NAME", "mid")
+        self._resolve_with_agents(
+            monkeypatch,
+            tmp_path,
+            [
+                {"name": "mid", "status": "running", "parent": "team-lead"},
+                {"name": "leaf", "status": "killed", "parent": "mid"},
+            ],
+        )
+
+        result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
+
+        assert result.action == "allow"
+        assert result.code == "D2"
+
+    def test_legacy_records_without_parent_still_exclude_self(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Pre-fix session: no record carries a parent field. The fallback still
+        # excludes self, so a legacy leaf (only its own record) allows at D2
+        # rather than regressing into the self-count bug.
+        monkeypatch.setenv("AGENT_NAME", "worker1")
+        self._resolve_with_agents(
+            monkeypatch,
+            tmp_path,
+            [{"name": "worker1", "status": "running"}],
+        )
 
         result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
 
@@ -101,7 +220,9 @@ class TestDecisionCore:
     @pytest.fixture(autouse=True)
     def _resolved(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
-        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda _sd: ["worker"])
+        monkeypatch.setattr(
+            lead_wake, "_live_subagent_names", lambda _sd, _id: ["worker"]
+        )
 
     def test_wake_blocks_read_messages_when_unread_present(
         self, tmp_path: Path
@@ -174,7 +295,9 @@ class TestProgressGuard:
     @pytest.fixture(autouse=True)
     def _resolved(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
-        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda _sd: ["worker"])
+        monkeypatch.setattr(
+            lead_wake, "_live_subagent_names", lambda _sd, _id: ["worker"]
+        )
 
     def test_wake_progress_guard_fail_open_after_cap(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -235,7 +358,9 @@ class TestIdentityAndArming:
         # AGENT_NAME=mid must scan inbox-mid.jsonl, NOT inbox-team-lead.jsonl
         # (regression vs the Pi team-lead-only bug; FR6/AC3).
         monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
-        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda _sd: ["worker"])
+        monkeypatch.setattr(
+            lead_wake, "_live_subagent_names", lambda _sd, _id: ["worker"]
+        )
         monkeypatch.setenv("AGENT_NAME", "mid")
         _write_inbox(tmp_path, "mid", ["bob"])
         _write_inbox(tmp_path, "team-lead", ["zoe"])
@@ -307,7 +432,9 @@ class TestMainEntrypoint:
         # D5 block via the real stdin/stdout entrypoint (mirrors test_hooks
         # io.StringIO faking). stdout carries the decision; stderr the log line.
         monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
-        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda _sd: ["worker"])
+        monkeypatch.setattr(
+            lead_wake, "_live_subagent_names", lambda _sd, _id: ["worker"]
+        )
         payload = json.dumps(_payload())
         monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
 
@@ -329,7 +456,7 @@ class TestMainEntrypoint:
     ) -> None:
         # D2 allow: no live subagents -> no stdout decision, still a stderr log.
         monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
-        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda _sd: [])
+        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda _sd, _id: [])
         monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_payload())))
 
         lead_wake.main(["--session-dir", str(tmp_path), "--reader", "team-lead"])
