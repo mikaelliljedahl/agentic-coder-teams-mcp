@@ -466,9 +466,7 @@ def _read_state_marker(session_id: str, name: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def _write_state_marker(
-    session_id: str, name: str, *, state: str, event: str
-) -> None:
+def _write_state_marker(session_id: str, name: str, *, state: str, event: str) -> None:
     """Atomically write an external member's lifecycle marker."""
     path = _state_marker_file(session_id, name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -823,9 +821,7 @@ def _external_record_matches(
     return all(record.get(field) == value for field, value in expected.items())
 
 
-def _external_membership_result(
-    session_id: str, ticket: dict, secret: str
-) -> dict:
+def _external_membership_result(session_id: str, ticket: dict, secret: str) -> dict:
     """Build the stable successful ``join_team`` response."""
     name = str(ticket.get("name") or "")
     parent = str(ticket.get("parent") or "")
@@ -880,17 +876,27 @@ def _member_operation(
     """Resolve a member and hold its registry lock through caller side effects."""
     parsed = _parse_member_token(member_token)
     if parsed is None:
-        yield None, None, "", {
-            "success": False,
-            "reason": "invalid_member_token",
-        }
+        yield (
+            None,
+            None,
+            "",
+            {
+                "success": False,
+                "reason": "invalid_member_token",
+            },
+        )
         return
     session_id, secret = parsed
     if not _agents_file(session_id).exists():
-        yield None, None, session_id, {
-            "success": False,
-            "reason": "session_not_found",
-        }
+        yield (
+            None,
+            None,
+            session_id,
+            {
+                "success": False,
+                "reason": "session_not_found",
+            },
+        )
         return
     computed = _member_digest(secret).encode()
     with _agents_file_lock(session_id):
@@ -910,24 +916,39 @@ def _member_operation(
                 record = candidate
                 break
         if record is None:
-            yield None, agents, session_id, {
-                "success": False,
-                "reason": "membership_revoked",
-            }
+            yield (
+                None,
+                agents,
+                session_id,
+                {
+                    "success": False,
+                    "reason": "membership_revoked",
+                },
+            )
             return
         status = record.get("status")
         if status == "left" and not allow_left:
-            yield None, agents, session_id, {
-                "success": False,
-                "reason": "membership_revoked",
-                "detail": "left",
-            }
+            yield (
+                None,
+                agents,
+                session_id,
+                {
+                    "success": False,
+                    "reason": "membership_revoked",
+                    "detail": "left",
+                },
+            )
             return
         if status not in {"running", "left"}:
-            yield None, agents, session_id, {
-                "success": False,
-                "reason": "membership_revoked",
-            }
+            yield (
+                None,
+                agents,
+                session_id,
+                {
+                    "success": False,
+                    "reason": "membership_revoked",
+                },
+            )
             return
         yield record, agents, session_id, None
 
@@ -1117,8 +1138,7 @@ def _has_autoadoptable_agent(session_id: str) -> bool:
     except (OSError, json.JSONDecodeError, ValueError):
         return False
     return any(
-        agent.get("backend") != "external"
-        for agent in _non_terminal_agents(agents)
+        agent.get("backend") != "external" for agent in _non_terminal_agents(agents)
     )
 
 
@@ -2683,9 +2703,7 @@ async def create_join_ticket(name: str, note: str = "") -> dict:
         with _agents_file_lock(session_id):
             agents = _load_agents_unlocked(session_id)
             tickets = _load_join_tickets_unlocked(session_id)
-            reserved_name = _unique_reserved_name(
-                requested, agents, tickets, now=now
-            )
+            reserved_name = _unique_reserved_name(requested, agents, tickets, now=now)
             ticket = {
                 "ticket_id": uuid.uuid4().hex,
                 "name": reserved_name,
@@ -2783,9 +2801,7 @@ async def join_team(session_id: str, token: str) -> dict:
             digest = _member_digest(secret)
             agents = _load_agents_unlocked(sid)
             matches = [
-                record
-                for record in agents
-                if record.get("join_ticket_id") == ticket_id
+                record for record in agents if record.get("join_ticket_id") == ticket_id
             ]
             if len(matches) > 1:
                 return {"success": False, "reason": "registry_corrupt"}
@@ -2926,9 +2942,7 @@ async def spawn_agent(
         session_id = _active_session_id(create=True)
         with _agents_transaction(session_id) as agents:
             tickets = _load_join_tickets_unlocked(session_id)
-            agent_name = _unique_reserved_name(
-                name, agents, tickets, now=time.time()
-            )
+            agent_name = _unique_reserved_name(name, agents, tickets, now=time.time())
 
             backend_name = backend.strip() or registry.default_backend()
             b = registry.get(backend_name)
@@ -3399,9 +3413,7 @@ async def external_send(member_token: str, text: str) -> dict:
                 "delivery": "inbox",
             }
             try:
-                _write_state_marker(
-                    session_id, name, state="running", event="activity"
-                )
+                _write_state_marker(session_id, name, state="running", event="activity")
             except OSError:
                 result["heartbeat_warning"] = True
             return result
@@ -3471,9 +3483,7 @@ async def external_read(
             )
             result["success"] = True
             try:
-                _write_state_marker(
-                    session_id, name, state="running", event="activity"
-                )
+                _write_state_marker(session_id, name, state="running", event="activity")
             except OSError:
                 result["heartbeat_warning"] = True
             return result
@@ -5205,18 +5215,14 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
                 ):
                     refusals.append(
                         {
-                            "idempotency_key": str(
-                                record.get("idempotency_key") or ""
-                            ),
+                            "idempotency_key": str(record.get("idempotency_key") or ""),
                             "to": target,
                             "status": "refused",
                             "reason": "external_agent_pull_only",
                         }
                     )
                     continue
-                if _reconcile_delivery_record(
-                    session_id, record, target_record
-                ):
+                if _reconcile_delivery_record(session_id, record, target_record):
                     txn.touch()
                 if not is_terminal(record) and record.get("phase") == PHASE_PENDING:
                     pending.append(dict(record))
@@ -5243,9 +5249,7 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
                 if result.get("reason") == "external_agent_pull_only":
                     refusals.append(
                         {
-                            "idempotency_key": str(
-                                record.get("idempotency_key") or ""
-                            ),
+                            "idempotency_key": str(record.get("idempotency_key") or ""),
                             "to": target,
                             "status": "refused",
                             "reason": "external_agent_pull_only",
@@ -5594,9 +5598,7 @@ def _marker_timestamp(marker: dict | None) -> float | None:
 
 def _public_agent_record(agent: dict) -> dict:
     """Return registry fields with every credential-bearing field omitted."""
-    return {
-        key: value for key, value in agent.items() if key not in CREDENTIAL_FIELDS
-    }
+    return {key: value for key, value in agent.items() if key not in CREDENTIAL_FIELDS}
 
 
 def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:

@@ -194,9 +194,10 @@ def test_join_happy_path(join_session: tuple[str, Path]) -> None:
     )
     assert marker["state"] == "running"
     assert marker["event"] == "joined"
-    assert result["watch_argv"][result["watch_argv"].index("--reader") + 1] == result[
-        "name"
-    ]
+    assert (
+        result["watch_argv"][result["watch_argv"].index("--reader") + 1]
+        == result["name"]
+    )
     listed = _run(ss.list_agents())
     assert listed[0]["backend"] == "external"
 
@@ -219,9 +220,9 @@ def test_join_replay_idempotent_and_used_no_record(
 
     expired = _ticket("expired")
     tickets = _tickets(session_dir)
-    next(t for t in tickets if t["ticket_id"] == expired["ticket_id"])[
-        "expires_at"
-    ] = time.time() - 1
+    next(t for t in tickets if t["ticket_id"] == expired["ticket_id"])["expires_at"] = (
+        time.time() - 1
+    )
     _write_tickets(session_dir, tickets)
     refused = _run(ss.join_team(sid, expired["token"]))
     assert refused["reason"] == "invalid_or_expired_token"
@@ -242,9 +243,9 @@ def test_used_ticket_retention(
 
     monkeypatch.setenv("WIN_AGENT_TEAMS_JOIN_TICKET_RETENTION_SECONDS", "1")
     tickets = _tickets(session_dir)
-    next(t for t in tickets if t["ticket_id"] == issued["ticket_id"])[
-        "used_at"
-    ] = time.time() - 2
+    next(t for t in tickets if t["ticket_id"] == issued["ticket_id"])["used_at"] = (
+        time.time() - 2
+    )
     _write_tickets(session_dir, tickets)
     _ticket("prune-trigger")
     assert all(t["ticket_id"] != issued["ticket_id"] for t in _tickets(session_dir))
@@ -266,9 +267,12 @@ def test_crash_window_A_open_ticket_existing_record(  # noqa: N802
     repaired = _run(ss.join_team(sid, issued["token"]))
     assert repaired["member_token"] == first["member_token"]
     assert len(ss._load_agents(sid)) == 1
-    assert next(
-        t for t in _tickets(session_dir) if t["ticket_id"] == issued["ticket_id"]
-    )["status"] == "used"
+    assert (
+        next(t for t in _tickets(session_dir) if t["ticket_id"] == issued["ticket_id"])[
+            "status"
+        ]
+        == "used"
+    )
     assert (session_dir / "state-visual-qa.json").exists()
 
     _write_tickets(
@@ -456,9 +460,7 @@ def test_external_read_full_cursor_semantics(
         {"from": "b", "text": "b1", "ts": "2"},
         {"from": "a", "text": "abcdef", "ts": "3"},
     ]
-    inbox.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
-    )
+    inbox.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
     with pytest.raises(ValueError, match="since_seq requires"):
         _run(ss.external_read(joined["member_token"], since_seq=1))
@@ -529,9 +531,9 @@ def test_external_send_and_heartbeat(
     warning = _run(ss.external_send(joined["member_token"], "one more"))
     assert warning["success"] is True
     assert warning["heartbeat_warning"] is True
-    lines = ss._inbox_file(sid, ss.ROOT_LEAD_NAME).read_text(
-        encoding="utf-8"
-    ).splitlines()
+    lines = (
+        ss._inbox_file(sid, ss.ROOT_LEAD_NAME).read_text(encoding="utf-8").splitlines()
+    )
     assert len(lines) == 2
 
 
@@ -716,8 +718,7 @@ def test_two_process_external_read_exactly_once(
     inbox = ss._inbox_file(sid, "visual-qa")
     inbox.write_text(
         "".join(
-            json.dumps({"from": "lead", "text": f"m-{index}", "ts": str(index)})
-            + "\n"
+            json.dumps({"from": "lead", "text": f"m-{index}", "ts": str(index)}) + "\n"
             for index in range(20)
         ),
         encoding="utf-8",
@@ -738,9 +739,7 @@ def test_two_process_external_read_exactly_once(
         process.join(timeout=10)
     assert all(process.exitcode == 0 for process in processes)
     results = [queue.get(timeout=2), queue.get(timeout=2)]
-    texts = [
-        message["text"] for result in results for message in result["messages"]
-    ]
+    texts = [message["text"] for result in results for message in result["messages"]]
     assert sorted(texts) == sorted(f"m-{index}" for index in range(20))
 
 
@@ -757,9 +756,7 @@ def test_lead_send_to_external_inbox(
 
     assert result["success"] is True
     assert result["delivery"] == "inbox"
-    lines = ss._inbox_file(sid, joined["name"]).read_text(
-        encoding="utf-8"
-    ).splitlines()
+    lines = ss._inbox_file(sid, joined["name"]).read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["text"] == "inspect this"
     assert deliveries.read_bytes() == before
@@ -888,9 +885,7 @@ def test_guaranteed_guards_both_paths(
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("claim")),
     )
 
-    direct = _run(
-        ss.follow_up_agent(joined["name"], "new", idempotency_key="new-key")
-    )
+    direct = _run(ss.follow_up_agent(joined["name"], "new", idempotency_key="new-key"))
     drained = _run(ss.deliver_pending("stale-key"))
 
     assert direct["reason"] == "external_agent_pull_only"
@@ -1131,9 +1126,7 @@ def test_revocation_races(
                 ss.external_send(joined["member_token"], "report")
             )
         else:
-            outcomes["operation"] = _run(
-                ss.external_read(joined["member_token"])
-            )
+            outcomes["operation"] = _run(ss.external_read(joined["member_token"]))
 
     threads = [threading.Thread(target=revoke), threading.Thread(target=operate)]
     for thread in threads:
@@ -1196,6 +1189,9 @@ asyncio.run(main())
         if key not in {"AGENT_NAME", "AGENT_SESSION_ID", "AGENT_PARENT_NAME"}
     }
     env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    env["HOMEDRIVE"] = home.drive or ""
+    env["HOMEPATH"] = str(home)
     env["WIN_AGENT_TEAMS_PARENT_ID"] = "restart-test-parent"
     completed = subprocess.run(  # noqa: S603 - fixed current venv interpreter.
         [sys.executable, "-c", code],
@@ -1217,8 +1213,7 @@ def test_large_inbox_read_contention_bounded(
     _issued, joined = _join_member(join_session)
     ss._inbox_file(sid, joined["name"]).write_text(
         "".join(
-            json.dumps({"from": "lead", "text": f"message-{index}", "ts": "t"})
-            + "\n"
+            json.dumps({"from": "lead", "text": f"message-{index}", "ts": "t"}) + "\n"
             for index in range(10_000)
         ),
         encoding="utf-8",
