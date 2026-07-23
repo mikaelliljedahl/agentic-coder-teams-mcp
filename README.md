@@ -20,41 +20,68 @@ Minimal MCP server for spawning and communicating with Claude Code, Codex, and P
 
 ## Quick Start
 
+> Full install, upgrade, and troubleshooting guide (including the "MCP server
+> doesn't show up in Claude Code" checklist): **[INSTALL.md](INSTALL.md)**.
+
 ### Prerequisites
 
 - Windows 10/11 or Linux
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - Claude Code CLI (`claude`), OpenAI Codex CLI (`codex`), and/or Pi CLI (`pi`) on `PATH`
-- `tmux` on Linux
+- Linux: a terminal emulator or `tmux` for visible agent windows
+
+### Step 0 — Install the server (required for every client)
+
+The package is not on PyPI; install from a clone. All the config snippets
+below point at the virtualenv this creates — **run this first**:
+
+```bash
+git clone https://github.com/mikaelliljedahl/agentic-coder-teams-mcp.git
+cd agentic-coder-teams-mcp
+uv sync
+```
+
+The launch command everywhere is the venv's Python running the server module:
+`/abs/path/to/agentic-coder-teams-mcp/.venv/bin/python -m claude_teams.server_simple`
+(Windows: `C:\abs\path\to\agentic-coder-teams-mcp\.venv\Scripts\python.exe`).
 
 ### Setup — Claude Code as Lead
 
-Add to your project's `.mcp.json` so Claude Code can spawn agents:
+Recommended: register once at **user scope** with the `claude mcp add` CLI —
+available in every project, no approval prompt, no hand-edited JSON:
+
+```bash
+# Linux
+claude mcp add --scope user win-agent-teams -- \
+  /abs/path/to/agentic-coder-teams-mcp/.venv/bin/python -m claude_teams.server_simple
+```
+
+```powershell
+# Windows (PowerShell)
+claude mcp add --scope user win-agent-teams -- C:\abs\path\to\agentic-coder-teams-mcp\.venv\Scripts\python.exe -m claude_teams.server_simple
+```
+
+Verify with `claude mcp list` (should report **connected**) or `/mcp` inside a
+session.
+
+Alternatively, register per-project via a `.mcp.json` in the root of **the
+project where you run `claude`** (not inside this repo's clone). Note that
+project-scope servers require a one-time interactive approval in Claude Code:
 
 ```json
 {
   "mcpServers": {
     "win-agent-teams": {
-      "command": "C:\\path\\to\\.venv\\Scripts\\python.exe",
+      "command": "/abs/path/to/agentic-coder-teams-mcp/.venv/bin/python",
       "args": ["-m", "claude_teams.server_simple"]
     }
   }
 }
 ```
 
-On Linux, use your virtualenv's Python path instead, for example:
-
-```json
-{
-  "mcpServers": {
-    "win-agent-teams": {
-      "command": "/path/to/.venv/bin/python",
-      "args": ["-m", "claude_teams.server_simple"]
-    }
-  }
-}
-```
+On Windows use the venv's `Scripts\python.exe` path with **doubled
+backslashes** (`"C:\\abs\\path\\to\\...\\.venv\\Scripts\\python.exe"`) —
+single backslashes are invalid JSON and break the whole file.
 
 Spawned Claude Code agents get the MCP server automatically via `--mcp-config`.
 Spawned Codex agents need the Codex setup below only when they must call MCP
@@ -63,11 +90,12 @@ workers can still be observed through `check_agent` output fallback.
 
 ### Setup — Codex as Lead (or as Spawned Agent)
 
-Add to `~/.codex/config.toml` so Codex can use the MCP tools (both as lead and as spawned agent):
+Add to `~/.codex/config.toml` (Windows: `C:\Users\<you>\.codex\config.toml`) so
+Codex can use the MCP tools (both as lead and as spawned agent):
 
 ```toml
 [mcp_servers.win-agent-teams]
-command = "C:\\path\\to\\.venv\\Scripts\\python.exe"
+command = "C:\\abs\\path\\to\\agentic-coder-teams-mcp\\.venv\\Scripts\\python.exe"
 args = ["-m", "claude_teams.server_simple"]
 env = { "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass" }
 enabled = true
@@ -77,7 +105,7 @@ Linux example:
 
 ```toml
 [mcp_servers.win-agent-teams]
-command = "/path/to/.venv/bin/python"
+command = "/abs/path/to/agentic-coder-teams-mcp/.venv/bin/python"
 args = ["-m", "claude_teams.server_simple"]
 env = { "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass" }
 enabled = true
@@ -404,6 +432,9 @@ second `Stop` matcher group alongside the state-marker `emit` hook). For a
   `~/.claude/settings.json`). It writes only the wake group, is idempotent, and
   preserves unrelated hooks.
 - `install_lead_wake(remove=true)` removes only the wake group.
+
+See [INSTALL.md](INSTALL.md) section 6 for the full automatic-vs-manual matrix,
+verification steps, and wake-related troubleshooting.
 
 Environment tunables:
 
