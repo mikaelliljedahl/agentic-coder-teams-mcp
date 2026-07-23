@@ -2761,6 +2761,12 @@ def _build_resume_request(
     extra = {
         "mcp_config_path": str(mcp_config_path),
         "agent_capability": "",
+        # Mirror the spawn path: the pi backend resolves its per-agent session
+        # dir (``<session_dir>/pi-sessions/<name>``) and the state-marker env
+        # from this. Dropping it here makes resume fall back to ``request.cwd``,
+        # so ``--continue`` targets a base that has no rollout and pi exits
+        # immediately (``resume_not_confirmed``).
+        "session_dir": str(_session_dir(session_id)),
         **_correlation_extra(correlation_id),
         **prompt_extra,
         **_hook_extra(session_id, agent_name, backend_name),
