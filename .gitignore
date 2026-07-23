@@ -15,13 +15,6 @@ venv/
 .DS_Store
 .mcp.json
 .omc
-# Ignore docs/ contents rather than docs/ itself: git will not descend into an
-# excluded directory, so a re-include below would never match. Feature artefacts
-# and protocol references are part of the review record (see the required
-# workflow in CLAUDE.md) and must reach the PR.
-docs/*
-!docs/features/
-!docs/reference/
 .coverage
 .remember
 FORK_INTEGRATION_ARCHITECTURE_PLAN.md
