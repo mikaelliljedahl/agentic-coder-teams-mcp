@@ -441,12 +441,14 @@ class TestAgentStatus:
         row = result[0]
         assert set(row) == {
             "name",
+            "backend",
             "state",
             "last_activity_ts",
             "unread_count",
             "seq",
             "heartbeat_age_s",
             "stalled",
+            "binding",
         }
         assert row["name"] == "worker"
         assert row["state"] == "waiting"

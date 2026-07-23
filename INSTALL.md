@@ -175,6 +175,55 @@ Codex's environment so identity resolves correctly).
 Verify: start a new `codex` session and ask it to call `list_backends`, or
 check `/mcp` (recent Codex builds list configured MCP servers on startup).
 
+## 4a. Separate external-member profile (recommended for Desktop QA)
+
+External members carry a returned `member_token` on every call; they do not
+rebind the MCP server's process-global identity. For client-surface isolation,
+use a **separate Claude Desktop profile, OS profile, or separate client
+instance** whose MCP configuration contains only this restricted entry (plus
+the browser tools the QA session needs):
+
+Linux:
+
+```json
+{
+  "mcpServers": {
+    "win-agent-teams-external": {
+      "command": "/abs/path/to/agentic-coder-teams-mcp/.venv/bin/python",
+      "args": ["-m", "claude_teams.server_simple"],
+      "env": {"WIN_AGENT_TEAMS_EXTERNAL_ONLY": "1"}
+    }
+  }
+}
+```
+
+Windows:
+
+```json
+{
+  "mcpServers": {
+    "win-agent-teams-external": {
+      "command": "C:\\abs\\path\\to\\agentic-coder-teams-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "claude_teams.server_simple"],
+      "env": {"WIN_AGENT_TEAMS_EXTERNAL_ONLY": "1"}
+    }
+  }
+}
+```
+
+The restricted server exposes exactly `join_team`, `external_send`,
+`external_read`, `leave_team`, and `list_backends`. The ordinary lead creates a
+ticket with `create_join_ticket` and hands its returned `join_prompt` to the
+external session.
+
+Do not describe two entries in one profile as isolation. If the normal
+`win-agent-teams` entry is also available to that conversation, ambient root
+tools remain selectable; this is a degraded dual-entry setup. If your Desktop
+version cannot scope MCP configuration to a separate profile or client
+instance, ambient-tool isolation is unavailable there. The token-carried
+membership and revocation semantics still work, but the client surface is not
+contained.
+
 ## 5. Pi
 
 Pi setup is different (no hand-written MCP config; identity is delivered via

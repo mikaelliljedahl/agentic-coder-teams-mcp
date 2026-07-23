@@ -22,3 +22,6 @@ def _clear_inherited_agent_env(monkeypatch: pytest.MonkeyPatch) -> None:
     from claude_teams import server_simple
 
     monkeypatch.setattr(server_simple, "_AGENT_SESSION_ID", "")
+    monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "")
+    monkeypatch.setattr(server_simple, "IDENTITY", server_simple.ROOT_LEAD_NAME)
+    monkeypatch.setattr(server_simple, "_IDENTITY_UNRESOLVED", False)
