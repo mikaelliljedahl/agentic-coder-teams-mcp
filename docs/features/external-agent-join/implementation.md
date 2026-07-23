@@ -224,3 +224,29 @@ All checks passed!
 uv run pytest -q
 1124 passed, 3 skipped
 ```
+
+## Live smoke test (2026-07-23)
+
+**Result: PASSED.** Run from a real Claude Desktop deployment against a live
+lead session (`5c170d7e-…`) with a separately-started Desktop QA session as the
+external member `visual-qa`:
+
+- Lead minted a join ticket via `create_join_ticket`; the QA session called
+  `join_team(session_id, token)` and received its `member_token`.
+- **Downstream (lead → external):** lead `send_message` to the member resolved
+  to `delivery:"inbox"` (pull-only, as designed); QA drained it with
+  `external_read`.
+- **Upstream (external → lead):** QA `external_send` landed in the lead inbox
+  and the lead read it with `read_messages`.
+
+**Process model — question answered.** Each interactive session gets its **own**
+win-agent-teams MCP server process (host process count went 2 → 3 when the QA
+session joined). There is no shared-process-per-Desktop concern; the
+token-carried identity design is safe regardless, and the earlier
+process-global-rebind blocker is moot by construction.
+
+**Wake follow-ups (out of this feature's scope):** upstream external→lead
+auto-wake is wired by running `install_lead_wake` on the lead. Downstream
+lead→external hands-free pickup is deferred to
+[`external-member-wake`](../external-member-wake/design.md) — pull-only remains
+correct (a Desktop conversation cannot be resumed like a spawned CLI child).
