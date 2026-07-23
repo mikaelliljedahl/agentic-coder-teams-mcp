@@ -301,11 +301,14 @@ class PiBackend(BaseBackend):
     ) -> list[str]:
         """Build the pi command that resumes a prior session.
 
-        The session id we set at spawn (``request.name``) is stable and
-        directory-scoped, so resume re-targets the same ``--session-dir`` and
-        ``--session-id`` and continues it. ``backend_session_id`` (pi's own
-        header id, discovered from disk) is accepted for symmetry but the
-        deterministic name binding is authoritative.
+        Resume re-targets the same per-agent ``--session-dir`` (which holds this
+        agent's single rollout) and passes ``--continue``. It must NOT also pass
+        ``--session-id``: pi's CLI rejects that combination
+        (``--session-id cannot be combined with --continue``) and exits
+        immediately, which the delivery layer reports as
+        ``resume_not_confirmed``. The directory scope makes ``--continue``
+        unambiguous. ``backend_session_id`` (pi's own header id, discovered from
+        disk) is accepted for symmetry but unused.
         """
         _ = backend_session_id
         cmd = [
@@ -314,8 +317,6 @@ class PiBackend(BaseBackend):
             *self.permission_args(request),
             "--session-dir",
             self._pi_session_dir(request),
-            "--session-id",
-            request.name,
             "--continue",
             *self._mcp_config_args(request),
             *self._model_args(request),
