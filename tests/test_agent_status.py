@@ -6,7 +6,24 @@ from pathlib import Path
 
 import pytest
 
-from claude_teams import server_simple
+from claude_teams import agent_output, server_simple
+from claude_teams.agent_output import (
+    BINDING_BOUND,
+    BINDING_LEGACY,
+    AgentOutput,
+    BindingResult,
+)
+
+
+def _binding(output: AgentOutput | None = None, outcome: str | None = None):
+    """Pin ``_resolve_agent_binding`` to a fixed A2 outcome for a consumer test.
+
+    Defaults to ``bound`` when an output is supplied and ``legacy`` when it is
+    not — ``legacy`` is the outcome whose consumer behaviour is unchanged from
+    before the validation ladder, so pre-ladder expectations still hold.
+    """
+    resolved = outcome or (BINDING_BOUND if output is not None else BINDING_LEGACY)
+    return lambda agent, **_: BindingResult(resolved, output)
 
 
 @pytest.fixture
@@ -29,6 +46,11 @@ def _add_agent(session_id: str, **overrides: object) -> dict:
         "status": "running",
         "spawned_at": 1000.0,
         "cwd": "C:\\project",
+        # R2: follow-up is downstream-only, and the default test IDENTITY is
+        # the root lead. The direction guard itself is covered in
+        # tests/test_direction_guard.py.
+        "spawned_by": "team-lead",
+        "spawned_by_source": "spawn",
     }
     agent.update(overrides)
     server_simple._save_agents(session_id, [agent])
@@ -62,7 +84,7 @@ class TestCheckAgentCompactShape:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
+        monkeypatch.setattr(server_simple, "_resolve_agent_binding", _binding(None))
 
         result = asyncio.run(server_simple.check_agent("worker"))
 
@@ -80,6 +102,8 @@ class TestCheckAgentCompactShape:
             "full_len",
             "heartbeat_age_s",
             "stalled",
+            "binding",
+            "binding_retriable",
         }
         assert "last_message" not in result
         assert "backend_session_id" not in result
@@ -94,17 +118,18 @@ class TestCheckAgentCompactShape:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        from types import SimpleNamespace
 
         long_message = "x" * 500
         monkeypatch.setattr(
             server_simple,
-            "_read_agent_output",
-            lambda agent: SimpleNamespace(
-                last_activity_at=1000.0,
-                last_message=long_message,
-                backend_session_id=None,
-                busy_hint=False,
+            "_resolve_agent_binding",
+            _binding(
+                AgentOutput(
+                    last_activity_at=1000.0,
+                    last_message=long_message,
+                    rollout_path="t.jsonl",
+                    backend_session_id=None,
+                ),
             ),
         )
 
@@ -123,16 +148,17 @@ class TestCheckAgentCompactShape:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        from types import SimpleNamespace
 
         monkeypatch.setattr(
             server_simple,
-            "_read_agent_output",
-            lambda agent: SimpleNamespace(
-                last_activity_at=1000.0,
-                last_message="short line",
-                backend_session_id=None,
-                busy_hint=False,
+            "_resolve_agent_binding",
+            _binding(
+                AgentOutput(
+                    last_activity_at=1000.0,
+                    last_message="short line",
+                    rollout_path="t.jsonl",
+                    backend_session_id=None,
+                ),
             ),
         )
 
@@ -150,16 +176,17 @@ class TestCheckAgentCompactShape:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        from types import SimpleNamespace
 
         monkeypatch.setattr(
             server_simple,
-            "_read_agent_output",
-            lambda agent: SimpleNamespace(
-                last_activity_at=1000.0,
-                last_message="hello world",
-                backend_session_id="backend-sess",
-                busy_hint=False,
+            "_resolve_agent_binding",
+            _binding(
+                AgentOutput(
+                    last_activity_at=1000.0,
+                    last_message="hello world",
+                    rollout_path="t.jsonl",
+                    backend_session_id="backend-sess",
+                ),
             ),
         )
 
@@ -184,7 +211,7 @@ class TestCheckAgentCompactShape:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
+        monkeypatch.setattr(server_simple, "_resolve_agent_binding", _binding(None))
         _append_message(session, server_simple.IDENTITY, "worker", "hi")
         _append_message(session, server_simple.IDENTITY, "worker", "there")
         _append_message(session, server_simple.IDENTITY, "someone-else", "noise")
@@ -198,36 +225,41 @@ class TestCheckAgentCompactShape:
 class TestFollowUpAgentInternalDict:
     """Regression: follow_up_agent must keep consuming the rich internal dict."""
 
-    def test_follow_up_refuses_busy_agent_with_recent_activity(
+    def test_follow_up_waits_on_a_busy_agent_with_recent_activity(
         self, session: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """B2 — the busy branch waits and then returns the cooperative tail."""
         _add_agent(session, spawned_at=1000.0, cwd="C:\\project")
+        monkeypatch.setattr(server_simple, "_DELIVERY_CALL_BUDGET_SECONDS", 0.0)
         monkeypatch.setattr(
             server_simple.process_manager,
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        from types import SimpleNamespace
 
         monkeypatch.setattr(
             server_simple,
-            "_read_agent_output",
-            lambda agent: SimpleNamespace(
-                last_activity_at=server_simple.time.time(),
-                last_message="working...",
-                backend_session_id="backend-sess",
-                busy_hint=False,
+            "_resolve_agent_binding",
+            _binding(
+                AgentOutput(
+                    last_activity_at=server_simple.time.time(),
+                    last_message="working...",
+                    rollout_path="t.jsonl",
+                    backend_session_id="backend-sess",
+                ),
             ),
         )
 
-        result = asyncio.run(server_simple.follow_up_agent("worker", "next task"))
+        result = asyncio.run(
+            server_simple.follow_up_agent("worker", "next task", "k12")
+        )
 
         assert result["success"] is False
-        assert result["reason"] == "agent_busy"
-        assert "backend_session_id" in result
-        assert "last_activity_at" in result
+        assert result["status"] == "queued"
+        assert result["phase"] == "pending"
+        assert result["message_id"]
 
-    def test_follow_up_reports_backend_session_missing(
+    def test_follow_up_reports_no_delivery_path_without_a_backend_session(
         self, session: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _add_agent(session, spawned_at=1000.0, cwd="C:\\project")
@@ -236,12 +268,28 @@ class TestFollowUpAgentInternalDict:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
 
-        result = asyncio.run(server_simple.follow_up_agent("worker", "next task"))
+        monkeypatch.setattr(
+            server_simple,
+            "_resolve_agent_binding",
+            _binding(
+                AgentOutput(
+                    last_activity_at=1000.0,
+                    last_message="hi",
+                    rollout_path="t.jsonl",
+                    backend_session_id=None,
+                ),
+                outcome=BINDING_BOUND,
+            ),
+        )
+
+        result = asyncio.run(
+            server_simple.follow_up_agent("worker", "next task", "k13")
+        )
 
         assert result["success"] is False
-        assert result["reason"] == "backend_session_missing"
+        assert result["reason"] == "no_delivery_path"
+        assert result["state"] == "no_backend_session"
 
 
 class TestListAgentsCompactRows:
@@ -258,7 +306,7 @@ class TestListAgentsCompactRows:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
+        monkeypatch.setattr(server_simple, "_resolve_agent_binding", _binding(None))
 
         result = asyncio.run(server_simple.list_agents())
 
@@ -272,6 +320,7 @@ class TestListAgentsCompactRows:
             "backend",
             "last_activity_at",
             "unread_count",
+            "binding",
         }
         assert "model" not in row
         assert "permission_mode" not in row
@@ -285,7 +334,7 @@ class TestListAgentsCompactRows:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        monkeypatch.setattr(server_simple, "_read_agent_output", lambda agent: None)
+        monkeypatch.setattr(server_simple, "_resolve_agent_binding", _binding(None))
 
         result = asyncio.run(server_simple.list_agents())
 
@@ -305,7 +354,7 @@ class TestListAgentsCompactRows:
         def fail_read(agent: dict) -> None:
             pytest.fail("list_agents must not scan the transcript when a marker exists")
 
-        monkeypatch.setattr(server_simple, "_read_agent_output", fail_read)
+        monkeypatch.setattr(server_simple, "_resolve_agent_binding", fail_read)
 
         result = asyncio.run(server_simple.list_agents())
 
@@ -320,16 +369,17 @@ class TestListAgentsCompactRows:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        from types import SimpleNamespace
 
         monkeypatch.setattr(
             server_simple,
-            "_read_agent_output",
-            lambda agent: SimpleNamespace(
-                last_activity_at=1000.0,
-                last_message="line one\nline two",
-                backend_session_id=None,
-                busy_hint=False,
+            "_resolve_agent_binding",
+            _binding(
+                AgentOutput(
+                    last_activity_at=1000.0,
+                    last_message="line one\nline two",
+                    rollout_path="t.jsonl",
+                    backend_session_id=None,
+                ),
             ),
         )
 
@@ -350,17 +400,18 @@ class TestListAgentsCompactRows:
             "health_check",
             lambda pid, expected_token=None: (True, ""),
         )
-        from types import SimpleNamespace
 
         long_line = "y" * 500
         monkeypatch.setattr(
             server_simple,
-            "_read_agent_output",
-            lambda agent: SimpleNamespace(
-                last_activity_at=1000.0,
-                last_message=long_line,
-                backend_session_id=None,
-                busy_hint=False,
+            "_resolve_agent_binding",
+            _binding(
+                AgentOutput(
+                    last_activity_at=1000.0,
+                    last_message=long_line,
+                    rollout_path="t.jsonl",
+                    backend_session_id=None,
+                ),
             ),
         )
 
@@ -473,11 +524,56 @@ class TestAgentStatus:
                 "agent_status must not scan the transcript when a marker exists"
             )
 
-        monkeypatch.setattr(server_simple, "_read_agent_output", fail_read)
+        monkeypatch.setattr(server_simple, "_resolve_agent_binding", fail_read)
 
         result = asyncio.run(server_simple.agent_status(names=["worker"]))
 
         assert result[0]["state"] == "running"
+
+    def test_the_no_marker_fallback_never_scans_all_history(
+        self, session: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A6: "stay cheap" means no second scan AND no all-history scan.
+
+        Deliberately does NOT mock ``_resolve_agent_binding``: the defect lives
+        *inside* the resolver, whose zero-window-match path falls back to
+        ``binder.scan(..., all_history=True)``. A test that replaces the whole
+        resolver and counts calls cannot see it.
+        """
+        _add_agent(session, correlation_id="corr-1", backend_session_id="sess-1")
+        monkeypatch.setattr(
+            server_simple.process_manager,
+            "health_check",
+            lambda pid, expected_token=None: (True, ""),
+        )
+
+        calls: list[bool] = []
+
+        class _SpyBinder:
+            cache_scope = "scope"
+
+            def resolve_by_session_id(self, session_id: str) -> None:
+                return None
+
+            def candidates(self, *, all_history: bool) -> list[Path]:
+                return []
+
+            def scan(self, token: str, *, all_history: bool, extra=None):
+                calls.append(all_history)
+                return [], False
+
+            def session_id(self, path: Path) -> None:
+                return None
+
+        monkeypatch.setattr(agent_output, "_make_binder", lambda *a, **k: _SpyBinder())
+
+        result = asyncio.run(server_simple.agent_status(names=["worker"]))
+
+        assert calls, "the fallback did not reach the transcript binder at all"
+        assert all(flag is False for flag in calls), (
+            f"an all-history scan ran on the cheap path: {calls}"
+        )
+        assert result[0]["state"] == "unknown"
 
 
 class TestKillAgentDeletesMarker:

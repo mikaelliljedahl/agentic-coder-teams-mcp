@@ -76,17 +76,20 @@ class TestKillRemovesRecord:
 
         assert rows == []
 
-    def test_follow_up_after_kill_returns_agent_not_found(
+    def test_follow_up_after_kill_names_the_unreachable_state(
         self, session: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _add_agent(session, backend_session_id="abc")
         _stub_owns(monkeypatch, owned=True)
 
         asyncio.run(server_simple.kill_agent("worker"))
-        result = asyncio.run(server_simple.follow_up_agent("worker", "continue"))
+        result = asyncio.run(server_simple.follow_up_agent("worker", "continue", "k38"))
 
+        # R7: a killed agent is unreachable by design, and the refusal names
+        # that state rather than reading as a lookup miss.
         assert result["success"] is False
-        assert result["reason"] == "agent_not_found"
+        assert result["reason"] == "no_delivery_path"
+        assert result["state"] == "record_removed"
 
     def test_check_agent_after_kill_returns_empty_dead(
         self, session: str, monkeypatch: pytest.MonkeyPatch
@@ -105,7 +108,7 @@ class TestKillFailClosed:
     def test_skips_process_kill_on_token_mismatch_but_removes_record(
         self, session: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _add_agent(session, create_token="stale-token")  # noqa: S106
+        _add_agent(session, create_token="stale-token")
         calls = _stub_owns(monkeypatch, owned=False)
 
         result = asyncio.run(server_simple.kill_agent("worker"))

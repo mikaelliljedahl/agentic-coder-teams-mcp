@@ -112,3 +112,7 @@ in mind whenever you touch `backends/`:
 - Lint with `ruff check`; keep new/changed files clean (pre-existing debt in
   untouched files is out of scope).
 - Match the surrounding code's docstring density and naming.
+
+## Reference documentation
+
+- `docs/reference/agent-messaging-protocol.md` documents how spawn, messaging, follow-up, the lifecycle hooks, the on-disk session contract, and the `watch` CLI actually behave. Read it instead of re-deriving the protocol from `server_simple.py`, `cli.py`, `hooks.py`, and the backends.

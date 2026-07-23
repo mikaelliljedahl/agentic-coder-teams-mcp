@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 from typing import ClassVar
 
+from claude_teams.agent_output import CORRELATION_FIELD, correlated_prompt
 from claude_teams.backends.base import (
     BaseBackend,
     SpawnRequest,
@@ -300,11 +301,14 @@ class PiBackend(BaseBackend):
     ) -> list[str]:
         """Build the pi command that resumes a prior session.
 
-        The session id we set at spawn (``request.name``) is stable and
-        directory-scoped, so resume re-targets the same ``--session-dir`` and
-        ``--session-id`` and continues it. ``backend_session_id`` (pi's own
-        header id, discovered from disk) is accepted for symmetry but the
-        deterministic name binding is authoritative.
+        Resume re-targets the same per-agent ``--session-dir`` (which holds this
+        agent's single rollout) and passes ``--continue``. It must NOT also pass
+        ``--session-id``: pi's CLI rejects that combination
+        (``--session-id cannot be combined with --continue``) and exits
+        immediately, which the delivery layer reports as
+        ``resume_not_confirmed``. The directory scope makes ``--continue``
+        unambiguous. ``backend_session_id`` (pi's own header id, discovered from
+        disk) is accepted for symmetry but unused.
         """
         _ = backend_session_id
         cmd = [
@@ -313,8 +317,6 @@ class PiBackend(BaseBackend):
             *self.permission_args(request),
             "--session-dir",
             self._pi_session_dir(request),
-            "--session-id",
-            request.name,
             "--continue",
             *self._mcp_config_args(request),
             *self._model_args(request),
@@ -392,6 +394,25 @@ class PiBackend(BaseBackend):
                 args.extend(["-e", str(ext)])
         return args
 
+    @staticmethod
+    def _correlated_prompt(request: SpawnRequest) -> str:
+        """Return the prompt with this spawn's correlation marker appended.
+
+        Pi takes the prompt verbatim as a single positional argument on the
+        ``node`` launch path, so — like Codex, and unlike Claude Code — the
+        marker can travel in the prompt itself and the backend appends it. The
+        server therefore leaves a pi prompt alone in ``_materialize_prompt``;
+        marking in both places would give pi two markers.
+
+        The id comes from ``extra`` and is never derived here. A record that
+        predates correlation carries no id, and inventing one would produce a
+        marker no existing transcript can contain.
+        """
+        correlation_id = (request.extra or {}).get(CORRELATION_FIELD)
+        if not correlation_id:
+            return request.prompt
+        return correlated_prompt(request.prompt, str(correlation_id), single_line=False)
+
     def _prompt_args(self, request: SpawnRequest) -> list[str]:
         """Return the initial-prompt argv for pi.
 
@@ -403,7 +424,7 @@ class PiBackend(BaseBackend):
         prompt_file = (request.extra or {}).get("prompt_file_path")
         if self._launches_via_shim() and prompt_file:
             return [f"@{prompt_file}", "Complete the task in the attached file."]
-        return [request.prompt]
+        return [self._correlated_prompt(request)]
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
         """Pass agent identity and the state-marker target dir to pi.

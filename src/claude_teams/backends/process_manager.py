@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, ClassVar, cast
 
-from claude_teams.agent_output import codex_correlation_token
+from claude_teams.agent_output import CORRELATION_FIELD, correlation_marker_token
 from claude_teams.backends.contracts import SpawnRequest, SpawnResult
 
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -83,6 +83,42 @@ def _build_posix_shell_command(cwd: str, cmd: list[str], env: dict[str, str]) ->
 def _powershell_quote(value: str) -> str:
     """Quote a value as a PowerShell single-quoted literal (``'`` -> ``''``)."""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _force_kill_pid(handle: str) -> None:
+    """Force-kill a PID, best-effort, on both Windows and POSIX.
+
+    Shared by every process manager's ``_kill_pid``. It exists because the
+    three managers each carried their own copy and only one of them grew the
+    Windows branch: the other two called ``signal.SIGKILL`` unguarded, which
+    does not exist on Windows and would raise ``AttributeError`` rather than
+    failing quietly. Keeping one implementation is what stops that drifting
+    apart again.
+
+    A non-integer handle is ignored on both platforms. On POSIX an ``OSError``
+    from ``os.kill`` (gone, or not ours to signal) is suppressed too. The
+    Windows branch does not suppress: ``subprocess.run`` is already
+    ``check=False``, so a failed ``taskkill`` is reported through its exit code
+    rather than raised, and an ``OSError`` there means ``taskkill.exe`` itself
+    could not be executed — a broken environment worth surfacing, not a dead
+    PID worth ignoring. Callers treat killing as best-effort and prove
+    ownership separately.
+    """
+    try:
+        pid = int(handle)
+    except ValueError:
+        return
+    if os.name == "nt":
+        taskkill = shutil.which("taskkill.exe") or "C:\\Windows\\System32\\taskkill.exe"
+        subprocess.run(  # noqa: S603 - PID is parsed as int before invocation.
+            [taskkill, "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
 
 
 def _read_windows_creation_token(pid: int) -> str | None:
@@ -169,6 +205,16 @@ def _codex_creation_epoch_ms(value: object) -> int:
     return int(digits) if digits else 0
 
 
+#: Provably this manager's process: in-memory ownership, or a matching token.
+OWNERSHIP_OURS = "ours"
+#: Provably NOT the process we mean: token mismatch, no token, or a dead PID.
+#: The only answer that may authorize reclaiming a lease or a record claim.
+OWNERSHIP_NOT_OURS = "not_ours"
+#: Alive, but ownership is unprovable (creation metadata unreadable). Never a
+#: licence to reclaim: "I could not check" is not "the holder is gone".
+OWNERSHIP_INDETERMINATE = "indeterminate"
+
+
 def creation_token(handle: str) -> str | None:
     """Return an opaque, PID-reuse-distinguishing creation token, or ``None``.
 
@@ -252,6 +298,40 @@ class _PidOwnershipMixin:
         info = self._processes.get(handle)
         return info is not None and self._tracked_alive(info)
 
+    def ownership_probe(self, handle: str, expected_token: str | None) -> str:
+        """Classify ``handle`` as :data:`OWNERSHIP_OURS`/``NOT_OURS``/``INDETERMINATE``.
+
+        ``owns_process`` collapses the last two into ``False``, which is right
+        for a **destructive** gate — never kill what you cannot prove is yours —
+        but wrong for a **reclaim** gate. Reclaiming a lease or a delivery-record
+        claim means "the holder is gone, so I may resume in its place", and an
+        unreadable creation token is not proof of that: it is most often a
+        transient access error against a process that is very much alive. Acting
+        on it authorizes a concurrent resume of one conversation.
+
+        So the three answers are kept apart:
+
+        - ``OURS`` — in-memory ownership of a live child, or a matching live
+          creation token.
+        - ``NOT_OURS`` — a token mismatch (PID reuse), a tokenless expectation,
+          or a PID that is not alive at all. Provably not the holder we mean.
+        - ``INDETERMINATE`` — the PID is alive but its creation token could not
+          be read, so we cannot tell ownership from reuse. Callers gating a
+          reclaim must treat this as "still held".
+        """
+        if self._has_live_registry_entry(handle):
+            return OWNERSHIP_OURS
+        if not expected_token:
+            return OWNERSHIP_NOT_OURS
+        live = creation_token(handle)
+        if live is not None:
+            return OWNERSHIP_OURS if live == expected_token else OWNERSHIP_NOT_OURS
+        # The token is unreadable. A PID that is not alive is settled: gone.
+        # A PID that IS alive with an unreadable token is genuinely unknown.
+        if self._pid_alive(handle):
+            return OWNERSHIP_INDETERMINATE
+        return OWNERSHIP_NOT_OURS
+
     def owns_process(self, handle: str, expected_token: str | None) -> bool:
         """Return whether ``handle`` is provably still our process (fail-closed).
 
@@ -260,13 +340,12 @@ class _PidOwnershipMixin:
         token equals ``expected_token``. A tokenless expectation, an unreadable
         live token (dead / access denied), or a mismatch all return ``False`` —
         so a reused or foreign PID is never gracefully-shut-down or killed.
+
+        Deliberately still a bool: this gates *destruction*, where "unproven"
+        and "not ours" must behave identically. Reclaim gates want
+        :meth:`ownership_probe`, which keeps the two apart.
         """
-        if self._has_live_registry_entry(handle):
-            return True
-        if not expected_token:
-            return False
-        live = creation_token(handle)
-        return live is not None and live == expected_token
+        return self.ownership_probe(handle, expected_token) == OWNERSHIP_OURS
 
     def _pid_health_with_token(
         self, handle: str, expected_token: str | None
@@ -728,23 +807,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
         process.terminate()
 
     def _kill_pid(self, handle: str) -> None:
-        try:
-            pid = int(handle)
-        except ValueError:
-            return
-        if os.name == "nt":
-            taskkill = (
-                shutil.which("taskkill.exe") or "C:\\Windows\\System32\\taskkill.exe"
-            )
-            subprocess.run(  # noqa: S603 - PID is parsed as int before invocation.
-                [taskkill, "/PID", str(pid), "/T", "/F"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            return
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
+        _force_kill_pid(handle)
 
     def _pid_alive(self, handle: str) -> bool:
         try:
@@ -963,8 +1026,16 @@ class WindowsProcessManager(_PidOwnershipMixin):
             text=True,
         )
         if codex_direct:
-            token = codex_correlation_token(request.agent_id)
-            pid = self._await_codex_tab_pid(token)
+            # PID discovery scans argv for the same server-issued marker the
+            # codex backend embedded in the prompt. Without an id there is no
+            # marker to find, so the discovery cannot succeed — fail loudly
+            # rather than scan for a derived token that is not in the argv.
+            correlation_id = (request.extra or {}).get(CORRELATION_FIELD)
+            pid = (
+                self._await_codex_tab_pid(correlation_marker_token(correlation_id))
+                if correlation_id
+                else None
+            )
             if pid is None:
                 raise WindowsTerminalTabSpawnError(title)
             # Persist the discovered PID to the same sidecar so restart recovery
@@ -1599,12 +1670,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
         )
 
     def _kill_pid(self, handle: str) -> None:
-        try:
-            pid = int(handle)
-        except ValueError:
-            return
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
+        _force_kill_pid(handle)
 
     def _pid_alive(self, handle: str) -> bool:
         try:
@@ -2076,12 +2142,7 @@ class LinuxTerminalProcessManager(_PidOwnershipMixin):
         return len(parts) == _PROC_STAT_SPLIT_FIELD_COUNT and parts[1].startswith("Z ")
 
     def _kill_pid(self, handle: str) -> None:
-        try:
-            pid = int(handle)
-        except ValueError:
-            return
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
+        _force_kill_pid(handle)
 
 
 def read_log_tail(path: Path, lines: int | None = None) -> str:

@@ -218,14 +218,66 @@ Add a per-backend branch to `server_simple._hook_extra` for any spawn-time setup
 
 So `check_agent`/`follow_up_agent` can recover `last_message` and
 `backend_session_id` even when the agent never messaged, add a
-`read_<name>_output(...)` in `src/claude_teams/agent_output.py` and a branch in
-`server_simple._read_agent_output` (today it handles `codex`, `claude-code`, `pi`).
+`read_<name>_output(...)` in `src/claude_teams/agent_output.py` and return it
+from your binder's `legacy_read` (see §6b). There is no longer a
+`server_simple._read_agent_output` dispatch — the binding ladder replaced it.
 The reader parses the CLI's own session/rollout log. When you control the storage
-location and session id (as pi does via `--session-dir`/`--session-id`), binding is
-trivial — glob the one file, read the header id, scan backward for the last
-assistant text (`agent_output.read_pi_output`). When you don't (codex), match by
-cwd + start-time and, if needed, a correlation token appended to the prompt
-(`agent_output.read_codex_output`, `codex_correlation_token`).
+location and session id (as pi does via `--session-dir`/`--session-id`), enumeration
+is a single directory listing (`agent_output.read_pi_output`). When you don't
+(codex), match by cwd + start-time (`agent_output.read_codex_output`).
+
+These readers are the **legacy** path only. They are reached through
+`_TranscriptBinder.legacy_read`, for records written before correlation existed.
+Everything spawned today goes through the binding ladder below instead.
+
+## 6b. The message-delivery protocol
+
+A backend that only implements the above will spawn fine and then refuse every
+follow-up. Binding an agent to *its own* transcript — not merely to a plausible
+one — needs three more pieces. Getting any of them wrong produces a false
+`delivered`: the server reports a message as received when it was not.
+
+**1. Correlation marker in the prompt.** The server mints a random
+`correlation_id` **per spawn** (`agent_output.new_correlation_id`) and persists it
+on the agent record. A per-agent *derived* token is not sufficient: a killed
+agent's name can be reused, so a derived token would name two conversations.
+
+Who appends the marker depends on how the prompt reaches the agent:
+
+- If the CLI takes the prompt **verbatim** (codex, pi), the backend appends it —
+  see `CodexBackend._correlated_prompt` / `PiBackend._correlated_prompt`, both
+  reading `extra[CORRELATION_FIELD]`. The server leaves such prompts alone.
+- If the server has to choose the transport (claude-code, which may route a
+  CLI-sensitive prompt through a sidecar file), the **server** owns it in
+  `server_simple._materialize_prompt`. The backend must then pass the prompt
+  through untouched, or the argv path gets two markers.
+
+Mark the **resume** as well as the spawn. A resume whose transcript cannot be
+identified is exactly the unverifiable receipt the protocol exists to prevent.
+Never mint an id for a record that has none — that is a `legacy` record, and a
+fresh id would match nothing in the conversation that already exists.
+
+**2. A binder.** Subclass `agent_output._TranscriptBinder` and register it in
+`_make_binder`. It enumerates candidate transcripts, parses a session id, and
+reads the last assistant message. There is deliberately **no newest-mtime
+fallback**: zero token matches is `unverified`, two is `ambiguous`. Recency is
+not identity, and a wrong `backend_session_id` pinned once never self-corrects.
+
+If your backend needs lookup metadata that is not derivable from `cwd` — as pi
+does, since the server chooses its storage dir — persist it on the agent record
+at spawn and read it from the `record` argument (`PI_SESSION_DIR_FIELD`). Do not
+re-derive the layout inside the reader.
+
+**3. A named receipt record.** Add a branch to `delivery.receipt_nonces` naming
+the record class that means *the agent received this text as input*: `type:
+"user"` for claude-code, the user `response_item` for codex, `type: "message"`
+with `message.role == "user"` for pi. Assistant output, tool invocations, and CLI
+diagnostics are **not** receipts — a nonce there proves the text was echoed or
+logged, not that it entered the agent's context.
+
+An unlisted backend yields no receipt, which makes delivery `unconfirmed` rather
+than `delivered`. That is the correct direction to fail, but it means follow-up
+never confirms, so a backend without a receipt branch is effectively read-only.
 
 ## 7. State reporting
 
@@ -278,6 +330,9 @@ Run `ruff check` and the full suite; then smoke-test a real spawn per DEVELOPMEN
 - [ ] Register in `registry._BUILTIN_BACKENDS`
 - [ ] Server glue: MCP identity injection + `_hook_extra` branch
 - [ ] `read_<name>_output` in `agent_output.py` + `_read_agent_output` branch
+- [ ] Correlation marker on **both** spawn and resume (backend-side if the prompt is verbatim, else server-side)
+- [ ] `_TranscriptBinder` subclass registered in `_make_binder` (no newest-mtime fallback)
+- [ ] Named receipt record branch in `delivery.receipt_nonces`
 - [ ] State reporting writing `state-<agent>.json`
 - [ ] `tests/test_backends/test_<name>.py`
 - [ ] README backend table + a setup section

@@ -12,7 +12,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from claude_teams import server_simple as _ss
+from claude_teams import leases, server_simple
+from claude_teams.agent_output import (
+    SPAWNED_BY_FIELD,
+    SPAWNED_BY_SOURCE_FIELD,
+    SPAWNED_BY_SOURCE_OPERATOR,
+)
 from claude_teams.backends.registry import registry
 from claude_teams.hooks import _SAFE_AGENT_RE
 from claude_teams.messaging import (
@@ -110,6 +115,286 @@ def backends(
             ", ".join(row["supported_models"]),
         )
     console.print(table)
+
+
+lease_app = typer.Typer(
+    name="lease",
+    help="Operator escape hatch for a stuck per-agent delivery lease (A4b).",
+    no_args_is_help=True,
+)
+app.add_typer(lease_app, name="lease")
+
+
+def _authorize(session_id: str, token: str) -> None:
+    """Abort unless ``token`` is the session's recovery token.
+
+    This path can terminate a live child and fence out a running delivery, so
+    it is deliberately CLI-only and gated. Nothing reachable over MCP can call
+    it: ordinary ``kill_agent`` never bypasses a live lease.
+    """
+    if not token or token != server_simple._ensure_lead_token(session_id):
+        console.print("[red]Invalid or missing session recovery token.[/red]")
+        raise typer.Exit(code=2)
+
+
+def _lease_or_exit(session_id: str, agent: str):
+    try:
+        lease = leases.active_lease(server_simple._leases_file(session_id), agent)
+    except leases.LeaseStoreError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=5) from exc
+    if lease is None:
+        console.print(f"[yellow]No lease held for {agent!r}.[/yellow]")
+        raise typer.Exit(code=1)
+    return lease
+
+
+def _describe(lease, *, holder_live: bool, child_alive: bool | None) -> dict:
+    return {
+        "agent": lease.agent,
+        "operation_id": lease.operation_id,
+        "generation": lease.generation,
+        "backend_session_id": lease.backend_session_id,
+        # The attempt nonce: what an operator needs to check by hand whether
+        # the prompt actually reached the target before forcing anything.
+        "attempt_nonce": lease.nonce,
+        "holder_pid": lease.holder_pid,
+        "holder_live": holder_live,
+        "resumed_child_alive": child_alive,
+        "deadline": lease.deadline,
+    }
+
+
+@lease_app.command("inspect")
+def lease_inspect(
+    session_id: str = typer.Argument(..., help="Session id holding the agent."),
+    agent: str = typer.Argument(..., help="Agent name."),
+    token: str = typer.Option(..., "--token", help="Session recovery token."),
+) -> None:
+    """Show the attempt nonce, holder liveness, and resumed-child liveness."""
+    _authorize(session_id, token)
+    lease = _lease_or_exit(session_id, agent)
+    holder_live = server_simple._lease_holder_live(
+        lease.holder_pid, lease.holder_create_token
+    )
+    console.print_json(
+        json.dumps(_describe(lease, holder_live=holder_live, child_alive=None))
+    )
+
+
+@lease_app.command("clear")
+def lease_clear(
+    session_id: str = typer.Argument(..., help="Session id holding the agent."),
+    agent: str = typer.Argument(..., help="Agent name."),
+    token: str = typer.Option(..., "--token", help="Session recovery token."),
+) -> None:
+    """Clear a lease whose holder is dead or token-mismatched.
+
+    Refuses a provably live holder: clearing under one would let a second
+    caller resume into a delivery that is still in progress. Use ``force`` for
+    a live-but-hung holder — it fences the holder out first.
+    """
+    _authorize(session_id, token)
+    lease = _lease_or_exit(session_id, agent)
+    if server_simple._lease_holder_live(lease.holder_pid, lease.holder_create_token):
+        console.print(
+            "[red]Holder is provably live; refusing to clear. "
+            "Use `lease force` if it is hung.[/red]"
+        )
+        raise typer.Exit(code=3)
+    with server_simple._agents_file_lock(session_id):
+        # Under the registry lock, which is what ``reserve_lease`` holds when it
+        # grants. Clearing outside it can drop a lease that was granted in the
+        # meantime, letting a third caller resume the same conversation.
+        _, persisted = leases.force_clear_lease(
+            server_simple._leases_file(session_id),
+            agent,
+            expect_operation_id=lease.operation_id,
+        )
+    if not persisted:
+        console.print(
+            "[red]The lease was not cleared: either it moved to another "
+            "operation, or the store could not be written.[/red]"
+        )
+        raise typer.Exit(code=4)
+    console.print(f"[green]Cleared stale lease for {agent!r}.[/green]")
+
+
+@lease_app.command("force")
+def lease_force(
+    session_id: str = typer.Argument(..., help="Session id holding the agent."),
+    agent: str = typer.Argument(..., help="Agent name."),
+    token: str = typer.Option(..., "--token", help="Session recovery token."),
+) -> None:
+    """Fence out a live-but-overdue holder, then release the lease.
+
+    Order is load-bearing. The **fencing generation is bumped first**, so the
+    original holder can no longer win its finalize CAS — otherwise it could
+    wake up after we terminated its child and write a record describing a
+    delivery that no longer exists. Only then is the resumed child terminated
+    (and only when ownership is provable), and only then is the lease cleared.
+
+    "Overdue" is enforced, not merely described: a holder that is provably live
+    and still inside its deadline is doing exactly what the lease is for, and
+    forcing it kills a delivery in progress. Wait for the deadline, or use
+    ``lease clear`` once the holder is gone.
+    """
+    _authorize(session_id, token)
+    lease = _lease_or_exit(session_id, agent)
+    lease_path = server_simple._leases_file(session_id)
+
+    holder_live = server_simple._lease_holder_live(
+        lease.holder_pid, lease.holder_create_token
+    )
+    if holder_live and time.time() < lease.deadline:
+        console.print(
+            "[red]Holder is live and not yet overdue "
+            f"(deadline {lease.deadline}); refusing to force. Forcing here "
+            "would terminate a delivery that is still within its lease.[/red]"
+        )
+        raise typer.Exit(code=3)
+
+    fenced_generation = None
+    terminated = False
+    cleared = None
+    persisted = False
+    # All three steps run inside ONE registry transaction, and the ordering
+    # inside it is the protocol.
+    #
+    # Splitting them was the defect: the operation id was revalidated only at
+    # the final compare-and-swap, so if the inspected operation finalized and a
+    # queued caller was granted the target in between — which ``reserve_lease``
+    # may legitimately do the moment the lock is free — this command fenced and
+    # killed THAT caller's live delivery and reported the mismatch afterwards,
+    # when nothing could be undone. Revalidating early is not enough on its own
+    # either: the handoff can happen between the check and the kill.
+    #
+    # ``reserve_lease`` grants only while holding this same lock, so holding it
+    # across the whole sequence is what makes the validation meaningful. The
+    # cost is that registry readers block for the duration; ``kill_process`` is
+    # a terminate, not the graceful-shutdown path, so that is bounded and short.
+    with server_simple._agents_transaction(session_id) as agents:
+        current = leases.active_lease(lease_path, agent)
+        if current is None or current.operation_id != lease.operation_id:
+            console.print(
+                "[red]The lease moved to another operation "
+                f"({None if current is None else current.operation_id}) after "
+                "it was inspected. Nothing was fenced, killed or cleared. "
+                "Re-inspect and retry.[/red]"
+            )
+            raise typer.Exit(code=4)
+
+        # Step 1 — fence, so the holder can no longer win its finalize CAS and
+        # write a record describing a delivery that is about to not exist.
+        record = next((a for a in agents if a.get("name") == agent), None)
+        child_pid = None
+        if record is not None:
+            fenced_generation = server_simple._bump_generation(record)
+            child_pid = record.get("pid")
+            server_simple._save_agents_transaction(session_id, agents)
+
+        # Step 2 — terminate the resumed child, only when ownership is provable.
+        if record is not None and child_pid is not None:
+            create_token = server_simple._agent_create_token(record)
+            if server_simple.process_manager.owns_process(str(child_pid), create_token):
+                server_simple.process_manager.kill_process(str(child_pid))
+                terminated = True
+
+        # Step 3 — release the lease. The CAS is kept even though nothing can
+        # have moved under the held lock: it is cheap, and it keeps the clear
+        # honest if this sequence is ever split again.
+        cleared, persisted = leases.force_clear_lease(
+            lease_path, agent, expect_operation_id=lease.operation_id
+        )
+    console.print_json(
+        json.dumps(
+            {
+                "forced": persisted,
+                "agent": agent,
+                "fenced_generation": fenced_generation,
+                "attempt_nonce": lease.nonce,
+                "child_terminated": terminated,
+                "lease_cleared": persisted,
+                "held_by_operation": None if cleared is None else cleared.operation_id,
+            }
+        )
+    )
+    if not persisted:
+        raise typer.Exit(code=4)
+
+
+@app.command("adopt")
+def adopt(
+    session_id: str = typer.Argument(..., help="Session id holding the agent."),
+    agent: str = typer.Argument(..., help="Agent name to adopt."),
+    parent: str = typer.Argument(..., help="Agent name to record as the spawner."),
+    token: str = typer.Option(..., "--token", help="Session recovery token."),
+    expect_generation: int = typer.Option(
+        ...,
+        "--expect-generation",
+        help="Record generation you observed; the write is refused if it moved.",
+    ),
+) -> None:
+    """Record who spawned an agent whose ``spawned_by`` field is missing.
+
+    Deliberately CLI-only and operator-driven. An MCP-callable equivalent would
+    reintroduce exactly the hole the direction guard closes: "callable only by
+    a caller claiming parentage" is tautological, because the operation itself
+    writes the caller as the spawner and an agent's identity is self-asserted.
+    A confused worker could adopt its own coordinator and then legitimately
+    follow it up, turning a one-call mistake into a two-call one.
+
+    Gated on the session recovery token *and* the generation you read, so an
+    adoption cannot be replayed against a record that changed underneath it.
+    The parentage is stored as operator-asserted rather than spawn-derived,
+    because it was asserted by a human and not observed at spawn.
+
+    Adoption is **recovery for a missing spawner, not re-parenting.** A record
+    that already names a spawner is refused: with the token and the generation
+    this would otherwise be able to move any record to any parent, which is
+    broader than the contract and would let an operator hand one agent
+    follow-up rights over another's child. Kill and respawn instead.
+
+    A worker with filesystem access can still edit ``agents.json`` directly.
+    That is an accepted non-goal: the guard prevents accidents, not bypasses.
+    """
+    _authorize(session_id, token)
+    with server_simple._agents_transaction(session_id) as agents:
+        record = next((a for a in agents if a.get("name") == agent), None)
+        if record is None:
+            console.print(f"[red]No agent named {agent!r} in {session_id!r}.[/red]")
+            raise typer.Exit(code=1)
+        current = record.get(SPAWNED_BY_FIELD)
+        if isinstance(current, str) and current:
+            console.print(
+                f"[red]{agent!r} already records {current!r} as its spawner. "
+                "adopt only fills in a MISSING spawner; it does not re-parent. "
+                "Kill and respawn the agent if the parentage is wrong.[/red]"
+            )
+            raise typer.Exit(code=4)
+        actual = server_simple._record_generation(record)
+        if actual != expect_generation:
+            console.print(
+                f"[red]Record generation is {actual}, not the expected "
+                f"{expect_generation}; refusing to adopt a record that moved."
+                "[/red]"
+            )
+            raise typer.Exit(code=3)
+        record[SPAWNED_BY_FIELD] = parent
+        record[SPAWNED_BY_SOURCE_FIELD] = SPAWNED_BY_SOURCE_OPERATOR
+        generation = server_simple._bump_generation(record)
+        server_simple._save_agents_transaction(session_id, agents)
+    console.print_json(
+        json.dumps(
+            {
+                "adopted": True,
+                "agent": agent,
+                "spawned_by": parent,
+                "spawned_by_source": SPAWNED_BY_SOURCE_OPERATOR,
+                "generation": generation,
+            }
+        )
+    )
 
 
 def _snapshot_mtimes(session_dir: Path, pattern: str) -> dict[str, tuple[int, int]]:
@@ -356,9 +641,9 @@ def session_dir() -> None:
     stdout. An internal error exits 1 with a message on stderr only.
     """
     try:
-        session_id = _ss._active_session_id(create=False)
+        session_id = server_simple._active_session_id(create=False)
         line = (
-            f"{session_id}\t{_ss._session_dir(session_id)}\t{_ss.IDENTITY}"
+            f"{session_id}\t{server_simple._session_dir(session_id)}\t{server_simple.IDENTITY}"
             if session_id
             else None
         )
@@ -405,7 +690,7 @@ def inbox_status(
         reader_name = os.environ.get("AGENT_NAME", "").strip() or "team-lead"
 
     directory = Path(session_dir)
-    base = _ss._SESSION_BASE.resolve()
+    base = server_simple._SESSION_BASE.resolve()
     if not directory.is_dir() or directory.resolve().parent != base:
         typer.echo(f"session_dir not under session base: {session_dir!r}", err=True)
         raise typer.Exit(code=4)

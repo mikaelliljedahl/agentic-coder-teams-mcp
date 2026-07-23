@@ -267,13 +267,32 @@ def test_recover_session_id_no_silent_autoadopt_for_unresolved_child(
 
 
 def test_root_lead_send_message_works(isolated, monkeypatch):
+    """A root lead's identity resolves far enough to classify a recipient.
+
+    This test arrived on ``main`` asserting ``success is True`` for a recipient
+    that does not exist in an empty registry, because ``send_message`` used to
+    re-route any unknown name to the lead. R5 removed that: a typo silently
+    delivered upstream is read by the wrong agent or by nobody, so an unknown
+    recipient is now refused (``_classify_recipient``).
+
+    The assertion is ported rather than deleted, because the property it guards
+    is about **identity**, not deliverability — the section header says so, and
+    the empty registry is incidental to ``_make_session``'s default. Reaching
+    ``recipient_not_addressable`` proves the guarded property precisely: the
+    call resolved ``IDENTITY`` to ``team-lead``, found the session, loaded the
+    registry, and got all the way to recipient classification. An identity
+    regression fails earlier and differently, which this still catches.
+    """
     sid = str(uuid.uuid4())
     _make_session(isolated.base, sid)
     monkeypatch.setattr(ss, "IDENTITY", ss.ROOT_LEAD_NAME)
     monkeypatch.setattr(ss, "_IDENTITY_UNRESOLVED", False)
     monkeypatch.setattr(ss, "_active_session_id", lambda **k: sid)
     result = asyncio.run(ss.send_message("hi", to="worker"))
-    assert result["success"] is True
+    assert result["reason"] == "recipient_not_addressable"
+    assert result["recipient_class"] == "unknown"
+    # The identity-failure modes this regression exists to catch:
+    assert result["reason"] not in {"session_not_found", "identity_unresolved"}
 
 
 def test_recovery_hint_retained_for_root_lead(isolated, monkeypatch):

@@ -152,15 +152,21 @@ def test_safe_float_bad_values():
     assert ss._safe_float("3.5") == 3.5
 
 
-def test_read_agent_output_unknown_backend_returns_none():
+def test_resolve_agent_binding_unknown_backend_is_unverified():
     agent = {
         "backend": "mystery",
         "spawned_at": 1.0,
         "cwd": "/some/where",
         "name": "a",
         "session_id": "s",
+        "correlation_id": "corr-1",
     }
-    assert ss._read_agent_output(agent) is None
+    binding = ss._resolve_agent_binding(agent)
+    # No binder exists for an unknown backend, so nothing can be verified --
+    # and "cannot verify" is terminal, not retriable.
+    assert binding.outcome == "unverified"
+    assert binding.output is None
+    assert binding.retriable is False
 
 
 def test_last_non_empty_line_all_blank():
@@ -314,23 +320,28 @@ def test_maybe_cleanup_tolerates_corrupt_stamp(isolated):
 
 
 # --------------------------------------------------------------------------
-# _message_recipient
+# _classify_recipient
 # --------------------------------------------------------------------------
 
 
-def test_message_recipient_known_agent_used_verbatim(isolated):
+def test_classify_recipient_own_child_is_the_guaranteed_path(isolated):
+    _make_session(
+        isolated.base,
+        "s1",
+        json.dumps([{"name": "worker", "pid": 1, ss.SPAWNED_BY_FIELD: "team-lead"}]),
+    )
+    assert ss._classify_recipient("worker", "s1") == (ss.RECIPIENT_CHILD, "worker")
+
+
+def test_classify_recipient_record_without_a_spawner_is_not_a_child(isolated):
+    """A pre-C1 record cannot be claimed as a child on a missing field alone."""
     _make_session(isolated.base, "s1", json.dumps([{"name": "worker", "pid": 1}]))
-    recipient, warning = ss._message_recipient("worker", "s1")
-    assert recipient == "worker"
-    assert warning is None
+    assert ss._classify_recipient("worker", "s1") == (ss.RECIPIENT_UNRELATED, "worker")
 
 
-def test_message_recipient_unknown_routes_to_lead_with_warning(isolated):
+def test_classify_recipient_unknown_is_refused_not_rerouted(isolated):
     _make_session(isolated.base, "s1", "[]")
-    recipient, warning = ss._message_recipient("ghost", "s1")
-    assert recipient == ss.ROOT_LEAD_NAME
-    assert warning is not None
-    assert "ghost" in warning
+    assert ss._classify_recipient("ghost", "s1") == (ss.RECIPIENT_UNKNOWN, "ghost")
 
 
 # --------------------------------------------------------------------------
@@ -529,7 +540,7 @@ def test_list_backends_enumerates_registry(isolated, monkeypatch):
 
 def test_follow_up_agent_no_session(isolated, monkeypatch):
     _no_session(monkeypatch)
-    result = asyncio.run(ss.follow_up_agent("worker", "next"))
+    result = asyncio.run(ss.follow_up_agent("worker", "next", "k44"))
     assert result["success"] is False
     assert result["reason"] == "session_not_found"
 
@@ -538,9 +549,20 @@ def test_follow_up_agent_unsupported_backend(isolated, monkeypatch):
     _make_session(
         isolated.base,
         "s1",
-        json.dumps([{"name": "worker", "pid": 1, "backend": "totally-bogus"}]),
+        json.dumps(
+            [
+                {
+                    "name": "worker",
+                    "pid": 1,
+                    "backend": "totally-bogus",
+                    # R2: the caller must be the recorded spawner, and the
+                    # default IDENTITY in tests is the root lead.
+                    "spawned_by": "team-lead",
+                }
+            ]
+        ),
     )
     monkeypatch.setattr(ss, "_active_session_id", lambda **kwargs: "s1")
-    result = asyncio.run(ss.follow_up_agent("worker", "next"))
+    result = asyncio.run(ss.follow_up_agent("worker", "next", "k45"))
     assert result["success"] is False
     assert result["reason"] == "backend_not_supported"

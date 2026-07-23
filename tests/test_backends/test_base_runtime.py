@@ -559,6 +559,38 @@ class TestWindowsTerminalTabSpawn:
                 is_interactive=True,
             )
 
+    def test_codex_direct_launch_without_a_correlation_id_fails_loudly(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        """Fail loud, never fall back to a derived token.
+
+        Direct-launch PID discovery scans argv for the server-issued marker.
+        With no correlation id there is no marker to find, so discovery cannot
+        succeed. Scanning for a *derived* token instead would be worse than
+        failing: the derived form is reused by any later agent taking the same
+        name, so it could bind this handle to the wrong process.
+        """
+        manager, _ = self._prep_manager(monkeypatch, tmp_path, codex_direct=True)
+        discovery_calls: list[str] = []
+
+        def record_discovery(marker: str) -> None:
+            discovery_calls.append(marker)
+
+        monkeypatch.setattr(manager, "_await_codex_tab_pid", record_discovery)
+
+        with pytest.raises(process_manager_mod.WindowsTerminalTabSpawnError):
+            manager.spawn_process(
+                _make_spawn_request(extra={}),
+                ["C:\\codex.exe", "-C", str(tmp_path), "p"],
+                {"PATH": "x"},
+                "codex",
+                is_interactive=True,
+            )
+
+        assert discovery_calls == [], (
+            "discovery must not even be attempted without a server-issued id"
+        )
+
     def test_immediate_exit_reaps_tab_and_raises(
         self, _make_spawn_request, monkeypatch, tmp_path
     ):
@@ -673,8 +705,8 @@ class TestWindowsTerminalTabSpawn:
         manager, popen_mock = self._prep_manager(monkeypatch, tmp_path, pid=4242)
 
         result = manager.spawn_process(
-            _make_spawn_request(),
-            ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:worker@team"],
+            _make_spawn_request(extra={"correlation_id": "corr-runtime"}),
+            ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:corr-runtime"],
             {"PATH": "x"},
             "codex",
             is_interactive=True,
@@ -710,8 +742,8 @@ class TestWindowsTerminalTabSpawn:
         monkeypatch.setattr(manager, "_await_codex_tab_pid", fake_discover)
 
         result = manager.spawn_process(
-            _make_spawn_request(),
-            ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:worker@team"],
+            _make_spawn_request(extra={"correlation_id": "corr-runtime"}),
+            ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:corr-runtime"],
             {"PATH": "x"},
             "codex",
             is_interactive=True,
@@ -729,8 +761,8 @@ class TestWindowsTerminalTabSpawn:
         assert not (tmp_path / "team" / "worker.launch.ps1").exists()
         # The discovered codex PID is persisted for restart recovery.
         assert (tmp_path / "team" / "worker.pid").read_text().strip() == "7777"
-        # Discovery keyed on the exact correlation token of the agent_id.
-        assert seen["token"] == "wat-corr:worker@team"  # noqa: S105 - correlation marker
+        # Discovery keyed on the server-issued correlation id from ``extra``.
+        assert seen["token"] == "wat-corr:corr-runtime"
         tab = manager._tabs["7777"]
         assert tab.wrapper_path is None
         assert tab.backend == "codex"
@@ -757,7 +789,7 @@ class TestWindowsTerminalTabSpawn:
 
         prompt = "Implement the parser; run the tests; report back"
         manager.spawn_process(
-            _make_spawn_request(),
+            _make_spawn_request(extra={"correlation_id": "corr-runtime"}),
             ["C:\\codex.exe", "-C", str(tmp_path), prompt],
             {"PATH": "x"},
             "codex",
@@ -806,8 +838,8 @@ class TestWindowsTerminalTabSpawn:
         manager, _ = self._prep_manager(monkeypatch, tmp_path, codex_direct=True)
         monkeypatch.setattr(manager, "_await_codex_tab_pid", lambda token: 7777)
         manager.spawn_process(
-            _make_spawn_request(),
-            ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:worker@team"],
+            _make_spawn_request(extra={"correlation_id": "corr-runtime"}),
+            ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:corr-runtime"],
             {},
             "codex",
             is_interactive=True,
@@ -844,8 +876,8 @@ class TestWindowsTerminalTabSpawn:
 
         with pytest.raises(process_manager_mod.WindowsTerminalTabSpawnError):
             manager.spawn_process(
-                _make_spawn_request(),
-                ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:worker@team"],
+                _make_spawn_request(extra={"correlation_id": "corr-runtime"}),
+                ["C:\\codex.exe", "-C", str(tmp_path), "p wat-corr:corr-runtime"],
                 {},
                 "codex",
                 is_interactive=True,

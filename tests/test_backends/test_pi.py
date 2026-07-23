@@ -241,10 +241,21 @@ class TestPiBuildCommand:
 
 
 class TestPiBuildResume:
-    def test_resume_adds_continue(self, _make_request, _direct_launch, _tty, _models):
+    def test_resume_uses_continue_without_session_id(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        # pi's CLI rejects ``--session-id`` combined with ``--continue`` and
+        # exits 1 immediately. The per-agent ``--session-dir`` already scopes
+        # resume to this agent's single session, so ``--continue`` alone is
+        # unambiguous.
         cmd = PiBackend().build_resume_command(_make_request(), "sid-abc")
         assert "--continue" in cmd
-        assert cmd[cmd.index("--session-id") + 1] == "worker"
+        assert "--session-id" not in cmd
+        # Resume still targets the per-agent session dir.
+        sdir = cmd[cmd.index("--session-dir") + 1]
+        assert sdir.endswith("pi-sessions/worker") or sdir.endswith(
+            "pi-sessions\\worker"
+        )
 
 
 class TestPiBuildEnv:

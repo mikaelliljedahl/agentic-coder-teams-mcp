@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import ClassVar
 
-from claude_teams.agent_output import codex_correlation_token
+from claude_teams.agent_output import CORRELATION_FIELD, correlated_prompt
 from claude_teams.backends._agent_discovery import discover_codex_style_agents
 from claude_teams.backends.base import (
     AgentProfile,
@@ -543,19 +543,25 @@ class CodexBackend(BaseBackend):
         return text
 
     def _correlated_prompt(self, request: SpawnRequest) -> str:
-        """Append a per-agent correlation marker to the initial prompt.
+        """Append the server-issued correlation marker to the initial prompt.
 
         The marker lets ``read_codex_output`` bind this agent's rollout file
         deterministically when two agents are spawned in the same ``cwd`` at
         nearly the same time (before Codex's own session id is known). Only
         used for the initial spawn; resume already has the backend session id.
+
+        The id is generated once per spawn by the server and travels in
+        ``extra["correlation_id"]``; it is deliberately **not** derived here.
+        A derived token would be reused by a later agent taking the same name,
+        and deriving a second one alongside the server's would put two markers
+        in one prompt. Absent id means the record predates correlation, so the
+        prompt goes out unmarked rather than silently marked with an invented
+        id (see ``agent_output.classify_correlation``).
         """
-        token = codex_correlation_token(request.agent_id)
-        return (
-            f"{request.prompt}\n\n"
-            f"[win-agent-teams correlation id: {token} "
-            "— internal marker, ignore this line]"
-        )
+        correlation_id = (request.extra or {}).get(CORRELATION_FIELD)
+        if not correlation_id:
+            return request.prompt
+        return correlated_prompt(request.prompt, correlation_id, single_line=False)
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
         """Pass agent identity and replicate the npm shim's runtime env.

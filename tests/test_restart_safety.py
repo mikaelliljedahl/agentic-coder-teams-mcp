@@ -14,7 +14,9 @@ from types import SimpleNamespace
 import pytest
 
 from claude_teams import server_simple as ss
+from claude_teams.agent_output import BINDING_BOUND, AgentOutput, BindingResult
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.delivery import DeliveryOutcome
 
 
 class _FakeResumeBackend:
@@ -49,6 +51,13 @@ def follow_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespac
     monkeypatch.setattr(ss, "_session_id", "session-id")
     monkeypatch.setattr(ss, "registry", _FakeRegistry(backend))
     monkeypatch.setattr(ss, "_inbox_locks", {})
+    # These tests are about the fail-closed PID gate and token persistence, not
+    # about A4 confirmation, so the confirmation outcome is pinned exactly as
+    # the binding is. Confirmation itself is proven against real transcripts in
+    # tests/test_delivery_confirmation.py and tests/test_follow_up_delivery.py.
+    monkeypatch.setattr(
+        ss, "confirm_delivery", lambda *a, **k: DeliveryOutcome("delivered", "")
+    )
     return SimpleNamespace(backend=backend, tmp_path=tmp_path)
 
 
@@ -65,6 +74,11 @@ def _write_agent(tmp_path: Path, **overrides: object) -> None:
         "model": "model",
         "permission_mode": "bypass",
         "reasoning_effort": None,
+        # R2: follow-up is downstream-only, and the default test IDENTITY is
+        # the root lead. The direction guard itself is covered in
+        # tests/test_direction_guard.py.
+        "spawned_by": "team-lead",
+        "spawned_by_source": "spawn",
     }
     record.update(overrides)
     ss._save_agents("session-id", [record])
@@ -88,12 +102,15 @@ def _idle_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ss.time, "time", lambda: 1_000.0)
     monkeypatch.setattr(
         ss,
-        "read_codex_output",
-        lambda spawned_at, cwd, **kwargs: SimpleNamespace(
-            last_activity_at=900.0,
-            last_message="done",
-            backend_session_id="backend-session-id",
-            busy_hint=False,
+        "_resolve_agent_binding",
+        lambda agent, **_: BindingResult(
+            BINDING_BOUND,
+            AgentOutput(
+                last_activity_at=900.0,
+                last_message="done",
+                rollout_path="t.jsonl",
+                backend_session_id="backend-session-id",
+            ),
         ),
     )
 
@@ -111,7 +128,7 @@ def test_tokenless_recovered_record_never_graceful_shutdowns_pid(
     _idle_output(monkeypatch)
     calls = _no_shutdown(monkeypatch)
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k39"))
 
     assert result["success"] is True
     assert calls["graceful"] == []  # never touched the unproven PID
@@ -123,7 +140,7 @@ def test_reused_pid_does_not_get_graceful_shutdown(
     follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Stored token mismatches the live PID's token (PID reuse after reboot).
-    _write_agent(follow_up.tmp_path, create_token="stale-token")  # noqa: S106
+    _write_agent(follow_up.tmp_path, create_token="stale-token")
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",
@@ -133,7 +150,7 @@ def test_reused_pid_does_not_get_graceful_shutdown(
     _idle_output(monkeypatch)
     calls = _no_shutdown(monkeypatch)
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k40"))
 
     assert result["success"] is True
     assert calls["graceful"] == []
@@ -166,12 +183,15 @@ def _busy_by_timer_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ss.time, "time", lambda: 1_000.0)
     monkeypatch.setattr(
         ss,
-        "read_codex_output",
-        lambda spawned_at, cwd, **kwargs: SimpleNamespace(
-            last_activity_at=990.0,
-            last_message="done",
-            backend_session_id="backend-session-id",
-            busy_hint=False,
+        "_resolve_agent_binding",
+        lambda agent, **_: BindingResult(
+            BINDING_BOUND,
+            AgentOutput(
+                last_activity_at=990.0,
+                last_message="done",
+                rollout_path="t.jsonl",
+                backend_session_id="backend-session-id",
+            ),
         ),
     )
 
@@ -190,7 +210,7 @@ def test_waiting_marker_allows_immediate_follow_up(
     # A "waiting" state marker is authoritative: even though activity is recent
     # (the inactivity timer would say busy), the agent is parked at a wait hook
     # and must be resumable immediately.
-    _write_agent(follow_up.tmp_path, create_token="tok")  # noqa: S106
+    _write_agent(follow_up.tmp_path, create_token="tok")
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",
@@ -201,18 +221,21 @@ def test_waiting_marker_allows_immediate_follow_up(
     _no_shutdown(monkeypatch)
     _write_state_marker("waiting")
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k41"))
 
     assert result["success"] is True
     assert follow_up.backend.resume_calls[0][1] == "backend-session-id"
 
 
-def test_recent_activity_without_waiting_marker_is_busy(
+def test_recent_activity_without_waiting_marker_waits_rather_than_resuming(
     follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # No "waiting" marker: the inactivity timer still guards a genuinely busy
-    # agent (recent activity, running marker) from being torn down.
-    _write_agent(follow_up.tmp_path, create_token="tok")  # noqa: S106
+    # agent (recent activity, running marker) from being torn down. Since B2
+    # that guard is a bounded wait rather than a refusal — but the invariant
+    # under test is unchanged: the busy agent's process is NOT replaced.
+    monkeypatch.setattr(ss, "_DELIVERY_CALL_BUDGET_SECONDS", 0.0)
+    _write_agent(follow_up.tmp_path, create_token="tok")
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",
@@ -221,17 +244,18 @@ def test_recent_activity_without_waiting_marker_is_busy(
     _busy_by_timer_output(monkeypatch)
     _write_state_marker("running")
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k42"))
 
     assert result["success"] is False
-    assert result["reason"] == "agent_busy"
+    assert result["status"] == "queued"
+    assert result["phase"] == "pending"
     assert follow_up.backend.resume_calls == []
 
 
 def test_follow_up_resume_persists_new_create_token(
     follow_up: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _write_agent(follow_up.tmp_path, create_token="stale-token")  # noqa: S106
+    _write_agent(follow_up.tmp_path, create_token="stale-token")
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",
@@ -242,8 +266,8 @@ def test_follow_up_resume_persists_new_create_token(
         ss.process_manager, "creation_token", lambda h: f"fresh-token-{h}"
     )
 
-    result = asyncio.run(ss.follow_up_agent("worker", "continue"))
+    result = asyncio.run(ss.follow_up_agent("worker", "continue", "k43"))
 
     assert result["success"] is True
     agents = ss._load_agents("session-id")
-    assert agents[0]["create_token"] == "fresh-token-789"  # noqa: S105
+    assert agents[0]["create_token"] == "fresh-token-789"
