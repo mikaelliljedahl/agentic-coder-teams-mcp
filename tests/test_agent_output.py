@@ -899,6 +899,10 @@ async def test_spawn_agent_persists_output_lookup_metadata(
     correlation_id = agents[0].pop("correlation_id")
     assert isinstance(correlation_id, str)
     assert correlation_id
+    # The create token is derived from the OS process and varies per spawn
+    # (and per platform), so it is popped and asserted by type, not value.
+    create_token = agents[0].pop("create_token")
+    assert create_token is None or isinstance(create_token, str)
     assert agents == [
         {
             "name": "worker",
@@ -912,7 +916,6 @@ async def test_spawn_agent_persists_output_lookup_metadata(
             "model": "model",
             "permission_mode": "bypass",
             "reasoning_effort": None,
-            "create_token": None,
             "prompt_transport": "argv",
             "spawned_by": "team-lead",
             "spawned_by_source": "spawn",
