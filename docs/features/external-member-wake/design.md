@@ -1,6 +1,9 @@
 # External-member wake (downstream, lead → external) — follow-up design sketch
 
-Status: **design sketch** (not planned/implemented). Follow-up to the shipped
+Status: **implemented** (Option A ergonomics on Option B's module — see
+[`plan.md`](plan.md); shipped as `member_wake` + `install_member_wake` on
+`feature/external-agent-join`). The fully self-locating multi-membership
+variant (Option B pointer file) remains a follow-up. Follow-up to the shipped
 `external-agent-join` feature (PR #38). Companion to the upstream wake that
 already works via `install_lead_wake`.
 

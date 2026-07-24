@@ -29,6 +29,13 @@ _HOOK_MODULE = "claude_teams.hooks"
 # for it live here, co-located with the ``emit`` wiring.
 _WAKE_MODULE = "claude_teams.lead_wake"
 
+# The external-member wake hook mirrors the lead-wake module but watches the
+# member's inbox in the JOINED lead's session dir (see
+# ``claude_teams.member_wake``). Its module string is deliberately distinct
+# from ``_WAKE_MODULE`` so the two Stop groups can be upserted/removed
+# independently and coexist in one settings file.
+_MEMBER_WAKE_MODULE = "claude_teams.member_wake"
+
 # Safety ceiling for the Stop wake hook. The hook never sleeps by default (pure
 # Design B), so this is only an upper bound; it matches the Stop hook default.
 _WAKE_HOOK_TIMEOUT_SECONDS = 600
@@ -158,6 +165,40 @@ def _wake_hook_matcher(session_dir: Path, reader: str) -> dict:
             {
                 "type": "command",
                 "command": _shell_quote_command(_wake_command(session_dir, reader)),
+                "timeout": _WAKE_HOOK_TIMEOUT_SECONDS,
+            }
+        ]
+    }
+
+
+def _member_wake_command(joined_session_dir: Path, member: str) -> list[str]:
+    """Return the argv for the external-member wake hook for ``member``.
+
+    Mirrors :func:`_wake_command`'s ``as_posix()`` rendering so the command is
+    JSON/TOML-safe on Windows. Both baked values are non-secret: the member
+    name and the JOINED lead's session dir. The ``member_token`` credential is
+    never baked (digest-only-at-rest invariant); the hook only instructs the
+    model to call ``external_read`` with the token it already holds.
+    """
+    return [
+        Path(sys.executable).as_posix(),
+        "-m",
+        _MEMBER_WAKE_MODULE,
+        "--joined-session-dir",
+        Path(joined_session_dir).as_posix(),
+        "--member",
+        member,
+    ]
+
+
+def _member_wake_hook_matcher(joined_session_dir: Path, member: str) -> dict:
+    return {
+        "hooks": [
+            {
+                "type": "command",
+                "command": _shell_quote_command(
+                    _member_wake_command(joined_session_dir, member)
+                ),
                 "timeout": _WAKE_HOOK_TIMEOUT_SECONDS,
             }
         ]

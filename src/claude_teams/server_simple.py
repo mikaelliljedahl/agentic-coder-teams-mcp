@@ -1519,9 +1519,16 @@ def _watch_argv(
     return argv
 
 
-def _watch_command_bash(session_dir: str | Path, timeout: float | None = None) -> str:
-    """Render the watch argv for Bash."""
-    return " ".join(shlex.quote(token) for token in _watch_argv(session_dir, timeout))
+def _watch_command_bash(
+    session_dir: str | Path,
+    timeout: float | None = None,
+    *,
+    reader: str | None = None,
+) -> str:
+    """Render the watch argv for Bash (optionally reader-scoped)."""
+    return " ".join(
+        shlex.quote(token) for token in _watch_argv(session_dir, timeout, reader)
+    )
 
 
 def _watch_command_powershell(
@@ -5903,6 +5910,48 @@ def _install_wake_hook(
     return result
 
 
+def _group_has_member_wake_token(group: object) -> bool:
+    """Return whether a Stop matcher group invokes the member-wake module."""
+    if not isinstance(group, dict):
+        return False
+    entries = cast("dict[str, Any]", group).get("hooks")
+    if not isinstance(entries, list):
+        return False
+    return any(
+        isinstance(h, dict)
+        and hooks._MEMBER_WAKE_MODULE
+        in str(cast("dict[str, Any]", h).get("command", ""))
+        for h in entries
+    )
+
+
+def _install_member_wake_hook(
+    config: dict[str, Any], wake_matcher: dict[str, Any], *, remove: bool
+) -> dict[str, Any]:
+    """Return ``config`` with the member-wake ``Stop`` matcher upserted or removed.
+
+    Mirrors :func:`_install_wake_hook` but keys on the ``member_wake`` module
+    string, so the member-wake group and the lead-wake group coexist and
+    removing one never touches the other (or any unrelated Stop group).
+    """
+    result = dict(config)
+    hooks_map = dict(result.get("hooks") or {})
+    stop = [
+        g for g in (hooks_map.get("Stop") or []) if not _group_has_member_wake_token(g)
+    ]
+    if not remove:
+        stop.append(wake_matcher)
+    if stop:
+        hooks_map["Stop"] = stop
+    else:
+        hooks_map.pop("Stop", None)
+    if hooks_map:
+        result["hooks"] = hooks_map
+    else:
+        result.pop("hooks", None)
+    return result
+
+
 def _lead_wake_settings_path(scope: str) -> Path:
     """Return the settings path for ``scope`` (``project`` cwd or ``user`` home)."""
     base = Path.home() if scope == "user" else Path.cwd()
@@ -5952,6 +6001,73 @@ async def install_lead_wake(remove: bool = False, scope: str = "project") -> dic
             "action": "removed" if remove else "installed",
             "path": str(path),
             "reader": identity,
+            "scope": scope,
+        }
+
+    return await run_blocking(_do_install)
+
+
+@_register_tool()
+async def install_member_wake(
+    joined_session_id: str,
+    member_name: str,
+    remove: bool = False,
+    scope: str = "user",
+) -> dict:
+    """Install (or remove) the external-member inbox-wake ``Stop`` hook.
+
+    Call this from the **joined member session** right after ``join_team`` so
+    the member is reliably nudged when the lead sends work. On every member
+    turn end the hook checks the member's inbox in the JOINED lead's session
+    dir: it blocks with an instruction to call
+    ``external_read(member_token=...)`` when unread messages wait, and
+    otherwise verifies a reader-scoped inbox watcher (``watch <joined dir>
+    --reader <member>``) is running as a background task, blocking with the
+    exact command when it is not. Lead → member remains pull-only: nothing is
+    pushed into the member session; its own turn end is the trigger.
+
+    Requirements and guarantees:
+    - The member's harness must support Claude Code ``Stop`` hooks; in a
+      client without them this install is a no-op.
+    - No credential is baked: the settings file carries only the member name
+      and the joined session dir, never the ``member_token``.
+    - ``scope="user"`` (default) writes ``~/.claude/settings.json`` — the file
+      an interactive/Desktop member session actually reads. ``scope="project"``
+      writes ``.claude/settings.json`` under the MCP server's cwd, which is
+      only correct when the member session runs in that same repo.
+    - Idempotent: re-running replaces the member-wake group in place. It
+      coexists with the lead-wake group (``install_lead_wake``); removing one
+      never touches the other. ``remove=True`` drops only the member group.
+    - Fail-open: when the membership ends (``leave_team``, kill, or the joined
+      session going stale) the hook allows every stop, so a stale install is
+      harmless. When you are finished as a member, call
+      ``leave_team(member_token=...)`` — or re-run with ``remove=True`` — to
+      stop the reminders. Runtime kill switch: ``WIN_AGENT_TEAMS_MEMBER_WAKE=0``
+      (falls back to ``WIN_AGENT_TEAMS_LEAD_WAKE`` when unset).
+    """
+    if scope not in {"project", "user"}:
+        return {"error": f"scope must be 'project' or 'user', got {scope!r}"}
+    member = (member_name or "").strip()
+    if not member:
+        return {"error": "member_name must be a non-empty string"}
+
+    def _do_install() -> dict:
+        sid, refusal = _validate_join_session_id(joined_session_id)
+        if refusal is not None:
+            return refusal
+        joined_dir = _session_dir(sid)
+        wake_matcher = hooks._member_wake_hook_matcher(joined_dir, member)
+        path = _lead_wake_settings_path(scope)
+        updated = _install_member_wake_hook(
+            _read_json_object(path), wake_matcher, remove=remove
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+        return {
+            "action": "removed" if remove else "installed",
+            "path": str(path),
+            "member": member,
+            "joined_session_dir": str(joined_dir),
             "scope": scope,
         }
 

@@ -340,6 +340,20 @@ after 30 seconds; POSIX `flock` waiters block. Consequently:
 - Lead `kill_agent` removes the record and artifacts without probing or
   signalling the informational PID. The next token call reports revocation.
 
+Lead → external is pull-only, but the member session can make the pull
+hands-free with `install_member_wake(joined_session_id, member_name)`: it bakes
+a `Stop` hook (`python -m claude_teams.member_wake --joined-session-dir <dir>
+--member <name>`, default `scope="user"` → `~/.claude/settings.json`) that on
+every member turn end blocks while unread messages wait in the joined
+`inbox-<member>` (instructing `external_read(member_token=...)`) and otherwise
+verifies a reader-scoped `watch <joined dir> --reader <member>` background
+watcher is armed. No credential is baked; the hook fails open when the
+membership is not `running`, when the joined session shows no activity within
+`WIN_AGENT_TEAMS_MEMBER_WAKE_TTL_SECONDS` (default 6h), or via the
+`WIN_AGENT_TEAMS_MEMBER_WAKE` kill switch (falls back to
+`WIN_AGENT_TEAMS_LEAD_WAKE` when unset). It coexists with the lead-wake `Stop`
+group; the harness must support Claude Code `Stop` hooks for it to do anything.
+
 `WIN_AGENT_TEAMS_EXTERNAL_ONLY=1` registers only `join_team`,
 `external_send`, `external_read`, `leave_team`, and `list_backends`. Use that
 entry alone in a separate Desktop profile/client instance for client-surface

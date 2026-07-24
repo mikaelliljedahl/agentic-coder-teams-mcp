@@ -26,6 +26,7 @@ Minimal MCP server for spawning and communicating with Claude Code, Codex, and P
 | `agent_watch_paths` | Session watch envelope plus minimal `{name, state_marker_path}` agent rows |
 | `list_backends` | List available backends |
 | `install_lead_wake` | Install/remove the Claude Code lead inbox-wake `Stop` hook for a top-level lead |
+| `install_member_wake` | Install/remove the external-member inbox-wake `Stop` hook for a joined member session |
 
 ## Quick Start
 
@@ -492,6 +493,22 @@ Environment tunables:
 | `WIN_AGENT_TEAMS_LEAD_WAKE` | `1` | Kill switch. `0` disables the hook at runtime (even for already-wired sessions). |
 | `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS` | `3` | Consecutive no-progress blocks before the guard fails open. |
 | `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_WAIT` | `0` | Optional in-hook grace-wait seconds (reserved; default `0` = no in-hook wait). |
+
+The downstream direction (lead → external member) has a member-shaped twin:
+after `join_team`, the member session calls
+`install_member_wake(joined_session_id, member_name)` (default `scope="user"`,
+i.e. `~/.claude/settings.json`) to bake a `claude_teams.member_wake` `Stop`
+hook that watches `inbox-<member>` in the **joined** lead's session dir. It
+blocks with an `external_read(member_token=...)` instruction while unread work
+waits, otherwise verifies a `watch <joined dir> --reader <member>` background
+watcher is armed, and fails open when the membership is no longer `running` or
+the joined session has been inactive longer than
+`WIN_AGENT_TEAMS_MEMBER_WAKE_TTL_SECONDS` (default `21600` = 6h). Kill switch:
+`WIN_AGENT_TEAMS_MEMBER_WAKE` (falls back to `WIN_AGENT_TEAMS_LEAD_WAKE` when
+unset); the no-progress guard shares `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS`
+and writes `wake-progress-member-<member>.json`. No `member_token` is ever
+baked into settings. The lead-wake and member-wake `Stop` groups coexist and
+are installed/removed independently.
 
 #### Manual smoke test (interactive; not run in CI)
 
