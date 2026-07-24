@@ -44,6 +44,7 @@ class ClaudeCodeBackend(BaseBackend):
         "haiku": "haiku",
         "sonnet": "sonnet",
         "opus": "opus",
+        "fable": "fable",
     }
 
     _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
@@ -76,7 +77,7 @@ class ClaudeCodeBackend(BaseBackend):
             list[str]: Curated list of supported model identifiers.
 
         """
-        return ["haiku", "sonnet", "opus"]
+        return ["haiku", "sonnet", "opus", "fable"]
 
     def default_model(self) -> str:
         """Return the default Claude Code model.
