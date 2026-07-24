@@ -91,7 +91,8 @@ class TestClaudeCodeSupportedModels:
         assert "haiku" in models
         assert "sonnet" in models
         assert "opus" in models
-        assert len(models) == 3
+        assert "fable" in models
+        assert len(models) == 4
 
 
 class TestClaudeCodeDefaultModel:
@@ -124,6 +125,10 @@ class TestClaudeCodeResolveModel:
     def test_resolves_direct_name_opus(self):
         backend = ClaudeCodeBackend()
         assert backend.resolve_model("opus") == "opus"
+
+    def test_resolves_direct_name_fable(self):
+        backend = ClaudeCodeBackend()
+        assert backend.resolve_model("fable") == "fable"
 
     def test_raises_for_unsupported_model(self):
         backend = ClaudeCodeBackend()
