@@ -6035,6 +6035,14 @@ async def install_member_wake(
       an interactive/Desktop member session actually reads. ``scope="project"``
       writes ``.claude/settings.json`` under the MCP server's cwd, which is
       only correct when the member session runs in that same repo.
+    - Shared-home caveat: at ``scope="user"`` this hook fires in EVERY Claude
+      session under that OS home. If the lead runs under the same home as the
+      member, the hook also fires in the lead's own session (it cannot tell it
+      apart — both keep ``IDENTITY=team-lead``) and nudges it to arm a watcher
+      it should not run. This is harmless (never-unstoppable, bounded) and
+      self-clears the moment the membership is ``left``/killed. To avoid it,
+      run the member in a separate profile/machine via
+      ``WIN_AGENT_TEAMS_EXTERNAL_ONLY=1`` — the supported member deployment.
     - Idempotent: re-running replaces the member-wake group in place. It
       coexists with the lead-wake group (``install_lead_wake``); removing one
       never touches the other. ``remove=True`` drops only the member group.
