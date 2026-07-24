@@ -184,6 +184,32 @@ class TestLiveSubagentScoping:
         assert result.action == "allow"
         assert result.code == "D2"
 
+    def test_left_external_member_is_not_live(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A member that called leave_team (status "left") has permanently
+        # departed and its inbox is drained, so the lead has nothing to wait
+        # for -> D2 allow. "left" is not a _TERMINAL_STATUSES value, so this
+        # guards the wake family against nagging forever after a leave_team.
+        monkeypatch.setenv("AGENT_NAME", "team-lead")
+        self._resolve_with_agents(
+            monkeypatch,
+            tmp_path,
+            [
+                {
+                    "name": "qa",
+                    "status": "left",
+                    "parent": "team-lead",
+                    "backend": "external",
+                },
+            ],
+        )
+
+        result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
+
+        assert result.action == "allow"
+        assert result.code == "D2"
+
     def test_legacy_records_without_parent_still_exclude_self(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

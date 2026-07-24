@@ -53,6 +53,8 @@ SPAWNED_BY_FIELD = "spawned_by"
 SPAWNED_BY_SOURCE_FIELD = "spawned_by_source"
 #: Derived from the spawning call itself — the normal case.
 SPAWNED_BY_SOURCE_SPAWN = "spawn"
+#: Authorized by a lead-issued external-member join ticket.
+SPAWNED_BY_SOURCE_JOIN = "join_ticket"
 #: Asserted by an operator through the CLI recovery path, not observed at
 #: spawn. Recorded distinctly so a later reader can tell the two apart.
 SPAWNED_BY_SOURCE_OPERATOR = "operator_asserted"

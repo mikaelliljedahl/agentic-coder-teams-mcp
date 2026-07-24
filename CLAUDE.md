@@ -56,8 +56,8 @@ spawning and messaging Claude Code, Codex, and Pi agents on Windows/Linux).
 - **Dev workflow** (plan → implement TDD → Codex cross-review → smoke → PR):
   see [DEVELOPMENT.md](DEVELOPMENT.md). Work on a branch in its own git
   **worktree** (`git worktree add ../wt-<slug> -b <branch> main`); never leave
-  work on the `main` tree. `docs/` is **gitignored** — shipped docs live at the
-  repo root.
+  work on the `main` tree. `docs/` (including `docs/features/` review records)
+  is tracked and committed to the feature branch.
 - **The consuming agent only reads MCP tool descriptions**, never this file or the
   README. Any disk contract or behavior an orchestrating agent must know goes in
   the **tool docstring**, not only in prose docs.

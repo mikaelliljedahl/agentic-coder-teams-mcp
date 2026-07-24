@@ -2,21 +2,31 @@
 
 Minimal MCP server for spawning and communicating with Claude Code, Codex, and Pi agents on Windows or Linux. Fire-and-forget agent spawning with bidirectional 1:1 messaging.
 
-## Tools (11 total)
+## Tools (20 total)
 
 | Tool | Description |
 |------|-------------|
 | `spawn_agent` | Start an agent process (fire-and-forget); returns its state-marker path |
+| `create_join_ticket` | Reserve a name and issue a paste-ready external-member join prompt |
+| `join_team` | Register a manually started interactive session with a join ticket |
+| `external_send` | Send from an external member to its parent using a member token |
+| `external_read` | Drain an external member's inbox using a member token |
+| `leave_team` | Permanently leave an external membership |
 | `send_message` | Send a message to an agent or lead |
 | `read_messages` | Read unread messages from own inbox (delta + watermark) |
 | `check_agent` | Check an agent's status: state, last line, unread count, stall signal |
 | `follow_up_agent` | Resume an existing logical agent with a follow-up prompt |
+| `delivery_status` | Reconcile/query one guaranteed-delivery attempt |
+| `deliver_pending` | Complete queued guaranteed-delivery attempts |
 | `kill_agent` | Force-kill an agent process |
+| `resume_session` | Explicitly adopt a recoverable prior session |
+| `session_info` | Report the active and recoverable sessions |
 | `list_agents` | List all agents with compact status rows |
 | `agent_status` | Cheap per-agent state/watermark/stall rows (no bodies) |
 | `agent_watch_paths` | Session watch envelope plus minimal `{name, state_marker_path}` agent rows |
 | `list_backends` | List available backends |
 | `install_lead_wake` | Install/remove the Claude Code lead inbox-wake `Stop` hook for a top-level lead |
+| `install_member_wake` | Install/remove the external-member inbox-wake `Stop` hook for a joined member session |
 
 ## Quick Start
 
@@ -174,6 +184,46 @@ prompts survive verbatim; session binding uses `--session-id <agent>` for
 deterministic resume.
 
 ## How It Works
+
+### External members
+
+A lead can attach a manually started interactive session—such as a visual QA
+session with browser access—without spawning its process:
+
+1. The lead calls `create_join_ticket(name, note)` and gives the returned
+   `join_prompt` to the human.
+2. The new session calls `join_team(session_id, token)` and saves the returned
+   `member_token`.
+3. The lead uses ordinary `send_message(to=<member>)`; the external member
+   polls with `external_read(member_token)` and reports with
+   `external_send(member_token, text)`.
+4. The member calls `leave_team(member_token)` when finished. The lead may
+   instead call `kill_agent`, which only deregisters an external member and
+   never probes or signals its informational PID.
+
+External delivery is inbox-only, pull-based, and unconfirmed. External members
+cannot be resumed with `follow_up_agent`. Join/member tokens are bearer
+credentials in the same-user disk threat model; `agents.json` stores only the
+member-token digest, and public status/list tools redact it.
+
+For the external session, run a separate Desktop profile or separate client
+instance whose MCP configuration contains only a
+`win-agent-teams-external` entry with
+`WIN_AGENT_TEAMS_EXTERNAL_ONLY=1`. That server exposes only `join_team`,
+`external_send`, `external_read`, `leave_team`, and `list_backends`. A dual
+registration in the same profile is a degraded mode: the normal ambient root
+tools remain selectable, so it does not provide client-surface isolation. If
+your client cannot scope MCP configuration to a separate profile or instance,
+ambient-tool isolation is unavailable on that client.
+
+### Registry backend labels
+
+| Registry `backend` | Process origin | Lead → agent delivery |
+|---|---|---|
+| `claude-code` | Spawned CLI | Guaranteed resume |
+| `codex` | Spawned CLI | Guaranteed resume |
+| `pi` | Spawned CLI | Guaranteed resume |
+| `external` | Manually started interactive session; not a spawn backend | Pull-only inbox |
 
 ### Spawning
 
@@ -444,6 +494,22 @@ Environment tunables:
 | `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS` | `3` | Consecutive no-progress blocks before the guard fails open. |
 | `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_WAIT` | `0` | Optional in-hook grace-wait seconds (reserved; default `0` = no in-hook wait). |
 
+The downstream direction (lead → external member) has a member-shaped twin:
+after `join_team`, the member session calls
+`install_member_wake(joined_session_id, member_name)` (default `scope="user"`,
+i.e. `~/.claude/settings.json`) to bake a `claude_teams.member_wake` `Stop`
+hook that watches `inbox-<member>` in the **joined** lead's session dir. It
+blocks with an `external_read(member_token=...)` instruction while unread work
+waits, otherwise verifies a `watch <joined dir> --reader <member>` background
+watcher is armed, and fails open when the membership is no longer `running` or
+the joined session has been inactive longer than
+`WIN_AGENT_TEAMS_MEMBER_WAKE_TTL_SECONDS` (default `21600` = 6h). Kill switch:
+`WIN_AGENT_TEAMS_MEMBER_WAKE` (falls back to `WIN_AGENT_TEAMS_LEAD_WAKE` when
+unset); the no-progress guard shares `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS`
+and writes `wake-progress-member-<member>.json`. No `member_token` is ever
+baked into settings. The lead-wake and member-wake `Stop` groups coexist and
+are installed/removed independently.
+
 #### Manual smoke test (interactive; not run in CI)
 
 This is the end-to-end delivery check. It has **not** been run in CI or this
@@ -529,7 +595,7 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 |-----------|---------|-------------|
 | `prompt` | required | Task prompt for the agent |
 | `name` | auto (`agent-1`) | Agent name |
-| `backend` | `claude-code` | `claude-code`, `codex`, or `pi` |
+| `backend` | `claude-code` | Spawn backends: `claude-code`, `codex`, or `pi`. `external` is a joined registry label, not a valid spawn backend. |
 | `model` | backend default | Model to use. For `codex`/`pi`, a capability tier (`low`/`medium`/`high`/`xhigh`/`ultra`) that bundles a model + effort. Pi tiers soft-fall-back to pi's default model when the tier's model is absent (e.g. after switching provider) rather than erroring. |
 | `reasoning_effort` | none | `low`/`medium`/`high`/`xhigh` (codex), `low`/`medium`/`high`/`xhigh`/`max` (claude-code). Ignored for `codex`/`pi` tiers (the tier owns the effort). |
 | `permission_mode` | `bypass` | `bypass`, `default`, or `require_approval` |

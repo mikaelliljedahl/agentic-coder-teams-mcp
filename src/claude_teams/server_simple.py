@@ -8,8 +8,10 @@ shadow the installed module.
 """
 
 import hashlib
+import hmac
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -35,6 +37,7 @@ from claude_teams.agent_output import (
     PROMPT_TRANSPORT_SIDECAR,
     SPAWNED_BY_FIELD,
     SPAWNED_BY_SOURCE_FIELD,
+    SPAWNED_BY_SOURCE_JOIN,
     SPAWNED_BY_SOURCE_SPAWN,
     BindingResult,
     _make_binder,
@@ -191,6 +194,12 @@ _NO_AUTOADOPT_ENV = "WIN_AGENT_TEAMS_NO_AUTOADOPT"
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"killed"})
 _RETENTION_DAYS_ENV = "WIN_AGENT_TEAMS_RETENTION_DAYS"
 _CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60.0
+_JOIN_TICKETS_NAME = "join-tickets.json"
+_JOIN_TICKET_TTL_SECONDS_DEFAULT = 24 * 60 * 60.0
+_JOIN_TICKET_RETENTION_SECONDS_DEFAULT = 7 * 24 * 60 * 60.0
+_MEMBER_TOKEN_FIELD_COUNT = 3
+_MEMBER_SECRET_LENGTH = 64
+CREDENTIAL_FIELDS: frozenset[str] = frozenset({"member_token_digest"})
 
 # A4/A4b timing. Held as module attributes rather than literals so tests can
 # inject a clock and drive the poll loop deterministically: the repo already
@@ -341,6 +350,21 @@ mcp = FastMCP(
     instructions="Spawn and communicate with Claude Code and Codex agents.",
 )
 
+
+def _register_tool(*, external: bool = False):
+    """Register one tool unless the import-time external-only gate excludes it."""
+
+    def _decorate(fn):
+        external_only = os.environ.get(
+            "WIN_AGENT_TEAMS_EXTERNAL_ONLY", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not external_only or external:
+            return mcp.tool()(fn)
+        return fn
+
+    return _decorate
+
+
 # Module-level session state for the lead role
 _session_id: str = _AGENT_SESSION_ID or ""
 
@@ -373,6 +397,11 @@ def _inbox_cursor_file(session_id: str, name: str) -> Path:
 def _state_marker_file(session_id: str, name: str) -> Path:
     """Return the hook-written state marker path for an agent (see hooks.py)."""
     return _session_dir(session_id) / f"state-{name}.json"
+
+
+def _join_tickets_file(session_id: str) -> Path:
+    """Return the lead-issued external-member ticket store path."""
+    return _session_dir(session_id) / _JOIN_TICKETS_NAME
 
 
 def _prompts_dir(session_id: str) -> Path:
@@ -435,6 +464,43 @@ def _read_state_marker(session_id: str, name: str) -> dict | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _write_state_marker(session_id: str, name: str, *, state: str, event: str) -> None:
+    """Atomically write an external member's lifecycle marker."""
+    path = _state_marker_file(session_id, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    marker = {"state": state, "event": event, "ts": time.time()}
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(marker), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+def _marker_schema_valid(marker: dict | None) -> bool:
+    """Return whether a marker satisfies the public state-marker schema."""
+    if marker is None or marker.get("state") not in _VALID_MARKER_STATES:
+        return False
+    if not isinstance(marker.get("event"), str):
+        return False
+    ts = marker.get("ts")
+    return isinstance(ts, int | float) and not isinstance(ts, bool)
+
+
+def _ensure_joined_marker(session_id: str, name: str) -> bool:
+    """Ensure a valid joined marker, preserving any valid newer marker."""
+    marker = _read_state_marker(session_id, name)
+    if _marker_schema_valid(marker):
+        return True
+    try:
+        _write_state_marker(session_id, name, state="running", event="joined")
+    except OSError:
+        return False
+    return True
 
 
 # In-process serialization of read_messages per inbox name. FastMCP runs the
@@ -540,6 +606,93 @@ def _save_agents_transaction(session_id: str, agents: list[dict]) -> None:
     _save_agents_unlocked(session_id, agents)
 
 
+def _strict_positive_seconds(env_name: str, default: float) -> float:
+    """Return a finite positive env override, otherwise ``default``."""
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def _join_ticket_ttl_seconds() -> float:
+    """Return the strict positive join-ticket TTL."""
+    return _strict_positive_seconds(
+        "WIN_AGENT_TEAMS_JOIN_TICKET_TTL_SECONDS",
+        _JOIN_TICKET_TTL_SECONDS_DEFAULT,
+    )
+
+
+def _join_ticket_retention_seconds() -> float:
+    """Return the strict positive consumed/expired ticket retention."""
+    return _strict_positive_seconds(
+        "WIN_AGENT_TEAMS_JOIN_TICKET_RETENTION_SECONDS",
+        _JOIN_TICKET_RETENTION_SECONDS_DEFAULT,
+    )
+
+
+def _load_join_tickets_unlocked(session_id: str) -> list[dict]:
+    """Load the ticket array while the caller holds the agents-file lock."""
+    path = _join_tickets_file(session_id)
+    if not path.exists():
+        return []
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [row for row in value if isinstance(row, dict)]
+
+
+def _ticket_retained(ticket: dict, *, now: float, retention: float) -> bool:
+    """Return whether an audit ticket remains inside its retention window."""
+    status = ticket.get("status")
+    if status == "used":
+        anchor = ticket.get("used_at")
+    elif status == "open":
+        expires_at = ticket.get("expires_at")
+        if isinstance(expires_at, int | float) and not isinstance(expires_at, bool):
+            if float(expires_at) >= now:
+                return True
+            anchor = expires_at
+        else:
+            return True
+    else:
+        # Unknown states are retained so reconciliation can fail closed.
+        return True
+    if not isinstance(anchor, int | float) or isinstance(anchor, bool):
+        return True
+    return now - float(anchor) <= retention
+
+
+def _save_join_tickets_unlocked(
+    session_id: str, tickets: list[dict], *, now: float | None = None
+) -> None:
+    """Prune retained audit rows and atomically save the ticket array."""
+    current = time.time() if now is None else now
+    retention = _join_ticket_retention_seconds()
+    retained = [
+        ticket
+        for ticket in tickets
+        if _ticket_retained(ticket, now=current, retention=retention)
+    ]
+    tickets[:] = retained
+    path = _join_tickets_file(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(retained, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+
+
 def _unique_agent_name(requested_name: str, agents: list[dict]) -> str:
     """Return an agent name that does not collide within this session."""
     requested = requested_name.strip()
@@ -555,6 +708,249 @@ def _unique_agent_name(requested_name: str, agents: list[dict]) -> str:
         if name not in existing:
             return name
         counter += 1
+
+
+def _ticket_name_reserved(ticket: dict, *, now: float) -> bool:
+    """Return whether an open and unexpired ticket reserves its member name."""
+    expires_at = ticket.get("expires_at")
+    return (
+        ticket.get("status") == "open"
+        and isinstance(expires_at, int | float)
+        and not isinstance(expires_at, bool)
+        and float(expires_at) > now
+    )
+
+
+def _unique_reserved_name(
+    requested_name: str, agents: list[dict], tickets: list[dict], *, now: float
+) -> str:
+    """De-duplicate against registry records and live ticket reservations."""
+    reservations = [
+        {"name": ticket.get("name")}
+        for ticket in tickets
+        if _ticket_name_reserved(ticket, now=now)
+    ]
+    return _unique_agent_name(requested_name, [*agents, *reservations])
+
+
+def _markdown_fence(text: str) -> str:
+    """Return a backtick fence longer than every run present in ``text``."""
+    longest = 0
+    current = 0
+    for character in text:
+        if character == "`":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return "`" * max(3, longest + 1)
+
+
+def _build_join_prompt(
+    *, session_id: str, token: str, name: str, parent: str, note: str
+) -> str:
+    """Build the deterministic paste-ready external-member join prompt."""
+    fence = _markdown_fence(note)
+    return (
+        f"You are joining {parent}'s win-agent-teams session as {name!r}.\n\n"
+        f"Role note:\n{fence}\n{note}\n{fence}\n\n"
+        "Join protocol:\n"
+        "1. Call this tool first, with these literal values:\n"
+        f"   join_team(session_id={session_id!r}, token={token!r})\n"
+        "2. You must save the returned member_token in this conversation. It is the "
+        "credential for every external member call, including after an MCP "
+        "server restart.\n"
+        "3. Poll external_read(member_token=...) for work. Reply upstream with "
+        "external_send(member_token=..., text=...). Do not use ambient team "
+        "tools from this external-member conversation.\n"
+        f"4. Optional watcher: win-agent-teams watch {_session_dir(session_id)} "
+        f"--reader {name}\n"
+        "5. When finished permanently, call leave_team(member_token=...).\n"
+    )
+
+
+def _member_secret(ticket_id: object, token: object) -> str:
+    """Derive the stable external-member secret from a join ticket."""
+    return hashlib.sha256(f"wam-member:{ticket_id}:{token}".encode()).hexdigest()
+
+
+def _member_digest(secret: str) -> str:
+    """Return the digest persisted in ``agents.json`` for a member secret."""
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+def _validate_join_session_id(session_id: str) -> tuple[str, dict | None]:
+    """Validate a join target exactly as the explicit resume path does."""
+    sid = session_id.strip()
+    if not sid:
+        return sid, {"success": False, "reason": "session_id_required"}
+    try:
+        uuid.UUID(sid)
+    except (ValueError, AttributeError):
+        return sid, {
+            "success": False,
+            "session_id": sid,
+            "reason": "invalid_session_id",
+        }
+    session_dir = _session_dir(sid)
+    if (
+        session_dir.resolve().parent != _SESSION_BASE.resolve()
+        or not _agents_file(sid).exists()
+    ):
+        return sid, {
+            "success": False,
+            "session_id": sid,
+            "reason": "session_not_found",
+        }
+    return sid, None
+
+
+def _external_record_matches(
+    record: dict, ticket: dict, session_id: str, expected_digest: str
+) -> bool:
+    """Validate immutable join-record fields before returning membership."""
+    expected = {
+        "name": ticket.get("name"),
+        "parent": ticket.get("parent"),
+        "member_token_digest": expected_digest,
+        "backend": "external",
+        "session_id": session_id,
+        SPAWNED_BY_FIELD: ticket.get("parent"),
+        SPAWNED_BY_SOURCE_FIELD: SPAWNED_BY_SOURCE_JOIN,
+    }
+    return all(record.get(field) == value for field, value in expected.items())
+
+
+def _external_membership_result(session_id: str, ticket: dict, secret: str) -> dict:
+    """Build the stable successful ``join_team`` response."""
+    name = str(ticket.get("name") or "")
+    parent = str(ticket.get("parent") or "")
+    session_dir = _session_dir(session_id)
+    return {
+        "success": True,
+        "name": name,
+        "parent": parent,
+        "session_id": session_id,
+        "member_token": f"wam1:{session_id}:{secret}",
+        "inbox_path": str(_inbox_file(session_id, name)),
+        "state_marker_path": str(_state_marker_file(session_id, name)),
+        "watch_argv": _watch_argv(session_dir, reader=name),
+        "instructions": (
+            "Save member_token. Poll external_read for work, answer with "
+            "external_send, and call leave_team only when leaving permanently."
+        ),
+    }
+
+
+def _parse_member_token(  # noqa: PLR0911 - exact grammar rejects each deviation.
+    member_token: object,
+) -> tuple[str, str] | None:
+    """Parse the exact external member-token grammar without raising."""
+    if not isinstance(member_token, str):
+        return None
+    fields = member_token.split(":")
+    if len(fields) != _MEMBER_TOKEN_FIELD_COUNT:
+        return None
+    version, session_id, secret = fields
+    if version != "wam1":
+        return None
+    try:
+        canonical = str(uuid.UUID(session_id))
+    except (ValueError, AttributeError):
+        return None
+    if canonical != session_id:
+        return None
+    if (
+        len(secret) != _MEMBER_SECRET_LENGTH
+        or not secret.isascii()
+        or any(character not in "0123456789abcdef" for character in secret)
+    ):
+        return None
+    return session_id, secret
+
+
+@contextmanager
+def _member_operation(
+    member_token: object, *, allow_left: bool = False
+) -> Iterator[tuple[dict | None, list[dict] | None, str, dict | None]]:
+    """Resolve a member and hold its registry lock through caller side effects."""
+    parsed = _parse_member_token(member_token)
+    if parsed is None:
+        yield (
+            None,
+            None,
+            "",
+            {
+                "success": False,
+                "reason": "invalid_member_token",
+            },
+        )
+        return
+    session_id, secret = parsed
+    if not _agents_file(session_id).exists():
+        yield (
+            None,
+            None,
+            session_id,
+            {
+                "success": False,
+                "reason": "session_not_found",
+            },
+        )
+        return
+    computed = _member_digest(secret).encode()
+    with _agents_file_lock(session_id):
+        agents = _load_agents_unlocked(session_id)
+        record = None
+        for candidate in agents:
+            if candidate.get("backend") != "external":
+                continue
+            stored = candidate.get("member_token_digest")
+            if not isinstance(stored, str):
+                continue
+            try:
+                stored_bytes = stored.encode()
+            except UnicodeError:
+                continue
+            if hmac.compare_digest(computed, stored_bytes):
+                record = candidate
+                break
+        if record is None:
+            yield (
+                None,
+                agents,
+                session_id,
+                {
+                    "success": False,
+                    "reason": "membership_revoked",
+                },
+            )
+            return
+        status = record.get("status")
+        if status == "left" and not allow_left:
+            yield (
+                None,
+                agents,
+                session_id,
+                {
+                    "success": False,
+                    "reason": "membership_revoked",
+                    "detail": "left",
+                },
+            )
+            return
+        if status not in {"running", "left"}:
+            yield (
+                None,
+                agents,
+                session_id,
+                {
+                    "success": False,
+                    "reason": "membership_revoked",
+                },
+            )
+            return
+        yield record, agents, session_id, None
 
 
 def _retention_days() -> float:
@@ -735,6 +1131,17 @@ def _autoadopt_enabled() -> bool:
     }
 
 
+def _has_autoadoptable_agent(session_id: str) -> bool:
+    """Whether a candidate has a live non-external record for silent adoption."""
+    try:
+        agents = _load_agents_unlocked(session_id)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    return any(
+        agent.get("backend") != "external" for agent in _non_terminal_agents(agents)
+    )
+
+
 def _require_resolved_identity() -> dict | None:
     """Return a structured refusal when identity is unresolved, else ``None``.
 
@@ -794,7 +1201,12 @@ def _recover_session_id() -> str:
     if not candidates:
         return ""
     single_lead_history = len(_distinct_binding_sessions()) <= 1
-    if _autoadopt_enabled() and len(candidates) == 1 and single_lead_history:
+    if (
+        _autoadopt_enabled()
+        and len(candidates) == 1
+        and single_lead_history
+        and _has_autoadoptable_agent(str(candidates[0]["session_id"]))
+    ):
         adopted = candidates[0]
         _pending_recovery = {
             "adopted_session": {
@@ -1093,17 +1505,30 @@ def _truncate(text: str | None, max_chars: int | None) -> tuple[str, bool, int]:
 _DEFAULT_LAST_LINE_MAX_CHARS = 200
 
 
-def _watch_argv(session_dir: str | Path, timeout: float | None = None) -> list[str]:
+def _watch_argv(
+    session_dir: str | Path,
+    timeout: float | None = None,
+    reader: str | None = None,
+) -> list[str]:
     """Return the canonical shell-neutral argv for watching ``session_dir``."""
     argv = [sys.executable, "-m", "claude_teams.cli", "watch", str(session_dir)]
     if timeout is not None:
         argv.extend(["--timeout", str(timeout)])
+    if reader is not None:
+        argv.extend(["--reader", reader])
     return argv
 
 
-def _watch_command_bash(session_dir: str | Path, timeout: float | None = None) -> str:
-    """Render the watch argv for Bash."""
-    return " ".join(shlex.quote(token) for token in _watch_argv(session_dir, timeout))
+def _watch_command_bash(
+    session_dir: str | Path,
+    timeout: float | None = None,
+    *,
+    reader: str | None = None,
+) -> str:
+    """Render the watch argv for Bash (optionally reader-scoped)."""
+    return " ".join(
+        shlex.quote(token) for token in _watch_argv(session_dir, timeout, reader)
+    )
 
 
 def _watch_command_powershell(
@@ -1239,6 +1664,8 @@ def _resolve_agent_binding(agent: dict, *, bounded_only: bool = False) -> Bindin
     ``bounded_only`` is A6's "stay cheap" mode: the mtime window only, with no
     all-history fallback behind it.
     """
+    if agent.get("backend") == "external":
+        return BindingResult("not_applicable")
     return resolve_agent_binding(
         agent, child_alive=lambda: _agent_alive(agent), bounded_only=bounded_only
     )
@@ -1263,6 +1690,12 @@ def _agent_alive(agent: dict) -> bool:
     is never seen as dead just because its launcher exited (which would let
     cleanup delete a session that still has a live agent).
     """
+    if agent.get("backend") == "external":
+        # External PIDs belong to a manually started, potentially shared MCP
+        # server and become stale across Desktop restarts. Membership state and
+        # markers are the honest liveness signal; never probe the informational
+        # PID.
+        return agent.get("status") == "running"
     launcher = str(agent.get("pid"))
     authoritative = process_manager.resolve_agent_pid(
         launcher, str(agent.get("session_id") or ""), str(agent.get("name") or "")
@@ -1306,11 +1739,12 @@ def _agent_check_payload(
     compact public ``check_agent`` shape by ``_compact_check_view``.
     """
     output = binding.output
+    public = _public_agent_record(agent)
     return {
         "name": name,
         "alive": alive,
-        "pid": agent["pid"],
-        "backend": agent.get("backend"),
+        "pid": public["pid"],
+        "backend": public.get("backend"),
         "backend_session_id": _stored_backend_session_id(agent),
         "last_activity_at": output.last_activity_at if output else None,
         "last_message": output.last_message if output else None,
@@ -2230,7 +2664,229 @@ def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str
     return {}
 
 
-@mcp.tool()
+@_register_tool()
+async def create_join_ticket(name: str, note: str = "") -> dict:
+    """Issue a replayable recovery credential for one external member.
+
+    The returned 32-lowercase-hex ``token`` is pasted into a separate,
+    interactive session's first ``join_team(session_id=..., token=...)`` call.
+    During the retention window, replaying that join credential recovers the
+    same membership and member token idempotently; it is not a strictly
+    one-time secret. The ticket is stored in ``join-tickets.json`` under the
+    active session directory, atomically and under the same cross-process lock
+    as ``agents.json``. Open, unexpired tickets reserve their safe member name
+    against both later tickets and ``spawn_agent``.
+
+    ``name`` must match ``[A-Za-z0-9_-]{1,64}`` before de-duplication. The
+    stored row is ``{ticket_id, name, token, parent, note, created_at,
+    expires_at, status, used_at, member_name}``; ``parent`` is this caller's
+    resolved identity. TTL defaults to 24 hours and retention for used/expired
+    audit rows defaults to seven days. Strict finite-positive overrides are
+    ``WIN_AGENT_TEAMS_JOIN_TICKET_TTL_SECONDS`` and
+    ``WIN_AGENT_TEAMS_JOIN_TICKET_RETENTION_SECONDS``; invalid, zero,
+    negative, NaN, or infinite values use the defaults. Store writes prune
+    audit rows beyond retention, while retained expired rows no longer reserve
+    names.
+
+    ``note`` is rendered literally inside a Markdown fence chosen so its
+    contents cannot close the block. The paste-ready ``join_prompt`` contains
+    the complete join/read/send/restart protocol and an optional watcher
+    command. The joining member must save the returned ``member_token`` and use
+    only ``external_send``, ``external_read``, and ``leave_team`` with it.
+    For client-surface isolation, run those calls through a separate MCP entry
+    with ``WIN_AGENT_TEAMS_EXTERNAL_ONLY=1``; that entry registers only the
+    four member tools plus ``list_backends``.
+    """
+
+    def _create() -> dict:
+        refusal = _require_resolved_identity()
+        if refusal is not None:
+            return refusal
+        requested = name.strip()
+        if not hooks._SAFE_AGENT_RE.fullmatch(requested):
+            return {"success": False, "reason": "invalid_name"}
+        session_id = _active_session_id(create=True)
+        now = time.time()
+        with _agents_file_lock(session_id):
+            agents = _load_agents_unlocked(session_id)
+            tickets = _load_join_tickets_unlocked(session_id)
+            reserved_name = _unique_reserved_name(requested, agents, tickets, now=now)
+            ticket = {
+                "ticket_id": uuid.uuid4().hex,
+                "name": reserved_name,
+                "token": uuid.uuid4().hex,
+                "parent": IDENTITY,
+                "note": note,
+                "created_at": now,
+                "expires_at": now + _join_ticket_ttl_seconds(),
+                "status": "open",
+                "used_at": None,
+                "member_name": None,
+            }
+            tickets.append(ticket)
+            _save_join_tickets_unlocked(session_id, tickets, now=now)
+        return {
+            "success": True,
+            "ticket_id": ticket["ticket_id"],
+            "name": reserved_name,
+            "session_id": session_id,
+            "token": ticket["token"],
+            "expires_at": ticket["expires_at"],
+            "join_prompt": _build_join_prompt(
+                session_id=session_id,
+                token=str(ticket["token"]),
+                name=reserved_name,
+                parent=IDENTITY,
+                note=note,
+            ),
+        }
+
+    return await run_blocking(_create)
+
+
+@_register_tool(external=True)
+async def join_team(session_id: str, token: str) -> dict:
+    """Join a lead's team as a pull-only external member.
+
+    Call this first from a manually started interactive session, using the
+    literal ``session_id`` and 32-lowercase-hex join ``token`` from the lead's
+    paste-ready prompt. The join credential is a replayable recovery credential
+    during ticket retention: replay returns the same membership and
+    ``member_token`` after an MCP restart. Save that member token; its exact
+    grammar is ``wam1:<canonical-lowercase-session-uuid>:<64-lowercase-hex>``.
+    ``agents.json`` stores only its SHA-256 digest, although a same-user reader
+    of ``join-tickets.json`` can reconstruct it from the retained ticket.
+
+    The registry row is ``{name, pid, backend:"external", session_id, parent,
+    status:"running", spawned_at, cwd, model:null, member_token_digest,
+    join_ticket_id, spawned_by, spawned_by_source:"join_ticket"}``. The secret
+    is deterministically derived as
+    ``sha256("wam-member:<ticket_id>:<ticket-token>")`` and the stored digest is
+    ``sha256(secret)``. No public list/status/check result exposes that digest.
+
+    The returned paths name ``inbox-<member>.jsonl`` and
+    ``state-<member>.json`` in the joined session. External messaging is pull
+    based and unconfirmed: use ``external_read`` to drain work and
+    ``external_send`` to report to the ticket's parent. ``pid`` in the registry
+    is informational and may be stale after Desktop restarts. A lead kill
+    deregisters the membership and never signals that PID; leave/kill revocation
+    is observed on the next token-bearing call.
+
+    Join reconciliation is crash-safe across the registry/ticket/marker write
+    windows. A missing or schema-invalid joined marker is repaired, while any
+    valid newer activity marker is preserved. If the contractual marker cannot
+    be written, this returns ``marker_write_failed`` with ``retriable=true``;
+    replay repairs it without duplicating the registry record. This tool never
+    adopts or mutates the ambient process identity or session binding.
+    ``WIN_AGENT_TEAMS_EXTERNAL_ONLY=1`` is the supported restricted server
+    entry for a separate Desktop profile/client instance; a dual entry in one
+    profile leaves ambient root tools selectable and is not isolation.
+    """
+
+    def _join() -> dict:  # noqa: PLR0911 - reconciliation state-machine cells.
+        sid, refusal = _validate_join_session_id(session_id)
+        if refusal is not None:
+            return refusal
+        now = time.time()
+        with _agents_file_lock(sid):
+            tickets = _load_join_tickets_unlocked(sid)
+            ticket = next(
+                (
+                    row
+                    for row in tickets
+                    if isinstance(token, str)
+                    and isinstance(row.get("token"), str)
+                    and row.get("token") == token
+                ),
+                None,
+            )
+            if ticket is None:
+                return {"success": False, "reason": "invalid_or_expired_token"}
+
+            ticket_id = ticket.get("ticket_id")
+            secret = _member_secret(ticket_id, ticket.get("token"))
+            digest = _member_digest(secret)
+            agents = _load_agents_unlocked(sid)
+            matches = [
+                record for record in agents if record.get("join_ticket_id") == ticket_id
+            ]
+            if len(matches) > 1:
+                return {"success": False, "reason": "registry_corrupt"}
+            record = matches[0] if matches else None
+            if record is not None and not _external_record_matches(
+                record, ticket, sid, digest
+            ):
+                return {"success": False, "reason": "registry_corrupt"}
+
+            status = ticket.get("status")
+            if status not in {"open", "used"}:
+                return {"success": False, "reason": "registry_corrupt"}
+            if record is not None and record.get("status") not in {
+                "running",
+                "left",
+            }:
+                return {"success": False, "reason": "registry_corrupt"}
+            if record is not None and record.get("status") == "left":
+                return {
+                    "success": False,
+                    "reason": "membership_revoked",
+                    "detail": "left",
+                }
+
+            if status == "used" and record is None:
+                return {"success": False, "reason": "token_already_used"}
+
+            if status == "open" and record is None:
+                expires_at = ticket.get("expires_at")
+                unexpired = (
+                    isinstance(expires_at, int | float)
+                    and not isinstance(expires_at, bool)
+                    and float(expires_at) > now
+                )
+                if not unexpired:
+                    return {
+                        "success": False,
+                        "reason": "invalid_or_expired_token",
+                    }
+                record = {
+                    "name": ticket.get("name"),
+                    "pid": os.getpid(),
+                    "backend": "external",
+                    "session_id": sid,
+                    "parent": ticket.get("parent"),
+                    "status": "running",
+                    "spawned_at": now,
+                    "cwd": str(Path.cwd()),
+                    "model": None,
+                    "member_token_digest": digest,
+                    "join_ticket_id": ticket_id,
+                    SPAWNED_BY_FIELD: ticket.get("parent"),
+                    SPAWNED_BY_SOURCE_FIELD: SPAWNED_BY_SOURCE_JOIN,
+                }
+                agents.append(record)
+                _save_agents_unlocked(sid, agents)
+
+            if status == "open":
+                # This is either a fresh join or crash window A. Expiry is
+                # intentionally irrelevant once the durable record exists.
+                ticket["status"] = "used"
+                ticket["used_at"] = now
+                ticket["member_name"] = ticket.get("name")
+                _save_join_tickets_unlocked(sid, tickets, now=now)
+
+            name = str(ticket.get("name") or "")
+            if not _ensure_joined_marker(sid, name):
+                return {
+                    "success": False,
+                    "reason": "marker_write_failed",
+                    "retriable": True,
+                }
+            return _external_membership_result(sid, ticket, secret)
+
+    return await run_blocking(_join)
+
+
+@_register_tool()
 async def spawn_agent(
     prompt: str,
     name: str = "",
@@ -2292,7 +2948,8 @@ async def spawn_agent(
             return refusal
         session_id = _active_session_id(create=True)
         with _agents_transaction(session_id) as agents:
-            agent_name = _unique_agent_name(name, agents)
+            tickets = _load_join_tickets_unlocked(session_id)
+            agent_name = _unique_reserved_name(name, agents, tickets, now=time.time())
 
             backend_name = backend.strip() or registry.default_backend()
             b = registry.get(backend_name)
@@ -2408,7 +3065,7 @@ async def spawn_agent(
     return _annotate(await run_blocking(_do_spawn))
 
 
-@mcp.tool()
+@_register_tool()
 async def send_message(
     text: str, to: str = "team-lead", idempotency_key: str = ""
 ) -> dict:
@@ -2422,11 +3079,15 @@ async def send_message(
     * **Your spawner** (the default) is written to its inbox. Its watcher wakes
       it; it consumes the message with read_messages. This is the upstream path
       and it is unchanged.
-    * **An agent you spawned** goes through the guaranteed path instead — the
-      same machinery as follow_up_agent, because a child that is not polling
-      would otherwise never see an inbox write. It therefore needs an
-      idempotency_key you choose before the call, and it returns the same
-      "delivered"/"failed"/"queued" statuses. Such a message
+    * **An external member you registered** receives one inbox line and returns
+      ``delivery="inbox"``. This is pull-based and unconfirmed: it reads the
+      message on its next ``external_read`` call. No idempotency key, lease,
+      durable delivery row, process resume, or wake is involved.
+    * **A spawned agent you spawned** goes through the guaranteed path instead
+      — the same machinery as follow_up_agent, because a spawned child that is
+      not polling would otherwise never see an inbox write. It therefore needs
+      an idempotency_key you choose before the call, and it returns the same
+      "delivered"/"failed"/"queued" statuses. Such a spawned-agent message
       does NOT enter the recipient's inbox, so read_messages cannot repeat it.
 
     Anyone else — a sibling, a grandchild, another lead's worker, or a name that
@@ -2439,13 +3100,58 @@ async def send_message(
         return {**refusal, "to": to}
     session_id = _active_session_id()
 
-    def _do_send() -> dict:
+    def _do_send() -> dict:  # noqa: PLR0911 - recipient-class contract cells.
         if not session_id:
             return {"success": False, "to": to, "reason": "session_not_found"}
 
         recipient_class, recipient = _classify_recipient(to, session_id)
 
         if recipient_class == RECIPIENT_CHILD:
+            # Re-resolve and act under one registry transaction. Kill, leave,
+            # and token-bearing member operations take this same lock, so a
+            # validated append cannot occur after revocation removed/left the
+            # record.
+            with _agents_transaction(session_id) as agents:
+                target = _find_agent(agents, recipient)
+                if (
+                    target is not None
+                    and target.get("backend") == "external"
+                    and target.get(SPAWNED_BY_FIELD) == IDENTITY
+                ):
+                    if target.get("status") == "left":
+                        return {
+                            "success": False,
+                            "to": recipient,
+                            "reason": "member_left",
+                            "retriable": False,
+                        }
+                    if target.get("status") != "running":
+                        return {
+                            "success": False,
+                            "to": recipient,
+                            "reason": "membership_revoked",
+                            "retriable": False,
+                        }
+                    line = json.dumps(
+                        {
+                            "from": IDENTITY,
+                            "text": text,
+                            "ts": datetime.now(UTC).isoformat(),
+                        }
+                    )
+                    with _inbox_file(session_id, recipient).open(
+                        "a", encoding="utf-8"
+                    ) as handle:
+                        handle.write(line + "\n")
+                    return {
+                        "success": True,
+                        "to": recipient,
+                        "delivery": "inbox",
+                        "note": (
+                            "External agent; pull-based and unconfirmed. It reads "
+                            "this inbox on its next external_read call."
+                        ),
+                    }
             # R5: the only accept-then-drop risk left is a child that is not
             # polling, so a downstream send is the guaranteed path, never an
             # inbox append. B4 stays intact — the audit row is the record, and
@@ -2490,7 +3196,111 @@ async def send_message(
 _DEFAULT_READ_LIMIT = 50
 
 
-@mcp.tool()
+def _read_inbox(
+    session_id: str,
+    reader: str,
+    *,
+    from_agent: str = "",
+    since_seq: int | None = None,
+    full: bool = False,
+    limit: int | None = None,
+    max_chars: int | None = None,
+) -> dict:
+    """Read and advance one inbox; the caller supplies the serialization."""
+    inbox = _inbox_file(session_id, reader)
+    cursor_file = _inbox_cursor_file(session_id, reader)
+    with _inbox_lock(reader):
+        cursors = _load_inbox_cursors(cursor_file)
+        by_sender = read_inbox_by_sender(inbox)
+        original_cursors = dict(cursors)
+        for sender in list(cursors):
+            observed = len(by_sender.get(sender, []))
+            cursors[sender] = min(cursors[sender], observed)
+
+        relevant = [from_agent] if from_agent else list(by_sender)
+        start_overrides: dict[str, int] = {}
+        if since_seq is not None and from_agent:
+            floor = cursors.get(from_agent, 0)
+            start_overrides[from_agent] = max(since_seq, floor, 0)
+
+        per_sender_batches: dict[str, list[tuple[int, int, dict]]] = {}
+        for sender in relevant:
+            entries = by_sender.get(sender, [])
+            start = start_overrides.get(sender, cursors.get(sender, 0))
+            per_sender_batches[sender] = [
+                (position, index, msg)
+                for position, (index, msg) in enumerate(entries)
+                if position >= start
+            ]
+
+        effective_limit = (
+            None if full else (_DEFAULT_READ_LIMIT if limit is None else limit)
+        )
+        selected: list[tuple[str, int, int, dict]] = [
+            (sender, position, index, msg)
+            for sender in relevant
+            for position, index, msg in per_sender_batches[sender]
+        ]
+        selected.sort(key=lambda item: item[2])
+        total_unread = len(selected)
+        has_more = False
+        if effective_limit is not None and len(selected) > effective_limit:
+            selected = selected[:effective_limit]
+            has_more = True
+
+        updated = dict(cursors)
+        for sender in relevant:
+            entries = by_sender.get(sender, [])
+            consumed_positions = [
+                position
+                for selected_sender, position, _, _ in selected
+                if selected_sender == sender
+            ]
+            if consumed_positions:
+                new_count = max(consumed_positions) + 1
+            else:
+                new_count = start_overrides.get(sender, cursors.get(sender, 0))
+            floor = max(cursors.get(sender, 0), start_overrides.get(sender, 0))
+            new_count = max(new_count, floor)
+            if entries or sender in cursors or sender in start_overrides:
+                updated[sender] = min(new_count, len(entries))
+
+        # limit=0 is a non-consuming watermark and must leave the cursor file
+        # byte-identical, including when loading revealed a clamp opportunity.
+        if effective_limit == 0:
+            updated = original_cursors
+        else:
+            _save_inbox_cursors(cursor_file, updated)
+
+        messages: list[dict] = []
+        for sender, position, _index, message in selected:
+            text, truncated, full_len = _truncate(message.get("text"), max_chars)
+            entry = {
+                "from": sender,
+                "text": text,
+                "ts": message.get("ts"),
+                "seq": position + 1,
+            }
+            if max_chars is not None:
+                entry["truncated"] = truncated
+                entry["full_len"] = full_len
+            messages.append(entry)
+
+        result: dict = {
+            "messages": messages,
+            "unread_count": total_unread,
+            "has_more": has_more,
+        }
+        if from_agent:
+            result["cursors"] = None
+            result["seq"] = updated.get(from_agent, cursors.get(from_agent, 0))
+        else:
+            result["cursors"] = updated
+            result["seq"] = None
+        return result
+
+
+@_register_tool()
 async def read_messages(
     from_agent: str = "",
     since_seq: int | None = None,
@@ -2548,117 +3358,194 @@ async def read_messages(
                 "unread_count": 0,
                 "has_more": False,
             }
-        inbox = _inbox_file(session_id, IDENTITY)
-        cursor_file = _inbox_cursor_file(session_id, IDENTITY)
-        with _inbox_lock(IDENTITY):
-            cursors = _load_inbox_cursors(cursor_file)
-            # A missing/empty inbox is just an empty snapshot. We must NOT
-            # early-return here: a stored forward cursor still needs clamping
-            # and persisting, otherwise a bad value would survive and could
-            # later swallow a sender's first message.
-            # Group valid messages by sender in file order, tracking each
-            # message's global position so the result preserves file order.
-            by_sender = read_inbox_by_sender(inbox)
-
-            # Clamp any stored count that exceeds the observed valid-message
-            # count for that sender down to the observed count. This covers
-            # senders absent from the current snapshot too (clamped to 0), so a
-            # bad forward cursor cannot skip that sender's first future message.
-            for sender in list(cursors):
-                observed = len(by_sender.get(sender, []))
-                cursors[sender] = min(cursors[sender], observed)
-
-            relevant = [from_agent] if from_agent else list(by_sender)
-            # start_overrides holds the effective read-start position (a
-            # per-sender COUNT) for THIS call, distinct from the persisted
-            # cursor value used as the no-newly-selected floor below.
-            start_overrides: dict[str, int] = {}
-            if since_seq is not None and from_agent:
-                floor = cursors.get(from_agent, 0)
-                start_overrides[from_agent] = max(since_seq, floor, 0)
-
-            # Per-sender batch entries, each tagged with its PER-SENDER
-            # position (0-based index into that sender's own entries list,
-            # i.e. seq - 1) so the global-index tuples from ``by_sender``
-            # never leak into cross-sender bookkeeping.
-            per_sender_batches: dict[str, list[tuple[int, int, dict]]] = {}
-            for sender in relevant:
-                entries = by_sender.get(sender, [])
-                start = start_overrides.get(sender, cursors.get(sender, 0))
-                per_sender_batches[sender] = [
-                    (position, index, msg)
-                    for position, (index, msg) in enumerate(entries)
-                    if position >= start
-                ]
-
-            effective_limit = (
-                None if full else (_DEFAULT_READ_LIMIT if limit is None else limit)
-            )
-            selected: list[tuple[str, int, int, dict]] = [
-                (sender, position, index, msg)
-                for sender in relevant
-                for position, index, msg in per_sender_batches[sender]
-            ]
-            selected.sort(key=lambda item: item[2])  # global file order
-            # The pending backlog is measured before any limit clipping so a
-            # non-consuming peek (limit=0) or a clipped batch still reports the
-            # true unread count instead of just the returned batch size.
-            total_unread = len(selected)
-            has_more = False
-            if effective_limit is not None and len(selected) > effective_limit:
-                selected = selected[:effective_limit]
-                has_more = True
-
-            updated = dict(cursors)
-            for sender in relevant:
-                entries = by_sender.get(sender, [])
-                consumed_positions = [
-                    position
-                    for sel_sender, position, _, _ in selected
-                    if sel_sender == sender
-                ]
-                if consumed_positions:
-                    new_count = max(consumed_positions) + 1
-                else:
-                    new_count = start_overrides.get(sender, cursors.get(sender, 0))
-                floor = max(cursors.get(sender, 0), start_overrides.get(sender, 0))
-                new_count = max(new_count, floor)
-                if entries or sender in cursors or sender in start_overrides:
-                    updated[sender] = min(new_count, len(entries))
-
-            _save_inbox_cursors(cursor_file, updated)
-
-            messages: list[dict] = []
-            for sender, position, _index, msg in selected:
-                text, truncated, full_len = _truncate(msg.get("text"), max_chars)
-                entry = {
-                    "from": sender,
-                    "text": text,
-                    "ts": msg.get("ts"),
-                    "seq": position + 1,
-                }
-                if max_chars is not None:
-                    entry["truncated"] = truncated
-                    entry["full_len"] = full_len
-                messages.append(entry)
-
-            result: dict = {
-                "messages": messages,
-                "unread_count": total_unread,
-                "has_more": has_more,
-            }
-            if from_agent:
-                result["cursors"] = None
-                result["seq"] = updated.get(from_agent, cursors.get(from_agent, 0))
-            else:
-                result["cursors"] = updated
-                result["seq"] = None
-            return result
+        return _read_inbox(
+            session_id,
+            IDENTITY,
+            from_agent=from_agent,
+            since_seq=since_seq,
+            full=full,
+            limit=limit,
+            max_chars=max_chars,
+        )
 
     return _annotate(await run_blocking(_do_read))
 
 
-@mcp.tool()
+@_register_tool(external=True)
+async def external_send(member_token: str, text: str) -> dict:
+    """Append a pull-only external member message to its parent's inbox.
+
+    ``member_token`` must exactly match
+    ``wam1:<canonical-lowercase-session-uuid>:<64-lowercase-hex>``. Every call
+    re-derives authority from the external registry record; leave or lead-side
+    kill is therefore enforced on the next call without relying on ambient MCP
+    identity or session state. The message line is
+    ``{"from": <member-name>, "text": <text>, "ts": <ISO timestamp>}`` in
+    ``inbox-<parent>.jsonl``. Success means only that the line reached the
+    parent's inbox: delivery is pull-based and unconfirmed.
+
+    The session's cross-process registry lock is held through token validation,
+    inbox append, and activity-marker write, linearizing the operation against
+    kill and leave. Lock waiters time out after 30 seconds on Windows and block
+    in POSIX ``flock``. If the append succeeds but the opportunistic
+    ``running/activity`` marker write fails, the result remains successful and
+    includes ``heartbeat_warning=true`` so retrying cannot duplicate a message.
+    """
+
+    def _send() -> dict:
+        with _member_operation(member_token) as (
+            record,
+            _agents,
+            session_id,
+            refusal,
+        ):
+            if refusal is not None:
+                return refusal
+            if record is None:
+                return {"success": False, "reason": "membership_revoked"}
+            name = str(record.get("name") or "")
+            parent = str(record.get("parent") or record.get(SPAWNED_BY_FIELD) or "")
+            line = json.dumps(
+                {
+                    "from": name,
+                    "text": text,
+                    "ts": datetime.now(UTC).isoformat(),
+                }
+            )
+            with _inbox_file(session_id, parent).open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+            result = {
+                "success": True,
+                "to": parent,
+                "delivery": "inbox",
+            }
+            try:
+                _write_state_marker(session_id, name, state="running", event="activity")
+            except OSError:
+                result["heartbeat_warning"] = True
+            return result
+
+    return await run_blocking(_send)
+
+
+@_register_tool(external=True)
+async def external_read(
+    member_token: str,
+    from_agent: str = "",
+    since_seq: int | None = None,
+    full: bool = False,
+    limit: int | None = None,
+    max_chars: int | None = None,
+) -> dict:
+    """Drain an external member's own inbox using its bearer token.
+
+    ``member_token`` must exactly match
+    ``wam1:<canonical-lowercase-session-uuid>:<64-lowercase-hex>``. Every call
+    re-derives the member name and session from ``agents.json``; it never reads
+    or mutates ambient identity, active-session, recovery, or binding state.
+    Leave or lead-side kill is enforced on the next call.
+
+    Cursor behavior is identical to ``read_messages``. The result contains
+    ``messages, cursors, seq, unread_count, has_more``; default calls drain.
+    ``from_agent`` scopes one sender; ``since_seq`` requires it. ``limit``
+    defaults to 50, negative values raise ``ValueError``, ``full=true`` ignores
+    it, and ``limit=0`` is a non-consuming watermark whose cursor file stays
+    byte-identical. ``max_chars`` adds per-message ``truncated``/``full_len``.
+
+    The cross-process registry lock remains held through the complete
+    load/read/advance/save transaction, then the in-process inbox lock, so two
+    old/new MCP processes using the same token consume each line exactly once
+    under the existing at-most-once response-loss semantics. Lock waiters time
+    out after 30 seconds on Windows and block in POSIX ``flock``; a large read
+    can delay registry operations. A failed activity-marker write after cursor
+    persistence returns success with ``heartbeat_warning=true``.
+    """
+    if since_seq is not None and not from_agent:
+        msg = "since_seq requires from_agent to be set"
+        raise ValueError(msg)
+    if limit is not None and limit < 0:
+        msg = "limit must not be negative"
+        raise ValueError(msg)
+
+    def _read() -> dict:
+        with _member_operation(member_token) as (
+            record,
+            _agents,
+            session_id,
+            refusal,
+        ):
+            if refusal is not None:
+                return refusal
+            if record is None:
+                return {"success": False, "reason": "membership_revoked"}
+            name = str(record.get("name") or "")
+            result = _read_inbox(
+                session_id,
+                name,
+                from_agent=from_agent,
+                since_seq=since_seq,
+                full=full,
+                limit=limit,
+                max_chars=max_chars,
+            )
+            result["success"] = True
+            try:
+                _write_state_marker(session_id, name, state="running", event="activity")
+            except OSError:
+                result["heartbeat_warning"] = True
+            return result
+
+    return await run_blocking(_read)
+
+
+@_register_tool(external=True)
+async def leave_team(member_token: str) -> dict:
+    """Permanently revoke this external membership without killing a process.
+
+    ``member_token`` must exactly match
+    ``wam1:<canonical-lowercase-session-uuid>:<64-lowercase-hex>``. Under the
+    session's cross-process registry lock, the matching external record changes
+    from ``running`` to ``left`` and its marker becomes ``waiting/left``.
+    Subsequent send/read calls return ``membership_revoked`` and replaying the
+    original join credential cannot resurrect the member.
+
+    The call is idempotent: an already-left member returns success with
+    ``already_left=true`` and does not rewrite the marker. The informational
+    registry PID is never probed or signalled. Lock waiters time out after 30
+    seconds on Windows and block in POSIX ``flock``.
+    """
+
+    def _leave() -> dict:
+        with _member_operation(member_token, allow_left=True) as (
+            record,
+            agents,
+            session_id,
+            refusal,
+        ):
+            if refusal is not None:
+                return refusal
+            if record is None or agents is None:
+                return {"success": False, "reason": "membership_revoked"}
+            name = str(record.get("name") or "")
+            if record.get("status") == "left":
+                return {
+                    "success": True,
+                    "name": name,
+                    "already_left": True,
+                }
+            record["status"] = "left"
+            _save_agents_unlocked(session_id, agents)
+            result = {"success": True, "name": name, "already_left": False}
+            try:
+                _write_state_marker(session_id, name, state="waiting", event="left")
+            except OSError:
+                result["heartbeat_warning"] = True
+            return result
+
+    return await run_blocking(_leave)
+
+
+@_register_tool()
 @_with_disk_note
 async def check_agent(
     name: str, full: bool = False, max_chars: int = _DEFAULT_LAST_LINE_MAX_CHARS
@@ -2685,6 +3572,9 @@ async def check_agent(
 
     Pass ``full=True`` to restore the full ``last_message`` (bounded to 1000
     chars) and ``backend_session_id`` for follow-up/resume workflows.
+    External records return ``backend="external"`` and
+    ``binding="not_applicable"``. Their PID is informational/stale and is not
+    probed; membership status plus marker activity is the liveness signal.
     """
     session_id = _active_session_id()
 
@@ -2975,6 +3865,19 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                 # "not found" that reads as a lookup miss. A killed agent is
                 # unreachable by design, and saying so is the point.
                 return _FollowUpPrep(refusal=_no_delivery_path(name, "record_removed"))
+
+            if agent.get("backend") == "external":
+                return _FollowUpPrep(
+                    refusal=_follow_up_failure(
+                        "external_agent_pull_only",
+                        name,
+                        detail=(
+                            "External members cannot be resumed or receive "
+                            "guaranteed delivery. Use send_message; it appends "
+                            "pull-based inbox work for external_read."
+                        ),
+                    )
+                )
 
             # R2/C2 — session resume is downstream-only.
             #
@@ -3973,6 +4876,21 @@ def _preflight_refusal(session_id: str, name: str) -> tuple[dict | None, tuple |
     return None, _parentage(agent)
 
 
+def _external_target_refusal(session_id: str, name: str) -> dict | None:
+    """Return the pull-only refusal for an external target, read-only."""
+    agent = _find_agent(_load_agents(session_id), name)
+    if agent is None or agent.get("backend") != "external":
+        return None
+    return _follow_up_failure(
+        "external_agent_pull_only",
+        name,
+        detail=(
+            "External members cannot be resumed or receive guaranteed delivery. "
+            "Use send_message; it appends pull-based inbox work for external_read."
+        ),
+    )
+
+
 def _settled_result(session_id: str, name: str, record: dict) -> dict:
     """Return the already-known outcome for a terminal same-key retry."""
     delivered = record.get("status") == STATUS_DELIVERED
@@ -4041,6 +4959,9 @@ def _guaranteed_send(  # noqa: PLR0911 - each return is a distinct refusal contr
     preflight, parentage = _preflight_refusal(session_id, name)
     if preflight is not None:
         return preflight
+    external_refusal = _external_target_refusal(session_id, name)
+    if external_refusal is not None:
+        return external_refusal
 
     options = {"replace_if_idle": replace_if_idle}
     try:
@@ -4095,11 +5016,16 @@ def _guaranteed_send(  # noqa: PLR0911 - each return is a distinct refusal contr
 #: same call that then hit one of these is rolled back rather than kept as
 #: evidence of a request that was refused.
 _C2_REFUSAL_REASONS = frozenset(
-    {"not_spawner", "parent_unknown", REASON_STALE_AUTHORIZATION}
+    {
+        "not_spawner",
+        "parent_unknown",
+        REASON_STALE_AUTHORIZATION,
+        "external_agent_pull_only",
+    }
 )
 
 
-@mcp.tool()
+@_register_tool()
 async def follow_up_agent(
     name: str,
     prompt: str,
@@ -4133,6 +5059,12 @@ async def follow_up_agent(
     be read a second time via read_messages; they are recorded in the sender's
     delivery store instead.
 
+    External members are pull-only and cannot be resumed. Targeting one returns
+    ``reason="external_agent_pull_only"`` before any delivery row, claim, lease,
+    backend lookup, or process operation. Use ``send_message`` instead; it
+    appends one unconfirmed inbox message for the member's next
+    ``external_read``.
+
     replace_if_idle defaults to True: an idle-but-alive process is gracefully
     shut down and resumed with the follow-up prompt. Set it to False to instead
     refuse such an agent with reason="agent_idle_but_alive".
@@ -4152,7 +5084,7 @@ async def follow_up_agent(
     return _annotate(await run_blocking(_run))
 
 
-@mcp.tool()
+@_register_tool()
 async def delivery_status(idempotency_key: str = "", to: str = "") -> dict:
     """Ask what happened to a guaranteed-path message you sent (R4).
 
@@ -4242,7 +5174,7 @@ def _delivery_status(session_id: str, idempotency_key: str, to: str) -> dict:
         return {"success": True, **public_view(record)}
 
 
-@mcp.tool()
+@_register_tool()
 async def deliver_pending(idempotency_key: str = "") -> dict:
     """Finish the guaranteed-path messages you were told to come back for.
 
@@ -4257,6 +5189,13 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
 
     Draining happens HERE and in follow_up_agent, and nowhere else. agent_status,
     check_agent and list_agents stay cheap reads on purpose.
+
+    A pending row whose target is now an external member is never claimed,
+    reconciled, resumed, or leased. The audit row remains unchanged and the
+    result's separate ``refusals`` list contains
+    ``{idempotency_key, to, status:"refused",
+    reason:"external_agent_pull_only"}``; durable delivery statuses remain
+    exactly queued/delivered/failed.
     """
     session_id = _active_session_id()
 
@@ -4268,15 +5207,29 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
         # Reconcile everything first, under one lock, so a message that
         # already landed is settled before anything considers resending it.
         pending: list[dict] = []
+        refusals: list[dict] = []
         with delivery_transaction(store) as txn:
             for record in txn.for_sender(IDENTITY):
                 if idempotency_key and record.get("idempotency_key") != idempotency_key:
                     continue
                 if is_terminal(record):
                     continue
-                if _reconcile_delivery_record(
-                    session_id, record, _find_agent(agents, str(record.get("to") or ""))
+                target = str(record.get("to") or "")
+                target_record = _find_agent(agents, target)
+                if (
+                    target_record is not None
+                    and target_record.get("backend") == "external"
                 ):
+                    refusals.append(
+                        {
+                            "idempotency_key": str(record.get("idempotency_key") or ""),
+                            "to": target,
+                            "status": "refused",
+                            "reason": "external_agent_pull_only",
+                        }
+                    )
+                    continue
+                if _reconcile_delivery_record(session_id, record, target_record):
                     txn.touch()
                 if not is_terminal(record) and record.get("phase") == PHASE_PENDING:
                     pending.append(dict(record))
@@ -4292,25 +5245,33 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
                 continue
             try:
                 deadline = _delivery_clock() + _DELIVERY_CALL_BUDGET_SECONDS
-                results.append(
-                    _guaranteed_delivery(
-                        session_id,
-                        target,
-                        str(record.get("prompt") or ""),
-                        bool(
-                            (record.get("options") or {}).get("replace_if_idle", True)
-                        ),
-                        record,
-                        deadline,
-                    )
+                result = _guaranteed_delivery(
+                    session_id,
+                    target,
+                    str(record.get("prompt") or ""),
+                    bool((record.get("options") or {}).get("replace_if_idle", True)),
+                    record,
+                    deadline,
                 )
+                if result.get("reason") == "external_agent_pull_only":
+                    refusals.append(
+                        {
+                            "idempotency_key": str(record.get("idempotency_key") or ""),
+                            "to": target,
+                            "status": "refused",
+                            "reason": "external_agent_pull_only",
+                        }
+                    )
+                else:
+                    results.append(result)
             finally:
                 _release_delivery_claim(session_id, record)
 
         return {
             "success": True,
-            "attempted": len(results),
+            "attempted": len(results) + len(refusals),
             "deliveries": delivery_store.list_for_sender(store, IDENTITY),
+            "refusals": refusals,
         }
 
     def _guarded() -> dict:
@@ -4408,7 +5369,7 @@ def _gc_prompt_files(session_id: str, name: str, *, child_exited: bool) -> None:
         remove_prompt_file(path)
 
 
-@mcp.tool()
+@_register_tool()
 async def kill_agent(name: str) -> dict:
     """Force-kill an agent and remove it from the session.
 
@@ -4420,6 +5381,13 @@ async def kill_agent(name: str) -> dict:
     ours (matching creation token or live in-memory ownership) — a reused or
     foreign PID is left untouched. A naturally-dead agent is NOT removed until
     killed, so it remains listable and resumable.
+
+    For ``backend="external"``, the PID belongs to a manually started,
+    potentially shared MCP server and is informational/stale. It is never
+    probed or signalled: kill only removes the member record, marker, inbox,
+    cursor, and sender history, returning ``killed_process=false`` and
+    ``reason="external_agent_deregistered"``. Its bearer token is revoked on
+    the next token-bearing call.
     """
     session_id = _active_session_id()
 
@@ -4430,6 +5398,20 @@ async def kill_agent(name: str) -> dict:
             agent = next((a for a in agents if a["name"] == name), None)
             if agent is None:
                 return {"success": False, "name": name}
+
+            if agent.get("backend") == "external":
+                remaining = [row for row in agents if row.get("name") != name]
+                agents[:] = remaining
+                _save_agents_transaction(session_id, agents)
+                if not _drop_agent_lease(_leases_file(session_id), name):
+                    logger.warning("Could not drop the lease entry for %s", name)
+                _cleanup_agent_artifacts(session_id, name, child_exited=True)
+                return {
+                    "success": True,
+                    "name": name,
+                    "killed_process": False,
+                    "reason": "external_agent_deregistered",
+                }
 
             # A4b — refuse while a delivery to this agent is provably in
             # flight. Killing now could orphan an already-spawned resumed
@@ -4512,7 +5494,7 @@ async def kill_agent(name: str) -> dict:
     return await run_blocking(_do_kill)
 
 
-@mcp.tool()
+@_register_tool()
 async def resume_session(session_id: str) -> dict:
     """Adopt a specific prior session by id after a restart.
 
@@ -4564,7 +5546,7 @@ async def resume_session(session_id: str) -> dict:
     return await run_blocking(_do_resume)
 
 
-@mcp.tool()
+@_register_tool()
 async def session_info() -> dict:
     """Report the current session and any recoverable prior sessions.
 
@@ -4621,16 +5603,25 @@ def _marker_timestamp(marker: dict | None) -> float | None:
     return None
 
 
+def _public_agent_record(agent: dict) -> dict:
+    """Return registry fields with every credential-bearing field omitted."""
+    return {key: value for key, value in agent.items() if key not in CREDENTIAL_FIELDS}
+
+
 def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:
     """Build a compact ``list_agents`` row (no leaked internal fields)."""
-    name = str(agent.get("name") or "")
+    public = _public_agent_record(agent)
+    name = str(public.get("name") or "")
     marker = _read_state_marker(session_id, name)
     last_activity_at = _marker_timestamp(marker)
     # The binding is resolved only on the transcript-fallback path. A compact
-    # row answered entirely from the state marker must not pay for a scan,
-    # which is the whole point of the marker; ``binding`` is then ``None``,
-    # meaning "not evaluated on this call" rather than any binding outcome.
-    binding_outcome: str | None = None
+    # row answered entirely from the state marker must not pay for a scan.
+    # External members have no transcript binding by design, so that outcome
+    # is known without a scan; for other backends ``None`` means "not
+    # evaluated on this call".
+    binding_outcome: str | None = (
+        "not_applicable" if public.get("backend") == "external" else None
+    )
     if last_activity_at is None:
         binding = _resolve_agent_binding(agent)
         binding_outcome = binding.outcome
@@ -4644,8 +5635,8 @@ def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:
         "name": name,
         "state": state,
         "alive": alive,
-        "pid": agent.get("pid"),
-        "backend": agent.get("backend"),
+        "pid": public.get("pid"),
+        "backend": public.get("backend"),
         "last_activity_at": last_activity_at,
         "unread_count": unread_count,
         # Binding outcome is its own field, never folded into lifecycle
@@ -4655,14 +5646,15 @@ def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:
     }
 
 
-@mcp.tool()
+@_register_tool()
 @_with_disk_note
 async def list_agents(full: bool = False) -> list[dict]:
     """List all agents with compact status rows.
 
     Default (``full=False``) rows are ``{name, state, alive, pid, backend,
-    last_activity_at, unread_count}`` — no transcript bodies. Pass
-    ``full=True`` to restore each agent's raw registry record plus
+    last_activity_at, unread_count, binding}`` — no transcript bodies. Pass
+    ``full=True`` to restore each agent's sanitized registry fields
+    (credential fields omitted) plus
     ``last_line`` (the last non-empty line of its most recent message),
     ``truncated``, and ``full_len`` (the untruncated character count).
 
@@ -4690,7 +5682,7 @@ async def list_agents(full: bool = False) -> list[dict]:
             )
             result.append(
                 {
-                    **agent,
+                    **_public_agent_record(agent),
                     "alive": alive,
                     "last_line": last_line,
                     "truncated": truncated,
@@ -4708,11 +5700,15 @@ async def list_agents(full: bool = False) -> list[dict]:
 
 def _agent_status_row(session_id: str, agent: dict) -> dict:
     """Build one ``agent_status`` row (marker + cursor reads only, no scan)."""
-    name = str(agent.get("name") or "")
+    public = _public_agent_record(agent)
+    name = str(public.get("name") or "")
     alive = _agent_alive(agent)
     marker = _read_state_marker(session_id, name)
     last_activity_ts = _marker_timestamp(marker)
     unbound = False
+    binding_outcome: str | None = (
+        "not_applicable" if public.get("backend") == "external" else None
+    )
     if last_activity_ts is None:
         # No marker timestamp: fall back to the transcript, but stay cheap.
         # This is exactly one binding resolution AND a genuinely bounded one:
@@ -4720,9 +5716,13 @@ def _agent_status_row(session_id: str, agent: dict) -> dict:
         # A6 forbids here. Without it "one call" was still unbounded work, and
         # a test that mocks the whole resolver cannot tell the difference.
         binding = _resolve_agent_binding(agent, bounded_only=True)
+        binding_outcome = binding.outcome
         output = binding.output
         last_activity_ts = output.last_activity_at if output else None
-        unbound = not binding.bound and binding.outcome != BINDING_LEGACY
+        unbound = not binding.bound and binding.outcome not in {
+            BINDING_LEGACY,
+            "not_applicable",
+        }
     state = _resolve_agent_state(
         alive=alive, marker=marker, last_activity_at=last_activity_ts
     )
@@ -4740,22 +5740,25 @@ def _agent_status_row(session_id: str, agent: dict) -> dict:
     )
     return {
         "name": name,
+        "backend": public.get("backend"),
         "state": state,
         "last_activity_ts": last_activity_ts,
         "unread_count": unread_count,
         "seq": seq,
         "heartbeat_age_s": heartbeat_age_s,
         "stalled": stalled,
+        "binding": binding_outcome,
     }
 
 
-@mcp.tool()
+@_register_tool()
 @_with_disk_note
 async def agent_status(names: list[str] | None = None) -> list[dict]:
     """Return cheap per-agent status rows: no bodies, no transcript scan.
 
-    Each row is exactly ``{name, state, last_activity_ts, unread_count, seq,
-    heartbeat_age_s, stalled}``. ``seq``/``unread_count`` are the caller's
+    Each row is exactly ``{name, backend, state, last_activity_ts,
+    unread_count, seq, heartbeat_age_s, stalled, binding}``.
+    ``seq``/``unread_count`` are the caller's
     per-sender count for messages FROM that named agent. ``names=None``
     returns all agents in the session; otherwise only the named agents
     (unknown names are skipped).
@@ -4773,6 +5776,11 @@ async def agent_status(names: list[str] | None = None) -> list[dict]:
     per agent. The marker (written by a Stop/SessionStart/etc. hook) is used
     directly when present; a transcript scan only happens as a fallback when
     no marker exists yet (e.g. hooks disabled or not yet fired).
+
+    External rows always report ``backend="external"`` and
+    ``binding="not_applicable"``. Their PID is informational and never probed;
+    running/left membership plus the activity marker are the honest liveness
+    signal.
 
     Recovery: if this returns empty right after a restart and you expected
     agents, call ``session_info()`` — a prior session for this workspace may
@@ -4792,7 +5800,7 @@ async def agent_status(names: list[str] | None = None) -> list[dict]:
     return await run_blocking(_do_status)
 
 
-@mcp.tool()
+@_register_tool()
 @_with_disk_note
 async def agent_watch_paths(names: list[str] | None = None) -> dict:
     """Return session watch metadata and minimal agent watch-path rows.
@@ -4841,7 +5849,7 @@ async def agent_watch_paths(names: list[str] | None = None) -> dict:
     return await run_blocking(_do_watch_paths)
 
 
-@mcp.tool()
+@_register_tool(external=True)
 async def list_backends() -> list[dict]:
     """List available spawner backends."""
 
@@ -4902,13 +5910,55 @@ def _install_wake_hook(
     return result
 
 
+def _group_has_member_wake_token(group: object) -> bool:
+    """Return whether a Stop matcher group invokes the member-wake module."""
+    if not isinstance(group, dict):
+        return False
+    entries = cast("dict[str, Any]", group).get("hooks")
+    if not isinstance(entries, list):
+        return False
+    return any(
+        isinstance(h, dict)
+        and hooks._MEMBER_WAKE_MODULE
+        in str(cast("dict[str, Any]", h).get("command", ""))
+        for h in entries
+    )
+
+
+def _install_member_wake_hook(
+    config: dict[str, Any], wake_matcher: dict[str, Any], *, remove: bool
+) -> dict[str, Any]:
+    """Return ``config`` with the member-wake ``Stop`` matcher upserted or removed.
+
+    Mirrors :func:`_install_wake_hook` but keys on the ``member_wake`` module
+    string, so the member-wake group and the lead-wake group coexist and
+    removing one never touches the other (or any unrelated Stop group).
+    """
+    result = dict(config)
+    hooks_map = dict(result.get("hooks") or {})
+    stop = [
+        g for g in (hooks_map.get("Stop") or []) if not _group_has_member_wake_token(g)
+    ]
+    if not remove:
+        stop.append(wake_matcher)
+    if stop:
+        hooks_map["Stop"] = stop
+    else:
+        hooks_map.pop("Stop", None)
+    if hooks_map:
+        result["hooks"] = hooks_map
+    else:
+        result.pop("hooks", None)
+    return result
+
+
 def _lead_wake_settings_path(scope: str) -> Path:
     """Return the settings path for ``scope`` (``project`` cwd or ``user`` home)."""
     base = Path.home() if scope == "user" else Path.cwd()
     return base / ".claude" / "settings.json"
 
 
-@mcp.tool()
+@_register_tool()
 async def install_lead_wake(remove: bool = False, scope: str = "project") -> dict:
     """Install (or remove) the Claude Code lead inbox-wake ``Stop`` hook.
 
@@ -4951,6 +6001,81 @@ async def install_lead_wake(remove: bool = False, scope: str = "project") -> dic
             "action": "removed" if remove else "installed",
             "path": str(path),
             "reader": identity,
+            "scope": scope,
+        }
+
+    return await run_blocking(_do_install)
+
+
+@_register_tool()
+async def install_member_wake(
+    joined_session_id: str,
+    member_name: str,
+    remove: bool = False,
+    scope: str = "user",
+) -> dict:
+    """Install (or remove) the external-member inbox-wake ``Stop`` hook.
+
+    Call this from the **joined member session** right after ``join_team`` so
+    the member is reliably nudged when the lead sends work. On every member
+    turn end the hook checks the member's inbox in the JOINED lead's session
+    dir: it blocks with an instruction to call
+    ``external_read(member_token=...)`` when unread messages wait, and
+    otherwise verifies a reader-scoped inbox watcher (``watch <joined dir>
+    --reader <member>``) is running as a background task, blocking with the
+    exact command when it is not. Lead → member remains pull-only: nothing is
+    pushed into the member session; its own turn end is the trigger.
+
+    Requirements and guarantees:
+    - The member's harness must support Claude Code ``Stop`` hooks; in a
+      client without them this install is a no-op.
+    - No credential is baked: the settings file carries only the member name
+      and the joined session dir, never the ``member_token``.
+    - ``scope="user"`` (default) writes ``~/.claude/settings.json`` — the file
+      an interactive/Desktop member session actually reads. ``scope="project"``
+      writes ``.claude/settings.json`` under the MCP server's cwd, which is
+      only correct when the member session runs in that same repo.
+    - Shared-home caveat: at ``scope="user"`` this hook fires in EVERY Claude
+      session under that OS home. If the lead runs under the same home as the
+      member, the hook also fires in the lead's own session (it cannot tell it
+      apart — both keep ``IDENTITY=team-lead``) and nudges it to arm a watcher
+      it should not run. This is harmless (never-unstoppable, bounded) and
+      self-clears the moment the membership is ``left``/killed. To avoid it,
+      run the member in a separate profile/machine via
+      ``WIN_AGENT_TEAMS_EXTERNAL_ONLY=1`` — the supported member deployment.
+    - Idempotent: re-running replaces the member-wake group in place. It
+      coexists with the lead-wake group (``install_lead_wake``); removing one
+      never touches the other. ``remove=True`` drops only the member group.
+    - Fail-open: when the membership ends (``leave_team``, kill, or the joined
+      session going stale) the hook allows every stop, so a stale install is
+      harmless. When you are finished as a member, call
+      ``leave_team(member_token=...)`` — or re-run with ``remove=True`` — to
+      stop the reminders. Runtime kill switch: ``WIN_AGENT_TEAMS_MEMBER_WAKE=0``
+      (falls back to ``WIN_AGENT_TEAMS_LEAD_WAKE`` when unset).
+    """
+    if scope not in {"project", "user"}:
+        return {"error": f"scope must be 'project' or 'user', got {scope!r}"}
+    member = (member_name or "").strip()
+    if not member:
+        return {"error": "member_name must be a non-empty string"}
+
+    def _do_install() -> dict:
+        sid, refusal = _validate_join_session_id(joined_session_id)
+        if refusal is not None:
+            return refusal
+        joined_dir = _session_dir(sid)
+        wake_matcher = hooks._member_wake_hook_matcher(joined_dir, member)
+        path = _lead_wake_settings_path(scope)
+        updated = _install_member_wake_hook(
+            _read_json_object(path), wake_matcher, remove=remove
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+        return {
+            "action": "removed" if remove else "installed",
+            "path": str(path),
+            "member": member,
+            "joined_session_dir": str(joined_dir),
             "scope": scope,
         }
 

@@ -287,6 +287,79 @@ rather than an error (`src/claude_teams/server_simple.py:1389-1396`).
 **This call is destructive by default** — it advances the persisted cursor, so
 messages are drained. Use `limit=0` to peek.
 
+### External members: `create_join_ticket`, `join_team`, `external_*`, `leave_team`
+
+An external member is a manually started interactive session registered as a
+child without a spawned backend process. The lead calls
+`create_join_ticket(name, note)`, which reserves a safe, de-duplicated name
+against both registry records and other open/unexpired tickets. Tickets live in
+the atomic `join-tickets.json` array under the session directory. Their TTL is
+24 hours by default; used and expired audit rows are retained for seven days.
+Both durations have strict finite-positive environment overrides:
+`WIN_AGENT_TEAMS_JOIN_TICKET_TTL_SECONDS` and
+`WIN_AGENT_TEAMS_JOIN_TICKET_RETENTION_SECONDS`.
+
+The paste-ready prompt tells the interactive session to call
+`join_team(session_id, token)`. The join credential is replayable during
+retention: reconciliation replays return the same membership after any of the
+registry/ticket/marker crash windows. `join_team` returns a bearer token with
+the exact grammar
+`wam1:<canonical-lowercase-hyphenated-session-uuid>:<64-lowercase-hex>`.
+`agents.json` stores only `sha256(secret)` as `member_token_digest`; public
+agent results omit credential fields. A same-user reader of
+`join-tickets.json` still has the derivation inputs, consistent with the
+existing file-level threat model.
+
+The external record has `backend: "external"`,
+`spawned_by_source: "join_ticket"`, and `status: "running"`. Its PID is only
+informational and can be stale after a Desktop restart. Binding is
+`not_applicable`. External-only sessions remain discoverable and explicitly
+resumable, but are not silently auto-adopted unless a live non-external record
+also exists.
+
+Every external call re-resolves authority from the token and registry while
+holding the cross-process agents lock through all side effects. The lock order
+is agents lock → per-inbox process lock → file I/O. Windows waiters time out
+after 30 seconds; POSIX `flock` waiters block. Consequently:
+
+- `external_send(member_token, text)` appends one line to the ticket parent's
+  inbox and returns `delivery: "inbox"`.
+- `external_read(member_token, ...)` uses the exact `read_messages` cursor,
+  filtering, limiting, and truncation contract, but its complete cursor
+  transaction is cross-process serialized.
+- Successful send/read operations write `running/activity`; marker failure is
+  reported as `heartbeat_warning: true` without turning the successful inbox
+  operation into a retryable failure.
+- `leave_team(member_token)` changes the record to `left` and writes
+  `waiting/left`. Repeating leave is successful and does not rewrite the
+  marker.
+- Lead `send_message` to a running external child performs one locked inbox
+  append. It never creates a delivery row or lease and needs no idempotency
+  key. `follow_up_agent` and stale `deliver_pending` rows refuse with
+  `external_agent_pull_only`.
+- Lead `kill_agent` removes the record and artifacts without probing or
+  signalling the informational PID. The next token call reports revocation.
+
+Lead → external is pull-only, but the member session can make the pull
+hands-free with `install_member_wake(joined_session_id, member_name)`: it bakes
+a `Stop` hook (`python -m claude_teams.member_wake --joined-session-dir <dir>
+--member <name>`, default `scope="user"` → `~/.claude/settings.json`) that on
+every member turn end blocks while unread messages wait in the joined
+`inbox-<member>` (instructing `external_read(member_token=...)`) and otherwise
+verifies a reader-scoped `watch <joined dir> --reader <member>` background
+watcher is armed. No credential is baked; the hook fails open when the
+membership is not `running`, when the joined session shows no activity within
+`WIN_AGENT_TEAMS_MEMBER_WAKE_TTL_SECONDS` (default 6h), or via the
+`WIN_AGENT_TEAMS_MEMBER_WAKE` kill switch (falls back to
+`WIN_AGENT_TEAMS_LEAD_WAKE` when unset). It coexists with the lead-wake `Stop`
+group; the harness must support Claude Code `Stop` hooks for it to do anything.
+
+`WIN_AGENT_TEAMS_EXTERNAL_ONLY=1` registers only `join_team`,
+`external_send`, `external_read`, `leave_team`, and `list_backends`. Use that
+entry alone in a separate Desktop profile/client instance for client-surface
+isolation. Running it beside the ordinary server in one profile leaves the
+ambient root tools selectable and is only a degraded compatibility setup.
+
 ### `check_agent(name, full=False, max_chars=200)`
 
 Reads the registry record, does a liveness check, and resolves the agent's
@@ -1633,9 +1706,12 @@ refused with `reason="recipient_not_addressable"` and nothing is written.
 An unrecognized name returns the same `state: "dead"`, `alive: false` payload as
 a genuinely dead agent (`src/claude_teams/server_simple.py:883-903`, `1543`).
 
-### Inbox cursor writes are not cross-process locked
+### Ambient inbox cursor writes are not cross-process locked
 
 The lock guarding load/advance/save is a `threading.Lock` scoped to one Python
 process, deliberately so (`src/claude_teams/server_simple.py:245-249`). The
 invariant relied upon is that only the inbox owner's identity writes its own
-cursor. Two MCP server processes sharing an `IDENTITY` and session would race.
+cursor. Two ambient MCP server processes sharing an `IDENTITY` and session
+would race. `external_read` is the deliberate exception: it holds the
+session's cross-process agents lock across the full cursor transaction because
+the portable member token can be used by an old and new server process at once.

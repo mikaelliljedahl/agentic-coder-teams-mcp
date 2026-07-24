@@ -144,8 +144,9 @@ def _live_subagent_names(session_dir: Path, identity: str) -> list[str]:
         name = str(rec.get("name") or "")
         if name == identity:
             continue  # never count self
-        if rec.get("status") in server_simple._TERMINAL_STATUSES:
-            continue  # terminal (e.g. killed) is not live
+        status = rec.get("status")
+        if status in server_simple._TERMINAL_STATUSES or status == "left":
+            continue  # killed (terminal) and left (departed member) are not live
         if any_parent:
             if rec.get("parent") == identity:
                 live.append(name)
