@@ -40,9 +40,18 @@ def _quiet_dir(tmp_path: Path) -> Path:
 
 
 def _shell_probe(argv: list[str]) -> bool:
+    """Report whether this shell is usable here, without ever failing the test.
+
+    The probe decides a skip, so every way of not answering must read as "not
+    available". ``TimeoutExpired`` is one of them: a GitHub Windows runner has
+    been seen returning 1 from ``powershell -NoProfile -Command "exit 0"``
+    while leaving the stdout pipe held open, which hangs the read rather than
+    raising ``OSError``. A shell that cannot answer ``exit 0`` is not a shell
+    these tests can exercise.
+    """
     try:
         return _run(argv).returncode == 0
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return False
 
 

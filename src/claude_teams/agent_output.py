@@ -700,7 +700,17 @@ def _resolve_path_text(value: str) -> str:
 
 
 def _encode_claude_cwd(cwd: str) -> str:
-    return re.sub(r"[\\/:]", "-", cwd)
+    r"""Encode a cwd the way Claude names its ``~/.claude/projects`` directory.
+
+    Claude replaces **every** non-alphanumeric character, not only the path
+    separators: ``C:\code\_wt\E13`` becomes ``C--code--wt-E13``. Encoding
+    just ``\/:`` left the underscore intact, so any cwd containing ``_``,
+    ``.``, or a space resolved to a directory that does not exist. That is
+    indistinguishable from "no transcripts", which the binding ladder reports
+    as ``unverified`` — a terminal outcome — so a live, healthy agent became
+    permanently unreachable by ``follow_up_agent``.
+    """
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
 # ---------------------------------------------------------------------------

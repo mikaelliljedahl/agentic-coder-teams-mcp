@@ -112,7 +112,10 @@ def _claude_message(
 
 
 def _claude_project_dir(home: Path, cwd: Path) -> Path:
-    encoded = re.sub(r"[\\/:]", "-", str(cwd.resolve()))
+    # Mirrors Claude Code's own layout: EVERY non-alphanumeric character in the
+    # cwd becomes "-", not just the separators. Encoding only "\\/:" here would
+    # make the fixtures agree with a reader bug instead of with Claude.
+    encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(cwd.resolve()))
     return home / ".claude" / "projects" / encoded
 
 
@@ -2180,6 +2183,35 @@ def test_binding_prefers_own_transcript_over_newer_foreign_one(
     assert result.output is not None
     assert result.output.backend_session_id == "mine"
     assert result.output.last_message == "mine"
+
+
+@pytest.mark.parametrize("leaf", ["_wt", "my work", "v1.2", "E12_s1-agg"])
+def test_binding_survives_non_alphanumeric_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leaf: str
+) -> None:
+    """A cwd with "_", " " or "." must still find Claude's project dir.
+
+    Claude encodes every non-alphanumeric character in the cwd as "-", so a
+    reader that only encodes the separators looks in a directory that does not
+    exist, sees zero candidates, and calls a perfectly healthy agent
+    ``unverified`` — terminal, so follow-up gives up on it for good.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    cwd = tmp_path / leaf / "work"
+    _write_claude_transcript(
+        _claude_project_dir(tmp_path, cwd),
+        "mine.jsonl",
+        session_id="mine",
+        mtime=_LADDER_SPAWNED_AT + 10,
+        correlation_id="corr-own",
+        text="mine",
+    )
+
+    result = _bind(_claude_record(cwd))
+
+    assert result.outcome == ao.BINDING_BOUND
+    assert result.output is not None
+    assert result.output.backend_session_id == "mine"
 
 
 def test_binding_repins_wrong_stored_id_to_token_match(
