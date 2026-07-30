@@ -153,7 +153,7 @@ async def test_sensitive_prompt_uses_sidecar_with_newline_marker(
 
 
 def _claude_project_dir(home: Path, cwd: Path) -> Path:
-    encoded = re.sub(r"[\\/:]", "-", str(cwd.resolve()))
+    encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(cwd.resolve()))
     return home / ".claude" / "projects" / encoded
 
 
@@ -401,8 +401,7 @@ def _write_marked_transcript(
 ) -> None:
     """Write a Claude transcript carrying ``correlation_id``'s marker."""
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    encoded = re.sub(r"[\\/:]", "-", str(Path(record["cwd"]).resolve()))
-    project_dir = tmp_path / ".claude" / "projects" / encoded
+    project_dir = _claude_project_dir(tmp_path, Path(record["cwd"]))
     project_dir.mkdir(parents=True, exist_ok=True)
     stamp = (
         datetime.fromtimestamp(float(record["spawned_at"]) + 5, tz=UTC)
