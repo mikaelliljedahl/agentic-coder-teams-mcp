@@ -143,6 +143,19 @@ async def _registered_description(tool_name: str) -> str:
 
 
 @pytest.mark.asyncio
+async def test_spawn_agent_permission_mode_schema_is_constrained() -> None:
+    tool = await server_simple.mcp.get_tool("spawn_agent")
+    assert tool is not None
+
+    permission_schema = tool.parameters["properties"]["permission_mode"]
+
+    assert permission_schema["default"] == "bypass"
+    assert permission_schema["enum"] == ["bypass", "default", "require_approval"]
+    assert "backend-native" in (tool.description or "")
+    assert "acceptEdits" in (tool.description or "")
+
+
+@pytest.mark.asyncio
 async def test_agent_status_description_documents_disk_contract_and_both_recipes() -> (
     None
 ):

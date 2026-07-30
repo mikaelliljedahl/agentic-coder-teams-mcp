@@ -2893,7 +2893,7 @@ async def spawn_agent(
     backend: str = "",
     model: str = "",
     cwd: str = "",
-    permission_mode: str = "bypass",
+    permission_mode: Literal["bypass", "default", "require_approval"] = "bypass",
     reasoning_effort: str = "",
     expected_outputs: list[str] | None = None,
 ) -> dict:
@@ -2915,6 +2915,10 @@ async def spawn_agent(
     max). For codex it is silently ignored when ``model`` is a capability tier
     (the tier owns the effort); it still applies to a blank/raw-slug codex
     model. Codex accepts low/medium/high/xhigh, plus max/ultra.
+
+    permission_mode: ``bypass`` (the autonomous default), ``default``, or
+    ``require_approval``. These are win-agent-teams modes, not backend-native
+    values such as Claude Code's ``acceptEdits``.
 
     expected_outputs (optional): the exact file paths you are instructing the
     agent to create. Echoed back verbatim in the result so you can watch
@@ -3001,10 +3005,7 @@ async def spawn_agent(
                 color="blue",
                 cwd=agent_cwd,
                 lead_session_id=IDENTITY,
-                permission_mode=cast(
-                    'Literal["default", "require_approval", "bypass"]',
-                    permission_mode,
-                ),
+                permission_mode=permission_mode,
                 reasoning_effort=effort,
                 extra=extra,
             )
