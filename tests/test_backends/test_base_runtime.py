@@ -444,6 +444,12 @@ class TestWindowsTerminalTabSpawn:
         popen_mock = MagicMock(return_value=MagicMock(pid=999))
         monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
         monkeypatch.setattr(manager, "_await_tab_pid", lambda sidecar: pid)
+        # The synthetic PID is not a live OS process, so pin liveness instead of
+        # letting the ambient process table decide it. Without this, a runner
+        # that happens to own PID 4242 sends _terminate_tab down the
+        # child-enumeration branch, where the mocked Popen above makes
+        # subprocess.run raise. Tests needing a live PID override this.
+        monkeypatch.setattr(manager, "_pid_alive", lambda handle: False)
         monkeypatch.setattr(
             process_manager_mod, "creation_token", lambda handle: f"tok-{handle}"
         )

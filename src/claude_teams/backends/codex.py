@@ -108,14 +108,20 @@ class CodexBackend(BaseBackend):
     # target model is not available on this codex install the spawn errors (no
     # silent downgrade). A tier fully determines model + effort; a caller-
     # supplied ``reasoning_effort`` is silently ignored for tiers.
-    #   low    -> Terra @ medium   (dirt cheap, quick/low-stakes)
-    #   medium -> Sol   @ low       (token-efficient general default)
+    #   low    -> Luna  @ high     (dirt cheap, quick/low-stakes)
+    #   medium -> Luna  @ xhigh    (token-efficient general default)
     #   high   -> Sol   @ medium   (backend dev, code review)
     #   xhigh  -> Sol   @ high     (genuinely hard problems)
     #   ultra  -> Sol   @ xhigh    (top; higher still is diminishing returns)
+    # The cheap end runs Luna rather than Terra or Sol: under the current usage
+    # limits Luna's per-message quota is an order of magnitude larger than
+    # Sol's while a high-effort Luna run costs only a few times the tokens, so
+    # Luna @ xhigh replaces Sol @ low at a fraction of the quota. Terra is no
+    # longer on the ladder (its quota is only ~2x Sol's), but remains reachable
+    # as a raw slug.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
-        "low": ("gpt-5.6-terra", "medium"),
-        "medium": ("gpt-5.6-sol", "low"),
+        "low": ("gpt-5.6-luna", "high"),
+        "medium": ("gpt-5.6-luna", "xhigh"),
         "high": ("gpt-5.6-sol", "medium"),
         "xhigh": ("gpt-5.6-sol", "high"),
         "ultra": ("gpt-5.6-sol", "xhigh"),
@@ -164,7 +170,7 @@ class CodexBackend(BaseBackend):
     def default_model(self) -> str:
         """Return the default capability tier.
 
-        ``medium`` (Sol @ low) is the token-efficient general-purpose default.
+        ``medium`` (Luna @ xhigh) is the token-efficient general-purpose default.
 
         Returns:
             str: Default tier name.

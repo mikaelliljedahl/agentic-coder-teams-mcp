@@ -121,14 +121,17 @@ class PiBackend(BaseBackend):
     # Codex, an unavailable tier model does NOT error — it falls back to pi's
     # own default model (see ``resolve_launch``), because the user may be logged
     # into a provider whose catalog does not contain these slugs.
-    #   low    -> Terra @ medium
-    #   medium -> Sol   @ low     (token-efficient general default)
+    #   low    -> Luna  @ high
+    #   medium -> Luna  @ xhigh   (token-efficient general default)
     #   high   -> Sol   @ medium
     #   xhigh  -> Sol   @ high
     #   ultra  -> Sol   @ xhigh
+    # The cheap end runs Luna rather than Terra or Sol for the quota reasons
+    # documented on the Codex ladder; Terra is off the ladder but still
+    # reachable as a raw slug.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
-        "low": ("gpt-5.6-terra", "medium"),
-        "medium": ("gpt-5.6-sol", "low"),
+        "low": ("gpt-5.6-luna", "high"),
+        "medium": ("gpt-5.6-luna", "xhigh"),
         "high": ("gpt-5.6-sol", "medium"),
         "xhigh": ("gpt-5.6-sol", "high"),
         "ultra": ("gpt-5.6-sol", "xhigh"),
