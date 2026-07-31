@@ -106,7 +106,11 @@ class TestPiModels:
         assert PiBackend().default_model() == "medium"
 
     def test_resolve_model_tier_to_slug(self):
-        assert PiBackend().resolve_model("medium") == "gpt-5.6-sol"
+        backend = PiBackend()
+        assert backend.resolve_model("low") == "gpt-5.6-luna"
+        assert backend.resolve_model("medium") == "gpt-5.6-luna"
+        assert backend.resolve_model("high") == "gpt-5.6-sol"
+        assert backend.resolve_model("ultra") == "gpt-5.6-sol"
 
     def test_resolve_model_passthrough(self):
         assert PiBackend().resolve_model("some-model") == "some-model"
@@ -117,8 +121,12 @@ class TestPiModels:
 
 class TestPiResolveLaunch:
     def test_tier_maps_to_model_and_thinking(self, _models):
-        assert PiBackend().resolve_launch("medium", None) == ("gpt-5.6-sol", "low")
-        assert PiBackend().resolve_launch("low", None) == ("gpt-5.6-terra", "medium")
+        backend = PiBackend()
+        assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
+        assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
+        assert backend.resolve_launch("ultra", None) == ("gpt-5.6-sol", "xhigh")
 
     def test_tier_owns_thinking_ignoring_caller(self, _models):
         assert PiBackend().resolve_launch("high", "max") == ("gpt-5.6-sol", "medium")
@@ -130,7 +138,18 @@ class TestPiResolveLaunch:
         # Logged into a provider without the gpt-5.6 catalog: keep the tier's
         # thinking level but drop the model so pi uses its own default.
         _models(["claude-sonnet-4", "claude-opus-4"])
-        assert PiBackend().resolve_launch("medium", None) == ("", "low")
+        assert PiBackend().resolve_launch("medium", None) == ("", "xhigh")
+
+    def test_partial_catalog_drops_model_rather_than_substituting(self, _models):
+        # Sol present but Luna absent: the Luna-backed tiers do NOT silently
+        # fall back to Sol (pi has no model-substitution rule) — they drop the
+        # model and keep the tier's thinking level, while the Sol-backed tiers
+        # are unaffected.
+        _models(["gpt-5.6-sol"])
+        backend = PiBackend()
+        assert backend.resolve_launch("low", None) == ("", "high")
+        assert backend.resolve_launch("medium", None) == ("", "xhigh")
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
 
     def test_raw_slug_passthrough_when_available(self, _models):
         assert PiBackend().resolve_launch("gpt-5.5", "high") == ("gpt-5.5", "high")
@@ -140,7 +159,7 @@ class TestPiResolveLaunch:
 
     def test_skips_validation_when_discovery_empty(self, _models):
         _models([])
-        assert PiBackend().resolve_launch("medium", None) == ("gpt-5.6-sol", "low")
+        assert PiBackend().resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
 
 
 class TestPiBuildCommand:
@@ -167,6 +186,31 @@ class TestPiBuildCommand:
         cmd = PiBackend().build_command(_make_request(model="gpt-5.6-sol"))
         assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-5.6-sol"
         assert cmd[cmd.index("--thinking") + 1] == "low"
+
+    def test_medium_tier_launch_reaches_argv(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        # The default tier's resolved (slug, thinking) must survive into argv:
+        # tuple-level resolve_launch assertions alone don't prove that.
+        backend = PiBackend()
+        model, thinking = backend.resolve_launch("medium", None)
+        cmd = backend.build_command(
+            _make_request(model=model, reasoning_effort=thinking)
+        )
+        assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-5.6-luna"
+        assert cmd[cmd.index("--thinking") + 1] == "xhigh"
+
+    def test_medium_tier_fallback_keeps_thinking_without_model(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        _models(["gpt-5.6-sol"])  # partial catalog: Sol present, Luna absent
+        backend = PiBackend()
+        model, thinking = backend.resolve_launch("medium", None)
+        cmd = backend.build_command(
+            _make_request(model=model, reasoning_effort=thinking)
+        )
+        assert "--model" not in cmd
+        assert cmd[cmd.index("--thinking") + 1] == "xhigh"
 
     def test_no_model_arg_when_blank(
         self, _make_request, _direct_launch, _tty, _models
