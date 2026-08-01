@@ -70,11 +70,12 @@ class TestCodexSupportedModels:
     def test_returns_capability_tiers_not_slugs(self):
         backend = CodexBackend()
         assert backend.supported_models() == [
+            "cheapest",
             "low",
             "medium",
             "high",
             "xhigh",
-            "ultra",
+            "max",
         ]
 
 
@@ -87,10 +88,11 @@ class TestCodexDefaultModel:
 class TestCodexResolveModel:
     def test_resolves_tier_to_slug(self):
         backend = CodexBackend()
+        assert backend.resolve_model("cheapest") == "gpt-5.6-luna"
         assert backend.resolve_model("low") == "gpt-5.6-luna"
         assert backend.resolve_model("medium") == "gpt-5.6-luna"
         assert backend.resolve_model("high") == "gpt-5.6-sol"
-        assert backend.resolve_model("ultra") == "gpt-5.6-sol"
+        assert backend.resolve_model("max") == "gpt-5.6-sol"
 
     def test_passes_through_direct_slug(self):
         backend = CodexBackend()
@@ -109,11 +111,19 @@ class TestCodexResolveLaunch:
     def test_tiers_map_to_model_and_effort(self, _stub_discovery):
         _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
         backend = CodexBackend()
+        assert backend.resolve_launch("cheapest", None) == (
+            "gpt-5.6-luna",
+            "medium",
+        )
         assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
         assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
         assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
         assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
-        assert backend.resolve_launch("ultra", None) == ("gpt-5.6-sol", "xhigh")
+        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "xhigh")
+
+    def test_old_ultra_name_uses_raw_slug_passthrough(self, _stub_discovery):
+        _stub_discovery(["ultra"])
+        assert CodexBackend().resolve_launch("ultra", None) == ("ultra", None)
 
     def test_explicit_effort_ignored_for_tier(self, _stub_discovery):
         _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
@@ -146,6 +156,10 @@ class TestCodexResolveLaunch:
     def test_luna_tiers_ok_without_sol(self, _stub_discovery):
         _stub_discovery(["gpt-5.6-terra", "gpt-5.6-luna"])  # Luna present
         backend = CodexBackend()
+        assert backend.resolve_launch("cheapest", None) == (
+            "gpt-5.6-luna",
+            "medium",
+        )
         assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
         assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
 
@@ -159,6 +173,8 @@ class TestCodexResolveLaunch:
         _stub_discovery(["gpt-5.6-terra", "gpt-5.6-sol"])  # Sol present
         backend = CodexBackend()
         assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
+        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "xhigh")
 
     def test_errors_when_no_5_6_at_all(self, _stub_discovery):
         _stub_discovery(["gpt-5.5"])  # neither Luna nor Sol
@@ -169,7 +185,7 @@ class TestCodexResolveLaunch:
     def test_skips_validation_when_discovery_unavailable(self, _stub_discovery):
         _stub_discovery([])  # cannot determine -> no false error
         backend = CodexBackend()
-        assert backend.resolve_launch("ultra", None) == ("gpt-5.6-sol", "xhigh")
+        assert backend.resolve_launch("ultra", None) == ("ultra", None)
 
 
 class TestCodexBuildCommand:
@@ -292,6 +308,18 @@ class TestCodexModelArg:
         cmd = backend.build_command(_make_request(model=model, reasoning_effort=effort))
 
         assert "model='gpt-5.6-luna'" in cmd
+        assert "model_reasoning_effort=xhigh" in cmd
+
+    def test_build_command_emits_max_tier_launch(
+        self, _make_request, _stub_discovery
+    ):
+        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
+        backend = CodexBackend()
+        model, effort = backend.resolve_launch("max", None)
+
+        cmd = backend.build_command(_make_request(model=model, reasoning_effort=effort))
+
+        assert "model='gpt-5.6-sol'" in cmd
         assert "model_reasoning_effort=xhigh" in cmd
 
     def test_build_command_omits_c_model_override_when_blank(self, _make_request):

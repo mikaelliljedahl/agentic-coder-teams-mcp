@@ -113,28 +113,30 @@ class PiBackend(BaseBackend):
         """
         return True
 
-    # The model interface exposed to the MCP caller: five capability tiers,
+    # The model interface exposed to the MCP caller: six capability tiers,
     # each bundling a concrete model with a ``--thinking`` level, as an
     # ascending cost/quality ladder. Names mirror the effort words the caller
-    # already reasons in (low..ultra), matching the Codex backend's ladder so a
+    # already reasons in (cheapest..max), matching the Codex backend's ladder so a
     # coordinator can pick a tier without knowing pi's model slugs. Unlike
     # Codex, an unavailable tier model does NOT error — it falls back to pi's
     # own default model (see ``resolve_launch``), because the user may be logged
     # into a provider whose catalog does not contain these slugs.
+    #   cheapest -> Luna @ medium
     #   low    -> Luna  @ high
     #   medium -> Luna  @ xhigh   (token-efficient general default)
     #   high   -> Sol   @ medium
     #   xhigh  -> Sol   @ high
-    #   ultra  -> Sol   @ xhigh
+    #   max    -> Sol   @ xhigh
     # The cheap end runs Luna rather than Terra or Sol for the quota reasons
     # documented on the Codex ladder; Terra is off the ladder but still
     # reachable as a raw slug.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
+        "cheapest": ("gpt-5.6-luna", "medium"),
         "low": ("gpt-5.6-luna", "high"),
         "medium": ("gpt-5.6-luna", "xhigh"),
         "high": ("gpt-5.6-sol", "medium"),
         "xhigh": ("gpt-5.6-sol", "high"),
-        "ultra": ("gpt-5.6-sol", "xhigh"),
+        "max": ("gpt-5.6-sol", "xhigh"),
     }
 
     _THINKING_OPTIONS: ClassVar[frozenset[str]] = frozenset(
@@ -144,7 +146,7 @@ class PiBackend(BaseBackend):
     def supported_models(self) -> list[str]:
         """Return the capability tiers the MCP caller may choose from.
 
-        Deliberately the tier names (``low``..``ultra``), not raw model slugs.
+        Deliberately the tier names (``cheapest``..``max``), not raw model slugs.
 
         Returns:
             list[str]: Selectable tier names, cheapest first.

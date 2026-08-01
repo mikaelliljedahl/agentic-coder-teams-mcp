@@ -100,19 +100,20 @@ class CodexBackend(BaseBackend):
         """
         return True
 
-    # The ONLY model interface exposed to the MCP caller: five capability
+    # The ONLY model interface exposed to the MCP caller: six capability
     # tiers, each bundling a concrete GPT-5.6 model with a reasoning effort,
     # as an ascending cost/quality ladder. Names mirror the effort words the
-    # caller already reasons in (low..ultra) rather than raw model slugs, which
+    # caller already reasons in (cheapest..max) rather than raw model slugs, which
     # the caller has no basis to choose between. All targets are GPT-5.6; if the
     # target model is not available on this codex install the spawn errors (no
     # silent downgrade). A tier fully determines model + effort; a caller-
     # supplied ``reasoning_effort`` is silently ignored for tiers.
+    #   cheapest -> Luna @ medium  (cheapest/fastest)
     #   low    -> Luna  @ high     (dirt cheap, quick/low-stakes)
     #   medium -> Luna  @ xhigh    (token-efficient general default)
     #   high   -> Sol   @ medium   (backend dev, code review)
     #   xhigh  -> Sol   @ high     (genuinely hard problems)
-    #   ultra  -> Sol   @ xhigh    (top; higher still is diminishing returns)
+    #   max    -> Sol   @ xhigh    (top; higher still is diminishing returns)
     # The cheap end runs Luna rather than Terra or Sol: under the current usage
     # limits Luna's per-message quota is an order of magnitude larger than
     # Sol's while a high-effort Luna run costs only a few times the tokens, so
@@ -120,11 +121,12 @@ class CodexBackend(BaseBackend):
     # longer on the ladder (its quota is only ~2x Sol's), but remains reachable
     # as a raw slug.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
+        "cheapest": ("gpt-5.6-luna", "medium"),
         "low": ("gpt-5.6-luna", "high"),
         "medium": ("gpt-5.6-luna", "xhigh"),
         "high": ("gpt-5.6-sol", "medium"),
         "xhigh": ("gpt-5.6-sol", "high"),
-        "ultra": ("gpt-5.6-sol", "xhigh"),
+        "max": ("gpt-5.6-sol", "xhigh"),
     }
 
     _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
@@ -156,7 +158,7 @@ class CodexBackend(BaseBackend):
     def supported_models(self) -> list[str]:
         """Return the capability tiers the MCP caller may choose from.
 
-        Deliberately the tier names (``low``..``ultra``), not raw model slugs:
+        Deliberately the tier names (``cheapest``..``max``), not raw model slugs:
         the caller reasons about how much capability a task needs, not about
         GPT-5.6 model identities. Each tier maps to a concrete model+effort in
         :attr:`_TIER_LAUNCH`.
@@ -206,7 +208,7 @@ class CodexBackend(BaseBackend):
 
         - Blank ``model`` -> ``("", effort)``: no ``-c model`` override is
           emitted and codex uses its own ``config.toml`` default (escape hatch).
-        - A capability tier (``low``/``medium``/``high``/``xhigh``/``ultra``)
+        - A capability tier (``cheapest``/``low``/``medium``/``high``/``xhigh``/``max``)
           resolves to its bundled ``(GPT-5.6 slug, effort)``; a caller-supplied
           ``reasoning_effort`` is silently ignored (the tier owns the effort).
         - Any other value is treated as a raw model slug and passes through

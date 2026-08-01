@@ -2902,11 +2902,12 @@ async def spawn_agent(
     model: pick by how much capability the task needs, not by a model name.
     For codex, choose one capability tier (each maps to a GPT-5.6 model at a
     fixed reasoning effort), cheapest first:
+      - ``cheapest`` -> fastest/cheapest tasks
       - ``low``    -> quick, low-stakes tasks
       - ``medium`` -> token-efficient general default
       - ``high``   -> backend development, code review
       - ``xhigh``  -> genuinely hard problems
-      - ``ultra``  -> the hardest problems (top tier)
+      - ``max``    -> the hardest problems (top tier)
     Spawning errors if the required GPT-5.6 model is not available on this
     machine (upgrade codex / check account access) — there is no silent
     downgrade. For claude-code, ``model`` is haiku/sonnet/opus/fable.
