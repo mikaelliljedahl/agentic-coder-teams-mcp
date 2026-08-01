@@ -95,11 +95,12 @@ class TestPiProperties:
 class TestPiModels:
     def test_supported_models_are_tiers(self):
         assert PiBackend().supported_models() == [
+            "cheapest",
             "low",
             "medium",
             "high",
             "xhigh",
-            "ultra",
+            "max",
         ]
 
     def test_default_model_is_medium(self):
@@ -107,10 +108,11 @@ class TestPiModels:
 
     def test_resolve_model_tier_to_slug(self):
         backend = PiBackend()
+        assert backend.resolve_model("cheapest") == "gpt-5.6-luna"
         assert backend.resolve_model("low") == "gpt-5.6-luna"
         assert backend.resolve_model("medium") == "gpt-5.6-luna"
         assert backend.resolve_model("high") == "gpt-5.6-sol"
-        assert backend.resolve_model("ultra") == "gpt-5.6-sol"
+        assert backend.resolve_model("max") == "gpt-5.6-sol"
 
     def test_resolve_model_passthrough(self):
         assert PiBackend().resolve_model("some-model") == "some-model"
@@ -122,11 +124,19 @@ class TestPiModels:
 class TestPiResolveLaunch:
     def test_tier_maps_to_model_and_thinking(self, _models):
         backend = PiBackend()
+        assert backend.resolve_launch("cheapest", None) == (
+            "gpt-5.6-luna",
+            "medium",
+        )
         assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
         assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
         assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
         assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
-        assert backend.resolve_launch("ultra", None) == ("gpt-5.6-sol", "xhigh")
+        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "xhigh")
+
+    def test_old_ultra_name_uses_raw_slug_behavior(self, _models):
+        _models(["ultra"])
+        assert PiBackend().resolve_launch("ultra", None) == ("ultra", None)
 
     def test_tier_owns_thinking_ignoring_caller(self, _models):
         assert PiBackend().resolve_launch("high", "max") == ("gpt-5.6-sol", "medium")
@@ -150,6 +160,8 @@ class TestPiResolveLaunch:
         assert backend.resolve_launch("low", None) == ("", "high")
         assert backend.resolve_launch("medium", None) == ("", "xhigh")
         assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
+        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "xhigh")
 
     def test_raw_slug_passthrough_when_available(self, _models):
         assert PiBackend().resolve_launch("gpt-5.5", "high") == ("gpt-5.5", "high")
@@ -199,6 +211,17 @@ class TestPiBuildCommand:
         )
         assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-5.6-luna"
         assert cmd[cmd.index("--thinking") + 1] == "xhigh"
+
+    def test_cheapest_tier_launch_reaches_argv(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        backend = PiBackend()
+        model, thinking = backend.resolve_launch("cheapest", None)
+        cmd = backend.build_command(
+            _make_request(model=model, reasoning_effort=thinking)
+        )
+        assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-5.6-luna"
+        assert cmd[cmd.index("--thinking") + 1] == "medium"
 
     def test_medium_tier_fallback_keeps_thinking_without_model(
         self, _make_request, _direct_launch, _tty, _models
