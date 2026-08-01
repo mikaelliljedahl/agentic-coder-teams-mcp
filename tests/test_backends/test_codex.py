@@ -310,9 +310,7 @@ class TestCodexModelArg:
         assert "model='gpt-5.6-luna'" in cmd
         assert "model_reasoning_effort=xhigh" in cmd
 
-    def test_build_command_emits_max_tier_launch(
-        self, _make_request, _stub_discovery
-    ):
+    def test_build_command_emits_max_tier_launch(self, _make_request, _stub_discovery):
         _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
         backend = CodexBackend()
         model, effort = backend.resolve_launch("max", None)
