@@ -1510,8 +1510,12 @@ def _watch_argv(
     timeout: float | None = None,
     reader: str | None = None,
 ) -> list[str]:
-    """Return the canonical shell-neutral argv for watching ``session_dir``."""
+    """Return an owner-bound shell-neutral argv for watching ``session_dir``."""
     argv = [sys.executable, "-m", "claude_teams.cli", "watch", str(session_dir)]
+    owner_pid = os.getppid()
+    owner_token = process_manager.creation_token(str(owner_pid))
+    if owner_token is not None:
+        argv.extend(["--owner-pid", str(owner_pid), "--owner-token", owner_token])
     if timeout is not None:
         argv.extend(["--timeout", str(timeout)])
     if reader is not None:
@@ -1558,7 +1562,11 @@ tight-poll this tool — use the watch recipe below instead.
 The `win-agent-teams` console script may not be on PATH. `spawn_agent` and
 `agent_watch_paths` return a ready-to-run, shell-neutral `watch_argv`, plus
 `watch_command_bash` and `watch_command_powershell` renderings. Use
-`watch_argv` for direct process spawning and for shells such as cmd.exe.
+`watch_argv` for direct process spawning and for shells such as cmd.exe. Run
+that exact command as one harness-tracked task. Never put it in `while true`,
+`nohup`, a detached wrapper script, or another self-restarting loop: the
+returned command is already bound to this coordinator's PID and exits when
+that owner disappears. Re-arm only from the live coordinator after a wake.
 The watcher ignores non-actionable churn — `running` hook transitions and
 `SubagentStop` (a worker's own internal Task subagent finishing) — and emits
 one JSON wake record: `reason="message"` for unread inbox data,
@@ -2941,8 +2949,10 @@ async def spawn_agent(
     Recommended coordination pattern: do NOT tight-poll. Run the returned
     ``watch_argv`` directly, or use the returned Bash/PowerShell rendering.
     Use a background watch for Claude Code and a bounded foreground watch for
-    Codex. The watcher is one-shot, so re-arm it after every wake. Re-check
-    status after timeout exit 2 before mounting the next watch.
+    Codex. Never wrap it in a detached or self-restarting shell loop. The
+    watcher is one-shot and owner-bound, so the live coordinator re-arms it
+    after every wake. Re-check status after timeout exit 2 before mounting the
+    next watch.
     """
 
     def _do_spawn() -> dict:

@@ -18,6 +18,10 @@ from claude_teams.agent_output import (
     SPAWNED_BY_SOURCE_FIELD,
     SPAWNED_BY_SOURCE_OPERATOR,
 )
+from claude_teams.backends.process_manager import (
+    OWNERSHIP_NOT_OURS,
+    process_manager,
+)
 from claude_teams.backends.registry import registry
 from claude_teams.hooks import _SAFE_AGENT_RE
 from claude_teams.messaging import (
@@ -484,6 +488,31 @@ def _require_safe_reader(reader: str) -> str:
     return reader
 
 
+def _owner_gone(owner_pid: int | None, owner_token: str | None) -> bool:
+    """Return whether an explicitly bound watcher owner is provably gone.
+
+    A transiently unreadable live process is deliberately not treated as dead:
+    ``ownership_probe`` distinguishes that indeterminate state from a missing
+    process or PID reuse. Canonical watch commands always pass PID and creation
+    token together, so a recycled PID cannot keep an orphan watcher alive.
+    """
+    if owner_pid is None or owner_token is None:
+        return False
+    return (
+        process_manager.ownership_probe(str(owner_pid), owner_token)
+        == OWNERSHIP_NOT_OURS
+    )
+
+
+def _require_live_owner(owner_pid: int | None, owner_token: str | None) -> None:
+    """Validate an optional owner binding and refuse a stale owner."""
+    if (owner_pid is None) != (owner_token is None):
+        typer.echo("--owner-pid and --owner-token must be supplied together", err=True)
+        raise typer.Exit(code=1)
+    if _owner_gone(owner_pid, owner_token):
+        raise typer.Exit(code=4)
+
+
 @app.command()
 def watch(
     session_dir: str = typer.Argument(..., help="Directory to watch."),
@@ -509,6 +538,17 @@ def watch(
             "omit for the current env-based behavior."
         ),
     ),
+    owner_pid: int | None = typer.Option(
+        None,
+        "--owner-pid",
+        min=1,
+        help="Exit when this coordinator PID is gone or reused.",
+    ),
+    owner_token: str | None = typer.Option(
+        None,
+        "--owner-token",
+        help="PID creation token paired with --owner-pid.",
+    ),
 ) -> None:
     """Block until an agent is waiting, an inbox is unread, or output changes.
 
@@ -527,8 +567,13 @@ def watch(
     ``waiting``, or ``output``. Timeout prints nothing and exits 2; re-check
     status after exit 2 because a waiting transition may precede the initial
     marker snapshot, or a genuine waiting edge may still be inside its settle
-    window at the deadline.
+    window at the deadline. Canonical commands bind the watcher to the
+    coordinator process with ``--owner-pid`` plus ``--owner-token``; owner exit
+    (including PID reuse) exits 4 so a detached shell cannot leave the watcher
+    behind.
     """
+    _require_live_owner(owner_pid, owner_token)
+
     directory = Path(session_dir)
     deadline = time.monotonic() + timeout
     before = _snapshot_mtimes(directory, pattern)
@@ -566,6 +611,8 @@ def watch(
     pending_waits: dict[str, float] = {}
 
     while True:
+        if _owner_gone(owner_pid, owner_token):
+            raise typer.Exit(code=4)
         now = time.monotonic()
         after = _snapshot_mtimes(directory, pattern)
         changed = _changed_paths(before, after)

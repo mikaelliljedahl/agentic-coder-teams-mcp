@@ -52,6 +52,11 @@ If unsure and you are on one shared machine/folder: pick **Mode A**.
    <your-name>`; append `--timeout 3600`.) When it fires (`reason:"message"`) it
    re-invokes you.
 
+   Run the returned command directly as one tracked background task. Never put
+   it in `while true`, `nohup`, a detached helper script, or another
+   self-restarting loop. The command is owner-bound and exits when this member
+   process disappears.
+
 3. **Drain and reply** whenever the watcher wakes you:
    ```
    external_read(member_token=...)          # read the lead's work

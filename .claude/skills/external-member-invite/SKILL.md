@@ -56,7 +56,9 @@ woken instead of polling:
 - If you are a **top-level** lead you started yourself, run `install_lead_wake`
   once, then keep an inbox watcher armed as a **background** task (the lead-wake
   Stop hook will print the exact `watch` command if none is armed). Re-arm it
-  after each wake; use a long `--timeout` so an idle wait rarely re-fires.
+  after each wake; use a long `--timeout` so an idle wait rarely re-fires. Run
+  that exact command directly—never through `while true`, `nohup`, or a detached
+  self-restarting wrapper.
 
 ### 4. Exchange messages
 

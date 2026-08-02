@@ -98,6 +98,12 @@ Do **not** spin on `check_agent`/`list_agents`. Each worker writes a `state-<age
 
 Execute the returned shell-neutral `watch_argv` directly. The `win-agent-teams` console script may not be on PATH. For pasted commands, use `watch_command_bash` in Bash and `watch_command_powershell` in PowerShell; for cmd.exe use `watch_argv`. The returned command uses the CLI's default 60-second timeout; append argv tokens when a different timeout or pattern is required.
 
+Run exactly one returned watcher command as a harness-tracked task. Never put it
+inside `while true`, `nohup`, a detached helper script, or any self-restarting
+loop. The returned command is bound to the current coordinator PID and exits
+when that owner disappears. Re-arm only from the still-live coordinator after
+the one-shot watcher wakes or times out.
+
 - **Claude Code coordinator** → run the watch as a **background** command. Its completion wakes you; then call `agent_status`/`check_agent` for the delta. You spend no tokens while it blocks.
 - **Codex coordinator** (no marker-event idle-wake) → for same-turn coordination, run the watch as a **bounded foreground** command in the **current turn**, looped: exit `0` means an **actionable edge** (see below) and exit `2` means timeout; on each exit, read the marker JSON (and/or call `agent_status`), then read messages and verify the output file before deciding the worker is done. If not done and the worker is still alive, watch again. Longer tasks can take several rounds — that is normal.
 - **Codex thread automation variant** → for long-running work where you do not want to hold the current turn open, create/use a Codex thread automation as a scheduled heartbeat for this same thread. On each wake, rediscover paths if needed (`agent_watch_paths` / retained `session_dir`), inspect marker/messages/output, then either stop/report or schedule/allow the next heartbeat. This is time-based polling, not an event wake from the marker file.
