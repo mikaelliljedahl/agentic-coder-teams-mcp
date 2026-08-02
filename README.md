@@ -401,7 +401,13 @@ The loop:
 2. Execute `watch_argv` directly, or use the rendering for your current shell.
    The `win-agent-teams` console script may not be on PATH; `watch_argv` uses
    the server's interpreter with `-m claude_teams.cli` and is the canonical
-   value (also use it for cmd.exe). The watcher ignores non-actionable churn
+   value (also use it for cmd.exe). The returned command carries the
+   coordinator PID and its creation token; it exits if that exact owner dies
+   or its PID is reused. Each lead receives its own binding, so concurrent
+   leads on one machine remain independent. Run it as one harness-tracked task.
+   Never place it in `while true`, `nohup`, a detached wrapper script, or
+   another self-restarting loop. Re-arm only from the live coordinator after a
+   wake. The watcher ignores non-actionable churn
    and exits only for actionable work: unread lead inbox data, a selected output
    change, or a marker that settles as `waiting`. Two writes are treated as
    churn and never wake on their own: `running` lifecycle transitions, and

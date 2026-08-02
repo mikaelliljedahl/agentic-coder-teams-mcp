@@ -13,6 +13,7 @@ from click.testing import Result
 from typer.testing import CliRunner
 
 from claude_teams import cli, server_simple
+from claude_teams.backends.process_manager import process_manager
 from claude_teams.cli import app
 
 
@@ -61,13 +62,58 @@ def test_watch_argv_starts_with_current_interpreter_module_and_watch() -> None:
     assert argv[:4] == [sys.executable, "-m", "claude_teams.cli", "watch"]
 
 
-def test_watch_argv_keeps_session_dir_with_spaces_as_one_token() -> None:
+def test_watch_argv_keeps_session_dir_with_spaces_as_one_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session_dir = "C:\\session root\\one session"
+    monkeypatch.setattr(server_simple.os, "getppid", lambda: 1234)
+    monkeypatch.setattr(
+        server_simple.process_manager, "creation_token", lambda handle: "born-1"
+    )
 
     argv = server_simple._watch_argv(session_dir)
 
     assert argv[4] == session_dir
-    assert len(argv) == 5
+    assert argv[5:] == [
+        "--owner-pid",
+        "1234",
+        "--owner-token",
+        "born-1",
+    ]
+
+
+def test_watch_argv_omits_owner_binding_when_token_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server_simple.process_manager, "creation_token", lambda handle: None
+    )
+
+    assert server_simple._watch_argv("session") == [
+        sys.executable,
+        "-m",
+        "claude_teams.cli",
+        "watch",
+        "session",
+    ]
+
+
+def test_watch_argv_binds_concurrent_leads_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_ids = iter([111, 222])
+    monkeypatch.setattr(server_simple.os, "getppid", lambda: next(parent_ids))
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "creation_token",
+        lambda handle: f"born-{handle}",
+    )
+
+    first = server_simple._watch_argv("session-a")
+    second = server_simple._watch_argv("session-b")
+
+    assert first[5:] == ["--owner-pid", "111", "--owner-token", "born-111"]
+    assert second[5:] == ["--owner-pid", "222", "--owner-token", "born-222"]
 
 
 def test_watch_argv_omits_timeout_when_none() -> None:
@@ -117,6 +163,42 @@ def test_watch_argv_executes_and_times_out_quietly(tmp_path: Path) -> None:
     assert result.returncode == 2
     assert result.stdout == ""
     assert result.stderr == ""
+
+
+def test_watch_subprocess_exits_when_bound_owner_dies(tmp_path: Path) -> None:
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1.5)"])
+    try:
+        token = process_manager.creation_token(str(owner.pid))
+        if token is None:
+            pytest.skip("process creation tokens are unavailable on this platform")
+        watcher = subprocess.Popen(  # noqa: S603 - fixed module argv.
+            [
+                sys.executable,
+                "-m",
+                "claude_teams.cli",
+                "watch",
+                str(tmp_path),
+                "--timeout",
+                "10",
+                "--owner-pid",
+                str(owner.pid),
+                "--owner-token",
+                token,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        owner.wait(timeout=5)
+        stdout, stderr = watcher.communicate(timeout=5)
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=5)
+
+    assert watcher.returncode == 4
+    assert stdout == ""
+    assert stderr == ""
 
 
 def test_watch_command_bash_executes_and_times_out_quietly(tmp_path: Path) -> None:

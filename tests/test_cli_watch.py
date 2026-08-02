@@ -8,6 +8,10 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from claude_teams import cli
+from claude_teams.backends.process_manager import (
+    OWNERSHIP_NOT_OURS,
+    OWNERSHIP_OURS,
+)
 from claude_teams.cli import app
 
 runner = CliRunner()
@@ -17,6 +21,64 @@ def test_watch_exits_2_on_timeout_with_no_change(tmp_path: Path) -> None:
     result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "1"])
 
     assert result.exit_code == 2
+
+
+def test_watch_exits_4_when_bound_owner_is_gone(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli.process_manager,
+        "ownership_probe",
+        lambda handle, token: OWNERSHIP_NOT_OURS,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "watch",
+            str(tmp_path),
+            "--owner-pid",
+            "123",
+            "--owner-token",
+            "born-1",
+        ],
+    )
+
+    assert result.exit_code == 4
+
+
+def test_watch_keeps_running_while_bound_owner_matches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        cli.process_manager,
+        "ownership_probe",
+        lambda handle, token: OWNERSHIP_OURS,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "watch",
+            str(tmp_path),
+            "--timeout",
+            "0",
+            "--owner-pid",
+            "123",
+            "--owner-token",
+            "born-1",
+        ],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_watch_rejects_partial_owner_binding(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["watch", str(tmp_path), "--owner-pid", "123", "--timeout", "0"],
+    )
+
+    assert result.exit_code == 1
+    assert "must be supplied together" in result.stderr
 
 
 def test_watch_exits_0_and_prints_path_when_file_created(

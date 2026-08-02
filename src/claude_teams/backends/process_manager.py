@@ -323,6 +323,13 @@ class _PidOwnershipMixin:
             return OWNERSHIP_OURS
         if not expected_token:
             return OWNERSHIP_NOT_OURS
+        # On Windows a terminated process's immutable creation FILETIME can
+        # remain readable briefly while another process still holds a handle.
+        # Token equality alone therefore does not prove liveness. Check the
+        # exit state first so an owner-bound watcher exits as soon as its
+        # coordinator does, even during that retained-handle window.
+        if not self._pid_alive(handle):
+            return OWNERSHIP_NOT_OURS
         live = creation_token(handle)
         if live is not None:
             return OWNERSHIP_OURS if live == expected_token else OWNERSHIP_NOT_OURS
