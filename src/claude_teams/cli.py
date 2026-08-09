@@ -517,7 +517,7 @@ def _require_live_owner(owner_pid: int | None, owner_token: str | None) -> None:
 def watch(
     session_dir: str = typer.Argument(..., help="Directory to watch."),
     timeout: float = typer.Option(
-        60.0, "--timeout", "-t", help="Seconds to wait before giving up."
+        1800.0, "--timeout", "-t", help="Seconds to wait before giving up."
     ),
     pattern: str = typer.Option(
         _WATCH_DEFAULT_PATTERN,

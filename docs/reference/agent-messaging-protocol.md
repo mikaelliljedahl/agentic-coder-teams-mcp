@@ -1402,8 +1402,8 @@ unmarked; no id is ever invented.
 
 ## 5. The watcher
 
-`win-agent-teams watch <session_dir> [--timeout 60] [--pattern state-*.json] [--inbox/--no-inbox]`
-(`src/claude_teams/cli.py:182-199`).
+`win-agent-teams watch <session_dir> [--timeout 1800] [--pattern state-*.json] [--inbox/--no-inbox]`
+(`src/claude_teams/cli.py`, the `watch()` command).
 
 ### The R3 delivery contract
 
@@ -1453,7 +1453,8 @@ its own inbox.
 ### Poll loop
 
 - Poll interval: **0.5 s** (`src/claude_teams/cli.py:19`, `309`).
-- Default timeout: **60 s** (`src/claude_teams/cli.py:186`).
+- Default timeout: **1800 s** (30 min) (`src/claude_teams/cli.py`, the `watch()`
+  `--timeout` option).
 - File identity is `(mtime_ns, size)`, not bare mtime, so a same-tick atomic
   replace that changes size is still detected
   (`src/claude_teams/cli.py:109-126`).
