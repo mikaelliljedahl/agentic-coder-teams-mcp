@@ -5,6 +5,8 @@ import threading
 import time
 from pathlib import Path
 
+import click
+import typer.main
 from typer.testing import CliRunner
 
 from claude_teams import cli
@@ -15,6 +17,18 @@ from claude_teams.backends.process_manager import (
 from claude_teams.cli import app
 
 runner = CliRunner()
+
+
+def test_watch_default_timeout_is_1800_seconds() -> None:
+    """Metadata-only: never invoke `watch` without an explicit timeout here."""
+    command = typer.main.get_command(app)
+    assert isinstance(command, click.Group)
+    watch_cmd = command.commands["watch"]
+    timeout_opt = next(
+        p for p in watch_cmd.params if "--timeout" in getattr(p, "opts", [])
+    )
+
+    assert timeout_opt.default == 1800.0
 
 
 def test_watch_exits_2_on_timeout_with_no_change(tmp_path: Path) -> None:
