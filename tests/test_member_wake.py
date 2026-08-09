@@ -310,6 +310,10 @@ class TestDecisionCore:
         assert "--reader" in result.reason
         assert MEMBER in result.reason
         assert "background" in result.reason.lower()
+        # Hook-emitted commands are deliberately unbound: the hook's parent is a
+        # transient wrapper, so a baked-in owner PID would die instantly (exit 4).
+        assert "--owner-pid" not in result.reason
+        assert "--owner-token" not in result.reason
         # The leave_team escape hatch (review-1 Major 1).
         assert "leave_team" in result.reason
 

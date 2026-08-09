@@ -22,6 +22,7 @@ def _run(
     *,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    timeout: float = 10,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603
         argv,
@@ -29,7 +30,7 @@ def _run(
         env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
         check=False,
     )
 
@@ -96,6 +97,40 @@ def test_watch_argv_omits_owner_binding_when_token_is_unavailable(
         "watch",
         "session",
     ]
+
+
+def test_watch_argv_omits_owner_binding_when_bind_owner_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server_simple.os, "getppid", lambda: 1234)
+    monkeypatch.setattr(
+        server_simple.process_manager, "creation_token", lambda handle: "born-1"
+    )
+
+    assert server_simple._watch_argv("session", bind_owner=False) == [
+        sys.executable,
+        "-m",
+        "claude_teams.cli",
+        "watch",
+        "session",
+    ]
+
+
+def test_watch_command_bash_omits_owner_binding_when_bind_owner_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server_simple.os, "getppid", lambda: 1234)
+    monkeypatch.setattr(
+        server_simple.process_manager, "creation_token", lambda handle: "born-1"
+    )
+
+    command = server_simple._watch_command_bash(
+        "session", reader="alice", bind_owner=False
+    )
+
+    assert "--owner-pid" not in command
+    assert "--owner-token" not in command
+    assert shlex.split(command)[-2:] == ["--reader", "alice"]
 
 
 def test_watch_argv_binds_concurrent_leads_independently(
@@ -199,6 +234,28 @@ def test_watch_subprocess_exits_when_bound_owner_dies(tmp_path: Path) -> None:
     assert watcher.returncode == 4
     assert stdout == ""
     assert stderr == ""
+
+
+def test_unbound_watch_argv_times_out_instead_of_exiting_owner_gone(
+    tmp_path: Path,
+) -> None:
+    # Field regression: a hook-emitted (unbound) watcher must live to its own
+    # timeout (exit 2), never exit 4 on a stale owner identity. Arranged so the
+    # DEFAULT path would have bound: this process' parent is live and a
+    # creation token is available.
+    if "--owner-pid" not in server_simple._watch_argv(tmp_path):
+        pytest.skip("process creation tokens are unavailable on this platform")
+    argv = server_simple._watch_argv(tmp_path, timeout=1, bind_owner=False)
+    assert "--owner-pid" not in argv
+    assert "--owner-token" not in argv
+
+    # Generous harness ceiling: interpreter startup under parallel-suite load
+    # has been observed near 10 s; the watcher itself still exits after ~1 s.
+    result = _run(argv, timeout=60)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == ""
 
 
 def test_watch_command_bash_executes_and_times_out_quietly(tmp_path: Path) -> None:

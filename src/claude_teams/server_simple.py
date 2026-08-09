@@ -1509,13 +1509,23 @@ def _watch_argv(
     session_dir: str | Path,
     timeout: float | None = None,
     reader: str | None = None,
+    *,
+    bind_owner: bool = True,
 ) -> list[str]:
-    """Return an owner-bound shell-neutral argv for watching ``session_dir``."""
+    """Return a shell-neutral argv for watching ``session_dir``.
+
+    Owner-bound by default: the command dies with this process' parent. Pass
+    ``bind_owner=False`` where the current parent is NOT the process that will
+    later run the command — notably the short-lived wake hooks, whose parent is
+    a transient wrapper that is already gone by then. Such commands are bounded
+    by the CLI's default ``--timeout`` instead.
+    """
     argv = [sys.executable, "-m", "claude_teams.cli", "watch", str(session_dir)]
-    owner_pid = os.getppid()
-    owner_token = process_manager.creation_token(str(owner_pid))
-    if owner_token is not None:
-        argv.extend(["--owner-pid", str(owner_pid), "--owner-token", owner_token])
+    if bind_owner:
+        owner_pid = os.getppid()
+        owner_token = process_manager.creation_token(str(owner_pid))
+        if owner_token is not None:
+            argv.extend(["--owner-pid", str(owner_pid), "--owner-token", owner_token])
     if timeout is not None:
         argv.extend(["--timeout", str(timeout)])
     if reader is not None:
@@ -1528,10 +1538,12 @@ def _watch_command_bash(
     timeout: float | None = None,
     *,
     reader: str | None = None,
+    bind_owner: bool = True,
 ) -> str:
     """Render the watch argv for Bash (optionally reader-scoped)."""
     return " ".join(
-        shlex.quote(token) for token in _watch_argv(session_dir, timeout, reader)
+        shlex.quote(token)
+        for token in _watch_argv(session_dir, timeout, reader, bind_owner=bind_owner)
     )
 
 
@@ -1597,7 +1609,10 @@ harness's own `background_tasks` on every lead turn end. When a worker reply is
 already unread it blocks instructing you to call `read_messages`; when no
 watcher is armed it blocks instructing you to run the `watch_command_bash` /
 `watch_argv` as a BACKGROUND task, so an idle lead is woken deterministically
-rather than relying on the model to re-arm. The hook writes a small
+rather than relying on the model to re-arm. Unlike the commands returned by
+`spawn_agent`/`agent_watch_paths`, a hook-suggested command is deliberately NOT
+owner-bound — the hook cannot know your PID — and is bounded by the default
+`--timeout` instead; run it exactly as given. The hook writes a small
 `wake-progress-<reader>.json` file under the session dir to bound a no-progress
 block loop and is always fail-open (never makes the lead unstoppable). Disable
 it at runtime with `WIN_AGENT_TEAMS_LEAD_WAKE=0`. Server-spawned agents get this

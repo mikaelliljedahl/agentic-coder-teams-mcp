@@ -1,0 +1,27 @@
+APPROVED
+
+1. MINOR — Add one runtime regression that proves the unbound helper path times out normally instead of exiting as owner-gone.
+
+   The proposed direct test checks only the rendered tokens (`docs/features/hook-watch-owner-binding/plan.md:61-63`, `:74-83`). That is enough to validate the local branch, but the field failure is specifically an executable-lifetime failure: owner-bound watch exits 4 after owner death, while an unbound watch should remain alive until its timeout. The existing suite already has the right subprocess seams: `tests/test_watch_command_discovery.py:160-165` proves a generated argv can run to timeout exit 2, and `tests/test_watch_command_discovery.py:168-201` proves a manually owner-bound watcher exits 4 after its owner dies. Add a variant that supplies `bind_owner=False` (with `getppid`/`creation_token` arranged so the default path would bind), executes with a short explicit timeout, and asserts exit 2 with quiet stdout/stderr. This closes the exact production symptom without requiring a brittle real Claude hook wrapper.
+
+2. MINOR — Pin the complete re-arm loop with an unbound command in `background_tasks`.
+
+   The plan correctly observes that armed detection ignores owner flags (`docs/features/hook-watch-owner-binding/plan.md:70-72`): `_command_matches_session` looks only for the CLI/watch/session identity (`src/claude_teams/lead_wake.py:179-194`), and `_is_armed` additionally requires a running task (`src/claude_teams/lead_wake.py:197-208`). However, the proposed tests stop at D5/M5 command emission. Existing D4 and M4 fixtures still generate their tracked command through the default, owner-bound helper (`tests/test_lead_wake.py:232-242`, `:267-274`; `tests/test_member_wake.py:281-295`). Add or adapt a case so a running `server_simple._watch_command_bash(..., bind_owner=False)` is accepted as D4/M4. Since member-wake imports the same `_is_armed`, one direct matcher test plus one decision-path assertion is sufficient; duplicating every matcher case is unnecessary.
+
+3. NIT — Tighten two causal statements in the plan and place the contract-note clarification in the hook paragraph.
+
+   `_watch_argv` always samples `os.getppid()`, but it emits the owner pair only when `creation_token` succeeds (`src/claude_teams/server_simple.py:1515-1518`). The field diagnosis remains correct because exit 4 demonstrates that an owner pair was emitted, but `docs/features/hook-watch-owner-binding/plan.md:13-20` should qualify the mechanism as “when the parent creation token is available.” Also, the Stop hook's re-arm loop does not bound an already-running unbound watcher; the CLI's default timeout does, so `plan.md:31-33` should attribute the lifetime bound to that timeout alone.
+
+   The current `_DISK_CONTRACT_NOTE` owner-binding sentence is already accurately scoped to commands returned by `spawn_agent`/`agent_watch_paths` (`src/claude_teams/server_simple.py:1563-1569`). Preserve that sentence and put the new unbound/default-timeout clarification in the later Stop-hook paragraph (`src/claude_teams/server_simple.py:1595-1602`). This keeps the two command contracts explicit instead of making the MCP-return contract sound conditional.
+
+Root-cause and design assessment
+
+The root cause is correct. `_arm_reason` and `_member_arm_reason` execute inside the short-lived hook processes and call `_watch_command_bash` there (`src/claude_teams/lead_wake.py:221-230`; `src/claude_teams/member_wake.py:154-165`). `_watch_command_bash` immediately delegates to `_watch_argv` (`src/claude_teams/server_simple.py:1526-1535`), so `os.getppid()` is evaluated while the hook process is running, not later when the coordinator launches the rendered command. The resulting PID/token therefore identify the hook's transient parent wrapper; owner validation correctly turns that stale identity into exit 4.
+
+Making only hook-emitted commands unbound is the right fix. Walking the hook's ancestor process tree to guess the coordinator would create a platform- and harness-specific contract, still require reliable process-identity/token selection, and remain vulnerable to wrapper topology changes. The hook payload and the reviewed wake logic expose no authoritative coordinator PID. A deliberately unbound, timeout-bounded watcher is simpler and matches the ownership semantics actually available at that boundary. Keeping `bind_owner=True` as the default preserves the stronger lifetime coupling for commands generated inside the MCP server.
+
+Touch-point assessment
+
+Caller tracing and literal caller search found exactly two production hook-context `_watch_command_bash` callers: `lead_wake._arm_reason` and `member_wake._member_arm_reason`. There is no direct hook-context `_watch_argv` caller. The other production uses are MCP/result discovery paths in `server_simple.py` (including direct argv and Bash/PowerShell renderings), so leaving defaults unchanged is correct. PowerShell needs no new parameter because no reviewed hook emits that rendering. The proposed source-file set is complete.
+
+The parameter design is also safe: add keyword-only `bind_owner: bool = True`, guard both the parent lookup/token lookup and pair emission behind it, and pass it by keyword through `_watch_command_bash`. When false, omit both `--owner-pid` and `--owner-token`; when true, preserve the current token-unavailable fallback and all existing argument ordering.

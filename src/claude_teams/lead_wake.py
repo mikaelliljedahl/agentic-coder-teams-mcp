@@ -220,7 +220,7 @@ def _read_reason(unread_senders: list[str]) -> str:
 
 def _arm_reason(session_dir: Path) -> str:
     """Operational D5 reason: no watcher armed, start it as a background task."""
-    cmd = server_simple._watch_command_bash(session_dir)
+    cmd = server_simple._watch_command_bash(session_dir, bind_owner=False)
     return (
         "An inbox watcher is not currently running for this session, so worker "
         "replies will not wake you while you are idle. Start the watcher now as "

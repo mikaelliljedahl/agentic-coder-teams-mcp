@@ -273,6 +273,27 @@ class TestDecisionCore:
         assert result.action == "allow"
         assert result.code == "D4"
 
+    def test_wake_allows_when_armed_bg_task_is_unbound(self, tmp_path: Path) -> None:
+        # D4: the hook-suggested (owner-unbound) command, once running, is
+        # recognised as armed — the re-arm loop closes on what D5 emits.
+        from claude_teams import server_simple
+
+        payload = _payload(
+            background_tasks=[
+                {
+                    "status": "running",
+                    "command": server_simple._watch_command_bash(
+                        tmp_path, bind_owner=False
+                    ),
+                }
+            ]
+        )
+
+        result = lead_wake.evaluate(payload, reader_arg="team-lead")
+
+        assert result.action == "allow"
+        assert result.code == "D4"
+
     def test_wake_blocks_arm_instruction_when_not_armed_no_unread(
         self, tmp_path: Path
     ) -> None:
@@ -286,7 +307,12 @@ class TestDecisionCore:
         # guard: the model must be able to run exactly what the match recognises).
         assert "claude_teams.cli" in result.reason
         assert "watch" in result.reason
+        assert str(tmp_path) in result.reason
         assert "background" in result.reason.lower()
+        # Hook-emitted commands are deliberately unbound: the hook's parent is a
+        # transient wrapper, so a baked-in owner PID would die instantly (exit 4).
+        assert "--owner-pid" not in result.reason
+        assert "--owner-token" not in result.reason
         # Operational, not an imperative token demand (spike probe a).
         assert "must now output" not in result.reason.lower()
 
@@ -411,6 +437,16 @@ class TestIdentityAndArming:
             + f"C:\\Users\\x\\.claude\\agent-sessions\\{session_dir.name}"
         )
         assert lead_wake._command_matches_session(win_cmd, session_dir) is True
+        # The unbound rendering the Stop hook now emits still matches.
+        from claude_teams import server_simple
+
+        assert (
+            lead_wake._command_matches_session(
+                server_simple._watch_command_bash(session_dir, bind_owner=False),
+                session_dir,
+            )
+            is True
+        )
         # A watch command for a DIFFERENT session does NOT match.
         other = "python -m claude_teams.cli watch /home/x/sessions/other-999"
         assert lead_wake._command_matches_session(other, session_dir) is False

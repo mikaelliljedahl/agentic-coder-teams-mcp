@@ -153,7 +153,9 @@ def _member_read_reason(unread_senders: list[str]) -> str:
 
 def _member_arm_reason(joined_session_dir: Path, member: str) -> str:
     """Operational M5 reason: arm the reader-scoped watcher, or leave the team."""
-    cmd = server_simple._watch_command_bash(joined_session_dir, reader=member)
+    cmd = server_simple._watch_command_bash(
+        joined_session_dir, reader=member, bind_owner=False
+    )
     return (
         "An inbox watcher is not currently running for the team session you "
         "joined, so lead messages will not wake you while you are idle. Start "
