@@ -5,6 +5,7 @@ import threading
 import time
 from pathlib import Path
 
+import click
 import typer.main
 from typer.testing import CliRunner
 
@@ -21,6 +22,7 @@ runner = CliRunner()
 def test_watch_default_timeout_is_1800_seconds() -> None:
     """Metadata-only: never invoke `watch` without an explicit timeout here."""
     command = typer.main.get_command(app)
+    assert isinstance(command, click.Group)
     watch_cmd = command.commands["watch"]
     timeout_opt = next(
         p for p in watch_cmd.params if "--timeout" in getattr(p, "opts", [])
