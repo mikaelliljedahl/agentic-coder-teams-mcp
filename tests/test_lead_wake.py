@@ -2,12 +2,14 @@
 
 import io
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from claude_teams import lead_wake
+from claude_teams import lead_wake, procinfo
 
 
 def _payload(**kw: object) -> dict:
@@ -41,9 +43,386 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in (
         "AGENT_NAME",
         "WIN_AGENT_TEAMS_LEAD_WAKE",
+        "WIN_AGENT_TEAMS_LEAD_WAKE_OWNER",
         "WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS",
     ):
         monkeypatch.delenv(var, raising=False)
+
+    # Legacy decision tests intentionally exercise private per-agent wiring.
+    # Tests that pass owner_mode explicitly still cover the shared-hook matrix.
+    original_evaluate = lead_wake.evaluate
+
+    def _evaluate_private(*args: object, **kwargs: object):
+        if "owner_mode" not in kwargs:
+            kwargs["owner_mode"] = "private"
+        return original_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(lead_wake, "evaluate", _evaluate_private)
+
+
+def _host(pid: int, name: str = "claude.exe") -> procinfo.HostResolution:
+    entry = procinfo.ProcessInfo(pid=pid, ppid=1, name=name)
+    return procinfo.HostResolution(chain=(entry,), host=entry)
+
+
+class TestOwnerGate:
+    def test_foreign_owner_short_circuits_before_all_session_work(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from claude_teams import server_simple
+
+        def _boom(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError
+
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(22)
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "b"
+        )
+        monkeypatch.setattr(lead_wake, "_resolve_session_dir", _boom)
+        monkeypatch.setattr(server_simple, "_active_session_id", _boom)
+        monkeypatch.setattr(lead_wake, "_scan_senders", _boom)
+        monkeypatch.setattr(lead_wake, "_write_guard", _boom)
+
+        result = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=11,
+            owner_host_token="a",
+        )
+
+        assert (result.action, result.code, result.log["why"]) == (
+            "allow",
+            "D0b",
+            "not-owner",
+        )
+
+    @pytest.mark.parametrize("name", ["codex.exe", "node.exe"])
+    def test_non_claude_nearest_host_is_owner_unknown_before_session_work(
+        self, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        chain = (
+            procinfo.ProcessInfo(1, 2, "python.exe"),
+            procinfo.ProcessInfo(2, 3, name),
+            procinfo.ProcessInfo(3, 0, "claude.exe"),
+        )
+        monkeypatch.setattr(
+            lead_wake.procinfo,
+            "resolve_nearest_host",
+            lambda: procinfo.HostResolution(chain=chain, host=chain[1]),
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager,
+            "creation_token",
+            lambda _pid: "token",
+        )
+        monkeypatch.setattr(
+            lead_wake,
+            "_resolve_session_dir",
+            lambda _arg: (_ for _ in ()).throw(AssertionError("must not resolve")),
+        )
+
+        result = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=2,
+            owner_host_token="token",
+        )
+
+        assert (result.code, result.log["why"]) == ("D0b", "owner-unknown")
+
+    def test_pid_match_token_mismatch_is_not_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(11)
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "new"
+        )
+
+        result = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=11,
+            owner_host_token="old",
+        )
+
+        assert result.code == "D0b"
+        assert result.log["why"] == "not-owner"
+
+    def test_matching_owner_reaches_session_resolution(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(11)
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "tok"
+        )
+        monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
+        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda *_args: [])
+
+        result = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=11,
+            owner_host_token="tok",
+        )
+
+        assert result.code == "D2"
+
+    def test_matching_owner_preserves_d3_and_d4_decisions(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from claude_teams import server_simple
+
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(11)
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "tok"
+        )
+        monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
+        monkeypatch.setattr(
+            lead_wake, "_live_subagent_names", lambda *_args: ["worker"]
+        )
+        _write_inbox(tmp_path, "team-lead", ["worker"])
+
+        unread = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=11,
+            owner_host_token="tok",
+        )
+        assert (unread.code, unread.action) == ("D3", "block")
+
+        (tmp_path / "inbox-team-lead.jsonl").unlink()
+        armed = lead_wake.evaluate(
+            _payload(
+                background_tasks=[
+                    {
+                        "status": "running",
+                        "command": server_simple._watch_command_bash(tmp_path),
+                    }
+                ]
+            ),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=11,
+            owner_host_token="tok",
+        )
+        assert (armed.code, armed.action) == ("D4", "allow")
+
+    def test_foreign_owner_main_writes_no_stdout_or_guard(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(22)
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "b"
+        )
+        monkeypatch.setattr(
+            lead_wake,
+            "_resolve_session_dir",
+            lambda _arg: (_ for _ in ()).throw(AssertionError),
+        )
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_payload())))
+
+        lead_wake.main(
+            [
+                "--owner-mode",
+                "bound",
+                "--owner-host-pid",
+                "11",
+                "--owner-host-token",
+                "a",
+            ]
+        )
+
+        assert capsys.readouterr().out == ""
+        assert not (tmp_path / "wake-progress-team-lead.json").exists()
+
+    @pytest.mark.parametrize(
+        ("mode", "pid", "token"),
+        [
+            (None, None, None),
+            ("bound", None, None),
+            ("bound", 1, None),
+            ("bound", None, "token"),
+            ("private", 1, "token"),
+            ("other", None, None),
+        ],
+    )
+    def test_unknown_or_inconsistent_owner_allows_without_resolution(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mode: str | None,
+        pid: object,
+        token: object,
+    ) -> None:
+        monkeypatch.setattr(
+            lead_wake,
+            "_resolve_session_dir",
+            lambda _arg: (_ for _ in ()).throw(AssertionError("must not resolve")),
+        )
+
+        result = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode=mode,
+            owner_host_pid=pid,
+            owner_host_token=token,
+        )
+
+        assert result.code == "D0b"
+        assert result.log["why"] == "owner-unknown"
+
+    @pytest.mark.parametrize(
+        ("pid", "token"), [("x", "t"), (-1, "t"), (True, "t"), (1, "")]
+    )
+    def test_malformed_bound_values_allow(self, pid: object, token: object) -> None:
+        result = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=pid,
+            owner_host_token=token,
+        )
+
+        assert result.code == "D0b"
+        assert result.log["why"] == "owner-unknown"
+
+    @pytest.mark.parametrize("failure", [OSError("walk"), None])
+    def test_walk_failure_or_disappearance_allows_unknown(
+        self, monkeypatch: pytest.MonkeyPatch, failure: BaseException | None
+    ) -> None:
+        if failure is not None:
+
+            def _raise() -> procinfo.HostResolution:
+                raise failure
+
+            monkeypatch.setattr(lead_wake.procinfo, "resolve_nearest_host", _raise)
+        else:
+            monkeypatch.setattr(
+                lead_wake.procinfo,
+                "resolve_nearest_host",
+                lambda: procinfo.HostResolution(chain=(), host=None),
+            )
+
+        result = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=1,
+            owner_host_token="token",
+        )
+
+        assert result.code == "D0b"
+        assert result.log["why"] == "owner-unknown"
+
+    def test_owner_kill_switch_skips_gate(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LEAD_WAKE_OWNER", "0")
+        monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
+        monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda *_args: [])
+
+        result = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=-1,
+            owner_host_token="",
+        )
+
+        assert result.code == "D2"
+
+    def test_restart_sequence_old_owner_silent_new_owner_blocks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
+        monkeypatch.setattr(
+            lead_wake, "_live_subagent_names", lambda *_args: ["worker"]
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "a"
+        )
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(11)
+        )
+
+        owner_a = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=11,
+            owner_host_token="a",
+        )
+
+        assert owner_a.code == "D5"
+        assert owner_a.action == "block"
+
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(22)
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "a2"
+        )
+        monkeypatch.setattr(
+            lead_wake,
+            "_resolve_session_dir",
+            lambda _arg: (_ for _ in ()).throw(
+                AssertionError("old binding must not touch disk")
+            ),
+        )
+        restarted_with_old_binding = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=11,
+            owner_host_token="a",
+        )
+
+        assert restarted_with_old_binding.code == "D0b"
+        assert restarted_with_old_binding.log["why"] == "not-owner"
+
+        monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
+        reinstalled_for_a2 = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=22,
+            owner_host_token="a2",
+        )
+        assert reinstalled_for_a2.code == "D5"
+        assert reinstalled_for_a2.action == "block"
+
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(11)
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "a"
+        )
+        old_a_with_new_binding = lead_wake.evaluate(
+            _payload(),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=22,
+            owner_host_token="a2",
+        )
+        assert old_a_with_new_binding.code == "D0b"
+        assert old_a_with_new_binding.log["why"] == "not-owner"
 
 
 class TestKillSwitchAndFailOpen:
@@ -402,6 +781,66 @@ class TestProgressGuard:
         assert result.action == "block"
         assert result.code == "D5"
 
+    def test_bound_owner_change_resets_old_guard_generation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS", "3")
+        _write_guard(tmp_path, "team-lead", {}, 2)  # old schema has no owner
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(7)
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "new"
+        )
+
+        result = lead_wake.evaluate(
+            _payload(stop_hook_active=True),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=7,
+            owner_host_token="new",
+        )
+
+        assert result.code == "D5"
+        guard = _read_guard(tmp_path, "team-lead")
+        assert guard["noprogress_blocks"] == 1
+        assert guard["owner_generation"] == "7:new"
+
+    def test_bound_owner_change_resets_different_owner_generation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS", "3")
+        prior = {
+            "schema": "lead-wake-progress/1",
+            "reader": "team-lead",
+            "senders": {},
+            "noprogress_blocks": 2,
+            "ts": 0.0,
+            "owner_generation": "6:old",
+        }
+        (tmp_path / "wake-progress-team-lead.json").write_text(
+            json.dumps(prior), encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            lead_wake.procinfo, "resolve_nearest_host", lambda: _host(7)
+        )
+        monkeypatch.setattr(
+            lead_wake.process_manager, "creation_token", lambda _pid: "new"
+        )
+
+        result = lead_wake.evaluate(
+            _payload(stop_hook_active=True),
+            reader_arg="team-lead",
+            owner_mode="bound",
+            owner_host_pid=7,
+            owner_host_token="new",
+        )
+
+        assert result.code == "D5"
+        guard = _read_guard(tmp_path, "team-lead")
+        assert guard["noprogress_blocks"] == 1
+        assert guard["owner_generation"] == "7:new"
+
 
 class TestIdentityAndArming:
     def test_wake_nested_lead_uses_agent_name_inbox(
@@ -485,6 +924,121 @@ class TestIdentityAndArming:
 
 
 class TestMainEntrypoint:
+    def test_stdout_flush_failure_is_swallowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        flush_error = OSError("broken pipe")
+
+        class FlushFails(io.StringIO):
+            def flush(self) -> None:
+                raise flush_error
+
+        stream = FlushFails()
+        monkeypatch.setattr(sys, "stdout", stream)
+        monkeypatch.setattr(
+            lead_wake,
+            "evaluate",
+            lambda *_args, **_kwargs: lead_wake.WakeDecision(
+                "block", "D5", reason="block"
+            ),
+        )
+
+        lead_wake.main([])
+
+        assert '"decision": "block"' in stream.getvalue()
+
+    @pytest.mark.parametrize("argv", [["--unknown"], ["--owner-mode"]])
+    def test_malformed_argv_subprocess_exits_zero_without_block_json(
+        self, argv: list[str]
+    ) -> None:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+
+        completed = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "claude_teams.lead_wake", *argv],
+            input="{}",
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+
+        assert completed.returncode == 0
+        assert '"decision": "block"' not in completed.stdout
+
+    def test_evaluation_failure_is_swallowed(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(
+            lead_wake,
+            "evaluate",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        lead_wake.main([])
+
+        assert '"decision": "block"' not in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "program",
+        [
+            (
+                "import claude_teams.lead_wake as m;"
+                "m.evaluate=lambda *a,**k:(_ for _ in ()).throw(RuntimeError());"
+                "m.main([])"
+            ),
+            (
+                "import claude_teams.lead_wake as m;"
+                "m._log_line=lambda *a:(_ for _ in ()).throw(RuntimeError());"
+                "m.main([])"
+            ),
+            "import claude_teams.lead_wake as m;m.sys.stderr=None;m.main([])",
+            (
+                "import claude_teams.lead_wake as m;m.sys.stdout=None;"
+                "m.evaluate=lambda *a,**k:m.WakeDecision('block','D5',reason='x');"
+                "m.main([])"
+            ),
+        ],
+    )
+    def test_entrypoint_internal_failures_exit_zero_in_subprocess(
+        self, program: str
+    ) -> None:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+
+        completed = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", program],
+            input="{}",
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+
+        assert completed.returncode == 0
+        assert '"decision": "block"' not in completed.stdout
+
+    def test_broken_stderr_and_stdout_are_swallowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stream_failure = OSError("broken stream")
+
+        class Broken:
+            def write(self, _value: str) -> int:
+                raise stream_failure
+
+        monkeypatch.setattr(
+            lead_wake,
+            "evaluate",
+            lambda *_args, **_kwargs: lead_wake.WakeDecision(
+                "block", "D5", reason="block"
+            ),
+        )
+        monkeypatch.setattr(sys, "stderr", Broken())
+        monkeypatch.setattr(sys, "stdout", Broken())
+
+        lead_wake.main([])
+
     def test_main_block_prints_decision_and_logs_to_stderr(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -500,7 +1054,16 @@ class TestMainEntrypoint:
         payload = json.dumps(_payload())
         monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
 
-        lead_wake.main(["--session-dir", str(tmp_path), "--reader", "team-lead"])
+        lead_wake.main(
+            [
+                "--session-dir",
+                str(tmp_path),
+                "--reader",
+                "team-lead",
+                "--owner-mode",
+                "private",
+            ]
+        )
 
         out = capsys.readouterr()
         decision = json.loads(out.out)
@@ -521,7 +1084,16 @@ class TestMainEntrypoint:
         monkeypatch.setattr(lead_wake, "_live_subagent_names", lambda _sd, _id: [])
         monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_payload())))
 
-        lead_wake.main(["--session-dir", str(tmp_path), "--reader", "team-lead"])
+        lead_wake.main(
+            [
+                "--session-dir",
+                str(tmp_path),
+                "--reader",
+                "team-lead",
+                "--owner-mode",
+                "private",
+            ]
+        )
 
         out = capsys.readouterr()
         assert out.out == ""
@@ -536,6 +1108,6 @@ class TestMainEntrypoint:
         monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: None)
         monkeypatch.setattr(sys, "stdin", io.StringIO("{not json"))
 
-        lead_wake.main(["--reader", "team-lead"])
+        lead_wake.main(["--reader", "team-lead", "--owner-mode", "private"])
 
         assert capsys.readouterr().out == ""

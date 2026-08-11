@@ -324,9 +324,12 @@ class TestWriteClaudeSettings:
         assert "--reader" in command
         assert "worker" in command
         assert tmp_path.as_posix() in command
+        assert '"--owner-mode" "private"' in command
 
     def test_wake_command_argv_shape(self) -> None:
-        argv = hooks._wake_command(Path("C:/sessions/abc"), "worker")
+        argv = hooks._wake_command(
+            Path("C:/sessions/abc"), "worker", owner_mode="private"
+        )
 
         assert argv[0] == Path(sys.executable).as_posix()
         assert "-m" in argv
@@ -335,6 +338,21 @@ class TestWriteClaudeSettings:
         assert argv[argv.index("--session-dir") + 1] == "C:/sessions/abc"
         assert "--reader" in argv
         assert argv[argv.index("--reader") + 1] == "worker"
+        assert argv[argv.index("--owner-mode") + 1] == "private"
+
+    def test_bound_wake_command_round_trips_owner_values(self) -> None:
+        argv = hooks._wake_command(
+            Path("C:/sessions/a b"),
+            "team-lead",
+            owner_mode="bound",
+            owner_host_pid=123,
+            owner_host_token="token with spaces",
+        )
+        command = hooks._shell_quote_command(argv)
+
+        assert argv[argv.index("--owner-host-pid") + 1] == "123"
+        assert argv[argv.index("--owner-host-token") + 1] == "token with spaces"
+        assert '"token with spaces"' in command
 
 
 class TestCodexHookOverrides:

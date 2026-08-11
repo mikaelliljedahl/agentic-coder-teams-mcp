@@ -140,7 +140,14 @@ def _hook_matcher(session_dir: Path, agent: str) -> dict:
     }
 
 
-def _wake_command(session_dir: Path, reader: str) -> list[str]:
+def _wake_command(
+    session_dir: Path,
+    reader: str,
+    *,
+    owner_mode: str,
+    owner_host_pid: int | None = None,
+    owner_host_token: str | None = None,
+) -> list[str]:
     """Return the argv for the lead-wake decision hook for ``reader``.
 
     Mirrors :func:`_emit_command`'s ``as_posix()`` rendering so the command is
@@ -148,7 +155,7 @@ def _wake_command(session_dir: Path, reader: str) -> list[str]:
     settings file at spawn time; the runtime still honours ``AGENT_NAME`` as the
     authoritative identity when both are present (see ``claude_teams.lead_wake``).
     """
-    return [
+    argv = [
         Path(sys.executable).as_posix(),
         "-m",
         _WAKE_MODULE,
@@ -156,15 +163,37 @@ def _wake_command(session_dir: Path, reader: str) -> list[str]:
         Path(session_dir).as_posix(),
         "--reader",
         reader,
+        "--owner-mode",
+        owner_mode,
     ]
+    if owner_host_pid is not None:
+        argv.extend(["--owner-host-pid", str(owner_host_pid)])
+    if owner_host_token is not None:
+        argv.extend(["--owner-host-token", owner_host_token])
+    return argv
 
 
-def _wake_hook_matcher(session_dir: Path, reader: str) -> dict:
+def _wake_hook_matcher(
+    session_dir: Path,
+    reader: str,
+    *,
+    owner_mode: str,
+    owner_host_pid: int | None = None,
+    owner_host_token: str | None = None,
+) -> dict:
     return {
         "hooks": [
             {
                 "type": "command",
-                "command": _shell_quote_command(_wake_command(session_dir, reader)),
+                "command": _shell_quote_command(
+                    _wake_command(
+                        session_dir,
+                        reader,
+                        owner_mode=owner_mode,
+                        owner_host_pid=owner_host_pid,
+                        owner_host_token=owner_host_token,
+                    )
+                ),
                 "timeout": _WAKE_HOOK_TIMEOUT_SECONDS,
             }
         ]
@@ -229,7 +258,9 @@ def write_claude_settings(session_dir: Path, agent_name: str) -> Path:
     # run on every Stop; a ``block`` from either wins and order is irrelevant
     # (spike probe d), so no merge is needed. Every other event keeps the single
     # ``emit`` group unchanged.
-    hooks_config["Stop"].append(_wake_hook_matcher(session_dir, agent_name))
+    hooks_config["Stop"].append(
+        _wake_hook_matcher(session_dir, agent_name, owner_mode="private")
+    )
     config = {"hooks": hooks_config}
     path = session_dir / f"hooks-{agent_name}.settings.json"
     path.write_text(json.dumps(config, indent=2), encoding="utf-8")

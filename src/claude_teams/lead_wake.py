@@ -31,9 +31,11 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from claude_teams import messaging, server_simple
+from claude_teams import messaging, procinfo, server_simple
+from claude_teams.backends import process_manager
 
 _KILL_SWITCH_ENV = "WIN_AGENT_TEAMS_LEAD_WAKE"
+_OWNER_KILL_SWITCH_ENV = "WIN_AGENT_TEAMS_LEAD_WAKE_OWNER"
 _MAX_NOPROGRESS_ENV = "WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS"
 _DEFAULT_MAX_NOPROGRESS = 3
 _ROOT_LEAD_NAME = "team-lead"
@@ -59,6 +61,64 @@ class WakeDecision:
 def _kill_switch_on() -> bool:
     """Return ``True`` unless the kill switch is explicitly set to ``0``."""
     return os.environ.get(_KILL_SWITCH_ENV, "1").strip() != "0"
+
+
+def _owner_gate_on() -> bool:
+    """Return whether conversation-owner enforcement is enabled."""
+    return os.environ.get(_OWNER_KILL_SWITCH_ENV, "1").strip() != "0"
+
+
+def _valid_owner_pid(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        pid = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _current_owner_identity() -> tuple[int, str] | None:
+    """Resolve this hook's nearest Claude host PID and creation token."""
+    try:
+        resolved = procinfo.resolve_nearest_host()
+    except BaseException:
+        return None
+    host = resolved.host
+    if host is None or not procinfo.is_claude_host(host):
+        return None
+    try:
+        current_token = process_manager.creation_token(str(host.pid))
+    except BaseException:
+        return None
+    if current_token is None:
+        return None
+    return host.pid, current_token
+
+
+def _owner_decision(
+    mode: str | None, host_pid: object, host_token: object
+) -> tuple[WakeDecision | None, str | None]:
+    """Evaluate D0b, returning a short-circuit decision or owner generation."""
+    if not _owner_gate_on():
+        return None, None
+    log = {"ran": True, "decision": "allow"}
+    if mode == "private" and host_pid is None and host_token is None:
+        return None, None
+    pid = _valid_owner_pid(host_pid)
+    token = host_token if isinstance(host_token, str) and host_token else None
+    if mode != "bound" or pid is None or token is None:
+        log["why"] = "owner-unknown"
+        return WakeDecision("allow", "D0b", log=log), None
+    current_owner = _current_owner_identity()
+    if current_owner is None:
+        log["why"] = "owner-unknown"
+        return WakeDecision("allow", "D0b", log=log), None
+    current_pid, current_token = current_owner
+    if current_pid != pid or current_token != token:
+        log["why"] = "not-owner"
+        return WakeDecision("allow", "D0b", log=log), None
+    return None, f"{pid}:{token}"
 
 
 def _max_noprogress() -> int:
@@ -251,6 +311,7 @@ def _write_guard(
     identity: str,
     senders: dict[str, dict[str, int]],
     noprogress: int,
+    owner_generation: str | None = None,
 ) -> None:
     """Atomically persist the progress snapshot (mirror hooks._write_marker_atomic)."""
     snapshot = {
@@ -264,6 +325,8 @@ def _write_guard(
         "noprogress_blocks": noprogress,
         "ts": time.time(),
     }
+    if owner_generation is not None:
+        marker["owner_generation"] = owner_generation
     path = _guard_file(session_dir, identity)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
@@ -301,6 +364,7 @@ def _apply_guard(
     payload: dict,
     block: WakeDecision,
     log: dict,
+    owner_generation: str | None = None,
 ) -> WakeDecision:
     """Consult the progress guard on a would-be block (D3/D5).
 
@@ -311,11 +375,15 @@ def _apply_guard(
     standalone skip.
     """
     prior = _read_guard(session_dir, identity)
+    if owner_generation is not None and (
+        prior is None or prior.get("owner_generation") != owner_generation
+    ):
+        prior = None
     stop_active = bool(payload.get("stop_hook_active"))
     cap = _max_noprogress()
 
     if _cursor_advanced(prior, senders):
-        _write_guard(session_dir, identity, senders, 0)
+        _write_guard(session_dir, identity, senders, 0, owner_generation)
         log["noprogress_blocks"] = 0
         return block
 
@@ -323,22 +391,25 @@ def _apply_guard(
     if stop_active:
         noprogress = prior_count + 1
         if noprogress >= cap:
-            _write_guard(session_dir, identity, senders, 0)
+            _write_guard(session_dir, identity, senders, 0, owner_generation)
             log["noprogress_blocks"] = noprogress
             log.update(decision="allow", why="guard-fail-open")
             return WakeDecision("allow", "D6", log=log)
     else:
         noprogress = prior_count
-    _write_guard(session_dir, identity, senders, noprogress)
+    _write_guard(session_dir, identity, senders, noprogress, owner_generation)
     log["noprogress_blocks"] = noprogress
     return block
 
 
-def evaluate(
+def evaluate(  # noqa: PLR0911 - decision-table rows intentionally return directly.
     payload: dict,
     *,
     reader_arg: str,
     session_dir_arg: str | None = None,
+    owner_mode: str | None = None,
+    owner_host_pid: object = None,
+    owner_host_token: object = None,
 ) -> WakeDecision:
     """Evaluate one Stop payload against the decision table (D0..D6)."""
     log: dict = {"ran": True}
@@ -346,6 +417,12 @@ def evaluate(
     if not _kill_switch_on():
         log.update(decision="allow", why="kill-switch-off")
         return WakeDecision("allow", "D0", log=log)
+
+    owner_result, owner_generation = _owner_decision(
+        owner_mode, owner_host_pid, owner_host_token
+    )
+    if owner_result is not None:
+        return owner_result
 
     identity = _resolve_identity(reader_arg)
     log["identity"] = identity
@@ -381,6 +458,7 @@ def evaluate(
             payload=payload,
             block=block,
             log=log,
+            owner_generation=owner_generation,
         )
     if armed:
         log.update(decision="allow", why="armed")
@@ -394,6 +472,7 @@ def evaluate(
         payload=payload,
         block=block,
         log=log,
+        owner_generation=owner_generation,
     )
 
 
@@ -401,6 +480,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m claude_teams.lead_wake")
     parser.add_argument("--session-dir", default=None)
     parser.add_argument("--reader", default=_ROOT_LEAD_NAME)
+    parser.add_argument("--owner-mode", default=None)
+    parser.add_argument("--owner-host-pid", default=None)
+    parser.add_argument("--owner-host-token", default=None)
     return parser.parse_args(argv)
 
 
@@ -435,18 +517,29 @@ def main(argv: list[str] | None = None) -> None:
     hook never emits ``{"continue":false}`` and never exits non-zero, so it can
     never make the lead unstoppable.
     """
-    args = _parse_args(sys.argv[1:] if argv is None else argv)
-    payload = _read_payload()
-    decision = evaluate(
-        payload,
-        reader_arg=args.reader,
-        session_dir_arg=args.session_dir,
-    )
-    sys.stderr.write(_log_line(decision) + "\n")
-    if decision.action == "block":
-        sys.stdout.write(
-            json.dumps({"decision": "block", "reason": decision.reason}) + "\n"
+    try:
+        args = _parse_args(sys.argv[1:] if argv is None else argv)
+        payload = _read_payload()
+        decision = evaluate(
+            payload,
+            reader_arg=args.reader,
+            session_dir_arg=args.session_dir,
+            owner_mode=args.owner_mode,
+            owner_host_pid=args.owner_host_pid,
+            owner_host_token=args.owner_host_token,
         )
+        with suppress(BaseException):
+            sys.stderr.write(_log_line(decision) + "\n")
+        if decision.action == "block":
+            with suppress(BaseException):
+                sys.stdout.write(
+                    json.dumps({"decision": "block", "reason": decision.reason}) + "\n"
+                )
+                sys.stdout.flush()
+    except BaseException:
+        # A Stop hook must never make the conversation unstoppable. This also
+        # catches argparse's SystemExit and failures in fallback diagnostics.
+        return
 
 
 if __name__ == "__main__":

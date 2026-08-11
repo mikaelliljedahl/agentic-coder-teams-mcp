@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_teams import hooks, member_wake
+from claude_teams import hooks, member_wake, procinfo
 from claude_teams import server_simple as ss
 
 MEMBER = "ext"
@@ -363,6 +363,17 @@ class TestProgressGuard:
         assert result.code == "M3"
         guard = json.loads(_guard_path(joined, MEMBER).read_text(encoding="utf-8"))
         assert guard["noprogress_blocks"] == 0
+        assert set(guard) == {
+            "schema",
+            "reader",
+            "senders",
+            "noprogress_blocks",
+            "ts",
+        }
+        assert guard["schema"] == "lead-wake-progress/1"
+        assert guard["reader"] == f"member-{MEMBER}"
+        assert "owner_generation" not in guard
+        assert not (joined / f"wake-progress-{MEMBER}.json").exists()
 
     def test_guard_not_consulted_without_stop_hook_active(
         self, monkeypatch: pytest.MonkeyPatch, joined: Path
@@ -472,6 +483,15 @@ def _isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespac
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.chdir(work)
+    host = procinfo.ProcessInfo(101, 1, "claude.exe")
+    monkeypatch.setattr(
+        ss.procinfo,
+        "resolve_nearest_host",
+        lambda: procinfo.HostResolution(chain=(host,), host=host),
+    )
+    monkeypatch.setattr(
+        ss.process_manager_module, "creation_token", lambda _pid: "lead-token"
+    )
     return SimpleNamespace(base=base, home=home, work=work)
 
 
@@ -573,9 +593,12 @@ class TestInstallMemberWakeTool:
 
 
 class TestCoexistence:
-    def test_member_and_lead_groups_coexist(self, _isolated: SimpleNamespace) -> None:
+    def test_member_and_lead_groups_coexist(
+        self, _isolated: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Case 10: install member then lead -> both Stop groups present.
         sid = _make_joined_session(_isolated.base)
+        monkeypatch.setattr(ss, "_session_id", sid)
 
         asyncio.run(ss.install_member_wake(sid, MEMBER))
         asyncio.run(ss.install_lead_wake(scope="user"))
@@ -584,8 +607,11 @@ class TestCoexistence:
         assert any("claude_teams.member_wake" in c for c in cmds)
         assert any("claude_teams.lead_wake" in c for c in cmds)
 
-    def test_removing_member_preserves_lead(self, _isolated: SimpleNamespace) -> None:
+    def test_removing_member_preserves_lead(
+        self, _isolated: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         sid = _make_joined_session(_isolated.base)
+        monkeypatch.setattr(ss, "_session_id", sid)
         asyncio.run(ss.install_lead_wake(scope="user"))
         asyncio.run(ss.install_member_wake(sid, MEMBER))
 
@@ -595,8 +621,11 @@ class TestCoexistence:
         assert not any("claude_teams.member_wake" in c for c in cmds)
         assert any("claude_teams.lead_wake" in c for c in cmds)
 
-    def test_removing_lead_preserves_member(self, _isolated: SimpleNamespace) -> None:
+    def test_removing_lead_preserves_member(
+        self, _isolated: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         sid = _make_joined_session(_isolated.base)
+        monkeypatch.setattr(ss, "_session_id", sid)
         asyncio.run(ss.install_member_wake(sid, MEMBER))
         asyncio.run(ss.install_lead_wake(scope="user"))
 

@@ -28,7 +28,7 @@ from typing import Any, Literal, cast
 
 from fastmcp import FastMCP
 
-from claude_teams import delivery, delivery_store, hooks
+from claude_teams import delivery, delivery_store, hooks, procinfo
 from claude_teams.agent_output import (
     BINDING_LEGACY,
     CORRELATION_FIELD,
@@ -47,6 +47,7 @@ from claude_teams.agent_output import (
     resolve_agent_binding,
 )
 from claude_teams.async_utils import run_blocking
+from claude_teams.backends import process_manager as process_manager_module
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.process_manager import (
     OWNERSHIP_NOT_OURS,
@@ -5985,6 +5986,26 @@ def _lead_wake_settings_path(scope: str) -> Path:
     return base / ".claude" / "settings.json"
 
 
+def _process_chain_rows(resolution: procinfo.HostResolution) -> list[dict[str, Any]]:
+    """Return the non-sensitive ancestry fields used in install refusals."""
+    return [
+        {"pid": entry.pid, "ppid": entry.ppid, "name": entry.name}
+        for entry in resolution.chain
+    ]
+
+
+def _write_json_object_atomic(path: Path, value: dict[str, Any]) -> None:
+    """Atomically replace ``path`` with formatted JSON, cleaning failed temps."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(value, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        with suppress(OSError):
+            tmp.unlink()
+
+
 @_register_tool()
 async def install_lead_wake(remove: bool = False, scope: str = "project") -> dict:
     """Install (or remove) the Claude Code lead inbox-wake ``Stop`` hook.
@@ -6006,29 +6027,114 @@ async def install_lead_wake(remove: bool = False, scope: str = "project") -> dic
       which are for server-spawned agents). Idempotent: re-running replaces the
       existing wake group in place and never duplicates it; unrelated hooks are
       preserved. ``remove=True`` drops only the wake group.
+    - Installation is bound to the current Claude conversation process. The
+      binding does not survive a conversation restart; re-run this tool after
+      restarting the lead. A re-install is an ownership handoff: the last
+      successful installer for this settings scope wins.
+    - ``remove=False`` requires a concrete active agent session and refuses
+      before touching settings when none exists. Spawn the first agent, then
+      call this tool again. This deliberately uses ``create=False`` so merely
+      configuring a hook cannot create or claim a session. Session discovery
+      may auto-adopt the sole prior cwd+identity session; the baked
+      ``--session-dir`` is therefore a fallback hint, while ownership alone is
+      conversation-scoped and runtime discovery remains authoritative.
+    - Success returns ``{"success": true, "action": "installed"|"removed", ...}``.
+      A prerequisite refusal returns
+      ``{"success": false, "reason": <reason>, "chain": [...]}``, where the
+      four stable reasons are ``host_walk_failed``, ``host_not_found``,
+      ``host_token_unavailable``, and ``no_active_session``. A settings I/O
+      failure instead returns ``settings_write_failed``.
     - The hook writes a small ``wake-progress-<reader>.json`` file under the
       session dir to bound a no-progress block loop. Disable at runtime with the
-      kill switch ``WIN_AGENT_TEAMS_LEAD_WAKE=0`` (no reinstall needed).
+      kill switch ``WIN_AGENT_TEAMS_LEAD_WAKE=0`` (no reinstall needed). Disable
+      only conversation-owner enforcement with
+      ``WIN_AGENT_TEAMS_LEAD_WAKE_OWNER=0``.
     """
     if scope not in {"project", "user"}:
         return {"error": f"scope must be 'project' or 'user', got {scope!r}"}
 
-    def _do_install() -> dict:
+    def _do_install() -> dict:  # noqa: PLR0911 - stable refusal/result matrix.
         identity = IDENTITY
-        session_id = _active_session_id(create=False)
-        session_dir = _session_dir(session_id) if session_id else _SESSION_BASE
-        wake_matcher = hooks._wake_hook_matcher(session_dir, identity)
+
+        # Removal is deliberately independent of process ancestry and session
+        # discovery. It needs only the selected settings scope.
+        if remove:
+            path = _lead_wake_settings_path(scope)
+            updated = _install_wake_hook(_read_json_object(path), {}, remove=True)
+            try:
+                _write_json_object_atomic(path, updated)
+            except OSError:
+                return {"success": False, "reason": "settings_write_failed"}
+            return {
+                "success": True,
+                "action": "removed",
+                "path": str(path),
+                "reader": identity,
+                "scope": scope,
+            }
+
+        # Resolve every ownership/session prerequisite before computing,
+        # reading, or creating the settings path. Refusals therefore leave an
+        # existing file byte-identical and cannot create its parent directory.
+        try:
+            resolution = procinfo.resolve_nearest_host()
+        except BaseException:
+            return {"success": False, "reason": "host_walk_failed", "chain": []}
+        chain = _process_chain_rows(resolution)
+        host = resolution.host
+        if (
+            host is None
+            or isinstance(host.pid, bool)
+            or host.pid <= 0
+            or not procinfo.is_claude_host(host)
+        ):
+            return {"success": False, "reason": "host_not_found", "chain": chain}
+        try:
+            host_token = process_manager_module.creation_token(str(host.pid))
+        except BaseException:
+            host_token = None
+        if not isinstance(host_token, str) or not host_token:
+            return {
+                "success": False,
+                "reason": "host_token_unavailable",
+                "chain": chain,
+            }
+        try:
+            session_id = _active_session_id(create=False)
+            session_dir = _session_dir(session_id) if session_id else None
+            session_is_active = session_dir is not None and session_dir.is_dir()
+        except BaseException:
+            session_dir = None
+            session_is_active = False
+        if not session_is_active or session_dir is None:
+            return {"success": False, "reason": "no_active_session", "chain": chain}
+
+        wake_matcher = hooks._wake_hook_matcher(
+            session_dir,
+            identity,
+            owner_mode="bound",
+            owner_host_pid=host.pid,
+            owner_host_token=host_token,
+        )
         path = _lead_wake_settings_path(scope)
         updated = _install_wake_hook(
-            _read_json_object(path), wake_matcher, remove=remove
+            _read_json_object(path), wake_matcher, remove=False
         )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+        try:
+            _write_json_object_atomic(path, updated)
+        except OSError:
+            return {"success": False, "reason": "settings_write_failed"}
         return {
-            "action": "removed" if remove else "installed",
+            "success": True,
+            "action": "installed",
             "path": str(path),
             "reader": identity,
             "scope": scope,
+            "binding": {"scope": "conversation", "survives_restart": False},
+            "note": (
+                "This binding is conversation-scoped and does not survive a "
+                "restart; re-run install_lead_wake after restarting the lead."
+            ),
         }
 
     return await run_blocking(_do_install)
