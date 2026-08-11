@@ -2962,6 +2962,18 @@ async def spawn_agent(
     the shell-specific ``watch_command_bash`` and
     ``watch_command_powershell`` renderings.
 
+    ``wake_binding`` reports whether the Claude Code lead inbox-wake ``Stop``
+    hook is installed AND bound to your conversation: ``{"state": "bound"}``
+    means it will nudge you when this worker replies while you are idle. Any of
+    ``"absent"``, ``"stale"`` (a hook bound to a different conversation
+    process — this is what a lead restart produces), or ``"legacy"`` comes with
+    a ``hint`` and means you should call ``install_lead_wake()`` now; the
+    binding is conversation-scoped and does NOT survive a restart, and a dead
+    binding is SILENT, so nothing else will remind you. ``"not_applicable"``
+    (you are not Claude-hosted) and ``"unknown"`` (ownership undeterminable)
+    need no action. Purely advisory — it never affects whether the spawn
+    succeeded.
+
     Recommended coordination pattern: do NOT tight-poll. Run the returned
     ``watch_argv`` directly, or use the returned Bash/PowerShell rendering.
     Use a background watch for Claude Code and a bounded foreground watch for
@@ -3077,6 +3089,12 @@ async def spawn_agent(
             _save_agents_transaction(session_id, agents)
 
         session_dir = str(_session_dir(session_id))
+        try:
+            wake_binding = _wake_binding_status()
+        except BaseException:
+            # Purely advisory: a broken probe must never fail a spawn that
+            # already succeeded.
+            wake_binding = {"state": "unknown"}
         return {
             "name": agent_name,
             "pid": pid,
@@ -3088,6 +3106,7 @@ async def spawn_agent(
             "watch_command_bash": _watch_command_bash(session_dir),
             "watch_command_powershell": _watch_command_powershell(session_dir),
             "expected_outputs": list(expected_outputs) if expected_outputs else [],
+            "wake_binding": wake_binding,
         }
 
     return _annotate(await run_blocking(_do_spawn))
@@ -5910,6 +5929,105 @@ def _group_has_wake_token(group: object) -> bool:
         and hooks._WAKE_MODULE in str(cast("dict[str, Any]", h).get("command", ""))
         for h in entries
     )
+
+
+def _wake_group_owner(group: object) -> tuple[str | None, str | None, str | None]:
+    """Return ``(owner_mode, owner_host_pid, owner_host_token)`` baked in ``group``.
+
+    Values are read back out of the rendered hook command string, which is the
+    only place the binding is persisted. Missing flags come back as ``None``.
+    """
+    if not isinstance(group, dict):
+        return (None, None, None)
+    entries = cast("dict[str, Any]", group).get("hooks")
+    if not isinstance(entries, list):
+        return (None, None, None)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        command = str(cast("dict[str, Any]", entry).get("command", ""))
+        if hooks._WAKE_MODULE not in command:
+            continue
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        flags: dict[str, str] = {}
+        for index, token in enumerate(argv[:-1]):
+            if token in {"--owner-mode", "--owner-host-pid", "--owner-host-token"}:
+                flags[token] = argv[index + 1]
+        return (
+            flags.get("--owner-mode"),
+            flags.get("--owner-host-pid"),
+            flags.get("--owner-host-token"),
+        )
+    return (None, None, None)
+
+
+def _wake_binding_status() -> dict[str, str]:
+    """Report whether a lead-wake hook is installed and bound to THIS process.
+
+    The binding dies with the conversation that installed it, and the symptom
+    of a dead binding is silence: the hook simply stops nudging. Nothing would
+    otherwise prompt a re-install, so ``spawn_agent`` — the point at which the
+    lead acquires a worker worth being woken for — reports this state.
+
+    States: ``bound`` (a group names this host process), ``stale`` (a group
+    exists but names another process, typically after a restart), ``legacy``
+    (a group with no owner binding at all), ``absent`` (no group in either
+    scope), ``not_applicable`` (this lead is not Claude-hosted, and the hook is
+    Claude-only), or ``unknown`` (ownership could not be determined).
+
+    Purely diagnostic and never raises: every failure degrades to ``unknown``.
+    """
+    try:
+        resolution = procinfo.resolve_nearest_host()
+        host = resolution.host
+        if host is None or not procinfo.is_claude_host(host):
+            return {"state": "not_applicable"}
+        token = process_manager_module.creation_token(str(host.pid))
+        if not isinstance(token, str) or not token:
+            return {"state": "unknown"}
+
+        best = "absent"
+        for scope in ("project", "user"):
+            config = _read_json_object(_lead_wake_settings_path(scope))
+            groups = (config.get("hooks") or {}).get("Stop") or []
+            if not isinstance(groups, list):
+                continue
+            for group in groups:
+                if not _group_has_wake_token(group):
+                    continue
+                mode, pid, group_token = _wake_group_owner(group)
+                if mode != "bound" or pid is None or group_token is None:
+                    best = "legacy" if best == "absent" else best
+                    continue
+                if pid == str(host.pid) and group_token == token:
+                    return {"state": "bound"}
+                best = "stale"
+        if best == "bound":  # pragma: no cover - returned eagerly above
+            return {"state": "bound"}
+        return {"state": best, "hint": _WAKE_BINDING_HINTS[best]}
+    except BaseException:
+        return {"state": "unknown"}
+
+
+_WAKE_BINDING_HINTS = {
+    "absent": (
+        "No lead inbox-wake hook is installed for this conversation, so you "
+        "will not be nudged when this worker replies while you are idle. Call "
+        "install_lead_wake() once, then arm the watcher as a background task."
+    ),
+    "stale": (
+        "A lead inbox-wake hook is installed but bound to a DIFFERENT "
+        "conversation process (this happens after the lead restarts), so it is "
+        "silent for you. Call install_lead_wake() again to re-bind it."
+    ),
+    "legacy": (
+        "The installed lead inbox-wake hook predates conversation binding and "
+        "is therefore inert. Call install_lead_wake() once to re-install it."
+    ),
+}
 
 
 def _install_wake_hook(

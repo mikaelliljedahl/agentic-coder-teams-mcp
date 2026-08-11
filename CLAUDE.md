@@ -16,11 +16,22 @@ Use this sequence for every non-trivial feature or bug fix:
 2. **Independent plan review** — ask an agent from the opposite model family to review the written plan. When the implementer is GPT/Codex, use Claude Code Opus; when the implementer is Claude, use a capable GPT/Codex model. Save the review under the same feature directory and resolve or explicitly disposition every finding before coding.
 3. **Implement with red-green-refactor TDD** — the GPT/Codex implementation agent owns the code by default. Add focused failing tests first and run them to establish red; make the smallest production change that turns them green; then refactor without changing behavior. Run focused tests followed by the full suite.
 4. **Independent post-implementation review** — ask Claude Code Opus to review the implementation against the approved plan, tests, and final diff. Save the review under the feature directory, address accepted findings, and rerun tests.
-5. **Pull request** — commit the scoped changes, push the feature branch, and create a PR with `gh`. This fork has multiple remotes, so use `--repo mikaelliljedahl/agentic-coder-teams-mcp` explicitly.
+5. **Pull request** — run all four quality gates (see below), then commit the scoped changes, push the feature branch, and create a PR with `gh`. This fork has multiple remotes, so use `--repo mikaelliljedahl/agentic-coder-teams-mcp` explicitly.
 
 Do not skip a review because the change appears small. If an external reviewer is unavailable, stop and report the blocker rather than silently self-approving.
 
 ## Quality gates and pre-existing breakage
+
+**Run all four CI gates locally before opening a PR.** CI (`.github/workflows`) runs these on Linux; running only some of them locally and reporting "gates green" is how a PR lands red:
+
+```bash
+uv run ruff format --check .
+uv run ruff check .
+uv run ty check
+uv run pytest
+```
+
+`ty check` is easy to forget because `ruff` and `pytest` can be green while it is red — and when it fails, CI never reaches the test step, so a Linux test result you were counting on never gets produced. On Windows, `ty` also reports a small number of platform-only diagnostics that do not appear in CI; compare against the CI log before treating one as yours.
 
 Run quality gates (lint, type-check, tests, coverage) across the **whole repository**, not only the files you changed. When a gate comes back red, "it was already broken" / "not my code" / "someone else's fault" is **never** an acceptable disposition on its own. Specifically:
 
