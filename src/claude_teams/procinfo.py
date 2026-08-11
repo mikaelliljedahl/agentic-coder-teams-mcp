@@ -10,6 +10,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 _MAX_WALK = 64
 _HOST_NAMES = frozenset({"claude", "codex", "pi"})
@@ -149,12 +150,20 @@ def _read_linux_process(
 
 
 def _create_toolhelp_snapshot(
-    kernel32: object, *, get_last_error: Callable[[], int] = ctypes.get_last_error
+    kernel32: Any, *, get_last_error: Callable[[], int] | None = None
 ) -> int:
-    """Create a process snapshot, retrying one transient bad-length failure."""
+    """Create a process snapshot, retrying one transient bad-length failure.
+
+    ``ctypes.get_last_error`` exists only on Windows, so it is resolved lazily
+    via ``getattr`` (as the other Windows-only ctypes entry points here are)
+    rather than referenced in the signature default, which a type checker
+    evaluates on every platform.
+    """
+    if get_last_error is None:
+        get_last_error = getattr(ctypes, "get_last_error")  # noqa: B009
     invalid = ctypes.c_void_p(-1).value
     for attempt in range(2):
-        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # type: ignore[attr-defined]
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
         if snapshot != invalid:
             return int(snapshot)
         error = get_last_error()

@@ -69,11 +69,18 @@ def _owner_gate_on() -> bool:
 
 
 def _valid_owner_pid(value: object) -> int | None:
+    # ``bool`` is an ``int`` subclass, so it must be excluded before the
+    # conversion rather than after it.
     if isinstance(value, bool):
         return None
-    try:
-        pid = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    if isinstance(value, int):
+        pid = value
+    elif isinstance(value, str):
+        try:
+            pid = int(value)
+        except ValueError:
+            return None
+    else:
         return None
     return pid if pid > 0 else None
 

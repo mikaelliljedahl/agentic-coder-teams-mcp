@@ -94,7 +94,8 @@ def test_full_host_set_stops_at_codex_before_outer_claude() -> None:
     )
 
     assert result.host == procinfo.ProcessInfo(2, 3, "codex.exe")
-    assert not procinfo.is_claude_host(result.host.name)
+    assert result.host is not None
+    assert not procinfo.is_claude_host(result.host)
 
 
 def test_node_launched_pi_stops_before_outer_claude() -> None:
@@ -117,6 +118,7 @@ def test_node_launched_pi_stops_before_outer_claude() -> None:
     )
 
     assert result.host == pi
+    assert result.host is not None
     assert not procinfo.is_claude_host(result.host)
 
 
@@ -146,6 +148,7 @@ def test_linux_node_shim_cmdline_identifies_host(
     assert entry == procinfo.ProcessInfo(
         123, 42, "node", ("/usr/bin/node", script, "--flag")
     )
+    assert entry is not None
     assert procinfo.host_kind(entry) == expected_kind
 
 
@@ -179,7 +182,7 @@ def test_linux_comm_is_fallback_when_cmdline_is_unavailable(tmp_path: Path) -> N
 
 
 def test_toolhelp_snapshot_retries_error_bad_length_once() -> None:
-    invalid = ctypes.c_void_p(-1).value
+    invalid: int = ctypes.c_void_p(-1).value or 0
 
     class Kernel32:
         def __init__(self) -> None:

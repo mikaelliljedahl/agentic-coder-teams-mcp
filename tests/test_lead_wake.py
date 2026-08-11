@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -52,7 +53,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Tests that pass owner_mode explicitly still cover the shared-hook matrix.
     original_evaluate = lead_wake.evaluate
 
-    def _evaluate_private(*args: object, **kwargs: object):
+    def _evaluate_private(*args: Any, **kwargs: Any) -> lead_wake.WakeDecision:
         if "owner_mode" not in kwargs:
             kwargs["owner_mode"] = "private"
         return original_evaluate(*args, **kwargs)
