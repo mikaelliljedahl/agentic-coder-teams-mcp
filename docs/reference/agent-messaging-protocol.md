@@ -354,6 +354,21 @@ membership is not `running`, when the joined session shows no activity within
 `WIN_AGENT_TEAMS_LEAD_WAKE` when unset). It coexists with the lead-wake `Stop`
 group; the harness must support Claude Code `Stop` hooks for it to do anything.
 
+The top-level Claude lead can similarly call `install_lead_wake`. A successful
+install binds the shared `Stop` group to the nearest Claude conversation host's
+PID plus creation token and to the currently active agent session. The hook's
+`D0b` owner row runs before session discovery: hooks running under another
+conversation, legacy hooks without an owner mode, and inconsistent owner
+arguments fail silent without reading session state. Reinstalling hands the
+selected settings scope to the new conversation. This binding is intentionally
+conversation-scoped and **does not survive a Claude conversation restart**;
+after restarting the lead, run `install_lead_wake` again. Removal needs neither
+an owner process nor an active session. `WIN_AGENT_TEAMS_LEAD_WAKE_OWNER=0`
+temporarily disables only the owner row for diagnosis.
+The baked `--session-dir` is a fallback hint, not the ownership identity:
+install-time discovery may auto-adopt the sole prior cwd+identity session, while
+the hook re-resolves the active session at runtime before using that fallback.
+
 `WIN_AGENT_TEAMS_EXTERNAL_ONLY=1` registers only `join_team`,
 `external_send`, `external_read`, `leave_team`, and `list_backends`. Use that
 entry alone in a separate Desktop profile/client instance for client-surface
