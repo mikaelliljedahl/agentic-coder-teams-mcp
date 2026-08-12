@@ -86,7 +86,7 @@ class ClaudeCodeBackend(BaseBackend):
             str: Default model identifier for this backend.
 
         """
-        return "sonnet"
+        return "opus"
 
     def resolve_model(self, generic_name: str) -> str:
         """Map a generic or direct model name to a Claude Code model.

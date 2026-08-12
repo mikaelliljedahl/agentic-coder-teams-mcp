@@ -96,9 +96,9 @@ class TestClaudeCodeSupportedModels:
 
 
 class TestClaudeCodeDefaultModel:
-    def test_returns_sonnet(self):
+    def test_returns_opus(self):
         backend = ClaudeCodeBackend()
-        assert backend.default_model() == "sonnet"
+        assert backend.default_model() == "opus"
 
 
 class TestClaudeCodeResolveModel:
