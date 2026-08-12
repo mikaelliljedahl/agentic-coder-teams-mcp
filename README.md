@@ -172,6 +172,21 @@ tool.
 > `resume_session` return `{"success": false, "reason": "identity_unresolved"}`)
 > rather than silently masquerade as `team-lead` and hijack the lead's session.
 
+A spawned pi agent is also launched **non-interactively by policy**, so it can
+never sit waiting on a question nobody will see (on Windows pi runs in a
+Terminal tab, where an `ask_user`-style extension tool would otherwise render a
+prompt and block forever):
+
+- `--exclude-tools ask_user,ask_question,ask_human,request_input` removes the
+  human-question tools from the model's tool list. Override the list with
+  `WIN_AGENT_TEAMS_PI_EXCLUDE_TOOLS` (comma-separated); set it to the empty
+  string to omit the flag entirely.
+- `--append-system-prompt` adds a three-line escalation policy: never wait for a
+  human, call `send_message` to the parent when blocked, then stop or continue
+  under a stated assumption.
+
+Both are passed on spawn **and** on resume.
+
 This covers both scenarios:
 1. **Pi as lead** — pi calls `spawn_agent` to start Claude Code, Codex, or other pi agents.
 2. **Pi as spawned agent using MCP tools** — a lead spawns a pi agent that calls `send_message` (etc.) back.

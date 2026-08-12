@@ -701,6 +701,29 @@ class TestWindowsTerminalTabSpawn:
         assert raw.startswith(b"\xef\xbb\xbf")
         assert "em—dash" in raw.decode("utf-8-sig")
 
+    def test_wrapper_does_not_rewrite_newlines_inside_the_prompt(self, tmp_path):
+        # ``Path.write_text`` opens in text mode, so Python's universal-newline
+        # translation rewrites EVERY LF -- including the ones inside the baked-in
+        # prompt literal -- to CRLF, and the agent receives a prompt that is not
+        # the one the caller sent. Reading the file back as text would hide it
+        # (the reader translates CRLF away again), so assert on raw bytes.
+        # Shared by all three backends' tab launches, not just pi.
+        manager = process_manager_mod.WindowsProcessManager()
+        wrapper = tmp_path / "w.launch.ps1"
+        sidecar = tmp_path / "w.pid"
+        prompt = "first line\nsecond 'line'\nname: \u00c5sa \u2014 done"
+
+        manager._write_tab_wrapper(
+            wrapper, "C:\\proj", ["claude", "--", prompt], {"K": "v"}, sidecar
+        )
+
+        raw = wrapper.read_bytes()
+        assert raw.startswith(b"\xef\xbb\xbf")
+        text = raw.decode("utf-8-sig")
+        assert "'first line\nsecond ''line''\nname: \u00c5sa \u2014 done'" in text
+        # The script's own lines still end CRLF, as PowerShell 5.1 expects.
+        assert "$ErrorActionPreference = 'Stop'\r\n" in text
+
     def test_codex_tab_uses_wrapper_by_default(
         self, _make_spawn_request, monkeypatch, tmp_path
     ):

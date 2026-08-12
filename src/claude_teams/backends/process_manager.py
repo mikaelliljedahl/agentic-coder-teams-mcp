@@ -1126,10 +1126,15 @@ class WindowsProcessManager(_PidOwnershipMixin):
         # and the shell exits cleanly -- matching the old console's auto-close.
         lines.append("exit 0")
         wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+        # Written as BYTES, deliberately. ``write_text`` opens in text mode, and
+        # Python's newline translation would then rewrite every LF to CRLF --
+        # including the ones INSIDE the single-quoted prompt literal, so the
+        # agent would receive a prompt the caller never sent. The explicit
+        # ``\r\n`` join above already gives PowerShell the line endings it wants.
         # BOM required: Windows PowerShell 5.1 decodes a BOM-less file as ANSI
         # (Windows-1252), corrupting non-ASCII bytes (e.g. the correlation-marker
         # em-dash). utf-8-sig writes the BOM so 5.1 reads it as UTF-8.
-        wrapper_path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8-sig")
+        wrapper_path.write_bytes(("\r\n".join(lines) + "\r\n").encode("utf-8-sig"))
 
     def _tab_window_id(self, team_name: str) -> str:
         """Return the Windows Terminal ``-w`` window name for a team.

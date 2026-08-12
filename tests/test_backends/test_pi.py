@@ -307,6 +307,127 @@ class TestPiBuildCommand:
         assert "multi\nline" not in cmd
 
 
+class TestPiInteractiveToolLockdown:
+    """A spawned pi agent must never be able to block on a human question.
+
+    On Windows we run pi in its TUI, so a user-global extension such as
+    ``ask_user`` finds ``ctx.mode === "tui"`` and renders a prompt in a tab
+    nobody is watching -- the agent then waits forever. Two layers guard it: a
+    hard ``--exclude-tools`` deny list and a soft ``--append-system-prompt``
+    escalation policy. Both must be on spawn *and* resume, since a resumed
+    agent runs with a fresh argv.
+    """
+
+    def test_build_command_excludes_interactive_tools(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        cmd = PiBackend().build_command(_make_request())
+        assert cmd[cmd.index("--exclude-tools") + 1] == (
+            "ask_user,ask_question,ask_human,request_input"
+        )
+
+    def test_resume_command_excludes_interactive_tools(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        cmd = PiBackend().build_resume_command(_make_request(), "sid-abc")
+        assert cmd[cmd.index("--exclude-tools") + 1] == (
+            "ask_user,ask_question,ask_human,request_input"
+        )
+
+    def test_exclude_tools_env_override(
+        self, _make_request, _direct_launch, _tty, _models, monkeypatch
+    ):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_PI_EXCLUDE_TOOLS", "ask_user,my_tool")
+        cmd = PiBackend().build_command(_make_request())
+        assert cmd[cmd.index("--exclude-tools") + 1] == "ask_user,my_tool"
+
+    def test_empty_exclude_tools_env_omits_flag(
+        self, _make_request, _direct_launch, _tty, _models, monkeypatch
+    ):
+        # An explicit empty value is the documented debugging escape hatch: no
+        # deny list at all, rather than the default one.
+        monkeypatch.setenv("WIN_AGENT_TEAMS_PI_EXCLUDE_TOOLS", "")
+        cmd = PiBackend().build_command(_make_request())
+        assert "--exclude-tools" not in cmd
+
+    def test_build_command_appends_escalation_policy(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        cmd = PiBackend().build_command(_make_request())
+        policy = cmd[cmd.index("--append-system-prompt") + 1]
+        assert "send_message" in policy
+        assert "never" in policy.lower()
+
+    def test_resume_command_appends_escalation_policy(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        cmd = PiBackend().build_resume_command(_make_request(), "sid-abc")
+        policy = cmd[cmd.index("--append-system-prompt") + 1]
+        assert "send_message" in policy
+
+    def test_escalation_policy_stays_short(self):
+        # Every pi turn pays for this text; keep it to ~3 lines.
+        assert len(pi_module._ESCALATION_POLICY.splitlines()) <= 3
+
+
+class TestPiPromptTransport:
+    """Prompt hazards pi resolves from the *first* character or from length."""
+
+    @pytest.mark.parametrize("lead", ["@", "/", "-"])
+    def test_leading_character_is_guarded(
+        self, _make_request, _direct_launch, _tty, _models, lead
+    ):
+        # ``@x`` is a CLI file include, ``/x`` an extension/skill command and
+        # ``-x`` a flag -- all decided from the token's first character only, so
+        # a leading newline defuses them without losing a byte of the prompt.
+        cmd = PiBackend().build_command(_make_request(prompt=f"{lead}do stuff"))
+        assert cmd[-1] == f"\n{lead}do stuff"
+
+    def test_ordinary_prompt_is_not_guarded(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        cmd = PiBackend().build_command(_make_request(prompt="do stuff"))
+        assert cmd[-1] == "do stuff"
+
+    def test_oversize_prompt_uses_sidecar_on_headless_path(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        # Headless (``-p --mode json``) puts the prompt on a real command line,
+        # which Windows rejects past ~32 KB; the sidecar is the escape.
+        _tty(False)
+        req = _make_request(
+            prompt="x" * (pi_module.MAX_ARGV_PROMPT_CHARS + 1),
+            extra={"session_dir": "S", "prompt_file_path": r"C:\p\worker.txt"},
+        )
+        cmd = PiBackend().build_command(req)
+        assert cmd[-2] == r"@C:\p\worker.txt"
+
+    def test_oversize_prompt_stays_in_argv_on_wrapper_path(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        # The TUI path bakes argv into a .ps1, so there is no command-line
+        # ceiling and the verbatim prompt is preferable to pi's ``<file>`` wrap.
+        prompt = "x" * (pi_module.MAX_ARGV_PROMPT_CHARS + 1)
+        req = _make_request(
+            prompt=prompt,
+            extra={"session_dir": "S", "prompt_file_path": r"C:\p\worker.txt"},
+        )
+        cmd = PiBackend().build_command(req)
+        assert cmd[-1] == prompt
+
+    def test_shim_without_sidecar_warns_about_multiline_argv(
+        self, _make_request, monkeypatch, _tty, _models, caplog
+    ):
+        # The shim routes argv through cmd.exe, which truncates at the first
+        # newline. We cannot fix it here, but it must not fail silently.
+        monkeypatch.setattr(PiBackend, "_launcher", lambda self: ["pi.cmd"])
+        req = _make_request(prompt="multi\nline", extra={"session_dir": "S"})
+        with caplog.at_level("WARNING"):
+            cmd = PiBackend().build_command(req)
+        assert cmd[-1] == "multi\nline"
+        assert any("truncat" in rec.message.lower() for rec in caplog.records)
+
+
 class TestPiBuildResume:
     def test_resume_uses_continue_without_session_id(
         self, _make_request, _direct_launch, _tty, _models

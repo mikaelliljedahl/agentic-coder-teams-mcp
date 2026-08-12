@@ -8,6 +8,8 @@ reports lifecycle state through a small bundled pi extension
 (``pi-extensions/win-agent-teams-state`` — passed via ``-e``).
 """
 
+import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -53,6 +55,50 @@ _MIN_MODEL_COLUMNS = 2
 # Process-lifetime cache of discovered pi model ids, keyed by the resolved
 # launcher key. Populated lazily on first tier resolution.
 _MODEL_ID_CACHE: dict[str, list[str]] = {}
+
+logger = logging.getLogger(__name__)
+
+# Tool names that ask a human a question and wait for the answer. Pi *core*
+# registers none of them, but a user-global extension can (the common one is
+# ``ask_user``, from a personal ``~/.pi/agent/settings.json`` extension). Such
+# an extension self-disables when ``ctx.mode !== "tui"`` — and on Windows we
+# deliberately run pi in its TUI, in a tab nobody is watching, so the question
+# renders and the agent blocks forever. ``--exclude-tools`` removes the tool
+# from the model's tool list outright. Pi tolerates names that are not
+# registered, so one static list is safe across installs.
+_DEFAULT_EXCLUDED_TOOLS = "ask_user,ask_question,ask_human,request_input"
+
+# Override for the deny list above (comma-separated). An explicitly empty value
+# omits ``--exclude-tools`` entirely — the debugging escape hatch for an
+# operator who wants the interactive tool back.
+_EXCLUDE_TOOLS_ENV = "WIN_AGENT_TEAMS_PI_EXCLUDE_TOOLS"
+
+# Belt-and-braces companion to the deny list: policy the model reads, so it
+# escalates instead of merely failing to find a question tool. Appended
+# verbatim via ``--append-system-prompt``; kept to three lines because every
+# turn of every pi agent pays for it. Note pi treats an ``--append-system-prompt``
+# value that names an existing file as that file's contents — this text cannot
+# be mistaken for a path.
+_ESCALATION_POLICY = (
+    "You run non-interactively: no human is watching your terminal, so never "
+    "ask a human a question and never wait for one to answer.\n"
+    "When you are blocked or need a decision, call the MCP tool send_message "
+    "(exposed here as win_agent_teams_send_message); it defaults to the parent "
+    "agent that spawned you.\n"
+    "Then either stop, or continue under an assumption you state explicitly in "
+    "your final message."
+)
+
+# Characters pi resolves from the FIRST character of the prompt token: ``@``
+# makes it a file include, ``/`` an extension command / skill / prompt-template
+# invocation, ``-`` a CLI flag. The same characters on any later line are inert.
+_GUARDED_LEADING_CHARS = ("@", "/", "-")
+
+# Above this many characters the prompt no longer travels as a command-line
+# argument on the headless path. Windows' command line breaks somewhere past
+# ~32 KB (``[WinError 206]``); 24 KB leaves room for the rest of the argv. The
+# TUI path bakes argv into a ``.ps1`` wrapper and has no such ceiling.
+MAX_ARGV_PROMPT_CHARS = 24 * 1024
 
 
 def _discover_pi_model_ids(launcher: list[str]) -> list[str]:
@@ -297,6 +343,7 @@ class PiBackend(BaseBackend):
             *self._mcp_config_args(request),
             *self._model_args(request),
             *self._extension_args(request),
+            *self._autonomy_args(),
         ]
         cmd.extend(self._prompt_args(request))
         return cmd
@@ -326,9 +373,32 @@ class PiBackend(BaseBackend):
             *self._mcp_config_args(request),
             *self._model_args(request),
             *self._extension_args(request),
+            *self._autonomy_args(),
         ]
         cmd.extend(self._prompt_args(request))
         return cmd
+
+    @staticmethod
+    def _autonomy_args() -> list[str]:
+        """Build the args that stop a spawned pi agent waiting on a human.
+
+        Two layers, deliberately redundant:
+
+        - ``--exclude-tools`` removes the human-question tools from the model's
+          tool list, so the deadlock is unreachable rather than discouraged.
+        - ``--append-system-prompt`` tells the model what to do *instead* —
+          escalate to the parent through the MCP ``send_message`` tool — because
+          a model that merely cannot ask may otherwise stall or guess silently.
+
+        Emitted on spawn and on resume alike: a resumed agent is launched with a
+        fresh argv, and a policy that lapses on resume is no policy at all.
+        """
+        args: list[str] = []
+        excluded = os.environ.get(_EXCLUDE_TOOLS_ENV, _DEFAULT_EXCLUDED_TOOLS).strip()
+        if excluded:
+            args.extend(["--exclude-tools", excluded])
+        args.extend(["--append-system-prompt", _ESCALATION_POLICY])
+        return args
 
     @staticmethod
     def _mcp_config_args(request: SpawnRequest) -> list[str]:
@@ -400,6 +470,20 @@ class PiBackend(BaseBackend):
         return args
 
     @staticmethod
+    def _guard_leading_char(prompt: str) -> str:
+        """Return ``prompt`` defused against pi's leading-character dispatch.
+
+        Pi decides ``@file`` / ``/command`` / ``-flag`` from the first character
+        of the argv token and never from a later line, so one leading newline
+        makes the whole prompt ordinary text again. Chosen over stripping or
+        escaping because it loses no byte of the caller's prompt — pi hands the
+        text to the model unchanged, leading whitespace included.
+        """
+        if prompt.startswith(_GUARDED_LEADING_CHARS):
+            return f"\n{prompt}"
+        return prompt
+
+    @staticmethod
     def _correlated_prompt(request: SpawnRequest) -> str:
         """Return the prompt with this spawn's correlation marker appended.
 
@@ -414,22 +498,44 @@ class PiBackend(BaseBackend):
         marker no existing transcript can contain.
         """
         correlation_id = (request.extra or {}).get(CORRELATION_FIELD)
+        prompt = PiBackend._guard_leading_char(request.prompt)
         if not correlation_id:
-            return request.prompt
-        return correlated_prompt(request.prompt, str(correlation_id), single_line=False)
+            return prompt
+        return correlated_prompt(prompt, str(correlation_id), single_line=False)
 
     def _prompt_args(self, request: SpawnRequest) -> list[str]:
         """Return the initial-prompt argv for pi.
 
         Direct ``node`` launch takes the prompt verbatim as a single positional
-        argument. On the shim fallback (``cmd.exe`` would mangle newlines) the
-        prompt is delivered as a ``@<file>`` include instead, when the server
-        wrote one, with a short plain-ASCII directive.
+        argument, which is the only fully faithful transport (pi wraps a
+        ``@file`` include in ``<file name="…">…</file>`` rather than inlining it
+        verbatim). The ``@<file>`` sidecar is therefore used only where argv
+        cannot carry the prompt intact, and only when the server wrote one:
+
+        - the ``pi.cmd`` shim fallback, where ``cmd.exe`` truncates the argv at
+          the first newline; and
+        - a very long prompt on the headless path, where the real command line
+          runs into the Windows length ceiling. The TUI path bakes argv into a
+          ``.ps1`` wrapper and is exempt.
+
+        A shim launch with a multi-line prompt and no sidecar is the one case
+        with no safe transport left; it is logged rather than silently truncated
+        downstream.
         """
+        prompt = self._correlated_prompt(request)
         prompt_file = (request.extra or {}).get("prompt_file_path")
-        if self._launches_via_shim() and prompt_file:
+        via_shim = self._launches_via_shim()
+        oversize = self._headless() and len(prompt) > MAX_ARGV_PROMPT_CHARS
+        if prompt_file and (via_shim or oversize):
             return [f"@{prompt_file}", "Complete the task in the attached file."]
-        return [self._correlated_prompt(request)]
+        if via_shim and "\n" in prompt:
+            logger.warning(
+                "pi agent %s launches via the pi.cmd shim with a multi-line "
+                "prompt and no prompt sidecar: cmd.exe will truncate the prompt "
+                "at the first newline",
+                request.name,
+            )
+        return [prompt]
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
         """Pass agent identity and the state-marker target dir to pi.
