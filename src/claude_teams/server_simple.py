@@ -2934,7 +2934,8 @@ async def spawn_agent(
       - ``max``    -> the hardest problems (top tier)
     Spawning errors if the required GPT-5.6 model is not available on this
     machine (upgrade codex / check account access) — there is no silent
-    downgrade. For claude-code, ``model`` is haiku/sonnet/opus/fable.
+    downgrade. For claude-code, ``model`` is haiku/sonnet/opus/fable and
+    defaults to ``opus`` when omitted.
 
     reasoning_effort: for claude-code, sets the effort (low/medium/high/xhigh/
     max). For codex it is silently ignored when ``model`` is a capability tier
