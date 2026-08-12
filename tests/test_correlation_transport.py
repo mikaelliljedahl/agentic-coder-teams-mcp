@@ -295,6 +295,49 @@ async def test_codex_spawn_prompt_is_not_marked_by_the_server(
     )
 
 
+def test_pi_multiline_prompt_gets_a_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pi's ``@file`` fallback needs the server to actually write the file.
+
+    ``PiBackend._prompt_args`` falls back to ``@<prompt_file>`` whenever argv
+    is unsafe (the ``pi.cmd`` shim truncates at the first newline, and the
+    headless path has a command-line ceiling) -- but that branch was dead,
+    because the server wrote a sidecar for ``claude-code`` only. The prompt
+    itself stays un-marked: pi's backend appends the one correlation marker.
+    """
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path / "sessions")
+    final_prompt, extra = server_simple._materialize_prompt(
+        "sess",
+        "worker",
+        "pi",
+        "first line\nsecond line",
+        "corr-pi",
+        file_token="nonce-1",
+    )
+
+    path = extra["prompt_file_path"]
+    assert Path(path).read_text(encoding="utf-8") == "first line\nsecond line"
+    assert final_prompt == "first line\nsecond line"
+    assert _CODEX_CORRELATION_PREFIX not in final_prompt
+
+
+def test_pi_short_single_line_prompt_stays_in_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path / "sessions")
+    _, extra = server_simple._materialize_prompt(
+        "sess",
+        "worker",
+        "pi",
+        "do stuff",
+        "corr-pi",
+        file_token="nonce-1",
+    )
+
+    assert extra.get("prompt_file_path") is None
+
+
 # --------------------------------------------------------------------------
 # A1c — the Claude path is as unambiguous as the Codex path
 #

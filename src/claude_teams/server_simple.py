@@ -49,6 +49,7 @@ from claude_teams.agent_output import (
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends import process_manager as process_manager_module
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.backends.pi import MAX_ARGV_PROMPT_CHARS
 from claude_teams.backends.process_manager import (
     OWNERSHIP_NOT_OURS,
     OWNERSHIP_OURS,
@@ -2463,6 +2464,21 @@ def _needs_prompt_file(prompt: str) -> bool:
     return any(char in prompt for char in _CLAUDE_PROMPT_FILE_CHARS)
 
 
+def _pi_needs_prompt_file(prompt: str) -> bool:
+    """Return whether a pi prompt needs a sidecar as a fallback transport.
+
+    Unlike Claude, pi normally reads the prompt from argv and the sidecar is
+    only a *fallback*: ``PiBackend._prompt_args`` uses it when the launch fell
+    back to the ``pi.cmd`` shim (``cmd.exe`` truncates argv at the first
+    newline) or when the prompt is too long for a real command line. The server
+    cannot tell which launcher the backend will resolve, so it writes the file
+    whenever one of those transports could plausibly be needed and lets the
+    backend decide. A short single-line prompt is safe on every pi transport and
+    gets no file.
+    """
+    return "\n" in prompt or "\r" in prompt or len(prompt) > MAX_ARGV_PROMPT_CHARS
+
+
 def _materialize_prompt(
     session_id: str,
     agent_name: str,
@@ -2491,9 +2507,12 @@ def _materialize_prompt(
        ``_CLAUDE_PROMPT_FILE_CHARS`` rather than bypassing it. The sidecar gets
        the newline-delimited form.
 
-    Codex is left untouched here: its backend appends the same server-issued id
-    itself (``CodexBackend._correlated_prompt``), so marking here too would
-    give Codex two markers.
+    Codex and pi are left un-marked here: their backends append the same
+    server-issued id themselves (``CodexBackend._correlated_prompt`` /
+    ``PiBackend._correlated_prompt``), so marking here too would give them two
+    markers. Pi does still get a **sidecar** when its prompt could need one
+    (see :func:`_pi_needs_prompt_file`) — the file is a fallback transport its
+    backend selects, not a second correlation site.
 
     A5: the sidecar path carries ``file_token`` so it is unique per call.
     ``delivery_nonce`` additionally appends the A4 delivery marker — supplied
@@ -2505,6 +2524,9 @@ def _materialize_prompt(
             # Codex quotes the prompt verbatim, so the marker travels in the
             # prompt itself; the newline form matches its correlation marker.
             prompt = delivered_prompt(prompt, delivery_nonce, single_line=False)
+        if backend_name == "pi" and _pi_needs_prompt_file(prompt):
+            path = _write_prompt_file(session_id, agent_name, file_token, prompt)
+            return prompt, {"prompt_file_path": str(path)}
         return prompt, {}
     use_file = _needs_prompt_file(prompt)
     if correlation_id:
@@ -2513,10 +2535,23 @@ def _materialize_prompt(
         prompt = delivered_prompt(prompt, delivery_nonce, single_line=not use_file)
     if not use_file:
         return prompt, {}
+    path = _write_prompt_file(session_id, agent_name, file_token, prompt)
+    return prompt, {"prompt_file_path": str(path)}
+
+
+def _write_prompt_file(
+    session_id: str, agent_name: str, file_token: str, prompt: str
+) -> Path:
+    """Write this attempt's prompt sidecar and return its path.
+
+    Shared by the Claude transport (where the sidecar is the prompt) and the pi
+    fallback transport (where it is only used if argv cannot carry the prompt),
+    so both spell the encoding and the directory creation the same way.
+    """
     path = _attempt_prompt_file(session_id, agent_name, file_token)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(prompt, encoding="utf-8")
-    return prompt, {"prompt_file_path": str(path)}
+    return path
 
 
 def _pi_binding_extra(

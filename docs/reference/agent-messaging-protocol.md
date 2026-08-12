@@ -1404,7 +1404,7 @@ one agent cannot collide on a single path. Cleanup is by age or on confirmed
 child exit, never "delete the others because a new call started".
 
 Codex has no prompt-file path: `_materialize_prompt` returns the prompt
-unchanged for any non-`claude-code` backend. Codex relies on passing the prompt
+unmarked for every non-`claude-code` backend. Codex relies on passing the prompt
 as a verbatim argv token via the native `.exe`, falling back to a JSON-encoded
 single-line form only when it is forced through the `codex.cmd` npm shim
 (`src/claude_teams/backends/codex.py`, `_prompt_arg`). Its marker is appended by
@@ -1412,6 +1412,24 @@ single-line form only when it is forced through the `codex.cmd` npm shim
 `extra["correlation_id"]` rather than deriving one — so a Codex prompt carries
 exactly one marker, never two. With no id in `extra` the prompt goes out
 unmarked; no id is ever invented.
+
+Pi is marked by its backend too (`PiBackend._correlated_prompt`), but it *does*
+get a sidecar — as a **fallback transport, not a second correlation site**. The
+server writes `prompts/{name}.<nonce>.prompt.txt` whenever the pi prompt is
+multi-line or longer than 24 KB (`_pi_needs_prompt_file`), and
+`PiBackend._prompt_args` uses it only where argv cannot carry the prompt intact:
+the `pi.cmd` shim fallback (`cmd.exe` truncates argv at the first newline) and an
+over-ceiling prompt on the headless path. Otherwise the verbatim argv token wins,
+because pi wraps a `@file` include in `<file name="…">…</file>` rather than
+inlining it. A prompt whose **first** character is `@`, `/` or `-` — the only
+position where pi dispatches on it — is prefixed with a single newline
+(`PiBackend._guard_leading_char`).
+
+A spawned pi agent is additionally launched with `--exclude-tools`
+(default `ask_user,ask_question,ask_human,request_input`, overridable via
+`WIN_AGENT_TEAMS_PI_EXCLUDE_TOOLS`; empty omits the flag) and an
+`--append-system-prompt` escalation policy telling it to `send_message` its
+parent instead of waiting for a human. Both are emitted on spawn and on resume.
 
 ---
 
