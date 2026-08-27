@@ -18,6 +18,38 @@ _BUILTIN_BACKENDS: dict[str, str] = {
     "pi": "claude_teams.backends.pi.PiBackend",
 }
 
+# Names an orchestrating agent plausibly guesses for a backend, mapped to the
+# canonical registry key. Exact matches only — a typo must still fail loudly
+# rather than be silently guessed at.
+_BACKEND_ALIASES: dict[str, str] = {
+    "claude": "claude-code",
+    "claudecode": "claude-code",
+    "claude_code": "claude-code",
+    "claude-cli": "claude-code",
+    "claude_code_cli": "claude-code",
+    "claude-code-cli": "claude-code",
+    "gpt": "codex",
+    "openai": "codex",
+    "codex-cli": "codex",
+}
+
+
+def canonical_backend_name(name: str) -> str:
+    """Map a caller-supplied backend name onto its canonical registry key.
+
+    Case- and whitespace-insensitive. Unknown names are returned stripped but
+    otherwise unchanged, so a genuine typo still raises at lookup time.
+
+    Args:
+        name: Backend name as the caller spelled it.
+
+    Returns:
+        str: The canonical backend key, or the stripped input when unknown.
+
+    """
+    stripped = name.strip()
+    return _BACKEND_ALIASES.get(stripped.lower(), stripped)
+
 
 class BackendRegistry:
     """Discovers and manages available spawner backends.
@@ -62,11 +94,32 @@ class BackendRegistry:
         """
         self._backends[name] = backend
 
-    def get(self, name: str) -> Backend:
-        """Get a backend by name.
+    def resolve_name(self, name: str) -> str:
+        """Return the canonical registry key for a caller-supplied name.
+
+        A registered backend always wins over the alias table, so a
+        third-party backend registered under an alias resolves to itself.
 
         Args:
-            name: Backend identifier.
+            name: Backend name as the caller spelled it.
+
+        Returns:
+            str: The canonical backend key, or the stripped input when neither
+            registered nor a known alias.
+
+        """
+        self._ensure_loaded()
+        stripped = name.strip()
+        if stripped in self._backends:
+            return stripped
+        return canonical_backend_name(stripped)
+
+    def get(self, name: str) -> Backend:
+        """Get a backend by name, resolving known aliases.
+
+        Args:
+            name: Backend identifier or a known alias (e.g. ``claude`` for
+                ``claude-code``).
 
         Returns:
             The Backend instance.
@@ -76,10 +129,10 @@ class BackendRegistry:
                 registered.
 
         """
-        self._ensure_loaded()
-        if name not in self._backends:
+        resolved = self.resolve_name(name)
+        if resolved not in self._backends:
             raise BackendNotRegisteredError(name, self._backends.keys())
-        return self._backends[name]
+        return self._backends[resolved]
 
     def list_available(self) -> list[str]:
         """Return sorted names of all available backends.

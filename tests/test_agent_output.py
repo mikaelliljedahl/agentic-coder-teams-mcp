@@ -40,6 +40,7 @@ from claude_teams.backends import process_base
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.backends.codex import CodexBackend
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.backends.registry import canonical_backend_name
 from claude_teams.delivery import DeliveryOutcome
 
 
@@ -878,6 +879,9 @@ async def test_spawn_agent_persists_output_lookup_metadata(
             return SimpleNamespace(process_handle="456")
 
     class FakeRegistry:
+        def resolve_name(self, name: str) -> str:
+            return canonical_backend_name(name)
+
         def default_backend(self) -> str:
             return "codex"
 
@@ -952,6 +956,9 @@ async def test_spawn_agent_deduplicates_name_within_session(
     class FakeRegistry:
         def __init__(self) -> None:
             self.backend = FakeBackend()
+
+        def resolve_name(self, name: str) -> str:
+            return canonical_backend_name(name)
 
         def default_backend(self) -> str:
             return "codex"

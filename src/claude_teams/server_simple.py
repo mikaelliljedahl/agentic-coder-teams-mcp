@@ -2958,6 +2958,14 @@ async def spawn_agent(
 ) -> dict:
     """Spawn a new agent process.
 
+    backend: which agentic CLI runs the agent. The only legal values are the
+    exact strings ``claude-code``, ``codex`` and ``pi`` — note the hyphen in
+    ``claude-code``; plain ``claude`` is a model family, not a backend. Omit it
+    (or pass ``""``) for the default, which is ``claude-code`` when it is
+    installed. ``list_backends()`` reports what is actually available on this
+    machine. A few obvious spellings (``claude``, ``claude_code``, ``gpt``,
+    ``openai``) are accepted as aliases, but anything else fails the spawn.
+
     model: pick by how much capability the task needs, not by a model name.
     For codex, choose one capability tier (each maps to a GPT-5.6 model at a
     fixed reasoning effort), cheapest first:
@@ -3030,7 +3038,14 @@ async def spawn_agent(
             tickets = _load_join_tickets_unlocked(session_id)
             agent_name = _unique_reserved_name(name, agents, tickets, now=time.time())
 
-            backend_name = backend.strip() or registry.default_backend()
+            # Canonicalize before anything stores or branches on the name: an
+            # alias must never reach the agent record, since every later
+            # lookup (resume, follow-up, output reader) keys off it.
+            backend_name = (
+                registry.resolve_name(backend)
+                if backend.strip()
+                else registry.default_backend()
+            )
             b = registry.get(backend_name)
 
             effort = reasoning_effort.strip() or None

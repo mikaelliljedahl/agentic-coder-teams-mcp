@@ -8,6 +8,7 @@ import pytest
 
 from claude_teams import server_simple
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.backends.registry import canonical_backend_name
 
 
 class _FakeBackend:
@@ -34,6 +35,9 @@ class _FakeRegistry:
     def __init__(self, backend: object, name: str = "claude-code") -> None:
         self._backend = backend
         self._name = name
+
+    def resolve_name(self, name: str) -> str:
+        return canonical_backend_name(name)
 
     def default_backend(self) -> str:
         return self._name
@@ -188,3 +192,34 @@ async def test_spawn_agent_and_watch_paths_return_equal_watch_metadata(
         "watch_command_powershell",
     }
     assert {key: spawned[key] for key in keys} == {key: watched[key] for key in keys}
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_records_canonical_backend_for_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``backend="claude"`` must spawn and persist as ``claude-code``.
+
+    The stored name keys every later lookup (resume, follow-up, output
+    reader), so an alias may never survive into the agent record.
+    """
+    backend = _FakeBackend()
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path / "sessions")
+    monkeypatch.setattr(server_simple, "_session_id", "")
+    monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
+
+    result = await server_simple.spawn_agent(
+        "prompt", name="worker", backend="claude", cwd=str(tmp_path)
+    )
+
+    assert result["backend"] == "claude-code"
+    agents = server_simple._load_agents(result["session_id"])
+    assert [a["backend"] for a in agents] == ["claude-code"]
+
+
+def test_spawn_agent_docstring_documents_backend_values() -> None:
+    description = server_simple.spawn_agent.__doc__ or ""
+
+    assert "backend:" in description
+    for name in ("claude-code", "codex", "pi"):
+        assert name in description

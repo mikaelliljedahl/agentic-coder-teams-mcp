@@ -21,6 +21,7 @@ from claude_teams.agent_output import (
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.backends.codex import CodexBackend
 from claude_teams.backends.contracts import SpawnRequest
+from claude_teams.backends.registry import canonical_backend_name
 
 
 class _FakeBackend:
@@ -47,6 +48,9 @@ class _FakeRegistry:
     def __init__(self, backend: object, name: str = "claude-code") -> None:
         self._backend = backend
         self._name = name
+
+    def resolve_name(self, name: str) -> str:
+        return canonical_backend_name(name)
 
     def default_backend(self) -> str:
         return self._name
