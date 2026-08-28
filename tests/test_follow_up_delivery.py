@@ -25,6 +25,7 @@ from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.process_manager import (
     OWNERSHIP_OURS,
 )
+from claude_teams.backends.registry import canonical_backend_name
 from claude_teams.delivery import DELIVERY_MARKER_PREFIX
 
 SESSION = "session-id"
@@ -82,6 +83,9 @@ class _FakeResumeBackend:
 class _FakeRegistry:
     def __init__(self, backend: object) -> None:
         self.backend = backend
+
+    def resolve_name(self, name: str) -> str:
+        return canonical_backend_name(name)
 
     def get(self, backend: str) -> object:
         return self.backend

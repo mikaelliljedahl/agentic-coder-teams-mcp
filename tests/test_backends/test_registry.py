@@ -170,3 +170,64 @@ class TestRegistryLazyLoading:
         with patch("claude_teams.backends.base.shutil.which", return_value=None):
             reg._ensure_loaded()
         assert reg._loaded is True
+
+
+class TestRegistryNameAliases:
+    """An orchestrating lead that guesses ``claude`` must not hard-fail."""
+
+    def _loaded_registry(self) -> BackendRegistry:
+        reg = BackendRegistry()
+        reg._loaded = True
+        reg._backends = {
+            "claude-code": _make_mock_backend("claude-code"),
+            "codex": _make_mock_backend("codex"),
+            "pi": _make_mock_backend("pi"),
+        }
+        return reg
+
+    @pytest.mark.parametrize(
+        ("alias", "canonical"),
+        [
+            ("claude", "claude-code"),
+            ("claudecode", "claude-code"),
+            ("claude_code", "claude-code"),
+            ("claude-cli", "claude-code"),
+            ("gpt", "codex"),
+            ("openai", "codex"),
+            ("codex-cli", "codex"),
+        ],
+    )
+    def test_resolve_name_maps_alias_to_canonical(self, alias, canonical):
+        reg = self._loaded_registry()
+        assert reg.resolve_name(alias) == canonical
+
+    @pytest.mark.parametrize("spelling", ["  Claude ", "CLAUDE", "Claude_Code"])
+    def test_resolve_name_is_case_and_whitespace_insensitive(self, spelling):
+        reg = self._loaded_registry()
+        assert reg.resolve_name(spelling) == "claude-code"
+
+    def test_resolve_name_passes_canonical_names_through(self):
+        reg = self._loaded_registry()
+        assert reg.resolve_name("claude-code") == "claude-code"
+        assert reg.resolve_name("pi") == "pi"
+
+    def test_resolve_name_passes_unknown_names_through_unchanged(self):
+        # A typo must still fail loudly at ``get()`` rather than be guessed at.
+        reg = self._loaded_registry()
+        assert reg.resolve_name("claudius") == "claudius"
+
+    def test_registered_name_wins_over_alias_table(self):
+        reg = self._loaded_registry()
+        own = _make_mock_backend("claude")
+        reg.register("claude", own)
+        assert reg.resolve_name("claude") == "claude"
+        assert reg.get("claude") is own
+
+    def test_get_resolves_alias_to_registered_backend(self):
+        reg = self._loaded_registry()
+        assert reg.get("claude") is reg._backends["claude-code"]
+
+    def test_get_still_raises_for_unknown_name(self):
+        reg = self._loaded_registry()
+        with pytest.raises(KeyError, match="claudius"):
+            reg.get("claudius")

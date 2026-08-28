@@ -32,6 +32,7 @@ from claude_teams.agent_output import (
 )
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.pi import PiBackend
+from claude_teams.backends.registry import canonical_backend_name
 from claude_teams.delivery import delivery_marker_token, receipt_nonces
 
 
@@ -59,6 +60,9 @@ class _FakeRegistry:
     def __init__(self, backend: object, name: str) -> None:
         self._backend = backend
         self._name = name
+
+    def resolve_name(self, name: str) -> str:
+        return canonical_backend_name(name)
 
     def default_backend(self) -> str:
         return self._name
