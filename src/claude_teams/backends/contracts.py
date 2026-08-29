@@ -1,9 +1,33 @@
 """Shared backend contracts, request/result types, and backend exceptions."""
 
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypedDict, runtime_checkable
+
+# ---------------------------------------------------------------------------
+# Shared GPT capability-tier policy
+# ---------------------------------------------------------------------------
+
+# Opt-in switch for the Luna-preferring tier ladder. The Codex and Pi backends
+# expose the same six tier names over the same GPT-5.6 models, so a coordinator
+# can pick a tier without knowing which backend will run it; the switch is
+# therefore shared rather than per-backend, so ``high`` never means one thing on
+# codex and another on pi. Exactly ``"1"`` opts in; anything else -- unset,
+# ``"0"``, ``"true"`` -- keeps the default ladder.
+PREFER_LUNA_ENV = "WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS"
+
+
+def prefer_luna_tiers() -> bool:
+    """Return whether the Luna-preferring tier ladder is opted into.
+
+    Read per call rather than at import so a long-lived MCP server whose
+    environment is updated mid-process picks the change up without a restart,
+    and so tests need no module reload.
+    """
+    return os.environ.get(PREFER_LUNA_ENV, "").strip() == "1"
+
 
 # ---------------------------------------------------------------------------
 # Backend-specific exceptions (previously in claude_teams.errors)
