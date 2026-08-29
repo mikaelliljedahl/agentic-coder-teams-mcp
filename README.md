@@ -617,10 +617,38 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 | `prompt` | required | Task prompt for the agent |
 | `name` | auto (`agent-1`) | Agent name |
 | `backend` | `claude-code` | Spawn backends: `claude-code`, `codex`, or `pi`. `external` is a joined registry label, not a valid spawn backend. |
-| `model` | backend default | Model to use. For `codex`/`pi`, a capability tier (`low`/`medium`/`high`/`xhigh`/`ultra`) that bundles a model + effort. Pi tiers soft-fall-back to pi's default model when the tier's model is absent (e.g. after switching provider) rather than erroring. |
+| `model` | backend default | Model to use. For `codex`/`pi`, a capability tier (`cheapest`/`low`/`medium`/`high`/`xhigh`/`max`) that bundles a model + effort. Pi tiers soft-fall-back to pi's default model when the tier's model is absent (e.g. after switching provider) rather than erroring. |
 | `reasoning_effort` | none | `low`/`medium`/`high`/`xhigh` (codex), `low`/`medium`/`high`/`xhigh`/`max` (claude-code). Ignored for `codex`/`pi` tiers (the tier owns the effort). |
 | `permission_mode` | `bypass` | `bypass`, `default`, or `require_approval` |
 | `cwd` | server cwd | Working directory for the agent |
+
+### GPT capability tiers (codex and pi)
+
+Tiers are the only model interface exposed to the caller for the GPT-backed
+backends: each bundles a GPT-5.6 model with a reasoning effort, forming an
+ascending cost/quality ladder. `codex` and `pi` share the same ladder on
+purpose, so a coordinator can pick a tier without knowing which backend will
+run it. The tier names are stable; what they resolve to is configurable.
+
+| Tier | Default | With `WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1` |
+| --- | --- | --- |
+| `cheapest` | Luna @ medium | Luna @ medium |
+| `low` | Luna @ high | Luna @ high |
+| `medium` | Luna @ xhigh | Luna @ xhigh |
+| `high` | Sol @ medium | **Luna @ max** |
+| `xhigh` | Sol @ high | **Sol @ medium** |
+| `max` | Sol @ xhigh | **Sol @ high** |
+
+Setting `WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1` (exactly `1`; anything
+else keeps the default) shifts the top three tiers one step toward Luna. Luna @
+max holds up about as well as Sol @ medium in practice, so this reserves the
+scarcer Sol quota for `xhigh`/`max` — the genuinely hard problems. The variable
+is read per spawn, so a running server picks up a change without a restart, and
+it applies to `codex` and `pi` together so the two never diverge.
+
+Unavailable-model behaviour is unchanged by the switch: `codex` errors
+(`BackendModelUnavailableError`) rather than downgrading silently, while `pi`
+keeps the tier's thinking level and drops the model so pi uses its own default.
 
 ## CLI
 

@@ -10,6 +10,8 @@ import pytest
 from claude_teams.agent_output import read_pi_output
 from claude_teams.backends import pi as pi_module
 from claude_teams.backends.base import SpawnRequest
+from claude_teams.backends.codex import CodexBackend
+from claude_teams.backends.contracts import PREFER_LUNA_ENV
 from claude_teams.backends.pi import PiBackend
 
 _ALL_MODELS = [
@@ -21,6 +23,22 @@ _ALL_MODELS = [
     "gpt-5.6-sol",
     "gpt-5.6-terra",
 ]
+
+
+@pytest.fixture(autouse=True)
+def _default_tier_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin every test to the default tier ladder unless it opts in itself."""
+    monkeypatch.delenv(PREFER_LUNA_ENV, raising=False)
+
+
+@pytest.fixture
+def _prefer_luna(monkeypatch: pytest.MonkeyPatch) -> Callable[[str], None]:
+    """Return a helper that sets the Luna-preferring opt-in env var."""
+
+    def apply(value: str = "1") -> None:
+        monkeypatch.setenv(PREFER_LUNA_ENV, value)
+
+    return apply
 
 
 @pytest.fixture
@@ -165,6 +183,69 @@ class TestPiResolveLaunch:
 
     def test_raw_slug_passthrough_when_available(self, _models):
         assert PiBackend().resolve_launch("gpt-5.5", "high") == ("gpt-5.5", "high")
+
+
+class TestPiPreferLunaTiers:
+    """Pi mirrors the Codex ladder, opt-in included, so a tier means the same
+    thing on both backends."""
+
+    def test_top_tiers_shift_toward_luna(self, _models, _prefer_luna):
+        _prefer_luna()
+        backend = PiBackend()
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "medium")
+        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "high")
+
+    def test_cheap_tiers_unchanged(self, _models, _prefer_luna):
+        _prefer_luna()
+        backend = PiBackend()
+        assert backend.resolve_launch("cheapest", None) == ("gpt-5.6-luna", "medium")
+        assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
+        assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
+
+    def test_matches_codex_ladder(self, _models, _prefer_luna):
+        # The two backends must not diverge: a coordinator picks a tier without
+        # knowing which backend will run it.
+        _prefer_luna()
+        assert PiBackend()._tier_launch() == CodexBackend()._tier_launch()
+
+    def test_resolve_model_follows_opt_in(self, _prefer_luna):
+        _prefer_luna()
+        backend = PiBackend()
+        assert backend.resolve_model("high") == "gpt-5.6-luna"
+        assert backend.resolve_model("xhigh") == "gpt-5.6-sol"
+        assert backend.resolve_model("max") == "gpt-5.6-sol"
+
+    def test_tier_names_and_order_unchanged(self, _prefer_luna):
+        _prefer_luna()
+        backend = PiBackend()
+        assert backend.supported_models() == [
+            "cheapest",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        ]
+        assert backend.default_model() == "medium"
+
+    @pytest.mark.parametrize("value", ["0", "", "true", "2"])
+    def test_only_exactly_one_opts_in(self, _models, _prefer_luna, value):
+        _prefer_luna(value)
+        assert PiBackend().resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
+
+    def test_soft_fallback_still_applies_to_shifted_tier(self, _models, _prefer_luna):
+        # ``high`` needs Luna under the opt-in; without it pi drops the model
+        # and keeps the tier's thinking level rather than erroring.
+        _models(["gpt-5.6-sol"])  # no Luna
+        _prefer_luna()
+        assert PiBackend().resolve_launch("high", None) == ("", "max")
+
+    def test_read_per_call_not_at_import(self, _models, _prefer_luna):
+        backend = PiBackend()
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
+        _prefer_luna()
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
 
     def test_raw_slug_dropped_when_unavailable(self, _models):
         assert PiBackend().resolve_launch("nope", "high") == ("", "high")

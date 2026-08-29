@@ -20,6 +20,7 @@ from claude_teams.backends.base import (
 from claude_teams.backends.contracts import (
     BackendBinaryNotFoundError,
     BackendModelUnavailableError,
+    prefer_luna_tiers,
 )
 from claude_teams.backends.process_manager import process_manager
 
@@ -129,6 +130,28 @@ class CodexBackend(BaseBackend):
         "max": ("gpt-5.6-sol", "xhigh"),
     }
 
+    # Opt-in ladder, selected by ``WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1``.
+    # Luna @ max holds up about as well as Sol @ medium in practice, so the top
+    # three tiers each shift one step toward Luna: ``high`` becomes Luna's
+    # ceiling, and Sol is reserved for ``xhigh``/``max`` -- the genuinely hard
+    # problems that are the only ones worth spending the scarcer Sol quota on.
+    # Tier *names* and their order are identical to the default ladder, so this
+    # changes only what a tier resolves to, never the caller-facing vocabulary.
+    #   cheapest -> Luna @ medium   (unchanged)
+    #   low      -> Luna @ high     (unchanged)
+    #   medium   -> Luna @ xhigh    (unchanged)
+    #   high     -> Luna @ max      (was Sol @ medium)
+    #   xhigh    -> Sol  @ medium   (was Sol @ high)
+    #   max      -> Sol  @ high     (was Sol @ xhigh)
+    _TIER_LAUNCH_PREFER_LUNA: ClassVar[dict[str, tuple[str, str]]] = {
+        "cheapest": ("gpt-5.6-luna", "medium"),
+        "low": ("gpt-5.6-luna", "high"),
+        "medium": ("gpt-5.6-luna", "xhigh"),
+        "high": ("gpt-5.6-luna", "max"),
+        "xhigh": ("gpt-5.6-sol", "medium"),
+        "max": ("gpt-5.6-sol", "high"),
+    }
+
     _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
         flag="-c",
         value_template="model_reasoning_effort={value}",
@@ -155,6 +178,17 @@ class CodexBackend(BaseBackend):
         """Parse ``[agents.*]`` tables from ``~/.codex/config.toml`` and project."""
         return discover_codex_style_agents(cwd, "codex")
 
+    def _tier_launch(self) -> dict[str, tuple[str, str]]:
+        """Return the tier ladder currently in force.
+
+        The Luna-preferring ladder when
+        ``WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1``, otherwise the
+        default. Both ladders carry the same tier names in the same order.
+        """
+        if prefer_luna_tiers():
+            return self._TIER_LAUNCH_PREFER_LUNA
+        return self._TIER_LAUNCH
+
     def supported_models(self) -> list[str]:
         """Return the capability tiers the MCP caller may choose from.
 
@@ -167,7 +201,7 @@ class CodexBackend(BaseBackend):
             list[str]: Selectable tier names, cheapest first.
 
         """
-        return list(self._TIER_LAUNCH)
+        return list(self._tier_launch())
 
     def default_model(self) -> str:
         """Return the default capability tier.
@@ -198,7 +232,7 @@ class CodexBackend(BaseBackend):
         key = generic_name.strip()
         if not key:
             return ""
-        tier = self._TIER_LAUNCH.get(key.lower())
+        tier = self._tier_launch().get(key.lower())
         return tier[0] if tier else key
 
     def resolve_launch(
@@ -209,7 +243,8 @@ class CodexBackend(BaseBackend):
         - Blank ``model`` -> ``("", effort)``: no ``-c model`` override is
           emitted and codex uses its own ``config.toml`` default (escape hatch).
         - A capability tier (``cheapest``/``low``/``medium``/``high``/``xhigh``/``max``)
-          resolves to its bundled ``(GPT-5.6 slug, effort)``; a caller-supplied
+          resolves to its bundled ``(GPT-5.6 slug, effort)`` from the ladder in
+          force (see :meth:`_tier_launch`); a caller-supplied
           ``reasoning_effort`` is silently ignored (the tier owns the effort).
         - Any other value is treated as a raw model slug and passes through
           (``reasoning_effort`` still applies here and to blank models).
@@ -221,7 +256,7 @@ class CodexBackend(BaseBackend):
         key = model.strip()
         if not key:
             return "", reasoning_effort
-        tier = self._TIER_LAUNCH.get(key.lower())
+        tier = self._tier_launch().get(key.lower())
         if tier is not None:
             slug, tier_effort = tier
             self._require_available(slug)

@@ -20,7 +20,10 @@ from claude_teams.backends.base import (
     BaseBackend,
     SpawnRequest,
 )
-from claude_teams.backends.contracts import BackendBinaryNotFoundError
+from claude_teams.backends.contracts import (
+    BackendBinaryNotFoundError,
+    prefer_luna_tiers,
+)
 from claude_teams.backends.process_manager import process_manager
 
 _LOCAL_PATH_CLS = type(Path.cwd())
@@ -185,6 +188,37 @@ class PiBackend(BaseBackend):
         "max": ("gpt-5.6-sol", "xhigh"),
     }
 
+    # Opt-in ladder, selected by ``WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1``
+    # (see :func:`claude_teams.backends.contracts.prefer_luna_tiers`). Identical
+    # to the Codex backend's opt-in ladder, for the same reason the default
+    # ladders match: a coordinator picks a tier without knowing which backend
+    # will run it, so the two must not diverge.
+    #   cheapest -> Luna @ medium   (unchanged)
+    #   low      -> Luna @ high     (unchanged)
+    #   medium   -> Luna @ xhigh    (unchanged)
+    #   high     -> Luna @ max      (was Sol @ medium)
+    #   xhigh    -> Sol  @ medium   (was Sol @ high)
+    #   max      -> Sol  @ high     (was Sol @ xhigh)
+    _TIER_LAUNCH_PREFER_LUNA: ClassVar[dict[str, tuple[str, str]]] = {
+        "cheapest": ("gpt-5.6-luna", "medium"),
+        "low": ("gpt-5.6-luna", "high"),
+        "medium": ("gpt-5.6-luna", "xhigh"),
+        "high": ("gpt-5.6-luna", "max"),
+        "xhigh": ("gpt-5.6-sol", "medium"),
+        "max": ("gpt-5.6-sol", "high"),
+    }
+
+    def _tier_launch(self) -> dict[str, tuple[str, str]]:
+        """Return the tier ladder currently in force.
+
+        The Luna-preferring ladder when
+        ``WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1``, otherwise the
+        default. Both ladders carry the same tier names in the same order.
+        """
+        if prefer_luna_tiers():
+            return self._TIER_LAUNCH_PREFER_LUNA
+        return self._TIER_LAUNCH
+
     _THINKING_OPTIONS: ClassVar[frozenset[str]] = frozenset(
         {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
     )
@@ -198,7 +232,7 @@ class PiBackend(BaseBackend):
             list[str]: Selectable tier names, cheapest first.
 
         """
-        return list(self._TIER_LAUNCH)
+        return list(self._tier_launch())
 
     def default_model(self) -> str:
         """Return the default capability tier (``medium``)."""
@@ -214,7 +248,7 @@ class PiBackend(BaseBackend):
         key = generic_name.strip()
         if not key:
             return ""
-        tier = self._TIER_LAUNCH.get(key.lower())
+        tier = self._tier_launch().get(key.lower())
         return tier[0] if tier else key
 
     def resolve_launch(
@@ -237,7 +271,7 @@ class PiBackend(BaseBackend):
         key = model.strip()
         if not key:
             return "", reasoning_effort
-        tier = self._TIER_LAUNCH.get(key.lower())
+        tier = self._tier_launch().get(key.lower())
         if tier is not None:
             slug, tier_effort = tier
             return (slug if self._model_available(slug) else ""), tier_effort
