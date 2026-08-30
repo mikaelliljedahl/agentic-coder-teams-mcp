@@ -1,6 +1,7 @@
 """Tests for bounded, cross-platform process ancestry discovery."""
 
 import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -313,12 +314,88 @@ def test_windows_command_lines_survives_an_undecodable_byte(
 ) -> None:
     """A byte that is not valid UTF-8 costs one character, not the whole table.
 
-    Without ``errors="replace"`` the reader thread dies, ``stdout`` comes back
-    ``None``, and the helper's own ``.strip()`` raises ``AttributeError`` past
-    its ``(OSError, SubprocessError)`` guard.
+    Without ``errors="replace"`` the decode fails, and how it fails depends on
+    the platform: on Windows the reader thread dies and ``stdout`` comes back
+    ``None`` (which the helper now degrades to an empty table); elsewhere the
+    ``UnicodeDecodeError`` reaches the caller. Either way the row below is
+    lost, which is what this asserts.
     """
     payload = b'[{"ProcessId": 7, "CommandLine": "C:/pi.exe --name \x8f"}]'
 
     result = _run_helper_against_shim(monkeypatch, _shim(tmp_path, payload))
 
     assert result[7] == ("C:/pi.exe", "--name", "�")
+
+
+#: Environment that forces a nested interpreter's default text encoding to
+#: ASCII on Linux (and leaves Windows on its own non-UTF-8 code page), so that
+#: dropping ``encoding="utf-8"`` provably changes the result.
+_ASCII_LOCALE_ENV = {
+    "PYTHONUTF8": "0",
+    "PYTHONCOERCECLOCALE": "0",
+    "LC_ALL": "C",
+    "LANG": "C",
+}
+
+
+def test_explicit_encoding_is_what_decodes_utf8_not_the_host_locale(
+    tmp_path: Path,
+) -> None:
+    """Prove the ``encoding="utf-8"`` keyword, not a lucky UTF-8 runner.
+
+    The tests above pass on a UTF-8 Linux runner even without the keyword,
+    because the locale default happens to agree. This one re-runs the same
+    scenario in a nested interpreter whose default text encoding is ASCII, and
+    also with the keyword patched out, so the two answers must differ.
+    """
+    shim = tmp_path / "shim.py"
+    shim.write_text(
+        "import sys\n"
+        'sys.stdout.buffer.write(b\'[{"ProcessId": 7, "CommandLine": '
+        '\\"pi \\xe2\\x89\\xa5\\"}]\')\n',
+        encoding="utf-8",
+    )
+    driver = tmp_path / "driver.py"
+    driver.write_text(
+        "import json, locale, subprocess, sys\n"
+        "from claude_teams import procinfo\n"
+        "strip_encoding = sys.argv[1] == 'strip'\n"
+        "real_run = subprocess.run\n"
+        "def run_shim(command, **kwargs):\n"
+        "    if strip_encoding:\n"
+        "        kwargs.pop('encoding', None)\n"
+        "        kwargs.pop('errors', None)\n"
+        "        kwargs['text'] = True\n"
+        f"    return real_run([sys.executable, {str(shim)!r}], **kwargs)\n"
+        "procinfo.shutil.which = lambda _n: sys.executable\n"
+        "procinfo.subprocess.run = run_shim\n"
+        "procinfo._split_windows_command_line = lambda line: tuple(line.split())\n"
+        "try:\n"
+        "    table = procinfo._windows_command_lines()\n"
+        "except UnicodeDecodeError:\n"
+        "    table = {}\n"
+        "print(json.dumps({'encoding': locale.getencoding(),\n"
+        "                  'argv': list(table.get(7, ()))}))\n",
+        encoding="utf-8",
+    )
+
+    def drive(mode: str) -> dict[str, object]:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, our own script.
+            [sys.executable, str(driver), mode],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, **_ASCII_LOCALE_ENV},
+            check=True,
+        )
+        return json.loads(completed.stdout)
+
+    kept = drive("keep")
+    stripped = drive("strip")
+
+    nested_encoding = str(kept["encoding"]).lower().replace("-", "_")
+    if nested_encoding in {"utf_8", "utf8", "cp65001"}:
+        pytest.skip(f"could not force a non-UTF-8 default: {nested_encoding}")
+    # With the keyword: the real characters. Without it: anything but.
+    assert kept["argv"] == ["pi", "≥"]
+    assert stripped["argv"] != kept["argv"]

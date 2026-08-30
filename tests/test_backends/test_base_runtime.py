@@ -1109,6 +1109,15 @@ class TestTmuxProcessManager:
             pytest.param("@�\t%42\t4242\n", id="corrupt-window-id"),
             pytest.param("@7\t%�\t4242\n", id="corrupt-pane-id"),
             pytest.param("@7\t%42\t-1\n", id="non-positive-pid"),
+            pytest.param("@7\t%42\t0\n", id="zero-pid"),
+            # `\d` and int() both accept Unicode decimal digits and a leading
+            # sign. tmux emits neither, and neither can be addressed back.
+            pytest.param(
+                "@١\t%٢\t4242\n",  # noqa: RUF001 - Arabic-Indic digits are the point.
+                id="unicode-digit-ids",
+            ),
+            pytest.param("@7\t%42\t+3\n", id="signed-pid"),
+            pytest.param("@7\t%42\t٣\n", id="unicode-digit-pid"),
         ],
     )
     def test_spawn_refuses_a_tmux_target_it_could_never_address(
@@ -1146,12 +1155,14 @@ class TestTmuxProcessManager:
             pytest.param("no such pane\n", id="unexpected-text"),
         ],
     )
-    def test_unreadable_pane_status_does_not_prove_ownership(self, monkeypatch, stdout):
+    def test_unreadable_pane_status_does_not_prove_ownership(
+        self, monkeypatch, tmp_path, stdout
+    ):
         """`#{pane_dead}` answers exactly "0" or "1"; anything else fails closed.
 
-        _tracked_alive uses this as PROOF that a pane is ours. Reading
-        "anything that is not 1" as alive would let a replacement character
-        claim ownership of a pane we cannot address.
+        Asserted through `_tracked_alive`, which is the call that actually
+        decides ownership: reading "anything that is not 1" as alive would let
+        a replacement character claim a pane we cannot address.
         """
         manager = process_manager_mod.TmuxProcessManager()
         monkeypatch.setattr(
@@ -1159,11 +1170,23 @@ class TestTmuxProcessManager:
             "run",
             MagicMock(return_value=MagicMock(stdout=stdout, stderr="", returncode=0)),
         )
+        info = process_manager_mod.TmuxProcessInfo(
+            pid=4242,
+            name="worker",
+            agent_id="agent",
+            team_name="team",
+            backend="codex",
+            target_id="@7",
+            pane_id="%42",
+            log_path=tmp_path / "worker.log",
+            started_at=1.0,
+        )
 
         alive, detail = manager._pane_alive("%42")
 
         assert alive is False
         assert "unreadable" in detail
+        assert manager._tracked_alive(info) is False
 
     def test_pane_status_zero_is_alive(self, monkeypatch):
         manager = process_manager_mod.TmuxProcessManager()

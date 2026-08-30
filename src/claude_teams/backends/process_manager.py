@@ -21,8 +21,14 @@ _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_NAME_LEN = 64
 _TMUX_SPAWN_FIELD_COUNT = 3
 #: tmux window and pane ids, as emitted by ``#{window_id}``/``#{pane_id}``.
-_TMUX_WINDOW_ID = re.compile(r"@\d+")
-_TMUX_PANE_ID = re.compile(r"%\d+")
+#: tmux formats these with ``@%u``/``%%%u``, so the language is ASCII digits
+#: only. ``\d`` would also accept Unicode decimal digits such as U+0661, which
+#: tmux can never emit and can never address either.
+_TMUX_WINDOW_ID = re.compile(r"@[0-9]+")
+_TMUX_PANE_ID = re.compile(r"%[0-9]+")
+#: Likewise ``int()`` accepts "+3", "٣" and surrounding whitespace; a pane PID
+#: is a plain positive decimal or it is not a pane PID.
+_TMUX_PANE_PID = re.compile(r"[1-9][0-9]*")
 _PROC_STAT_SPLIT_FIELD_COUNT = 2
 _STILL_ACTIVE = 259
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -1674,15 +1680,10 @@ class TmuxProcessManager(_PidOwnershipMixin):
         if not _TMUX_PANE_ID.fullmatch(pane_id):
             msg = f"Unexpected tmux pane id: {pane_id!r}"
             raise RuntimeError(msg)
-        try:
-            pid = int(pid_text)
-        except ValueError as err:
-            msg = f"Unexpected tmux pane PID: {pid_text!r}"
-            raise RuntimeError(msg) from err
-        if pid <= 0:
+        if not _TMUX_PANE_PID.fullmatch(pid_text):
             msg = f"Unexpected tmux pane PID: {pid_text!r}"
             raise RuntimeError(msg)
-        return window_id, pane_id, pid
+        return window_id, pane_id, int(pid_text)
 
     def _pane_alive(self, pane_id: str) -> tuple[bool, str]:
         tmux = self._tmux_binary()

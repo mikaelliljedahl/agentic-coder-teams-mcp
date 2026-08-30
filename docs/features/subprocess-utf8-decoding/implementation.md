@@ -67,11 +67,48 @@ Two of them were wrong, and both are fixed here:
 - **MINOR — the docstrings described the wrong failure mechanics.** Corrected
   above and in the tests; both modes are now stated.
 
-Codex's remaining suggestion — forcing the process' default text encoding to
-ASCII so that dropping `encoding="utf-8"` fails on a UTF-8 Linux runner — was
-not implemented. On Linux the real-subprocess tests prove `errors=`; `encoding=`
-is pinned by the call-shape test. This is stated in the test docstrings rather
-than papered over.
+## Review round 2
+
+`code-review-2.md` (Codex, adversarial, on the round-1 response): CHANGES
+REQUESTED again. It confirmed the `_pane_alive` blocker RESOLVED — including
+checking tmux's own `format.c` across 1.8, 2.0, 3.0a and master to establish
+that `#{pane_dead}` really is only ever `0` or `1`, so failing closed breaks no
+legitimate caller — and reproduced the whole red-against-`main` table. Four
+things were still wrong:
+
+- **MAJOR — the "strict" tmux id parser was not strict.** Python's `\d` is
+  Unicode-aware and `int()` accepts a sign, so `@١  %٢  +3` was *accepted* and
+  registered a target that can never be addressed. The same failure class the
+  round-1 fix was supposed to close, through a different input. Now ASCII-only:
+  `@[0-9]+`, `%[0-9]+`, and a PID that must full-match `[1-9][0-9]*`.
+- **MAJOR — smoke phase 2 could pass against broken `main`.** It only checked
+  that argv was non-empty, and on this machine `main` returned a populated
+  table full of mojibake. Rewritten to assert the exact non-ASCII script path
+  round-trips, and verified to print `True` on this branch and `False` against
+  `main`.
+- **MAJOR — smoke phase 4c tested nothing.** `TmuxProcessManager` has no
+  `list_sessions`, so my `hasattr` fallback always printed "inspect manually".
+  Replaced with a real pane driven through the production `_pane_alive`.
+- **MINOR — the ownership test never reached ownership** (it called
+  `_pane_alive`, not `_tracked_alive`), **phase 3 was source-grep theatre**
+  (now runs PowerShell and inspects the raw first bytes for a BOM), and the
+  **row-count evidence was presented as an invariant** when it is a dated
+  single-machine snapshot.
+
+It also found a genuine false positive I introduced: `_not_false` flagged
+`capture_output=None` and `capture_output=0`, which are "off". The guard now
+distinguishes statically-falsey literals from non-literal unknowns, and the
+"does not cry wolf" table covers those cases.
+
+**The encoding is now proved behaviourally.** Round 1 asked for a test that
+fails when only `encoding="utf-8"` is dropped, independent of the host locale;
+round 1's response admitted it did not have one, and round 2 demonstrated the
+gap by mutating the keyword away and watching the test stay green.
+`test_explicit_encoding_is_what_decodes_utf8_not_the_host_locale` re-runs the
+scenario in a nested interpreter forced to an ASCII default
+(`PYTHONUTF8=0`, `PYTHONCOERCECLOCALE=0`, `LC_ALL=C`) and asserts the two
+answers differ. Against `main` it fails with
+`['pi', 'â‰¥'] != ['pi', '≥']` — the mojibake, named.
 
 ## Evidence
 
@@ -83,21 +120,31 @@ and fails there:
 | `test_windows_command_lines_asks_the_child_for_utf8` | `KeyError: 'encoding'` |
 | `test_windows_command_lines_decodes_real_utf8_bytes` | `KeyError: 7` |
 | `test_windows_command_lines_survives_an_undecodable_byte` | `KeyError: 7` |
-| `test_spawn_refuses_a_tmux_target_it_could_never_address` (×3) | no `RuntimeError` |
+| `test_explicit_encoding_is_what_decodes_utf8_not_the_host_locale` | `['pi', 'â‰¥'] != ['pi', '≥']` |
+| `test_spawn_refuses_a_tmux_target_it_could_never_address` (×7) | no `RuntimeError` |
 | `test_unreadable_pane_status_does_not_prove_ownership` (×3) | reported alive |
 | `test_subprocess_decoding.py` | fails on `procinfo.py`, `process_base.py`, `process_manager.py` |
 
-The two `_run_helper_against_shim` tests drive `_windows_command_lines` with a
+The `_run_helper_against_shim` tests drive `_windows_command_lines` with a
 **real child process** and a real `subprocess.run`; only the executable and the
-Windows-only argv splitter are substituted, so they run on Linux too.
+Windows-only argv splitter are substituted, so they run on Linux too. The
+locale test goes further and runs the whole thing in a nested interpreter whose
+default text encoding is forced to ASCII, which is what makes it independent of
+the runner's own locale.
 
-Behavioural check on Windows — a child was started whose argv carries `≥ → é 中`,
-then the live process table was read back (`smoke-test.md`, phase 1):
+Behavioural checks on Windows, `smoke-test.md` phases 1–3. These are **dated
+single-machine observations (2026-08-30)**, not stable invariants — the process
+table is a snapshot and the pre-fix damage takes more than one shape:
 
-| sources | rows returned | child's argv | marker intact |
-|---|---|---|---|
-| `main` | 0 | `None` | no |
-| this branch | 291 | full argv | yes |
+| check | `main` | this branch |
+|---|---|---|
+| planted argv `≥ → é 中` round-trips (phase 1) | no — 0 rows, `argv: None` | yes |
+| planted non-ASCII node script path survives (phase 2) | `False` | `True` |
+| PowerShell output has no BOM and starts with `[` (phase 3) | n/a | `True` |
+
+A second run on the same machine produced 287 rows against `main` with argv
+present but *mangled*, rather than 0 rows. The invariant that holds either way
+is the marker round-trip, which is what the smoke test now judges on.
 
 Two test doubles in `tests/test_backends/test_base_runtime.py` assert the exact
 kwargs of a `subprocess.run` call and were updated to include

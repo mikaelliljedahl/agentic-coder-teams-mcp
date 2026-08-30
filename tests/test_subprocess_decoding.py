@@ -49,15 +49,19 @@ def _keyword(node: ast.Call, name: str) -> ast.expr | None:
 
 
 def _not_false(value: ast.expr | None) -> bool:
-    """True unless the keyword is absent or a literal ``False``.
+    """True unless the keyword is absent or a *statically falsey* literal.
 
-    A non-literal (``text=some_flag``) counts as a candidate rather than being
-    waved through, so refactoring a literal into a variable cannot silently
-    escape the guard.
+    subprocess reads these options for truthiness, so ``False``, ``None`` and
+    ``0`` are all "off" and must not be flagged. A non-literal
+    (``text=some_flag``) is the opposite case: it counts as a candidate rather
+    than being waved through, so refactoring a literal into a variable cannot
+    silently escape the guard.
     """
     if value is None:
         return False
-    return not (isinstance(value, ast.Constant) and value.value is False)
+    if isinstance(value, ast.Constant):
+        return bool(value.value)
+    return True
 
 
 def _is_pipe(value: ast.expr | None) -> bool:
@@ -150,6 +154,17 @@ def test_guard_catches_the_shapes_it_claims_to(tmp_path: Path, source: str) -> N
         ),
         pytest.param("subprocess.run(a, capture_output=True)", id="bytes-not-decoded"),
         pytest.param("subprocess.run(a, text=True)", id="not-captured"),
+        # subprocess reads these for truthiness, so a falsey literal is "off".
+        pytest.param(
+            "subprocess.run(a, capture_output=None, text=True)",
+            id="capture_output-none",
+        ),
+        pytest.param(
+            "subprocess.run(a, capture_output=0, text=True)", id="capture_output-zero"
+        ),
+        pytest.param(
+            "subprocess.run(a, capture_output=True, text=None)", id="text-none"
+        ),
     ],
 )
 def test_guard_does_not_cry_wolf(tmp_path: Path, source: str) -> None:

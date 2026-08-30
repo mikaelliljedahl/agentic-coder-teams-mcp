@@ -7,6 +7,9 @@ things a monkeypatched `subprocess.run` cannot exercise.
 
 Budget: ~5 minutes on Windows, ~5 more on Linux if tmux is available.
 
+**Run every command in Git Bash**, the Windows phases included. They use `cat`,
+`/tmp` and backslash line continuations — they are not PowerShell.
+
 ## What you are looking for
 
 Not a crash. **The pre-fix failure is silent**, in two ways.
@@ -74,13 +77,21 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe /tmp/probe_argv.py
 `PYTHONIOENCODING=utf-8` is for the *print*, not the code under test — without
 it your own console raises on `≥` and hides the result.
 
-**PASS**: `rows` is in the hundreds, `argv seen` shows the marker intact, and
-`MARKER kept : True`.
+**PASS**: `MARKER kept : True`. That single line is the invariant — the exact
+marker round-trips.
 
-**FAIL (the pre-fix behaviour)**: `rows : 0`, `argv seen : None`,
-`MARKER kept : False`, with a `UnicodeDecodeError` traceback from
-`Thread-N (_readerthread)` printed above it. Note that the call **returned
-normally** — it did not raise. That is the point.
+**FAIL**: anything else. The pre-fix behaviour has more than one shape and you
+should not wait for a particular one:
+
+* `rows : 0` and `argv seen : None` — the mis-decode put a control character in
+  the JSON and the whole table was discarded. Observed on 2026-08-30.
+* `rows` in the hundreds but `MARKER kept : False` — the table survived and the
+  argv is mojibake (`≥` shows as `â‰¥`). Equally a failure, and the quieter one.
+* a `UnicodeDecodeError` traceback from `Thread-N (_readerthread)` above an
+  otherwise normal return — the call did **not** raise; the stream was lost.
+
+Which shape you get depends on the active code page and on what happens to be
+running, so judge on `MARKER kept`, not on the row count.
 
 To see the pre-fix behaviour for yourself, run the same script against `main`'s
 sources without checking anything out:
@@ -90,51 +101,65 @@ PYTHONPATH=C:/code/github/win-agent-teams-mcp/agentic-coder-teams-mcp/src \
   PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe /tmp/probe_argv.py
 ```
 
-## Phase 2 — Windows: the degradation the empty table causes
+## Phase 2 — Windows: the classification that argv exists to serve
 
-An empty table is not an abstract loss. `procinfo` uses argv to stop the
-ancestry walk at the right host: a bare `node.exe` is only recognisable as Pi
-or as Claude Code by the script path in its argv.
+Losing or mangling argv is not an abstract loss. `procinfo` uses argv to stop
+the ancestry walk at the right host: a bare `node.exe` is recognisable as Pi or
+as Claude Code **only** by the script path in its argv. So plant a child whose
+script path carries a non-ASCII character and ask whether that path survives.
 
 ```bash
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -c "
 import subprocess, sys, time
 from claude_teams import procinfo
-MARKER = 'win-agent-teams-smoke-\u2265'
-child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)', MARKER],
+SCRIPT = '/opt/smoke-\u2265/node_modules/@earendil-works/pi-coding-agent/dist/cli.js'
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)', SCRIPT],
                          creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 time.sleep(2)
-result = procinfo.resolve_nearest_host(child.pid)
-print('host      :', result.host)
-print('argv empty:', [e.name for e in result.chain if not e.argv])
+argv = procinfo._windows_command_lines().get(child.pid, ())
+print('script argv intact:', SCRIPT in argv)
+print('argv              :', argv)
 child.kill()
 "
 ```
 
-**PASS**: the chain's entries carry argv; `argv empty` is short or empty.
+**PASS**: `script argv intact: True`.
 
-**FAIL (pre-fix)**: every entry has `argv=()`, so `host_kind` cannot tell a
-node-launched Pi from a node-launched Claude Code, and it says so nowhere.
+**FAIL**: `False` — whether because the table came back empty or because the
+path came back mangled. Both are the same defect, and both leave `host_kind`
+unable to tell a node-launched Pi from a node-launched Claude Code. Do **not**
+accept a merely non-empty argv as a pass: the mangled case has a non-empty argv,
+and that is the shape `main` produced here on 2026-08-30.
 
 ## Phase 3 — Windows: no BOM, no blank line
 
 The fix prepends `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;` to
 the PowerShell command. If that emitted a BOM or a leading newline, `json.loads`
 would fail and the helper would fall back to `{}` — the same silent empty table,
-for a new reason. Prove the payload is clean:
+for a new reason. Run the real command and look at the real first bytes:
 
 ```bash
 .venv/Scripts/python.exe -c "
-import inspect, re, subprocess
-from claude_teams import procinfo
-src = inspect.getsource(procinfo._windows_command_lines)
-cmd = re.search(r'\"\[Console\].*?Compress\",', src, re.S).group(0)
-print('command contains UTF8 pin:', 'OutputEncoding' in cmd)
+import subprocess
+cmd = ('[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; '
+       'Get-CimInstance Win32_Process | '
+       'Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress')
+out = subprocess.run(['powershell.exe', '-NoProfile', '-Command', cmd],
+                     capture_output=True, timeout=30).stdout
+print('BOM        :', out.startswith(b'\xef\xbb\xbf'))
+print('starts JSON:', out.lstrip()[:1] in (b'[', b'{'))
+print('first bytes:', out[:8])
 "
 ```
 
-then confirm end-to-end that the JSON parses — phase 1 already does: a
-non-zero `rows` is only reachable through `json.loads`.
+**PASS**: `BOM : False` and `starts JSON: True`. **FAIL**: a BOM, or a first
+byte that is neither `[` nor `{`.
+
+This is the only phase that inspects the child's raw output bytes. Phase 1
+covers the same ground end to end — a non-zero row count is reachable only
+through a successful `json.loads` — but a BOM failure there would be
+indistinguishable from any other empty table, which is why this phase is
+separate.
 
 ## Phase 4 — Linux: tmux, and the two protocols that must NOT be lenient
 
@@ -181,25 +206,33 @@ for bad in ['@?\t%42\t4242', '@7\t%?\t4242', '@7\t%42\t-1']:
 **PASS**: all three are refused. **FAIL**: any is accepted — that registers an
 agent whose pane can never be health-checked, signalled or killed.
 
-### 4c. And the ordinary path still works
+### 4c. A real pane, through the real decode policy
 
-Skip if `tmux` is absent.
+This one needs tmux; skip it if `tmux` is absent. It drives the production
+`_pane_alive` against a pane that really exists, in a window whose name carries
+characters the C locale cannot represent — so the decode policy is exercised
+for real rather than mocked.
 
 ```bash
 tmux new-session -d -s smoke-utf8 -n "fönster-≥" "sleep 60"
+PANE=$(tmux list-panes -t smoke-utf8 -F '#{pane_id}' | head -1)
 uv run python -c "
+import sys
 from claude_teams.backends import process_manager as pm
-print(pm.TmuxProcessManager().list_sessions() if hasattr(pm.TmuxProcessManager, 'list_sessions') else 'inspect manually')
-"
+m = pm.TmuxProcessManager()
+print('live pane :', m._pane_alive(sys.argv[1]))
+print('bogus pane:', m._pane_alive('%999999'))
+" "$PANE"
 tmux kill-session -t smoke-utf8
 ```
 
-**PASS**: the call returns, and the window name round-trips or is replaced with
-`\ufffd` — either is acceptable, because `errors="replace"` is deliberately a
-*don't crash* policy here, not a *decode correctly* one. Only `procinfo`'s
-PowerShell query got a real encoding contract.
+**PASS**: the live pane reports `(True, 'tmux pane running')` and the bogus one
+reports `(False, <tmux's own error text>)`.
 
-**FAIL**: `UnicodeDecodeError`.
+**FAIL**: `UnicodeDecodeError` from either call, or the bogus pane reporting
+`True`. A *live* pane reporting `unreadable tmux pane status` would mean this
+tmux build does not answer `#{pane_dead}` with `0`/`1` — report that rather
+than working around it, because the strict check in 4a depends on it.
 
 ## Phase 5 — the guard holds
 
