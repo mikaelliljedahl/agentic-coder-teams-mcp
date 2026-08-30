@@ -64,6 +64,11 @@ PHASE_SETTLED = "settled"
 #: Terminal failure reason for definite non-delivery (dead child, no receipt).
 REASON_NOT_DELIVERED = "not_delivered"
 
+#: Optional provenance on a row settled from ANOTHER key's receipt: the same
+#: request retried under a new key, aliased onto the attempt whose nonce is the
+#: evidence. Absent on every ordinary row.
+RECONCILED_FROM_FIELD = "reconciled_from_key"
+
 #: Refusal when a key is reused with any differing request field.
 IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 
@@ -230,8 +235,14 @@ def public_view(record: dict[str, Any]) -> dict[str, Any]:
     ``fingerprint``, ``sender``, ``operation_id`` and ``prompt_file`` are
     internal: the first is a comparison key callers must not depend on, and
     the rest are transport bookkeeping.
+
+    ``reconciled_from_key`` is the one optional member of the contract. It
+    appears only on a row settled from ANOTHER key's receipt — a retry of the
+    same request under a new key — and names the key whose nonce is the
+    evidence. Without it such a row would read as ``delivered`` with an empty
+    nonce and no way to see why.
     """
-    return {
+    view = {
         "message_id": record.get("message_id", ""),
         "idempotency_key": record.get("idempotency_key", ""),
         "to": record.get("to", ""),
@@ -243,6 +254,10 @@ def public_view(record: dict[str, Any]) -> dict[str, Any]:
         "created_at": record.get("created_at"),
         "settled_at": record.get("settled_at"),
     }
+    provenance = record.get(RECONCILED_FROM_FIELD)
+    if provenance:
+        view[RECONCILED_FROM_FIELD] = provenance
+    return view
 
 
 def load_records(path: Path) -> dict[str, dict[str, Any]]:
@@ -404,6 +419,7 @@ __all__ = [
     "PHASE_SETTLED",
     "PHASE_UNCONFIRMED",
     "REASON_NOT_DELIVERED",
+    "RECONCILED_FROM_FIELD",
     "STATUS_DELIVERED",
     "STATUS_FAILED",
     "STATUS_QUEUED",

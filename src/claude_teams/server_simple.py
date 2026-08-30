@@ -79,10 +79,12 @@ from claude_teams.delivery_store import (
     PHASE_SENT,
     PHASE_UNCONFIRMED,
     REASON_NOT_DELIVERED,
+    RECONCILED_FROM_FIELD,
     STATUS_DELIVERED,
     STATUS_FAILED,
     STATUS_QUEUED,
     DeliveryStoreError,
+    DeliveryTransaction,
     delivery_transaction,
     is_terminal,
     mark_phase,
@@ -2200,6 +2202,182 @@ def _reconcile_pending_delivery(
     return scanner.full_scan(nonce) == SCAN_FOUND
 
 
+#: The pending attempt's own row could not be identified in the store, or its
+#: nonce matched several rows. Unknown state, so nothing is sent and the
+#: marker — the only remaining duplicate guard — is kept.
+REASON_PENDING_UNRESOLVABLE = "pending_attempt_unresolvable"
+
+#: The pending attempt's row was already settled ``failed``, and ``settle()``
+#: will not overwrite a terminal row. Aliasing a new key onto it would tell two
+#: callers two different things about one attempt.
+REASON_PRIOR_SETTLED_FAILED = "prior_attempt_settled_failed"
+
+#: Verdicts from :func:`_settle_reconciled_attempt` that are not barriers.
+_RECONCILE_SAME_KEY = "same_key"
+_RECONCILE_ALIAS = "alias"
+_RECONCILE_SEND = "send"
+_RECONCILE_VERDICTS = frozenset(
+    {_RECONCILE_SAME_KEY, _RECONCILE_ALIAS, _RECONCILE_SEND}
+)
+
+
+def _resolve_pending_row(
+    txn: DeliveryTransaction, sender: str, to: str, nonce: str
+) -> dict | None:
+    """Return the ONE row of ``sender``, for ``to``, carrying ``nonce``.
+
+    The marker on the agent record holds a nonce and nothing else, so the
+    store — where every attempt writes its nonce before the resume — is what
+    says which request that nonce belonged to. ``None`` means the store cannot
+    answer: either no row carries it, or several do.
+    """
+    if not nonce:
+        return None
+    matches = [
+        row
+        for row in txn.for_sender(sender, to)
+        if str(row.get("nonce") or "") == nonce
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _settle_reconciled_attempt(
+    session_id: str, name: str, nonce: str, record: dict
+) -> str:
+    """Settle what the found receipt proves, and say what the caller gets.
+
+    Called only after the pending attempt's nonce was positively found in the
+    target's transcript. Returns ``same_key``/``alias``/``send``, or a barrier
+    reason. Every store write happens in ONE transaction, so the two rows can
+    never settle apart; the registry marker is cleared by the caller only
+    after this has committed.
+
+    Before this existed the shortcut answered ``delivered`` for whatever the
+    next call happened to be: a different prompt was dropped unsent, and the
+    caller's own row was left at ``queued/pending`` contradicting the very
+    receipt it had just been handed.
+    """
+    sender = str(record.get("sender") or "")
+    key = str(record.get("idempotency_key") or "")
+
+    def _barrier(txn: DeliveryTransaction, reason: str) -> str:
+        """Nothing is settled and nothing is sent; say so on the row too."""
+        stored = txn.get(sender, key) or record
+        mark_phase(stored, PHASE_PENDING, reason=reason)
+        txn.put(stored)
+        record.update(stored)
+        return reason
+
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        row = _resolve_pending_row(txn, sender, name, nonce)
+        if row is None:
+            return _barrier(txn, REASON_PENDING_UNRESOLVABLE)
+        if is_terminal(row) and row.get("status") == STATUS_FAILED:
+            return _barrier(txn, REASON_PRIOR_SETTLED_FAILED)
+        if not is_terminal(row):
+            settle(row, STATUS_DELIVERED, reason="", now=time.time())
+            txn.put(row)
+        if str(row.get("idempotency_key") or "") == key:
+            record.update(row)
+            return _RECONCILE_SAME_KEY
+        if str(row.get("fingerprint") or "") != str(record.get("fingerprint") or ""):
+            # A different request entirely. The old instruction is provably
+            # complete, so sending this one cannot duplicate it — and dropping
+            # it, which is what used to happen, loses it silently.
+            return _RECONCILE_SEND
+        # Same request under a new key. The scan is positive evidence that a
+        # request with THIS fingerprint was observed in the target's context,
+        # so ``delivered`` is true for it; the nonce stays empty because the
+        # receipt belongs to the other row, and the provenance says which.
+        caller = txn.get(sender, key) or record
+        caller[RECONCILED_FROM_FIELD] = str(row.get("idempotency_key") or "")
+        settle(caller, STATUS_DELIVERED, reason="", now=time.time())
+        txn.put(caller)
+        record.update(caller)
+        return _RECONCILE_ALIAS
+
+
+def _answer_reconciled_attempt(
+    session_id: str,
+    name: str,
+    agents: list[dict],
+    agent: dict,
+    record: dict,
+    *,
+    backend_name: str,
+    backend_session_id: str,
+    save_changed: bool,
+) -> dict | None:
+    """Answer a found receipt, or return ``None`` to send this request anyway.
+
+    Runs inside ``_prepare``'s registry transaction, so it may mutate ``agent``
+    and save; it must never re-enter ``_load_agents``. Order is store first,
+    registry second: a crash in between leaves a stale marker over terminal
+    rows, which the next call clears, rather than a cleared marker over an
+    unsettled row, which would let the same prompt be sent twice.
+    """
+    pending = _pending_delivery(agent) or {}
+    verdict = _settle_reconciled_attempt(
+        session_id, name, str(pending.get("nonce") or ""), record
+    )
+    if verdict not in _RECONCILE_VERDICTS:
+        # Barrier: nothing settled, nothing sent, marker KEPT — it is the only
+        # remaining guard against re-sending a prompt that provably landed.
+        if save_changed:
+            _save_agents_transaction(session_id, agents)
+        return _reconcile_barrier(session_id, name, record, verdict)
+
+    remove_prompt_file(_optional_path(pending.get("prompt_file")))
+    agent.pop(PENDING_DELIVERY_FIELD, None)
+    _bump_generation(agent)
+    _save_agents_transaction(session_id, agents)
+    if verdict == _RECONCILE_SEND:
+        return None
+
+    result = {
+        "success": True,
+        "name": name,
+        "reconciled": True,
+        "pid": agent.get("pid"),
+        "backend": backend_name,
+        "backend_session_id": backend_session_id,
+        "session_id": session_id,
+        "detail": (
+            "A previous attempt's prompt was confirmed in the target's context "
+            "after that call returned; this request is identical, so it was not "
+            "sent again."
+        ),
+    }
+    if verdict == _RECONCILE_ALIAS:
+        result[RECONCILED_FROM_FIELD] = str(record.get(RECONCILED_FROM_FIELD) or "")
+    return _with_public_status(result, record)
+
+
+def _clear_reconciled_marker(session_id: str, agent_name: str, nonce: str) -> None:
+    """Drop the agent marker whose attempt has just been settled.
+
+    Separate from the settlement on purpose: the store commits first, so a
+    crash in between leaves a stale marker over terminal rows rather than a
+    cleared marker over an unsettled one. The stale marker is benign — the
+    next call that reaches the shortcut re-settles nothing and clears it.
+    """
+    if not nonce or not agent_name:
+        return
+    try:
+        with _agents_transaction(session_id) as agents:
+            agent = _find_agent(agents, agent_name)
+            if agent is None:
+                return
+            pending = _pending_delivery(agent)
+            if pending is None or str(pending.get("nonce") or "") != nonce:
+                return
+            remove_prompt_file(_optional_path(pending.get("prompt_file")))
+            agent.pop(PENDING_DELIVERY_FIELD, None)
+            _save_agents_transaction(session_id, agents)
+    except OSError:
+        logger.debug("Could not clear a settled pending marker", exc_info=True)
+
+
 def _scan_for_nonce(session_id: str, agent: dict | None, nonce: str) -> str:
     """Search the whole of ``agent``'s bound transcript for ``nonce``.
 
@@ -3185,8 +3363,11 @@ async def send_message(
       — the same machinery as follow_up_agent, because a spawned child that is
       not polling would otherwise never see an inbox write. It therefore needs
       an idempotency_key you choose before the call, and it returns the same
-      "delivered"/"failed"/"queued" statuses. Such a spawned-agent message
-      does NOT enter the recipient's inbox, so read_messages cannot repeat it.
+      "delivered"/"failed"/"queued" statuses, including follow_up_agent's
+      request-scoped reconciliation (an identical request may answer
+      "delivered" with reconciled_from_key; a different request is sent). Such
+      a spawned-agent message does NOT enter the recipient's inbox, so
+      read_messages cannot repeat it.
 
     Anyone else — a sibling, a grandchild, another lead's worker, or a name that
     matches no agent — is REFUSED, and nothing is sent. A misspelled recipient
@@ -4083,28 +4264,23 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             if _reconcile_pending_delivery(
                 agent, backend_name, str(backend_session_id), binding, session_id
             ):
-                reconciled = _pending_delivery(agent) or {}
-                remove_prompt_file(_optional_path(reconciled.get("prompt_file")))
-                agent.pop(PENDING_DELIVERY_FIELD, None)
-                _bump_generation(agent)
-                _save_agents_transaction(session_id, agents)
-                return _FollowUpPrep(
-                    refusal={
-                        "success": True,
-                        "name": name,
-                        "status": "delivered",
-                        "reconciled": True,
-                        "pid": agent.get("pid"),
-                        "backend": backend_name,
-                        "backend_session_id": str(backend_session_id),
-                        "session_id": session_id,
-                        "detail": (
-                            "A previous attempt's prompt was confirmed in the "
-                            "target's context after that call returned; it was "
-                            "not sent again."
-                        ),
-                    }
+                # WHICH request that receipt belongs to is decided by the
+                # store, not by this call. Answering ``delivered`` for whatever
+                # the caller happened to pass is how a different prompt got
+                # dropped unsent while its own row stayed at ``queued/pending``.
+                # ``None`` means "a different request" — fall through and send.
+                answer = _answer_reconciled_attempt(
+                    session_id,
+                    name,
+                    agents,
+                    agent,
+                    record,
+                    backend_name=backend_name,
+                    backend_session_id=str(backend_session_id),
+                    save_changed=changed,
                 )
+                if answer is not None:
+                    return _FollowUpPrep(refusal=answer)
 
             if alive:
                 last_activity_at = status.get("last_activity_at")
@@ -4805,6 +4981,49 @@ def _delivery_in_progress(session_id: str, name: str, record: dict) -> dict:
     )
 
 
+#: What a caller can do about each barrier. Both are reachable only from a
+#: damaged store or a crash-orphaned row, never from healthy operation.
+_RECONCILE_BARRIER_DETAIL = {
+    REASON_PENDING_UNRESOLVABLE: (
+        "An earlier attempt to this agent was just confirmed in its context, "
+        "but the durable row carrying that attempt's nonce is missing from the "
+        "delivery store, or several rows carry it. Which request it was "
+        "therefore cannot be established, so NOTHING was sent by this call and "
+        "nothing is claimed delivered. Inspect delivery_status(to=<name>) or "
+        "deliver_pending() for this sender's rows; kill_agent clears the "
+        "agent's state entirely."
+    ),
+    REASON_PRIOR_SETTLED_FAILED: (
+        "An earlier attempt to this agent was just confirmed in its context, "
+        "but its durable row was already settled 'failed' and a settled "
+        "outcome is never withdrawn. NOTHING was sent by this call. Query "
+        "delivery_status(to=<name>) to see that row; kill_agent clears the "
+        "agent's state entirely."
+    ),
+}
+
+
+def _reconcile_barrier(session_id: str, name: str, record: dict, reason: str) -> dict:
+    """Refuse without sending, when the found receipt cannot be attributed.
+
+    Retriable and re-evaluated on every call: a restored store resolves
+    normally next time. The alternative — clearing the marker and letting the
+    retry through — would resend a prompt that was just proven to have landed.
+    """
+    return _with_public_status(
+        {
+            "success": False,
+            "name": name,
+            "reason": reason,
+            "retriable": True,
+            "session_id": session_id,
+            "sender_obligation": _TAIL_OBLIGATION,
+            "detail": _RECONCILE_BARRIER_DETAIL.get(reason, ""),
+        },
+        record,
+    )
+
+
 def _unresolved_attempt_result(session_id: str, name: str, record: dict) -> dict:
     """Report an in-flight attempt whose fate is still unknown, without resending.
 
@@ -4858,6 +5077,23 @@ def _reconcile_before_resend(session_id: str, name: str, record: dict) -> dict |
             txn.touch()
         record.update(stored)
     if is_terminal(record):
+        # This is the same-key half of the shortcut in ``_prepare``, and it
+        # settles the row before that code is ever reached. Without clearing
+        # the marker here too, the attempt stays remembered on the agent after
+        # its own row is terminal. Store first, registry second — the same
+        # order, for the same reason.
+        #
+        # ONLY on ``delivered``. A row settled ``failed`` on a complete
+        # negative scan can still be contradicted by a transcript write that
+        # lands afterwards, and the marker is what makes the next call meet the
+        # terminal-failed barrier instead of silently sending the same request
+        # a second time.
+        if record.get("status") == STATUS_DELIVERED:
+            _clear_reconciled_marker(
+                session_id,
+                str(record.get("to") or ""),
+                str(record.get("nonce") or ""),
+            )
         return _settled_result(session_id, name, record)
     return _unresolved_attempt_result(session_id, name, record)
 
@@ -5144,6 +5380,15 @@ async def follow_up_agent(
     with a byte-identical request returns the same attempt and never sends
     twice; reusing it with any changed field returns idempotency_conflict and
     changes nothing.
+
+    Reconciliation is scoped to the request it reconciles. When an earlier
+    attempt to this agent turns out to have landed after its call returned,
+    what you get depends on what YOU asked for: an identical request (same
+    prompt and options) answers "delivered" and, if you used a new key, names
+    the earlier one in reconciled_from_key; a DIFFERENT request is sent
+    normally, because the earlier one is complete; and an earlier attempt whose
+    durable row cannot be identified is refused, retriable, with nothing sent
+    and nothing claimed delivered.
 
     Returns exactly three statuses. "delivered" means the prompt was observed
     in the target's context — a returned PID never means that. "failed" means
