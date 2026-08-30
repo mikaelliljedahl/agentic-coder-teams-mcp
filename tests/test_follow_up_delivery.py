@@ -421,6 +421,406 @@ async def test_a_later_flush_reconciles_and_does_not_resend(
     assert second["reconciled"] is True
     assert len(backend.resume_calls) == 1, "the prompt must not be delivered twice"
     assert server_simple.PENDING_DELIVERY_FIELD not in _record()
+    # The response and the store must agree: a receipt the caller cannot look
+    # up under its own key is the false receipt this reconciliation exists to
+    # avoid producing.
+    assert second["reconciled_from_key"] == "k29"
+    assert (await server_simple.delivery_status("k29"))["status"] == "delivered"
+    assert (await server_simple.delivery_status("k30"))["status"] == "delivered"
+
+
+# ==========================================================================
+# R6 — reconciliation is scoped to the request it reconciles
+# ==========================================================================
+
+
+def _unconfirmed_attempt(backend, env, key: str, prompt: str = "next prompt"):
+    """Leave one unconfirmed attempt behind, then flush its receipt."""
+
+    async def _run() -> str:
+        result = await server_simple.follow_up_agent(AGENT, prompt, key)
+        assert result["phase"] == "unconfirmed", result
+        nonce = _nonce_of(backend.resume_calls[-1][0].prompt)
+        _append(
+            env.transcript,
+            _claude_user_record(f"{prompt} {DELIVERY_MARKER_PREFIX}{nonce}"),
+        )
+        return nonce
+
+    return _run()
+
+
+def _rows() -> dict:
+    """The durable delivery store, keyed by idempotency key."""
+    from claude_teams import delivery_store
+
+    path = server_simple._deliveries_file(SESSION)
+    with delivery_store.delivery_transaction(path) as txn:
+        return {str(row.get("idempotency_key")): dict(row) for row in txn.data.values()}
+
+
+@pytest.mark.asyncio
+async def test_a_new_key_for_the_same_request_settles_the_callers_own_row(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The receipt must describe the key the caller actually holds.
+
+    Answering ``delivered`` while ``delivery_status(that key)`` still says
+    ``queued/pending, attempts: 0`` is a false receipt: the caller cannot
+    recover the outcome from the only handle it was given.
+    """
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k101")
+    second = await server_simple.follow_up_agent(AGENT, "next prompt", "k102")
+
+    assert second["status"] == "delivered"
+    assert second["reconciled_from_key"] == "k101"
+    assert len(backend.resume_calls) == 1
+
+    own = await server_simple.delivery_status("k102")
+    assert own["status"] == "delivered"
+    assert own["reconciled_from_key"] == "k101"
+    assert own["nonce"] == "", "an aliased row must not claim the other's receipt"
+    assert (await server_simple.delivery_status("k101"))["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_a_new_key_for_a_different_request_is_really_sent(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reconciling a prior attempt must not swallow a different prompt."""
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k103")
+
+    backend.on_resume = lambda nonce: _append(
+        env.transcript,
+        _claude_user_record(f"something else {DELIVERY_MARKER_PREFIX}{nonce}"),
+    )
+    second = await server_simple.follow_up_agent(AGENT, "something else", "k104")
+
+    assert second["status"] == "delivered"
+    assert second.get("reconciled") is not True
+    assert len(backend.resume_calls) == 2, "the new prompt was never sent"
+    assert _nonce_of(backend.resume_calls[1][0].prompt) in {
+        row["nonce"] for row in _rows().values()
+    }
+    assert (await server_simple.delivery_status("k103"))["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_an_option_only_difference_is_a_different_request(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``options`` are part of the fingerprint, so they are part of identity."""
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k105")
+
+    second = await server_simple.follow_up_agent(
+        AGENT, "next prompt", "k106", replace_if_idle=False
+    )
+
+    # Not aliased onto the prior attempt, and past the shortcut into the
+    # ordinary send path — where this call's own option refuses an idle child.
+    assert second.get("reconciled") is not True
+    assert second.get("status") != "delivered"
+    assert second["reason"] == "agent_idle_but_alive"
+
+
+@pytest.mark.asyncio
+async def test_an_option_only_difference_is_actually_sent(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same arm, followed all the way to a real second attempt."""
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k118")
+
+    # The child is gone, so ``replace_if_idle=False`` has nothing to refuse and
+    # the fall-through reaches a genuine resume.
+    _dead_agent(monkeypatch)
+    backend.on_resume = lambda nonce: _append(
+        env.transcript,
+        _claude_user_record(f"next prompt {DELIVERY_MARKER_PREFIX}{nonce}"),
+    )
+    second = await server_simple.follow_up_agent(
+        AGENT, "next prompt", "k119", replace_if_idle=False
+    )
+
+    assert second["status"] == "delivered"
+    assert second.get("reconciled") is not True
+    assert len(backend.resume_calls) == 2
+    assert (await server_simple.delivery_status("k119"))["nonce"] == _nonce_of(
+        backend.resume_calls[1][0].prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_prior_attempt_is_refused_not_claimed(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A marker whose row is gone is unknown state: refuse, keep the guard."""
+    from claude_teams import delivery_store
+
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k107")
+
+    # The store is damaged: the row carrying the marker's nonce is gone.
+    path = server_simple._deliveries_file(SESSION)
+    with delivery_store.delivery_transaction(path) as txn:
+        for key in [k for k, row in txn.data.items() if row.get("nonce")]:
+            del txn.data[key]
+        txn.touch()
+
+    second = await server_simple.follow_up_agent(AGENT, "next prompt", "k108")
+
+    assert second["success"] is False
+    assert second["reason"] == "pending_attempt_unresolvable"
+    assert second["status"] == "queued"
+    assert second["retriable"] is True
+    assert len(backend.resume_calls) == 1, "nothing may be sent under a barrier"
+    assert server_simple.PENDING_DELIVERY_FIELD in _record(), (
+        "the marker is the only remaining duplicate guard"
+    )
+    own = await server_simple.delivery_status("k108")
+    assert own["status"] == "queued"
+    assert own["reason"] == "pending_attempt_unresolvable"
+
+
+@pytest.mark.asyncio
+async def test_a_prior_attempt_settled_failed_is_not_resurrected(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row already settled ``failed`` must not become someone else's receipt.
+
+    Reachable when kill-time cleanup settled the row on a complete negative
+    scan and the transcript write landed afterwards.
+    """
+    from claude_teams import delivery_store
+
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k109")
+
+    path = server_simple._deliveries_file(SESSION)
+    with delivery_store.delivery_transaction(path) as txn:
+        for row in txn.data.values():
+            if row.get("nonce"):
+                delivery_store.settle(
+                    row, delivery_store.STATUS_FAILED, reason="not_delivered", now=1.0
+                )
+        txn.touch()
+
+    second = await server_simple.follow_up_agent(AGENT, "next prompt", "k110")
+
+    assert second["success"] is False
+    assert second["reason"] == "prior_attempt_settled_failed"
+    assert second["retriable"] is True
+    assert len(backend.resume_calls) == 1
+    assert server_simple.PENDING_DELIVERY_FIELD in _record()
+    assert (await server_simple.delivery_status("k109"))["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_two_rows_carrying_one_nonce_are_a_barrier_too(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nonce the store cannot attribute to ONE request attributes to none."""
+    from claude_teams import delivery_store
+
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k120")
+
+    path = server_simple._deliveries_file(SESSION)
+    with delivery_store.delivery_transaction(path) as txn:
+        original = next(row for row in txn.data.values() if row.get("nonce"))
+        twin = dict(original)
+        twin["idempotency_key"] = "k121"
+        twin["message_id"] = "twin"
+        txn.put(twin)
+
+    second = await server_simple.follow_up_agent(AGENT, "next prompt", "k122")
+
+    assert second["reason"] == "pending_attempt_unresolvable"
+    assert len(backend.resume_calls) == 1
+    assert server_simple.PENDING_DELIVERY_FIELD in _record()
+    # Nothing was settled off an ambiguous nonce. (delivery_status is itself a
+    # reconciler, so read the store directly rather than through it.)
+    assert {row["status"] for row in _rows().values()} == {"queued"}
+
+
+@pytest.mark.asyncio
+async def test_a_late_receipt_after_a_failed_same_key_retry_does_not_resend(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Settling ``failed`` must not throw away the duplicate guard.
+
+    A complete negative scan against a dead child is definite non-delivery, but
+    a transcript write can still land afterwards. If the marker went with the
+    failure, the next call would have nothing to reconcile against and would
+    send an instruction the target has already had.
+    """
+    alive = {"v": True}
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (alive["v"] and handle == "789", "x"),
+    )
+
+    first = await server_simple.follow_up_agent(AGENT, "next prompt", "k123")
+    assert first["phase"] == "unconfirmed"
+    nonce = _nonce_of(backend.resume_calls[0][0].prompt)
+
+    # The child dies with no receipt, and the same-key retry settles it failed
+    # once the flush grace has passed.
+    alive["v"] = False
+    monkeypatch.setattr(
+        server_simple.time,
+        "time",
+        lambda: 1_000.0 + server_simple._UNCONFIRMED_FLUSH_GRACE_SECONDS + 1.0,
+    )
+    retry = await server_simple.follow_up_agent(AGENT, "next prompt", "k123")
+    assert retry["status"] == "failed"
+
+    # ...and only then does the buffered write arrive.
+    _append(
+        env.transcript,
+        _claude_user_record(f"next prompt {DELIVERY_MARKER_PREFIX}{nonce}"),
+    )
+    third = await server_simple.follow_up_agent(AGENT, "next prompt", "k124")
+
+    assert third["reason"] == "prior_attempt_settled_failed"
+    assert len(backend.resume_calls) == 1, "the prompt must not be sent twice"
+
+
+@pytest.mark.asyncio
+async def test_a_same_key_retry_settles_and_clears_the_marker(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same-key half settles before ``_prepare``, so it clears too."""
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k111")
+    second = await server_simple.follow_up_agent(AGENT, "next prompt", "k111")
+
+    assert second["status"] == "delivered"
+    assert len(backend.resume_calls) == 1
+    assert server_simple.PENDING_DELIVERY_FIELD not in _record()
+
+
+@pytest.mark.asyncio
+async def test_deliver_pending_aliases_an_identical_pending_row(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain shares ``_prepare``, so it must share the contract."""
+    from claude_teams import delivery_store
+
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k112")
+
+    # A second row for the same request, still pending — the shape the tail
+    # exists to complete.
+    path = server_simple._deliveries_file(SESSION)
+    with delivery_store.delivery_transaction(path) as txn:
+        txn.put(
+            delivery_store.new_record(
+                sender=server_simple.IDENTITY,
+                idempotency_key="k113",
+                to=AGENT,
+                fingerprint=delivery_store.request_fingerprint(
+                    to=AGENT,
+                    prompt="next prompt",
+                    options={"replace_if_idle": True},
+                ),
+                created_at=1_000.0,
+            )
+        )
+
+    await server_simple.deliver_pending()
+
+    assert len(backend.resume_calls) == 1, "an identical request is not resent"
+    aliased = await server_simple.delivery_status("k113")
+    assert aliased["status"] == "delivered"
+    assert aliased["reconciled_from_key"] == "k112"
+
+
+@pytest.mark.asyncio
+async def test_send_message_to_a_child_uses_the_same_contract(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child ``send_message`` is the guaranteed path under another name."""
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k114", prompt="an instruction")
+    result = await server_simple.send_message("an instruction", AGENT, "k115")
+
+    assert result["status"] == "delivered"
+    assert result["reconciled_from_key"] == "k114"
+    assert len(backend.resume_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_lost_settlement_write_sends_nothing_and_keeps_the_marker(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4/B0: an unwritable store is unknown state, so nothing may proceed."""
+    from claude_teams import delivery_store
+
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+
+    await _unconfirmed_attempt(backend, env, "k116")
+
+    # The failure has to land on the SETTLEMENT write, not on the row creation
+    # that precedes it — failing earlier would refuse before this code path is
+    # ever reached, and the test would pass with the old bug still in place.
+    real_save = delivery_store.save_records
+    writes = {"n": 0}
+
+    def flaky_save(path, data) -> bool:
+        writes["n"] += 1
+        return real_save(path, data) if writes["n"] == 1 else False
+
+    monkeypatch.setattr(delivery_store, "save_records", flaky_save)
+    second = await server_simple.follow_up_agent(AGENT, "next prompt", "k117")
+
+    assert writes["n"] > 1, "the settlement write was never attempted"
+    assert second["success"] is False
+    assert second["reason"] == "delivery_store_unavailable"
+    assert len(backend.resume_calls) == 1
+    assert server_simple.PENDING_DELIVERY_FIELD in _record()
+    rows = _rows()
+    assert "k117" in rows, "the caller's row was created before the failure"
+    assert rows["k117"]["status"] == "queued"
+    assert rows["k116"]["status"] == "queued", "the old row must not be settled"
 
 
 @pytest.mark.asyncio

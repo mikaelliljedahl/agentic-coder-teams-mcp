@@ -246,6 +246,19 @@ def test_public_view_exposes_exactly_the_query_contract_fields(
     }
 
 
+def test_provenance_appears_only_on_a_row_settled_from_another_key() -> None:
+    """An aliased row is ``delivered`` with an empty nonce; say why.
+
+    Without this the caller sees a receipt with no evidence attached to it and
+    no way to reach the attempt the evidence actually belongs to.
+    """
+    record = _record()
+    record[ds.RECONCILED_FROM_FIELD] = "k-earlier"
+
+    assert ds.public_view(record)[ds.RECONCILED_FROM_FIELD] == "k-earlier"
+    assert ds.RECONCILED_FROM_FIELD not in ds.public_view(_record())
+
+
 def test_a_new_record_starts_queued_pending_and_unsettled() -> None:
     record = _record()
     assert record["status"] == ds.STATUS_QUEUED
