@@ -211,7 +211,11 @@ def _windows_command_lines() -> dict[int, tuple[str, ...]]:
                 "-NoProfile",
                 "-Command",
                 # Windows PowerShell writes a redirected stream in the console
-                # code page, which mangles any non-ASCII path or argument. Pin
+                # code page, which mangles any non-ASCII path or argument. That
+                # is not a cosmetic loss: a mangled byte lands in the JSON as a
+                # control character (an observed argv turned into "=\x1a"), and
+                # json.loads then rejects the whole payload, so ONE process
+                # with a non-ASCII command line emptied the entire table. Pin
                 # both ends to UTF-8 so the argv we compare is the real one.
                 "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
                 "Get-CimInstance Win32_Process | "
@@ -220,16 +224,20 @@ def _windows_command_lines() -> dict[int, tuple[str, ...]]:
             check=False,
             capture_output=True,
             # Never ``text=True`` on its own: it decodes with the locale
-            # encoding (cp1252 on a Swedish Windows), and an undecodable byte
-            # raises UnicodeDecodeError from subprocess' reader thread, which
-            # the guard below does not catch.
+            # encoding (cp1252 on a Swedish Windows). An undecodable byte then
+            # kills subprocess' reader thread, ``stdout`` comes back None, and
+            # the ``.strip()`` below raises AttributeError past the guard on
+            # the next line, which was written for a different failure.
             encoding="utf-8",
             errors="replace",
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
-    if completed.returncode != 0 or not completed.stdout.strip():
+    # Defensive: nothing here should be able to lose the stream any more, but
+    # a lost stream must stay a quiet empty table rather than an AttributeError
+    # thrown at whatever happened to be asking about process ancestry.
+    if completed.returncode != 0 or not (completed.stdout or "").strip():
         return {}
     try:
         value = json.loads(completed.stdout)

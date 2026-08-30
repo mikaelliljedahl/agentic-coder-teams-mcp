@@ -1103,6 +1103,78 @@ class TestTmuxProcessManager:
         assert "exec codex exec 'do stuff'" in command[-1]
         assert manager._processes["4242"].target_id == "%42"
 
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            pytest.param("@�\t%42\t4242\n", id="corrupt-window-id"),
+            pytest.param("@7\t%�\t4242\n", id="corrupt-pane-id"),
+            pytest.param("@7\t%42\t-1\n", id="non-positive-pid"),
+        ],
+    )
+    def test_spawn_refuses_a_tmux_target_it_could_never_address(
+        self, _make_spawn_request, monkeypatch, tmp_path, stdout
+    ):
+        """A replacement character in an id must fail the spawn, not register it.
+
+        errors="replace" means a corrupt byte now arrives as U+FFFD instead of
+        raising. Counting the fields would accept it, report success, and leave
+        an agent whose pane can never be health-checked, signalled or killed.
+        """
+        manager = process_manager_mod.TmuxProcessManager()
+        run_mock = MagicMock(return_value=MagicMock(stdout=stdout, returncode=0))
+        monkeypatch.setenv("TMUX", "tmux-session-token")
+        monkeypatch.delenv("USE_TMUX_WINDOWS", raising=False)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
+        monkeypatch.setattr(process_manager_mod.subprocess, "run", run_mock)
+
+        with pytest.raises(RuntimeError):
+            manager.spawn_process(
+                _make_spawn_request(),
+                ["codex", "exec", "do stuff"],
+                {"AGENT_NAME": "worker"},
+                "codex",
+                is_interactive=True,
+            )
+
+        assert manager._processes == {}
+
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            pytest.param("�\n", id="replacement-character"),
+            pytest.param("", id="empty"),
+            pytest.param("no such pane\n", id="unexpected-text"),
+        ],
+    )
+    def test_unreadable_pane_status_does_not_prove_ownership(self, monkeypatch, stdout):
+        """`#{pane_dead}` answers exactly "0" or "1"; anything else fails closed.
+
+        _tracked_alive uses this as PROOF that a pane is ours. Reading
+        "anything that is not 1" as alive would let a replacement character
+        claim ownership of a pane we cannot address.
+        """
+        manager = process_manager_mod.TmuxProcessManager()
+        monkeypatch.setattr(
+            process_manager_mod.subprocess,
+            "run",
+            MagicMock(return_value=MagicMock(stdout=stdout, stderr="", returncode=0)),
+        )
+
+        alive, detail = manager._pane_alive("%42")
+
+        assert alive is False
+        assert "unreadable" in detail
+
+    def test_pane_status_zero_is_alive(self, monkeypatch):
+        manager = process_manager_mod.TmuxProcessManager()
+        monkeypatch.setattr(
+            process_manager_mod.subprocess,
+            "run",
+            MagicMock(return_value=MagicMock(stdout="0\n", stderr="", returncode=0)),
+        )
+
+        assert manager._pane_alive("%42") == (True, "tmux pane running")
+
     def test_spawn_inside_tmux_can_use_windows(self, _make_spawn_request, monkeypatch):
         manager = process_manager_mod.TmuxProcessManager()
         monkeypatch.setenv("TMUX", "tmux-session-token")

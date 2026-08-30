@@ -3,7 +3,9 @@
 import ctypes
 import os
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -215,15 +217,14 @@ def test_real_os_walk_returns_a_plausible_chain() -> None:
     assert all(entry.pid > 0 and entry.name for entry in result.chain)
 
 
-def test_windows_command_lines_decodes_utf8_and_never_raises(
+def test_windows_command_lines_asks_the_child_for_utf8(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The CIM query must decode as UTF-8, and a stray byte must not crash it.
+    """Both halves of the encoding contract are present in the call itself.
 
-    ``text=True`` alone decodes with the locale encoding - cp1252 on a Swedish
-    Windows - and any undecodable byte in a command line raises
-    ``UnicodeDecodeError`` out of ``subprocess.run``, past the
-    ``(OSError, SubprocessError)`` guard this helper relies on.
+    This is a call-shape assertion only - it proves nothing about decoding.
+    The behaviour is covered by the real-subprocess test below; this one exists
+    so that dropping *either* half fails loudly and separately.
     """
     argv: list[str] = []
     options: dict[str, object] = {}
@@ -233,15 +234,91 @@ def test_windows_command_lines_decodes_utf8_and_never_raises(
     ) -> subprocess.CompletedProcess[str]:
         argv.extend(command)
         options.update(kwargs)
-        payload = '[{"ProcessId": 7, "CommandLine": "C:/b�n/pi.exe --namé"}]'
-        return subprocess.CompletedProcess(command, 0, payload, "")
+        return subprocess.CompletedProcess(command, 0, "[]", "")
 
     monkeypatch.setattr(procinfo.subprocess, "run", fake_run)
 
-    result = procinfo._windows_command_lines()
+    procinfo._windows_command_lines()
 
+    # The parent decodes as UTF-8...
     assert options["encoding"] == "utf-8"
     assert options["errors"] == "replace"
-    # The child has to emit UTF-8 too, or decoding it as UTF-8 is a guess.
-    assert "UTF8" in " ".join(argv)
-    assert result[7] == ("C:/b�n/pi.exe", "--namé")
+    # ...and the child is told to emit it, or that decode is a guess.
+    assert "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;" in argv[-1]
+
+
+def _shim(tmp_path: Path, payload: bytes, *, require_utf8_prefix: bool = True) -> Path:
+    """A stand-in for powershell.exe that writes ``payload`` as raw bytes."""
+    script = tmp_path / "shim.py"
+    guard = (
+        "if '[Console]::OutputEncoding' not in sys.argv[-1]:\n"
+        "    sys.stderr.write('child was never told to emit UTF-8')\n"
+        "    raise SystemExit(1)\n"
+        if require_utf8_prefix
+        else ""
+    )
+    script.write_text(
+        f"import sys\n{guard}sys.stdout.buffer.write({payload!r})\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+def _run_helper_against_shim(
+    monkeypatch: pytest.MonkeyPatch, shim: Path
+) -> dict[int, tuple[str, ...]]:
+    """Drive ``_windows_command_lines`` with a REAL child, on any platform.
+
+    ``subprocess.run`` stays real - that is the whole point, since the defect
+    lives in how subprocess decodes the stream. Only the executable and the
+    Windows-only argv splitter are substituted.
+    """
+    real_run = subprocess.run
+
+    def run_shim(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return real_run([sys.executable, str(shim), *command[1:]], **kwargs)
+
+    monkeypatch.setattr(procinfo.shutil, "which", lambda _name: sys.executable)
+    monkeypatch.setattr(procinfo.subprocess, "run", run_shim)
+    monkeypatch.setattr(
+        procinfo, "_split_windows_command_line", lambda line: tuple(line.split())
+    )
+    return procinfo._windows_command_lines()
+
+
+def test_windows_command_lines_decodes_real_utf8_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Non-ASCII argv survives the round trip through a real child process.
+
+    Pre-fix this is where the damage was invisible: the bytes decoded through
+    the console code page instead, `≥` became `=\\x1a`, the SUB control
+    character made ``json.loads`` reject the whole 170 KB payload, and the
+    helper answered "the process table is empty".
+    """
+    # The UTF-8 bytes of "≥中é", written out so the test does not depend on
+    # this source file's own encoding.
+    non_ascii = b"\xe2\x89\xa5\xe4\xb8\xad\xc3\xa9"
+    payload = (
+        b'[{"ProcessId": 7, "CommandLine": "C:/pi.exe --name ' + non_ascii + b'"}]'
+    )
+
+    result = _run_helper_against_shim(monkeypatch, _shim(tmp_path, payload))
+
+    assert result[7] == ("C:/pi.exe", "--name", "≥中é")
+
+
+def test_windows_command_lines_survives_an_undecodable_byte(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A byte that is not valid UTF-8 costs one character, not the whole table.
+
+    Without ``errors="replace"`` the reader thread dies, ``stdout`` comes back
+    ``None``, and the helper's own ``.strip()`` raises ``AttributeError`` past
+    its ``(OSError, SubprocessError)`` guard.
+    """
+    payload = b'[{"ProcessId": 7, "CommandLine": "C:/pi.exe --name \x8f"}]'
+
+    result = _run_helper_against_shim(monkeypatch, _shim(tmp_path, payload))
+
+    assert result[7] == ("C:/pi.exe", "--name", "�")

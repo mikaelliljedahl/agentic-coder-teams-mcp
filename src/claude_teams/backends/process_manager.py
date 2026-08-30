@@ -20,6 +20,9 @@ from claude_teams.backends.contracts import SpawnRequest, SpawnResult
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_NAME_LEN = 64
 _TMUX_SPAWN_FIELD_COUNT = 3
+#: tmux window and pane ids, as emitted by ``#{window_id}``/``#{pane_id}``.
+_TMUX_WINDOW_ID = re.compile(r"@\d+")
+_TMUX_PANE_ID = re.compile(r"%\d+")
 _PROC_STAT_SPLIT_FIELD_COUNT = 2
 _STILL_ACTIVE = 259
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -1653,16 +1656,32 @@ class TmuxProcessManager(_PidOwnershipMixin):
         )
 
     def _parse_tmux_spawn_output(self, output: str) -> tuple[str, str, int]:
+        """Parse ``@window<TAB>%pane<TAB>pid``, refusing anything that is not that.
+
+        All three fields are a machine protocol and all three are later used to
+        ADDRESS the pane. Counting the fields is not enough: a malformed window
+        or pane id registers a spawn that reports success and can then never be
+        health-checked, signalled or killed. Validate each one.
+        """
         fields = output.strip().split("\t")
         if len(fields) != _TMUX_SPAWN_FIELD_COUNT:
             msg = f"Unexpected tmux spawn output: {output!r}"
             raise RuntimeError(msg)
         window_id, pane_id, pid_text = fields
+        if not _TMUX_WINDOW_ID.fullmatch(window_id):
+            msg = f"Unexpected tmux window id: {window_id!r}"
+            raise RuntimeError(msg)
+        if not _TMUX_PANE_ID.fullmatch(pane_id):
+            msg = f"Unexpected tmux pane id: {pane_id!r}"
+            raise RuntimeError(msg)
         try:
             pid = int(pid_text)
         except ValueError as err:
             msg = f"Unexpected tmux pane PID: {pid_text!r}"
             raise RuntimeError(msg) from err
+        if pid <= 0:
+            msg = f"Unexpected tmux pane PID: {pid_text!r}"
+            raise RuntimeError(msg)
         return window_id, pane_id, pid
 
     def _pane_alive(self, pane_id: str) -> tuple[bool, str]:
@@ -1676,8 +1695,17 @@ class TmuxProcessManager(_PidOwnershipMixin):
         )
         if result.returncode != 0:
             return False, result.stderr.strip() or "tmux target not found"
-        if result.stdout.strip() == "1":
+        # ``#{pane_dead}`` is a machine protocol: tmux answers exactly "0" or
+        # "1". Anything else is an unreadable answer, and _tracked_alive uses
+        # this result as PROOF that a pane is ours -- so an unreadable answer
+        # has to fail closed. Reading "not 1" as alive would let a replacement
+        # character, or any unexpected text, claim ownership of a pane we
+        # cannot actually address.
+        status = result.stdout.strip()
+        if status == "1":
             return False, "tmux pane dead"
+        if status != "0":
+            return False, f"unreadable tmux pane status: {status!r}"
         return True, "tmux pane running"
 
     def _kill_tmux_target(self, target_id: str) -> None:
