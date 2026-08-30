@@ -115,6 +115,7 @@ def _force_kill_pid(handle: str) -> None:
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         return
     with contextlib.suppress(OSError):
@@ -1256,6 +1257,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         stdout = result.stdout.strip()
         if not stdout:
@@ -1367,6 +1369,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         pids: list[int] = []
         for token in result.stdout.split():
@@ -1426,6 +1429,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=True,
             capture_output=True,
             text=True,
+            errors="replace",
             env=merged_env,
         )
         window_id, pane_id, pid = self._parse_tmux_spawn_output(result.stdout)
@@ -1488,6 +1492,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -1513,6 +1518,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         if result.returncode != 0:
             return ""
@@ -1529,6 +1535,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         if enter:
             subprocess.run(  # noqa: S603 - tmux argv is built internally.
@@ -1536,6 +1543,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
                 check=False,
                 capture_output=True,
                 text=True,
+                errors="replace",
             )
 
     def log_path(self, team_name: str, agent_name: str) -> Path:
@@ -1664,6 +1672,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         if result.returncode != 0:
             return False, result.stderr.strip() or "tmux target not found"
@@ -1679,6 +1688,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
 
     def _kill_pid(self, handle: str) -> None:
@@ -1724,6 +1734,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         return result.returncode == 0
 
@@ -2098,6 +2109,7 @@ class LinuxTerminalProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         return result.returncode == 0
 

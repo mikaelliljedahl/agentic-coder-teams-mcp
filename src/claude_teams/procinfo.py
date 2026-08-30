@@ -210,12 +210,21 @@ def _windows_command_lines() -> dict[int, tuple[str, ...]]:
                 powershell,
                 "-NoProfile",
                 "-Command",
+                # Windows PowerShell writes a redirected stream in the console
+                # code page, which mangles any non-ASCII path or argument. Pin
+                # both ends to UTF-8 so the argv we compare is the real one.
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
                 "Get-CimInstance Win32_Process | "
                 "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
             ],
             check=False,
             capture_output=True,
-            text=True,
+            # Never ``text=True`` on its own: it decodes with the locale
+            # encoding (cp1252 on a Swedish Windows), and an undecodable byte
+            # raises UnicodeDecodeError from subprocess' reader thread, which
+            # the guard below does not catch.
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):

@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -212,3 +213,35 @@ def test_real_os_walk_returns_a_plausible_chain() -> None:
     assert result.chain
     assert result.chain[0].pid == os.getpid()
     assert all(entry.pid > 0 and entry.name for entry in result.chain)
+
+
+def test_windows_command_lines_decodes_utf8_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CIM query must decode as UTF-8, and a stray byte must not crash it.
+
+    ``text=True`` alone decodes with the locale encoding - cp1252 on a Swedish
+    Windows - and any undecodable byte in a command line raises
+    ``UnicodeDecodeError`` out of ``subprocess.run``, past the
+    ``(OSError, SubprocessError)`` guard this helper relies on.
+    """
+    argv: list[str] = []
+    options: dict[str, object] = {}
+
+    def fake_run(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        argv.extend(command)
+        options.update(kwargs)
+        payload = '[{"ProcessId": 7, "CommandLine": "C:/b�n/pi.exe --namé"}]'
+        return subprocess.CompletedProcess(command, 0, payload, "")
+
+    monkeypatch.setattr(procinfo.subprocess, "run", fake_run)
+
+    result = procinfo._windows_command_lines()
+
+    assert options["encoding"] == "utf-8"
+    assert options["errors"] == "replace"
+    # The child has to emit UTF-8 too, or decoding it as UTF-8 is a guess.
+    assert "UTF8" in " ".join(argv)
+    assert result[7] == ("C:/b�n/pi.exe", "--namé")

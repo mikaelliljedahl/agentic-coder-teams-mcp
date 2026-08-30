@@ -205,6 +205,7 @@ class TestBaseBackendWaitIdle:
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
 
 
@@ -1236,6 +1237,7 @@ class TestTmuxProcessManager:
             "check": False,
             "capture_output": True,
             "text": True,
+            "errors": "replace",
         }
 
 
