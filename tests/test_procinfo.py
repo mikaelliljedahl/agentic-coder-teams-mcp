@@ -327,13 +327,16 @@ def test_windows_command_lines_survives_an_undecodable_byte(
     assert result[7] == ("C:/pi.exe", "--name", "�")
 
 
-#: Environment that forces a nested interpreter's default text encoding to
-#: ASCII on Linux (and leaves Windows on its own non-UTF-8 code page), so that
-#: dropping ``encoding="utf-8"`` provably changes the result.
-_ASCII_LOCALE_ENV = {
+#: Forces a nested interpreter's default text encoding away from UTF-8, so that
+#: dropping ``encoding="utf-8"`` provably changes the result. On Linux the C
+#: locale gives ASCII once UTF-8 mode and locale coercion are both off; Windows
+#: is already on its own code page. If this ever stops working the test FAILS —
+#: see the assertion below for why it must not skip.
+_NON_UTF8_LOCALE_ENV = {
     "PYTHONUTF8": "0",
     "PYTHONCOERCECLOCALE": "0",
     "LC_ALL": "C",
+    "LC_CTYPE": "C",
     "LANG": "C",
 }
 
@@ -345,8 +348,15 @@ def test_explicit_encoding_is_what_decodes_utf8_not_the_host_locale(
 
     The tests above pass on a UTF-8 Linux runner even without the keyword,
     because the locale default happens to agree. This one re-runs the same
-    scenario in a nested interpreter whose default text encoding is ASCII, and
-    also with the keyword patched out, so the two answers must differ.
+    scenario in a nested interpreter whose default text encoding is not UTF-8.
+
+    The mutation removes ``encoding`` and **nothing else**: ``errors="replace"``
+    stays, so the stripped run cannot differ merely by raising. The only
+    variable is which decoder subprocess picks, which is exactly the claim.
+
+    A runner where the non-UTF-8 default cannot be forced FAILS rather than
+    skips. This is the only behavioural proof of the encoding half of the fix;
+    a silent skip would quietly delete it.
     """
     shim = tmp_path / "shim.py"
     shim.write_text(
@@ -363,8 +373,9 @@ def test_explicit_encoding_is_what_decodes_utf8_not_the_host_locale(
         "real_run = subprocess.run\n"
         "def run_shim(command, **kwargs):\n"
         "    if strip_encoding:\n"
+        # ONLY the encoding. errors='replace' stays, so a difference cannot be
+        # explained by strict decoding raising instead of choosing a decoder.
         "        kwargs.pop('encoding', None)\n"
-        "        kwargs.pop('errors', None)\n"
         "        kwargs['text'] = True\n"
         f"    return real_run([sys.executable, {str(shim)!r}], **kwargs)\n"
         "procinfo.shutil.which = lambda _n: sys.executable\n"
@@ -385,7 +396,7 @@ def test_explicit_encoding_is_what_decodes_utf8_not_the_host_locale(
             capture_output=True,
             encoding="utf-8",
             errors="replace",
-            env={**os.environ, **_ASCII_LOCALE_ENV},
+            env={**os.environ, **_NON_UTF8_LOCALE_ENV},
             check=True,
         )
         return json.loads(completed.stdout)
@@ -394,8 +405,13 @@ def test_explicit_encoding_is_what_decodes_utf8_not_the_host_locale(
     stripped = drive("strip")
 
     nested_encoding = str(kept["encoding"]).lower().replace("-", "_")
-    if nested_encoding in {"utf_8", "utf8", "cp65001"}:
-        pytest.skip(f"could not force a non-UTF-8 default: {nested_encoding}")
-    # With the keyword: the real characters. Without it: anything but.
+    assert nested_encoding not in {"utf_8", "utf8", "cp65001"}, (
+        f"the nested interpreter still defaults to {nested_encoding!r}, so this "
+        f"test cannot tell the explicit encoding from the host locale. Fix the "
+        f"forcing in _NON_UTF8_LOCALE_ENV rather than skipping: this is the only "
+        f"behavioural proof that encoding='utf-8' is what decodes the stream."
+    )
+    # With the keyword: the real characters. Without it, and with errors=
+    # unchanged: the locale decoder's answer, which is not the real characters.
     assert kept["argv"] == ["pi", "≥"]
     assert stripped["argv"] != kept["argv"]

@@ -1,12 +1,13 @@
 """Every ``subprocess.run`` that decodes a captured stream names an errors policy.
 
 ``text=True`` decodes a child's output with the *locale* encoding - cp1252 on a
-Swedish Windows - and an undecodable byte kills subprocess' reader thread. What
-the caller then sees is not a clean exception: ``completed.stdout`` comes back
-``None``, and the next ``.strip()`` on it raises ``AttributeError`` from inside
-a helper whose ``except (OSError, subprocess.SubprocessError)`` guard was
-written for a different failure. So a captured, decoded stream has to name an
-``errors`` policy.
+Swedish Windows - and an undecodable byte then fails in a way the call site is
+not expecting. On Windows it kills subprocess' reader thread and
+``completed.stdout`` comes back ``None``, so the next thing to touch it raises
+``AttributeError``; elsewhere the ``UnicodeDecodeError`` reaches the caller.
+Neither is caught by the ``except (OSError, subprocess.SubprocessError)``
+guards these call sites wrap themselves in. So a captured, decoded stream has
+to name an ``errors`` policy.
 
 **Scope, stated plainly.** This guard inspects calls spelled literally
 ``subprocess.run``, and nothing else. It deliberately does NOT cover:
@@ -51,17 +52,19 @@ def _keyword(node: ast.Call, name: str) -> ast.expr | None:
 def _not_false(value: ast.expr | None) -> bool:
     """True unless the keyword is absent or a *statically falsey* literal.
 
-    subprocess reads these options for truthiness, so ``False``, ``None`` and
-    ``0`` are all "off" and must not be flagged. A non-literal
-    (``text=some_flag``) is the opposite case: it counts as a candidate rather
-    than being waved through, so refactoring a literal into a variable cannot
-    silently escape the guard.
+    subprocess reads these options for truthiness, so ``False``, ``None``, ``0``
+    and every empty literal are "off" and must not be flagged. Anything that is
+    not a literal at all (``text=some_flag``) is the opposite case: it counts as
+    a candidate rather than being waved through, so refactoring a literal into a
+    variable cannot silently escape the guard.
     """
     if value is None:
         return False
-    if isinstance(value, ast.Constant):
-        return bool(value.value)
-    return True
+    try:
+        return bool(ast.literal_eval(value))
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        # Not a literal — a name, a call, an f-string. Stay conservative.
+        return True
 
 
 def _is_pipe(value: ast.expr | None) -> bool:
@@ -161,6 +164,22 @@ def test_guard_catches_the_shapes_it_claims_to(tmp_path: Path, source: str) -> N
         ),
         pytest.param(
             "subprocess.run(a, capture_output=0, text=True)", id="capture_output-zero"
+        ),
+        pytest.param(
+            "subprocess.run(a, capture_output=-0, text=True)",
+            id="capture_output-negzero",
+        ),
+        pytest.param(
+            "subprocess.run(a, capture_output=(), text=True)", id="capture_output-tuple"
+        ),
+        pytest.param(
+            "subprocess.run(a, capture_output=[], text=True)", id="capture_output-list"
+        ),
+        pytest.param(
+            "subprocess.run(a, capture_output={}, text=True)", id="capture_output-dict"
+        ),
+        pytest.param(
+            "subprocess.run(a, capture_output='', text=True)", id="capture_output-str"
         ),
         pytest.param(
             "subprocess.run(a, capture_output=True, text=None)", id="text-none"

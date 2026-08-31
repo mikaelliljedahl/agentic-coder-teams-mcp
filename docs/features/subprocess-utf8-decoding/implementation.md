@@ -110,6 +110,40 @@ scenario in a nested interpreter forced to an ASCII default
 answers differ. Against `main` it fails with
 `['pi', 'â‰¥'] != ['pi', '≥']` — the mojibake, named.
 
+## Review round 3
+
+`code-review-3.md`: CHANGES REQUESTED. It closed out the tmux work as RESOLVED
+— checking that `output.strip()` before the tab split makes both LF and CRLF
+parse, and that no legitimate tmux id is now rejected — and re-audited all 14
+`errors="replace"` sites independently rather than trusting round 1's table,
+finding no third machine protocol. Four things were still open:
+
+- **MAJOR — the locale test did not isolate the encoding.** Its mutation
+  removed `encoding` *and* `errors` together, so the stripped run could differ
+  merely by raising rather than by picking the locale decoder. It now removes
+  `encoding` only; `errors="replace"` stays, so the sole variable is which
+  decoder subprocess chooses. Verified: still passes here, still fails against
+  `main` with `['pi', 'â‰¥'] != ['pi', '≥']`.
+- **MAJOR — that test could silently skip.** A `pytest.skip` when the non-UTF-8
+  default could not be forced would have deleted the only behavioural proof of
+  the encoding half on exactly the runner (Linux) where it matters. It is now a
+  **failure** with a message naming what to fix. `LC_CTYPE=C` was added to the
+  forcing.
+- **MAJOR — `_not_false` still had false positives.** `bool(value.value)` only
+  covers `ast.Constant`; `()`, `[]`, `{}` and `-0` parse as other node types and
+  were flagged. Now `ast.literal_eval` with a conservative fallback, and the
+  "does not cry wolf" table covers all of them.
+- **MINOR ×3** — the production comment still described a `.strip()` failure the
+  null guard has since made impossible; smoke phase 2's heading claimed a
+  classification check it does not perform (it is an argv round-trip probe, and
+  now says so, pointing at the two tests that do cover the classifier); and
+  phase 3's `out.lstrip()[:1]` accepted the leading blank line its own heading
+  promised to reject. All three corrected.
+
+Round 3 could not execute on native Linux (no WSL, no Docker), so its
+tmux-on-Linux verification is source-level. **The smoke test's phase 4 has not
+been run on Linux by any round.**
+
 ## Evidence
 
 Red first. Every test below was run against `main`'s sources via `PYTHONPATH`
@@ -158,6 +192,18 @@ results that also fail on `main` and do not appear in CI:
 
 - `tests/test_follow_up_delivery.py::test_kill_agent_proceeds_when_the_holder_token_no_longer_matches`
 - `ty` diagnostic `unresolved-attribute` on `tests/test_join_team.py:730`
+
+## Known risk before merge
+
+`test_explicit_encoding_is_what_decodes_utf8_not_the_host_locale` now **fails**
+rather than skips if it cannot force a non-UTF-8 default in its nested
+interpreter. That is deliberate — a skip would silently remove the only
+behavioural proof of the encoding — but it has only been exercised on Windows,
+where the default is cp1252 anyway. On Linux it relies on `LC_ALL=C` plus
+`PYTHONUTF8=0` and `PYTHONCOERCECLOCALE=0` yielding an ASCII default. **Run the
+suite on the Lubuntu VM before merging.** If that assumption does not hold, the
+test fails loudly with a message naming the fix, which is the intended
+behaviour — but it would be a red CI run.
 
 ## Not fixed here
 

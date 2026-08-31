@@ -225,9 +225,12 @@ def _windows_command_lines() -> dict[int, tuple[str, ...]]:
             capture_output=True,
             # Never ``text=True`` on its own: it decodes with the locale
             # encoding (cp1252 on a Swedish Windows). An undecodable byte then
-            # kills subprocess' reader thread, ``stdout`` comes back None, and
-            # the ``.strip()`` below raises AttributeError past the guard on
-            # the next line, which was written for a different failure.
+            # kills subprocess' reader thread on Windows and ``stdout`` comes
+            # back None; elsewhere the UnicodeDecodeError reaches this caller.
+            # Neither is caught by the guard below, which was written for a
+            # different failure. (Pre-fix, the None also made an unguarded
+            # ``.strip()`` raise AttributeError; the guard further down now
+            # degrades that to an empty table.)
             encoding="utf-8",
             errors="replace",
             timeout=10,

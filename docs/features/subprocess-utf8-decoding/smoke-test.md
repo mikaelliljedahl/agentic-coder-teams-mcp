@@ -101,12 +101,15 @@ PYTHONPATH=C:/code/github/win-agent-teams-mcp/agentic-coder-teams-mcp/src \
   PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe /tmp/probe_argv.py
 ```
 
-## Phase 2 — Windows: the classification that argv exists to serve
+## Phase 2 — Windows: a non-ASCII script path survives in argv
 
-Losing or mangling argv is not an abstract loss. `procinfo` uses argv to stop
-the ancestry walk at the right host: a bare `node.exe` is recognisable as Pi or
-as Claude Code **only** by the script path in its argv. So plant a child whose
-script path carries a non-ASCII character and ask whether that path survives.
+This is an argv round-trip probe, not a classification test — it does not
+launch node and does not call `host_kind`. What it establishes is the
+precondition classification depends on: `procinfo` stops the ancestry walk at
+the right host by reading the script path out of a bare `node.exe`'s argv, so
+if a non-ASCII path cannot survive that read, the classification downstream
+cannot be right either. `test_node_launched_pi_stops_before_outer_claude` and
+`test_linux_node_shim_cmdline_identifies_host` cover the classifier itself.
 
 ```bash
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -c "
@@ -127,9 +130,10 @@ child.kill()
 
 **FAIL**: `False` — whether because the table came back empty or because the
 path came back mangled. Both are the same defect, and both leave `host_kind`
-unable to tell a node-launched Pi from a node-launched Claude Code. Do **not**
-accept a merely non-empty argv as a pass: the mangled case has a non-empty argv,
-and that is the shape `main` produced here on 2026-08-30.
+without the argv it needs to tell a node-launched Pi from a node-launched
+Claude Code. Do **not** accept a merely non-empty argv as a pass: the mangled
+case has a non-empty argv, and that is the shape `main` produced here on
+2026-08-30.
 
 ## Phase 3 — Windows: no BOM, no blank line
 
@@ -147,13 +151,17 @@ cmd = ('[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; '
 out = subprocess.run(['powershell.exe', '-NoProfile', '-Command', cmd],
                      capture_output=True, timeout=30).stdout
 print('BOM        :', out.startswith(b'\xef\xbb\xbf'))
-print('starts JSON:', out.lstrip()[:1] in (b'[', b'{'))
+print('first byte :', out[:1])
+print('starts JSON:', out[:1] in (b'[', b'{'))
 print('first bytes:', out[:8])
 "
 ```
 
-**PASS**: `BOM : False` and `starts JSON: True`. **FAIL**: a BOM, or a first
-byte that is neither `[` nor `{`.
+**PASS**: `BOM : False` and `starts JSON: True` — the *first* byte, with no
+`lstrip()` softening it, because a leading blank line is exactly one of the
+things this phase exists to catch.
+
+**FAIL**: a BOM, or a first byte that is neither `[` nor `{`.
 
 This is the only phase that inspects the child's raw output bytes. Phase 1
 covers the same ground end to end — a non-zero row count is reachable only
