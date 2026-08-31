@@ -149,6 +149,7 @@ class BaseBackend:
                 check=False,
                 capture_output=True,
                 text=True,
+                errors="replace",
             )
         except (OSError, subprocess.SubprocessError):
             return False
@@ -171,6 +172,7 @@ class BaseBackend:
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
             env=os.environ.copy(),
         )
         return {

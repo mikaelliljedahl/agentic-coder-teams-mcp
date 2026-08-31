@@ -20,6 +20,15 @@ from claude_teams.backends.contracts import SpawnRequest, SpawnResult
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_NAME_LEN = 64
 _TMUX_SPAWN_FIELD_COUNT = 3
+#: tmux window and pane ids, as emitted by ``#{window_id}``/``#{pane_id}``.
+#: tmux formats these with ``@%u``/``%%%u``, so the language is ASCII digits
+#: only. ``\d`` would also accept Unicode decimal digits such as U+0661, which
+#: tmux can never emit and can never address either.
+_TMUX_WINDOW_ID = re.compile(r"@[0-9]+")
+_TMUX_PANE_ID = re.compile(r"%[0-9]+")
+#: Likewise ``int()`` accepts "+3", "٣" and surrounding whitespace; a pane PID
+#: is a plain positive decimal or it is not a pane PID.
+_TMUX_PANE_PID = re.compile(r"[1-9][0-9]*")
 _PROC_STAT_SPLIT_FIELD_COUNT = 2
 _STILL_ACTIVE = 259
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -115,6 +124,7 @@ def _force_kill_pid(handle: str) -> None:
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         return
     with contextlib.suppress(OSError):
@@ -1256,6 +1266,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         stdout = result.stdout.strip()
         if not stdout:
@@ -1367,6 +1378,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         pids: list[int] = []
         for token in result.stdout.split():
@@ -1426,6 +1438,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=True,
             capture_output=True,
             text=True,
+            errors="replace",
             env=merged_env,
         )
         window_id, pane_id, pid = self._parse_tmux_spawn_output(result.stdout)
@@ -1488,6 +1501,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -1513,6 +1527,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         if result.returncode != 0:
             return ""
@@ -1529,6 +1544,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         if enter:
             subprocess.run(  # noqa: S603 - tmux argv is built internally.
@@ -1536,6 +1552,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
                 check=False,
                 capture_output=True,
                 text=True,
+                errors="replace",
             )
 
     def log_path(self, team_name: str, agent_name: str) -> Path:
@@ -1645,17 +1662,28 @@ class TmuxProcessManager(_PidOwnershipMixin):
         )
 
     def _parse_tmux_spawn_output(self, output: str) -> tuple[str, str, int]:
+        """Parse ``@window<TAB>%pane<TAB>pid``, refusing anything that is not that.
+
+        All three fields are a machine protocol and all three are later used to
+        ADDRESS the pane. Counting the fields is not enough: a malformed window
+        or pane id registers a spawn that reports success and can then never be
+        health-checked, signalled or killed. Validate each one.
+        """
         fields = output.strip().split("\t")
         if len(fields) != _TMUX_SPAWN_FIELD_COUNT:
             msg = f"Unexpected tmux spawn output: {output!r}"
             raise RuntimeError(msg)
         window_id, pane_id, pid_text = fields
-        try:
-            pid = int(pid_text)
-        except ValueError as err:
+        if not _TMUX_WINDOW_ID.fullmatch(window_id):
+            msg = f"Unexpected tmux window id: {window_id!r}"
+            raise RuntimeError(msg)
+        if not _TMUX_PANE_ID.fullmatch(pane_id):
+            msg = f"Unexpected tmux pane id: {pane_id!r}"
+            raise RuntimeError(msg)
+        if not _TMUX_PANE_PID.fullmatch(pid_text):
             msg = f"Unexpected tmux pane PID: {pid_text!r}"
-            raise RuntimeError(msg) from err
-        return window_id, pane_id, pid
+            raise RuntimeError(msg)
+        return window_id, pane_id, int(pid_text)
 
     def _pane_alive(self, pane_id: str) -> tuple[bool, str]:
         tmux = self._tmux_binary()
@@ -1664,11 +1692,21 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         if result.returncode != 0:
             return False, result.stderr.strip() or "tmux target not found"
-        if result.stdout.strip() == "1":
+        # ``#{pane_dead}`` is a machine protocol: tmux answers exactly "0" or
+        # "1". Anything else is an unreadable answer, and _tracked_alive uses
+        # this result as PROOF that a pane is ours -- so an unreadable answer
+        # has to fail closed. Reading "not 1" as alive would let a replacement
+        # character, or any unexpected text, claim ownership of a pane we
+        # cannot actually address.
+        status = result.stdout.strip()
+        if status == "1":
             return False, "tmux pane dead"
+        if status != "0":
+            return False, f"unreadable tmux pane status: {status!r}"
         return True, "tmux pane running"
 
     def _kill_tmux_target(self, target_id: str) -> None:
@@ -1679,6 +1717,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
 
     def _kill_pid(self, handle: str) -> None:
@@ -1724,6 +1763,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         return result.returncode == 0
 
@@ -2098,6 +2138,7 @@ class LinuxTerminalProcessManager(_PidOwnershipMixin):
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
         return result.returncode == 0
 
