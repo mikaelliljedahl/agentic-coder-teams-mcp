@@ -8,6 +8,7 @@ create token.
 """
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -120,6 +121,10 @@ def test_tokenless_recovered_record_never_graceful_shutdowns_pid(
 ) -> None:
     # No create_token (record predates tokens) but the PID looks alive+idle.
     _write_agent(follow_up.tmp_path)  # no create_token
+    (follow_up.tmp_path / "sessions" / "session-id" / "state-worker.json").write_text(
+        json.dumps({"state": "waiting", "event": "Stop", "ts": 950.0}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",
@@ -141,6 +146,10 @@ def test_reused_pid_does_not_get_graceful_shutdown(
 ) -> None:
     # Stored token mismatches the live PID's token (PID reuse after reboot).
     _write_agent(follow_up.tmp_path, create_token="stale-token")
+    (follow_up.tmp_path / "sessions" / "session-id" / "state-worker.json").write_text(
+        json.dumps({"state": "waiting", "event": "Stop", "ts": 950.0}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         ss.process_manager,
         "health_check",

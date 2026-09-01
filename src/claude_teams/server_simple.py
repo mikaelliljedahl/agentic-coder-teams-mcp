@@ -220,6 +220,8 @@ _DELIVERY_POLL_SECONDS = 0.25
 #: ``call_budget_s`` on every ``follow_up_agent`` result. Keep it below the
 #: smallest realistic MCP client timeout.
 _DELIVERY_CALL_BUDGET_SECONDS = 45.0
+#: Minimum pacing hint for callers returning to a cooperative pending tail.
+_DELIVERY_RETRY_AFTER_SECONDS = 60.0
 #: How long after a child is proven dead an ``unconfirmed`` attempt waits for a
 #: final transcript flush before it may be settled ``failed``. Buffered writes
 #: routinely land after the process exits, and settling early would report a
@@ -4288,7 +4290,10 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                 # signal: the agent has reached a wait/stop hook and is parked
                 # awaiting input, so we can resume it immediately. It is
                 # resolved FIRST, ahead of the transcript-derived checks below,
-                # which are only heuristics for when no reliable marker exists.
+                # which can only classify an unmarked live agent as busy.
+                # A live agent may be killed and resumed only with this
+                # authoritative hook-written marker; transcript inactivity is
+                # never sufficient.
                 # Ordering matters: an agent parked at a Stop hook before
                 # emitting any assistant text has no ``last_message``, and
                 # checking that first reported ``agent_busy`` for precisely the
@@ -4314,8 +4319,9 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                     # sleeping under it would block every registry reader on
                     # the machine.
                     #
-                    # The three-way split below is unchanged from the refusal
-                    # version; only the two "busy" arms became waits.
+                    # Every non-marker live state is busy. The old
+                    # transcript-inactivity heuristic could fall through to
+                    # replacement here; it may now only keep the call waiting.
                     # ``agent_state_unknown`` stays a refusal: it is not a
                     # busy agent, it is one we cannot describe at all, and
                     # waiting for that resolves nothing.
@@ -4330,7 +4336,11 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                         return _refuse("agent_state_unknown")
                     if time.time() - float(last_activity_at) < _FOLLOW_UP_IDLE_SECONDS:
                         return _wait()
-                if not replace_if_idle:
+                    # Even at or beyond the transcript-idle threshold, an
+                    # unmarked live agent is still busy. Inactivity is never
+                    # sufficient to authorize kill plus resume.
+                    return _wait()
+                if idle_by_marker and not replace_if_idle:
                     return _refuse("agent_idle_but_alive")
 
             agent_name = str(agent.get("name") or name)
@@ -4674,11 +4684,13 @@ def _with_public_status(result: dict, record: dict) -> dict:
 #: told plainly that the tail is cooperative — there is no dispatcher, so
 #: nothing completes it unless the sender comes back.
 _TAIL_OBLIGATION = (
-    "SENDER OBLIGATION: this message was NOT delivered and nothing will "
-    "deliver it on your behalf — there is no background dispatcher. Call "
-    "deliver_pending() (or follow_up_agent again with this same "
-    "idempotency_key) to finish it. The message stays durably queryable via "
-    "delivery_status(idempotency_key) until it settles."
+    "SENDER OBLIGATION: this message is durably queued and safe; there is no "
+    "background dispatcher. The CHEAP next step is "
+    "delivery_status(idempotency_key), which is read-only and actively "
+    "reconciles. Call deliver_pending() (or follow_up_agent with the same key) "
+    "only after retry_after_s seconds, or once check_agent/delivery_status "
+    "shows the target waiting. Never retry in a tight loop — each premature "
+    "retry wastes the call budget without delivering anything."
 )
 
 
@@ -4715,6 +4727,7 @@ def _pending_tail(
             "phase": PHASE_PENDING,
             "reason": waited_for or "call_budget_expired",
             "retriable": True,
+            "retry_after_s": _DELIVERY_RETRY_AFTER_SECONDS,
             "queue_position": position,
             "session_id": session_id,
             "sender_obligation": _TAIL_OBLIGATION,
@@ -5390,6 +5403,11 @@ async def follow_up_agent(
     durable row cannot be identified is refused, retriable, with nothing sent
     and nothing claimed delivered.
 
+    Send once, then poll delivery_status(idempotency_key); it is read-only and
+    actively reconciles. Drain with deliver_pending() (or follow_up_agent with
+    the same key) when check_agent/delivery_status shows the target waiting or
+    after retry_after_s seconds. Never retry in a tight loop.
+
     Returns exactly three statuses. "delivered" means the prompt was observed
     in the target's context — a returned PID never means that. "failed" means
     definite non-delivery (child dead, no receipt). "queued" means still in
@@ -5524,6 +5542,10 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
     This is the cooperative tail R1 declares. There is no background dispatcher,
     so a message that returned status="queued" is completed only when you call
     this (or follow_up_agent again with the same key).
+
+    Send once, then poll delivery_status; drain when the target is waiting or
+    after retry_after_s seconds. Never retry in a tight loop: premature retries
+    waste the call budget without delivering anything.
 
     For each of your unsettled messages it reconciles first — rescanning for
     the previous attempt's receipt — and only then re-delivers, so a prompt
