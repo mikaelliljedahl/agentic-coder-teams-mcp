@@ -1461,6 +1461,10 @@ async def test_follow_up_agent_refuses_idle_live_agent_without_replace(
     backend = _FakeResumeBackend()
     _setup_follow_up_session(tmp_path, monkeypatch, backend)
     _write_agent_for_follow_up(tmp_path)
+    (tmp_path / "sessions" / "session-id" / "state-worker.json").write_text(
+        json.dumps({"state": "waiting", "event": "Stop", "ts": 950.0}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         server_simple.process_manager,
         "health_check",
@@ -1535,6 +1539,10 @@ async def test_follow_up_agent_replaces_idle_live_agent_when_allowed(
     backend = _FakeResumeBackend()
     _setup_follow_up_session(tmp_path, monkeypatch, backend)
     _write_agent_for_follow_up(tmp_path)
+    (tmp_path / "sessions" / "session-id" / "state-worker.json").write_text(
+        json.dumps({"state": "waiting", "event": "Stop", "ts": 950.0}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         server_simple.process_manager,
         "health_check",

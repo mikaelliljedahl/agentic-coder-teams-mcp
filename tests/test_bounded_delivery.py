@@ -204,6 +204,13 @@ def _record(key: str = KEY, sender: str = "team-lead") -> dict:
     return found
 
 
+def _shutdown_recorder(calls: list[object]):
+    def record(*args: object, **_kwargs: object) -> None:
+        calls.append(args[0] if args else None)
+
+    return record
+
+
 # ==========================================================================
 # B2 / B0 — a busy target is waited for, not refused
 # ==========================================================================
@@ -258,12 +265,121 @@ async def test_busy_target_that_never_becomes_resumable_returns_the_pending_tail
     assert result["status"] == "queued"
     assert result["phase"] == "pending"
     assert result["reason"] != "failed"
-    assert "deliver_pending" in result["sender_obligation"]
+    obligation = result["sender_obligation"].lower()
+    assert result["retry_after_s"] == 60.0
+    assert "delivery_status" in obligation
+    assert "retry_after_s" in obligation
+    assert "tight loop" in obligation
+    assert "immediately retry" not in obligation
     assert backend.resume_calls == [], "nothing was sent"
     stored = _record()
     assert stored["status"] == ds.STATUS_QUEUED
     assert stored["phase"] == ds.PHASE_PENDING
     assert stored["settled_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_stale_transcript_activity_without_marker_never_kills_live_child(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transcript age can only keep an unmarked live target in the busy arm."""
+    env.state.last_activity_at = 900.0
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+    shutdowns: list[object] = []
+    record_shutdown = _shutdown_recorder(shutdowns)
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "graceful_shutdown",
+        record_shutdown,
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "kill_process",
+        record_shutdown,
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager, "owns_process", lambda *args, **kwargs: True
+    )
+
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", KEY)
+
+    assert result["status"] == "queued"
+    assert result["phase"] == "pending"
+    assert backend.resume_calls == [], "an unmarked live child must not be resumed"
+    assert shutdowns == [], "transcript inactivity must not authorize shutdown"
+
+
+@pytest.mark.asyncio
+async def test_waiting_marker_allows_live_idle_child_to_be_replaced(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the authoritative waiting marker permits kill plus resume."""
+    _write_waiting_marker(env)
+
+    def write_receipt(nonce: str) -> None:
+        _append(
+            env.transcript,
+            _claude_user_record(f"next prompt {DELIVERY_MARKER_PREFIX}{nonce}"),
+        )
+
+    backend = _FakeResumeBackend(write_receipt)
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+    shutdowns: list[object] = []
+    record_shutdown = _shutdown_recorder(shutdowns)
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "graceful_shutdown",
+        record_shutdown,
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "kill_process",
+        record_shutdown,
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager, "owns_process", lambda *args, **kwargs: True
+    )
+
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", KEY)
+
+    assert result["success"] is True
+    assert result["status"] == "delivered"
+    assert shutdowns, "the waiting marker must preserve the replacement path"
+    assert len(backend.resume_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_waiting_marker_with_replace_if_idle_false_is_refused(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_waiting_marker(env)
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+    shutdowns: list[object] = []
+    record_shutdown = _shutdown_recorder(shutdowns)
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "graceful_shutdown",
+        record_shutdown,
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "kill_process",
+        record_shutdown,
+    )
+
+    result = await server_simple.follow_up_agent(
+        AGENT, "next prompt", KEY, replace_if_idle=False
+    )
+
+    assert result["success"] is False
+    assert result["reason"] == "agent_idle_but_alive"
+    assert backend.resume_calls == []
+    assert shutdowns == []
 
 
 @pytest.mark.asyncio

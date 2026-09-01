@@ -208,6 +208,13 @@ def _child_alive(monkeypatch: pytest.MonkeyPatch, alive: bool) -> None:
     )
 
 
+def _write_waiting_marker(env: SimpleNamespace) -> None:
+    server_simple._state_marker_file(SESSION, AGENT).write_text(
+        json.dumps({"state": "waiting", "event": "Stop", "ts": 950.0}),
+        encoding="utf-8",
+    )
+
+
 def _record() -> dict:
     return server_simple._load_agents(SESSION)[0]
 
@@ -497,6 +504,7 @@ async def test_a_new_key_for_a_different_request_is_really_sent(
     _child_alive(monkeypatch, True)
 
     await _unconfirmed_attempt(backend, env, "k103")
+    _write_waiting_marker(env)
 
     backend.on_resume = lambda nonce: _append(
         env.transcript,
@@ -523,13 +531,15 @@ async def test_an_option_only_difference_is_a_different_request(
     _child_alive(monkeypatch, True)
 
     await _unconfirmed_attempt(backend, env, "k105")
+    _write_waiting_marker(env)
 
     second = await server_simple.follow_up_agent(
         AGENT, "next prompt", "k106", replace_if_idle=False
     )
 
     # Not aliased onto the prior attempt, and past the shortcut into the
-    # ordinary send path — where this call's own option refuses an idle child.
+    # ordinary send path — where this call's own option refuses a marked idle
+    # child.
     assert second.get("reconciled") is not True
     assert second.get("status") != "delivered"
     assert second["reason"] == "agent_idle_but_alive"
@@ -850,6 +860,7 @@ async def test_confirmation_does_not_hold_the_registry_lock(
     monkeypatch.setattr(
         server_simple.process_manager, "health_check", probe_registry_during_poll
     )
+    _write_waiting_marker(env)
 
     await server_simple.follow_up_agent(AGENT, "next prompt", "k31")
 
@@ -1195,6 +1206,7 @@ async def test_each_call_writes_a_distinct_prompt_file(
 
     await server_simple.follow_up_agent(AGENT, sensitive, "k34")
     first = sorted(server_simple._prompts_dir(SESSION).iterdir())
+    _write_waiting_marker(env)
     await server_simple.follow_up_agent(AGENT, sensitive, "k35")
     second = sorted(server_simple._prompts_dir(SESSION).iterdir())
 
