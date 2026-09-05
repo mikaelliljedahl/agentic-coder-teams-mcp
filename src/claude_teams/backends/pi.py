@@ -33,6 +33,10 @@ _LOCAL_PATH_CLS = type(Path.cwd())
 # provider, tier launches fail loudly while explicit raw slugs retain their
 # soft-fallback escape hatch (see ``resolve_launch``).
 _PI_PROVIDER = "openai-codex"
+_PI_UPGRADE_HINT = (
+    "Upgrade pi: npm install -g @earendil-works/pi-coding-agent@latest "
+    "(or add the model to your provider config)"
+)
 
 # ``pi``'s npm bin script hands off to this entry under the package root. We
 # resolve and launch it via ``node`` directly (bypassing the ``pi.cmd`` shim),
@@ -251,11 +255,7 @@ class PiBackend(BaseBackend):
                     slug,
                     self._name,
                     available,
-                    upgrade_hint=(
-                        "Upgrade pi: npm install -g "
-                        "@earendil-works/pi-coding-agent@latest "
-                        "(or add the model to your provider config)"
-                    ),
+                    upgrade_hint=_PI_UPGRADE_HINT,
                 )
             return slug, tier_effort
         return (key if self._model_available(key) else ""), reasoning_effort

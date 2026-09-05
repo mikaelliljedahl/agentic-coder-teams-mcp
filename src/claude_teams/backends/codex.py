@@ -41,6 +41,7 @@ _MODEL_DISCOVERY_TIMEOUT_S = 20.0
 # binary path. Populated lazily on first ``supported_models``/tier resolution so
 # a spawn pays at most one ``codex debug models`` subprocess per process.
 _MODEL_SLUG_CACHE: dict[str, list[str]] = {}
+_CODEX_UPGRADE_HINT = "Upgrade codex: npm install -g @openai/codex@latest"
 
 
 def _discover_codex_model_slugs(binary: str) -> list[str]:
@@ -245,7 +246,7 @@ class CodexBackend(BaseBackend):
 
         Validation is skipped when discovery yields nothing (cannot determine),
         so a discovery hiccup never blocks a spawn; codex itself would then
-        reject an genuinely-missing model at launch.
+        reject a genuinely-missing model at launch.
         """
         available = self._available_model_slugs()
         if available and slug not in available:
@@ -253,7 +254,7 @@ class CodexBackend(BaseBackend):
                 slug,
                 self._name,
                 available,
-                upgrade_hint="Upgrade codex: npm install -g @openai/codex@latest",
+                upgrade_hint=_CODEX_UPGRADE_HINT,
             )
 
     def default_permission_args(self) -> list[str]:

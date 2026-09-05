@@ -641,12 +641,11 @@ backend has a fixed ladder tuned to its context window:
 | `max` | Astra @ medium | Astra @ medium |
 
 Codex caps context at 262k, so Luna @ max cannot finish complex tasks there;
-Sol @ medium is the only 262k-safe point between Luna and Astra; Astra is
-`gpt-6-astra`. Pi runs Luna
+Sol @ medium is the only 262k-safe point between Luna and Astra. Pi runs Luna
 with a 1M window, so Luna @ max preserves the same capability step. Astra
-replaces Sol at the top because it dominates every Sol point above Sol @ medium
-at equal or lower cost. Sol and Terra remain available when passed as raw model
-slugs.
+(`gpt-6-astra`) replaces Sol at the top because it dominates every Sol point
+above Sol @ medium at equal or lower cost. Sol and Terra remain available when
+passed as raw model slugs.
 
 When live discovery is non-empty and a tier's model is absent, both `codex` and
 `pi` raise `BackendModelUnavailableError` rather than silently downgrading.

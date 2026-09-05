@@ -3172,8 +3172,8 @@ async def spawn_agent(
     The codex and pi ladders differ only at ``high``: codex uses Sol @ medium
     (the 262k-context-safe bridge), while pi uses Luna @ max (its 1M context
     window). Both use Astra (``gpt-6-astra``) @ low/medium for ``xhigh``/``max``.
-    If live model
-    discovery is non-empty and a required tier model is unavailable, both codex
+    If live model discovery is non-empty and a required tier model is
+    unavailable, both codex
     and pi raise ``BackendModelUnavailableError`` with a backend-specific
     upgrade command (``npm install -g @openai/codex@latest`` or
     ``npm install -g @earendil-works/pi-coding-agent@latest``); tiers never
