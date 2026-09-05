@@ -272,7 +272,76 @@ class TestClaudeCodeBuildEnv:
 
         assert env["CLAUDECODE"] == "1"
         assert env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
-        assert len(env) == 5
+        assert env["WIN_AGENT_TEAMS_LEAD_WAKE"] == "0"
+        assert env["WIN_AGENT_TEAMS_LEAD_WAKE_BASELINE"] == "1"
+        assert env["WIN_AGENT_TEAMS_MEMBER_WAKE"] == "1"
+        assert len(env) == 8
+
+    def test_build_env_preserves_global_switches_for_opt_in(self, _make_request):
+        request = _make_request(extra={"enable_spawned_lead_wake": "1"})
+
+        env = ClaudeCodeBackend().build_env(request)
+
+        assert "WIN_AGENT_TEAMS_LEAD_WAKE" not in env
+        assert "WIN_AGENT_TEAMS_MEMBER_WAKE" not in env
+
+    def test_default_preserves_member_wake_fallback_when_lead_globally_disabled(
+        self, _make_request, monkeypatch
+    ):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LEAD_WAKE", "0")
+
+        env = ClaudeCodeBackend().build_env(_make_request())
+
+        assert env["WIN_AGENT_TEAMS_LEAD_WAKE"] == "0"
+        assert env["WIN_AGENT_TEAMS_LEAD_WAKE_BASELINE"] == "0"
+        assert env["WIN_AGENT_TEAMS_MEMBER_WAKE"] == "0"
+
+    def test_default_normalizes_padded_disabled_lead_switch(
+        self, _make_request, monkeypatch
+    ):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LEAD_WAKE", " 0 ")
+
+        env = ClaudeCodeBackend().build_env(_make_request())
+
+        assert env["WIN_AGENT_TEAMS_LEAD_WAKE_BASELINE"] == "0"
+        assert env["WIN_AGENT_TEAMS_MEMBER_WAKE"] == "0"
+
+    def test_default_preserves_explicit_member_wake_switch(
+        self, _make_request, monkeypatch
+    ):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_MEMBER_WAKE", "0")
+
+        env = ClaudeCodeBackend().build_env(_make_request())
+
+        assert env["WIN_AGENT_TEAMS_LEAD_WAKE"] == "0"
+        assert "WIN_AGENT_TEAMS_MEMBER_WAKE" not in env
+
+    def test_nested_opt_in_restores_enabled_operator_baseline(
+        self, _make_request, monkeypatch
+    ):
+        default_env = ClaudeCodeBackend().build_env(_make_request())
+        for key, value in default_env.items():
+            monkeypatch.setenv(key, value)
+
+        opted_in_env = ClaudeCodeBackend().build_env(
+            _make_request(extra={"enable_spawned_lead_wake": "1"})
+        )
+
+        assert opted_in_env["WIN_AGENT_TEAMS_LEAD_WAKE"] == "1"
+
+    def test_nested_opt_in_preserves_disabled_operator_baseline(
+        self, _make_request, monkeypatch
+    ):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LEAD_WAKE", "0")
+        default_env = ClaudeCodeBackend().build_env(_make_request())
+        for key, value in default_env.items():
+            monkeypatch.setenv(key, value)
+
+        opted_in_env = ClaudeCodeBackend().build_env(
+            _make_request(extra={"enable_spawned_lead_wake": "1"})
+        )
+
+        assert opted_in_env["WIN_AGENT_TEAMS_LEAD_WAKE"] == "0"
 
     def test_supplies_child_identity_for_nested_orchestration(self, _make_request):
         request = _make_request(

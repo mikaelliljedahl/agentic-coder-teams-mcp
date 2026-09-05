@@ -179,6 +179,16 @@ def test_hook_extra_unknown_backend_returns_empty():
     assert ss._hook_extra("sid", "agent", "mystery-backend") == {}
 
 
+@pytest.mark.parametrize("backend", ["codex", "pi"])
+def test_hook_extra_non_claude_backends_ignore_spawned_lead_wake(
+    isolated, backend: str
+):
+    without = ss._hook_extra("sid", "agent", backend, False)
+    with_opt_in = ss._hook_extra("sid", "agent", backend, True)
+
+    assert with_opt_in == without
+
+
 def test_pi_wake_extension_dir_override_existing(isolated, monkeypatch, tmp_path):
     ext = tmp_path / "custom-wake"
     ext.mkdir()

@@ -19,6 +19,7 @@ from claude_teams.backends.contracts import (
 )
 
 _LOCAL_PATH_CLS = type(Path.cwd())
+_LEAD_WAKE_BASELINE_ENV = "WIN_AGENT_TEAMS_LEAD_WAKE_BASELINE"
 
 
 class ClaudeCodeBackend(BaseBackend):
@@ -294,6 +295,23 @@ class ClaudeCodeBackend(BaseBackend):
             "AGENT_SESSION_ID": request.team_name,
             "AGENT_PARENT_NAME": request.lead_session_id,
         }
+        enable_lead_wake = (request.extra or {}).get("enable_spawned_lead_wake") == "1"
+        inherited_lead_wake = os.environ.get(
+            _LEAD_WAKE_BASELINE_ENV,
+            os.environ.get("WIN_AGENT_TEAMS_LEAD_WAKE", "1"),
+        )
+        lead_wake_baseline = "0" if inherited_lead_wake.strip() == "0" else "1"
+        if enable_lead_wake:
+            if _LEAD_WAKE_BASELINE_ENV in os.environ:
+                env["WIN_AGENT_TEAMS_LEAD_WAKE"] = lead_wake_baseline
+        else:
+            # A user/project-level Stop hook is inherited by spawned processes.
+            # Disable only lead wake by default. Preserve member wake's previous
+            # fallback and the operator's baseline for nested opt-in spawns.
+            env[_LEAD_WAKE_BASELINE_ENV] = lead_wake_baseline
+            env["WIN_AGENT_TEAMS_LEAD_WAKE"] = "0"
+            if "WIN_AGENT_TEAMS_MEMBER_WAKE" not in os.environ:
+                env["WIN_AGENT_TEAMS_MEMBER_WAKE"] = lead_wake_baseline
         agent_capability = (request.extra or {}).get("agent_capability")
         if agent_capability:
             env["CLAUDE_TEAMS_AGENT_CAPABILITY"] = agent_capability

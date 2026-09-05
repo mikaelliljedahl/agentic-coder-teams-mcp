@@ -78,6 +78,65 @@ def _record(session_id: str, name: str = "worker") -> dict:
     return next(a for a in agents if a["name"] == name)
 
 
+@pytest.mark.asyncio
+async def test_spawned_lead_wake_defaults_off_and_is_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _session(tmp_path, monkeypatch)
+
+    result = await server_simple.spawn_agent(
+        "plain prompt", name="worker", backend="claude-code", cwd=str(tmp_path)
+    )
+
+    request = backend.last_request
+    assert request is not None
+    assert (request.extra or {})["enable_spawned_lead_wake"] == "0"
+    assert _record(result["session_id"])["enable_spawned_lead_wake"] is False
+    settings = json.loads(_read_text((request.extra or {})["hooks_settings_path"]))
+    assert not any(
+        "claude_teams.lead_wake" in group["hooks"][0]["command"]
+        for group in settings["hooks"]["Stop"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawned_lead_wake_opt_in_is_persisted_and_preserved_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _session(tmp_path, monkeypatch)
+
+    result = await server_simple.spawn_agent(
+        "plain prompt",
+        name="worker",
+        backend="claude-code",
+        cwd=str(tmp_path),
+        enable_spawned_lead_wake=True,
+    )
+
+    request = backend.last_request
+    assert request is not None
+    assert (request.extra or {})["enable_spawned_lead_wake"] == "1"
+    agent = _record(result["session_id"])
+    assert agent["enable_spawned_lead_wake"] is True
+    settings = json.loads(_read_text((request.extra or {})["hooks_settings_path"]))
+    assert any(
+        "claude_teams.lead_wake" in group["hooks"][0]["command"]
+        for group in settings["hooks"]["Stop"]
+    )
+
+    *_, resumed_request, _ = server_simple._build_resume_request(
+        result["session_id"],
+        agent,
+        "worker",
+        str(tmp_path),
+        backend,
+        "claude-code",
+        "follow up",
+        "nonce",
+    )
+    assert (resumed_request.extra or {})["enable_spawned_lead_wake"] == "1"
+
+
 # --------------------------------------------------------------------------
 # A1 — transport selection and marker form
 # --------------------------------------------------------------------------

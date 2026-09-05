@@ -181,9 +181,9 @@ def _live_subagent_names(session_dir: Path, identity: str) -> list[str]:
     Scoped to the caller's own children so a leaf worker never counts itself
     (or a sibling) as something it must wait for: a record counts only when its
     ``parent`` field equals ``identity`` AND its ``name`` differs from
-    ``identity`` (self is always excluded). Empty means the agent leads no live
-    children, so it has nothing to wait for (D2 fast allow) — exactly what a
-    leaf worker must hit.
+    ``identity`` (self is always excluded), and its recorded process must still
+    be alive. Empty means the agent leads no live children, so it has nothing to
+    wait for (D2 fast allow) — exactly what a leaf worker must hit.
 
     Backward tolerance: agent records written before the ``parent`` field
     existed carry no parent at all. When NOT ONE record in the registry has a
@@ -214,11 +214,15 @@ def _live_subagent_names(session_dir: Path, identity: str) -> list[str]:
         status = rec.get("status")
         if status in server_simple._TERMINAL_STATUSES or status == "left":
             continue  # killed (terminal) and left (departed member) are not live
-        if any_parent:
-            if rec.get("parent") == identity:
+        if any_parent and rec.get("parent") != identity:
+            continue
+        try:
+            if server_simple._agent_alive(rec):
                 live.append(name)
-        else:
-            live.append(name)
+        except Exception:
+            # A Stop hook must fail open when liveness cannot be established;
+            # an uncertain stale row must not create an unbounded wake loop.
+            return []
     return live
 
 
