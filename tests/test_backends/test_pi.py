@@ -11,7 +11,7 @@ from claude_teams.agent_output import read_pi_output
 from claude_teams.backends import pi as pi_module
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.codex import CodexBackend
-from claude_teams.backends.contracts import PREFER_LUNA_ENV
+from claude_teams.backends.contracts import BackendModelUnavailableError
 from claude_teams.backends.pi import PiBackend
 
 _ALL_MODELS = [
@@ -22,23 +22,8 @@ _ALL_MODELS = [
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-6-astra",
 ]
-
-
-@pytest.fixture(autouse=True)
-def _default_tier_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin every test to the default tier ladder unless it opts in itself."""
-    monkeypatch.delenv(PREFER_LUNA_ENV, raising=False)
-
-
-@pytest.fixture
-def _prefer_luna(monkeypatch: pytest.MonkeyPatch) -> Callable[[str], None]:
-    """Return a helper that sets the Luna-preferring opt-in env var."""
-
-    def apply(value: str = "1") -> None:
-        monkeypatch.setenv(PREFER_LUNA_ENV, value)
-
-    return apply
 
 
 @pytest.fixture
@@ -129,8 +114,9 @@ class TestPiModels:
         assert backend.resolve_model("cheapest") == "gpt-5.6-luna"
         assert backend.resolve_model("low") == "gpt-5.6-luna"
         assert backend.resolve_model("medium") == "gpt-5.6-luna"
-        assert backend.resolve_model("high") == "gpt-5.6-sol"
-        assert backend.resolve_model("max") == "gpt-5.6-sol"
+        assert backend.resolve_model("high") == "gpt-5.6-luna"
+        assert backend.resolve_model("xhigh") == "gpt-6-astra"
+        assert backend.resolve_model("max") == "gpt-6-astra"
 
     def test_resolve_model_passthrough(self):
         assert PiBackend().resolve_model("some-model") == "some-model"
@@ -148,106 +134,63 @@ class TestPiResolveLaunch:
         )
         assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
         assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
-        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "xhigh")
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
+        assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
+
+    def test_legacy_luna_env_has_no_effect(self, _models, monkeypatch):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS", "1")
+        backend = PiBackend()
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
+        assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
+
+    def test_backend_ladders_differ_only_at_high(self):
+        pi_ladder = PiBackend()._TIER_LAUNCH
+        codex_ladder = CodexBackend()._TIER_LAUNCH
+        assert pi_ladder != codex_ladder
+        assert set(pi_ladder) == set(codex_ladder)
+        differences = [
+            tier for tier in pi_ladder if pi_ladder[tier] != codex_ladder[tier]
+        ]
+        assert differences == ["high"]
 
     def test_old_ultra_name_uses_raw_slug_behavior(self, _models):
         _models(["ultra"])
         assert PiBackend().resolve_launch("ultra", None) == ("ultra", None)
 
     def test_tier_owns_thinking_ignoring_caller(self, _models):
-        assert PiBackend().resolve_launch("high", "max") == ("gpt-5.6-sol", "medium")
+        assert PiBackend().resolve_launch("high", "low") == ("gpt-5.6-luna", "max")
 
     def test_blank_defers_to_pi_default(self):
         assert PiBackend().resolve_launch("", None) == ("", None)
 
-    def test_soft_fallback_when_tier_model_absent(self, _models):
-        # Logged into a provider without the gpt-5.6 catalog: keep the tier's
-        # thinking level but drop the model so pi uses its own default.
+    def test_errors_when_tier_model_absent(self, _models):
         _models(["claude-sonnet-4", "claude-opus-4"])
-        assert PiBackend().resolve_launch("medium", None) == ("", "xhigh")
+        with pytest.raises(
+            BackendModelUnavailableError,
+            match=r"npm install -g @earendil-works/pi-coding-agent@latest",
+        ):
+            PiBackend().resolve_launch("medium", None)
 
-    def test_partial_catalog_drops_model_rather_than_substituting(self, _models):
-        # Sol present but Luna absent: the Luna-backed tiers do NOT silently
-        # fall back to Sol (pi has no model-substitution rule) — they drop the
-        # model and keep the tier's thinking level, while the Sol-backed tiers
-        # are unaffected.
+    def test_partial_catalog_errors_for_absent_tier(self, _models):
+        # A stale/partial catalog must fail rather than dropping the model or
+        # substituting a different provider model.
         _models(["gpt-5.6-sol"])
-        backend = PiBackend()
-        assert backend.resolve_launch("low", None) == ("", "high")
-        assert backend.resolve_launch("medium", None) == ("", "xhigh")
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
-        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "xhigh")
+        with pytest.raises(BackendModelUnavailableError, match=r"gpt-5\.6-luna"):
+            PiBackend().resolve_launch("low", None)
+        with pytest.raises(BackendModelUnavailableError, match=r"gpt-5\.6-luna"):
+            PiBackend().resolve_launch("high", None)
+
+    def test_provider_prefixed_catalog_entry_is_available(self, _models):
+        _models(["openai-codex/gpt-6-astra"])
+        assert PiBackend().resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
 
     def test_raw_slug_passthrough_when_available(self, _models):
         assert PiBackend().resolve_launch("gpt-5.5", "high") == ("gpt-5.5", "high")
 
-
-class TestPiPreferLunaTiers:
-    """Pi mirrors the Codex ladder, opt-in included, so a tier means the same
-    thing on both backends."""
-
-    def test_top_tiers_shift_toward_luna(self, _models, _prefer_luna):
-        _prefer_luna()
-        backend = PiBackend()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "medium")
-        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "high")
-
-    def test_cheap_tiers_unchanged(self, _models, _prefer_luna):
-        _prefer_luna()
-        backend = PiBackend()
-        assert backend.resolve_launch("cheapest", None) == ("gpt-5.6-luna", "medium")
-        assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
-        assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
-
-    def test_matches_codex_ladder(self, _models, _prefer_luna):
-        # The two backends must not diverge: a coordinator picks a tier without
-        # knowing which backend will run it.
-        _prefer_luna()
-        assert PiBackend()._tier_launch() == CodexBackend()._tier_launch()
-
-    def test_resolve_model_follows_opt_in(self, _prefer_luna):
-        _prefer_luna()
-        backend = PiBackend()
-        assert backend.resolve_model("high") == "gpt-5.6-luna"
-        assert backend.resolve_model("xhigh") == "gpt-5.6-sol"
-        assert backend.resolve_model("max") == "gpt-5.6-sol"
-
-    def test_tier_names_and_order_unchanged(self, _prefer_luna):
-        _prefer_luna()
-        backend = PiBackend()
-        assert backend.supported_models() == [
-            "cheapest",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-            "max",
-        ]
-        assert backend.default_model() == "medium"
-
-    @pytest.mark.parametrize("value", ["0", "", "true", "2"])
-    def test_only_exactly_one_opts_in(self, _models, _prefer_luna, value):
-        _prefer_luna(value)
-        assert PiBackend().resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
-
-    def test_soft_fallback_still_applies_to_shifted_tier(self, _models, _prefer_luna):
-        # ``high`` needs Luna under the opt-in; without it pi drops the model
-        # and keeps the tier's thinking level rather than erroring.
-        _models(["gpt-5.6-sol"])  # no Luna
-        _prefer_luna()
-        assert PiBackend().resolve_launch("high", None) == ("", "max")
-
-    def test_read_per_call_not_at_import(self, _models, _prefer_luna):
-        backend = PiBackend()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
-        _prefer_luna()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
-
-    def test_raw_slug_dropped_when_unavailable(self, _models):
+    def test_raw_slug_soft_fallback_when_unavailable(self, _models):
+        _models(["gpt-5.6-sol"])
         assert PiBackend().resolve_launch("nope", "high") == ("", "high")
 
     def test_skips_validation_when_discovery_empty(self, _models):
@@ -303,18 +246,6 @@ class TestPiBuildCommand:
         )
         assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-5.6-luna"
         assert cmd[cmd.index("--thinking") + 1] == "medium"
-
-    def test_medium_tier_fallback_keeps_thinking_without_model(
-        self, _make_request, _direct_launch, _tty, _models
-    ):
-        _models(["gpt-5.6-sol"])  # partial catalog: Sol present, Luna absent
-        backend = PiBackend()
-        model, thinking = backend.resolve_launch("medium", None)
-        cmd = backend.build_command(
-            _make_request(model=model, reasoning_effort=thinking)
-        )
-        assert "--model" not in cmd
-        assert cmd[cmd.index("--thinking") + 1] == "xhigh"
 
     def test_no_model_arg_when_blank(
         self, _make_request, _direct_launch, _tty, _models

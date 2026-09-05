@@ -193,9 +193,11 @@ first real evidence of life is the appearance of `state-{name}.json`.
 **Failure modes** are exceptions, not result fields: `BackendNotRegisteredError`
 (`src/claude_teams/backends/registry.py:78-79`),
 `BackendBinaryNotFoundError` (`src/claude_teams/backends/claude_code.py:121`),
-`BackendModelUnavailableError` for a Codex tier whose GPT-5.6 model this install
-does not expose (`src/claude_teams/backends/codex.py:237-246`) — there is no
-silent downgrade.
+`BackendModelUnavailableError` for a Codex or Pi tier whose model this install
+does not expose (`src/claude_teams/backends/codex.py:243-257`,
+`src/claude_teams/backends/pi.py:222-260`) — both backends include a concrete
+upgrade hint and never silently downgrade a tier. Pi keeps its soft fallback for
+an unavailable explicit raw slug.
 
 ### `send_message(text, to="team-lead", idempotency_key="")`
 

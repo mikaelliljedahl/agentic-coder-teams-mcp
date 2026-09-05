@@ -619,7 +619,7 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 | `prompt` | required | Task prompt for the agent |
 | `name` | auto (`agent-1`) | Agent name |
 | `backend` | `claude-code` | Spawn backends: `claude-code`, `codex`, or `pi`. `external` is a joined registry label, not a valid spawn backend. |
-| `model` | backend default | Model to use. For `codex`/`pi`, a capability tier (`cheapest`/`low`/`medium`/`high`/`xhigh`/`max`) that bundles a model + effort. Pi tiers soft-fall-back to pi's default model when the tier's model is absent (e.g. after switching provider) rather than erroring. |
+| `model` | backend default | Model to use. For `codex`/`pi`, a capability tier (`cheapest`/`low`/`medium`/`high`/`xhigh`/`max`) that bundles a model + effort. Both backends error when live discovery cannot find a tier model; pi raw slugs retain a soft fallback to its configured default. |
 | `reasoning_effort` | none | `low`/`medium`/`high`/`xhigh` (codex), `low`/`medium`/`high`/`xhigh`/`max` (claude-code). Ignored for `codex`/`pi` tiers (the tier owns the effort). |
 | `permission_mode` | `bypass` | `bypass`, `default`, or `require_approval` |
 | `cwd` | server cwd | Working directory for the agent |
@@ -627,30 +627,35 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 ### GPT capability tiers (codex and pi)
 
 Tiers are the only model interface exposed to the caller for the GPT-backed
-backends: each bundles a GPT-5.6 model with a reasoning effort, forming an
-ascending cost/quality ladder. `codex` and `pi` share the same ladder on
-purpose, so a coordinator can pick a tier without knowing which backend will
-run it. The tier names are stable; what they resolve to is configurable.
+backends: each bundles a GPT model with a reasoning effort, forming an
+ascending cost/quality ladder. The tier names and order are stable, while each
+backend has a fixed ladder tuned to its context window:
 
-| Tier | Default | With `WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1` |
+| Tier | codex (262k ctx) | pi (Luna @ 1M) |
 | --- | --- | --- |
 | `cheapest` | Luna @ medium | Luna @ medium |
 | `low` | Luna @ high | Luna @ high |
 | `medium` | Luna @ xhigh | Luna @ xhigh |
-| `high` | Sol @ medium | **Luna @ max** |
-| `xhigh` | Sol @ high | **Sol @ medium** |
-| `max` | Sol @ xhigh | **Sol @ high** |
+| `high` | **Sol @ medium** | **Luna @ max** |
+| `xhigh` | Astra @ low | Astra @ low |
+| `max` | Astra @ medium | Astra @ medium |
 
-Setting `WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1` (exactly `1`; anything
-else keeps the default) shifts the top three tiers one step toward Luna. Luna @
-max holds up about as well as Sol @ medium in practice, so this reserves the
-scarcer Sol quota for `xhigh`/`max` — the genuinely hard problems. The variable
-is read per spawn, so a running server picks up a change without a restart, and
-it applies to `codex` and `pi` together so the two never diverge.
+Codex caps context at 262k, so Luna @ max cannot finish complex tasks there;
+Sol @ medium is the only 262k-safe point between Luna and Astra; Astra is
+`gpt-6-astra`. Pi runs Luna
+with a 1M window, so Luna @ max preserves the same capability step. Astra
+replaces Sol at the top because it dominates every Sol point above Sol @ medium
+at equal or lower cost. Sol and Terra remain available when passed as raw model
+slugs.
 
-Unavailable-model behaviour is unchanged by the switch: `codex` errors
-(`BackendModelUnavailableError`) rather than downgrading silently, while `pi`
-keeps the tier's thinking level and drops the model so pi uses its own default.
+When live discovery is non-empty and a tier's model is absent, both `codex` and
+`pi` raise `BackendModelUnavailableError` rather than silently downgrading.
+The error includes a backend-specific upgrade hint: `codex` suggests
+`npm install -g @openai/codex@latest`, while `pi` suggests
+`npm install -g @earendil-works/pi-coding-agent@latest` (or adding the model to
+provider config). Empty discovery skips validation. Explicit raw slugs remain
+an escape hatch; pi soft-falls to its configured default when such a slug is
+absent.
 
 ## CLI
 

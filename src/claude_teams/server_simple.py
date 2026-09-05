@@ -3161,23 +3161,30 @@ async def spawn_agent(
     ``openai``) are accepted as aliases, but anything else fails the spawn.
 
     model: pick by how much capability the task needs, not by a model name.
-    For codex, choose one capability tier (each maps to a GPT-5.6 model at a
-    fixed reasoning effort), cheapest first:
+    For codex and pi, choose one capability tier (each maps to a concrete GPT
+    model at a fixed reasoning effort), cheapest first:
       - ``cheapest`` -> fastest/cheapest tasks
       - ``low``    -> quick, low-stakes tasks
       - ``medium`` -> token-efficient general default
       - ``high``   -> backend development, code review
       - ``xhigh``  -> genuinely hard problems
       - ``max``    -> the hardest problems (top tier)
-    Spawning errors if the required GPT-5.6 model is not available on this
-    machine (upgrade codex / check account access) — there is no silent
-    downgrade. For claude-code, ``model`` is haiku/sonnet/opus/fable and
-    defaults to ``opus`` when omitted.
+    The codex and pi ladders differ only at ``high``: codex uses Sol @ medium
+    (the 262k-context-safe bridge), while pi uses Luna @ max (its 1M context
+    window). Both use Astra (``gpt-6-astra``) @ low/medium for ``xhigh``/``max``.
+    If live model
+    discovery is non-empty and a required tier model is unavailable, both codex
+    and pi raise ``BackendModelUnavailableError`` with a backend-specific
+    upgrade command (``npm install -g @openai/codex@latest`` or
+    ``npm install -g @earendil-works/pi-coding-agent@latest``); tiers never
+    silently downgrade. Raw slugs pass through; pi retains its soft fallback
+    for an unavailable raw slug. For claude-code, ``model`` is
+    haiku/sonnet/opus/fable and defaults to ``opus`` when omitted.
 
     reasoning_effort: for claude-code, sets the effort (low/medium/high/xhigh/
-    max). For codex it is silently ignored when ``model`` is a capability tier
-    (the tier owns the effort); it still applies to a blank/raw-slug codex
-    model. Codex accepts low/medium/high/xhigh, plus max/ultra.
+    max). For codex/pi it is silently ignored when ``model`` is a capability
+    tier (the tier owns the effort); it still applies to a blank/raw-slug model.
+    Codex accepts low/medium/high/xhigh, plus max/ultra.
 
     permission_mode: ``bypass`` (the autonomous default), ``default``, or
     ``require_approval``. These are win-agent-teams modes, not backend-native
