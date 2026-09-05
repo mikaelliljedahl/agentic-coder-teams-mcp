@@ -22,7 +22,7 @@ from claude_teams.backends.base import (
 )
 from claude_teams.backends.contracts import (
     BackendBinaryNotFoundError,
-    prefer_luna_tiers,
+    BackendModelUnavailableError,
 )
 from claude_teams.backends.process_manager import process_manager
 
@@ -30,9 +30,13 @@ _LOCAL_PATH_CLS = type(Path.cwd())
 
 # Provider that backs a ChatGPT Plus/Pro (Codex) login. Model tiers below are
 # expressed against this provider; if the user is logged into a different
-# provider these slugs are absent and the launch falls back to pi's own default
-# model (see ``resolve_launch``) rather than erroring.
+# provider, tier launches fail loudly while explicit raw slugs retain their
+# soft-fallback escape hatch (see ``resolve_launch``).
 _PI_PROVIDER = "openai-codex"
+_PI_UPGRADE_HINT = (
+    "Upgrade pi: npm install -g @earendil-works/pi-coding-agent@latest "
+    "(or add the model to your provider config)"
+)
 
 # ``pi``'s npm bin script hands off to this entry under the package root. We
 # resolve and launch it via ``node`` directly (bypassing the ``pi.cmd`` shim),
@@ -112,6 +116,7 @@ def _discover_pi_model_ids(launcher: list[str]) -> list[str]:
 
         provider      model                context  max-out  thinking  images
         openai-codex  gpt-5.6-sol          372K     128K     yes       yes
+        openai-codex  gpt-6-astra          272K     128K     yes       yes
 
     Only the model column is kept. Any failure (binary missing, timeout, not
     logged in) yields ``[]`` so callers treat the set as unknown and skip
@@ -165,59 +170,27 @@ class PiBackend(BaseBackend):
     # The model interface exposed to the MCP caller: six capability tiers,
     # each bundling a concrete model with a ``--thinking`` level, as an
     # ascending cost/quality ladder. Names mirror the effort words the caller
-    # already reasons in (cheapest..max), matching the Codex backend's ladder so a
-    # coordinator can pick a tier without knowing pi's model slugs. Unlike
-    # Codex, an unavailable tier model does NOT error — it falls back to pi's
-    # own default model (see ``resolve_launch``), because the user may be logged
-    # into a provider whose catalog does not contain these slugs.
-    #   cheapest -> Luna @ medium
-    #   low    -> Luna  @ high
-    #   medium -> Luna  @ xhigh   (token-efficient general default)
-    #   high   -> Sol   @ medium
-    #   xhigh  -> Sol   @ high
-    #   max    -> Sol   @ xhigh
-    # The cheap end runs Luna rather than Terra or Sol for the quota reasons
-    # documented on the Codex ladder; Terra is off the ladder but still
-    # reachable as a raw slug.
+    # already reasons in (cheapest..max), while the ladder is tuned for Pi's
+    # 1M context window. A tier owns its model and thinking level; if discovery
+    # exposes a non-empty catalog without that model, the tier errors rather
+    # than silently falling back to Pi's configured default.
+    #   cheapest -> Luna  @ medium
+    #   low      -> Luna  @ high
+    #   medium   -> Luna  @ xhigh   (token-efficient general default)
+    #   high     -> Luna  @ max     (1M-context bridge)
+    #   xhigh    -> Astra @ low
+    #   max      -> Astra @ medium   (top)
+    # Astra replaces Sol at the top; Sol and Terra remain reachable as raw
+    # slugs. See the Codex ladder for the 262k-context rationale for the
+    # backends' one intentional difference at ``high``.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
         "cheapest": ("gpt-5.6-luna", "medium"),
         "low": ("gpt-5.6-luna", "high"),
         "medium": ("gpt-5.6-luna", "xhigh"),
-        "high": ("gpt-5.6-sol", "medium"),
-        "xhigh": ("gpt-5.6-sol", "high"),
-        "max": ("gpt-5.6-sol", "xhigh"),
-    }
-
-    # Opt-in ladder, selected by ``WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1``
-    # (see :func:`claude_teams.backends.contracts.prefer_luna_tiers`). Identical
-    # to the Codex backend's opt-in ladder, for the same reason the default
-    # ladders match: a coordinator picks a tier without knowing which backend
-    # will run it, so the two must not diverge.
-    #   cheapest -> Luna @ medium   (unchanged)
-    #   low      -> Luna @ high     (unchanged)
-    #   medium   -> Luna @ xhigh    (unchanged)
-    #   high     -> Luna @ max      (was Sol @ medium)
-    #   xhigh    -> Sol  @ medium   (was Sol @ high)
-    #   max      -> Sol  @ high     (was Sol @ xhigh)
-    _TIER_LAUNCH_PREFER_LUNA: ClassVar[dict[str, tuple[str, str]]] = {
-        "cheapest": ("gpt-5.6-luna", "medium"),
-        "low": ("gpt-5.6-luna", "high"),
-        "medium": ("gpt-5.6-luna", "xhigh"),
         "high": ("gpt-5.6-luna", "max"),
-        "xhigh": ("gpt-5.6-sol", "medium"),
-        "max": ("gpt-5.6-sol", "high"),
+        "xhigh": ("gpt-6-astra", "low"),
+        "max": ("gpt-6-astra", "medium"),
     }
-
-    def _tier_launch(self) -> dict[str, tuple[str, str]]:
-        """Return the tier ladder currently in force.
-
-        The Luna-preferring ladder when
-        ``WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1``, otherwise the
-        default. Both ladders carry the same tier names in the same order.
-        """
-        if prefer_luna_tiers():
-            return self._TIER_LAUNCH_PREFER_LUNA
-        return self._TIER_LAUNCH
 
     _THINKING_OPTIONS: ClassVar[frozenset[str]] = frozenset(
         {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
@@ -232,7 +205,7 @@ class PiBackend(BaseBackend):
             list[str]: Selectable tier names, cheapest first.
 
         """
-        return list(self._tier_launch())
+        return list(self._TIER_LAUNCH)
 
     def default_model(self) -> str:
         """Return the default capability tier (``medium``)."""
@@ -248,7 +221,7 @@ class PiBackend(BaseBackend):
         key = generic_name.strip()
         if not key:
             return ""
-        tier = self._tier_launch().get(key.lower())
+        tier = self._TIER_LAUNCH.get(key.lower())
         return tier[0] if tier else key
 
     def resolve_launch(
@@ -260,21 +233,31 @@ class PiBackend(BaseBackend):
           its own default model.
         - A capability tier resolves to its bundled ``(slug, thinking)``; the
           caller-supplied ``reasoning_effort`` is ignored (the tier owns it).
-        - Any other value is treated as a raw model id and passes through.
+          An unavailable tier model raises :class:`BackendModelUnavailableError`
+          instead of silently degrading.
+        - Any other value is treated as a raw model id and passes through. An
+          unavailable raw slug retains the soft fallback to ``("", effort)``
+          because a raw slug is an explicit provider-specific choice.
 
-        The resolved slug is checked against the models this pi login actually
-        exposes (``pi --list-models``). **Unlike Codex, an unavailable model is
-        NOT an error**: it degrades to ``("", thinking)`` so pi falls back to
-        its default model. Discovery returning nothing (offline / not logged in)
-        skips validation entirely.
+        Tier and raw-slug availability are checked against the models this pi
+        login exposes (``pi --list-models``). Discovery returning nothing
+        (offline / not logged in) skips validation entirely.
         """
         key = model.strip()
         if not key:
             return "", reasoning_effort
-        tier = self._tier_launch().get(key.lower())
+        tier = self._TIER_LAUNCH.get(key.lower())
         if tier is not None:
             slug, tier_effort = tier
-            return (slug if self._model_available(slug) else ""), tier_effort
+            if not self._model_available(slug):
+                available = self._available_model_ids()
+                raise BackendModelUnavailableError(
+                    slug,
+                    self._name,
+                    available,
+                    upgrade_hint=_PI_UPGRADE_HINT,
+                )
+            return slug, tier_effort
         return (key if self._model_available(key) else ""), reasoning_effort
 
     def _model_available(self, model: str) -> bool:
@@ -282,13 +265,14 @@ class PiBackend(BaseBackend):
 
         Returns True when discovery yields nothing ("cannot determine" — never
         block a launch on a discovery hiccup) or when the id (with any
-        ``provider/`` prefix stripped) is in the discovered set.
+        ``provider/`` prefix stripped from either side) is in the discovered
+        set.
         """
         available = self._available_model_ids()
         if not available:
             return True
         bare = model.split("/", 1)[-1]
-        return bare in available
+        return any(candidate.split("/", 1)[-1] == bare for candidate in available)
 
     def _available_model_ids(self) -> list[str]:
         """Return the model ids this pi login exposes (empty if unknown)."""

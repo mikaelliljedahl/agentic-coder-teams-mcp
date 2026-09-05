@@ -8,30 +8,7 @@ from claude_teams.agent_output import CORRELATION_FIELD, correlation_marker_toke
 from claude_teams.backends import codex as codex_module
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.codex import CodexBackend
-from claude_teams.backends.contracts import (
-    PREFER_LUNA_ENV,
-    BackendModelUnavailableError,
-)
-
-
-@pytest.fixture(autouse=True)
-def _default_tier_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin every test to the default tier ladder unless it opts in itself.
-
-    The Luna-preferring ladder is selected by a machine-global env var, so a
-    developer who has it exported would otherwise see unrelated tier tests fail.
-    """
-    monkeypatch.delenv(PREFER_LUNA_ENV, raising=False)
-
-
-@pytest.fixture
-def _prefer_luna(monkeypatch: pytest.MonkeyPatch) -> Callable[[str], None]:
-    """Return a helper that sets the Luna-preferring opt-in env var."""
-
-    def apply(value: str = "1") -> None:
-        monkeypatch.setenv(PREFER_LUNA_ENV, value)
-
-    return apply
+from claude_teams.backends.contracts import BackendModelUnavailableError
 
 
 @pytest.fixture
@@ -115,7 +92,8 @@ class TestCodexResolveModel:
         assert backend.resolve_model("low") == "gpt-5.6-luna"
         assert backend.resolve_model("medium") == "gpt-5.6-luna"
         assert backend.resolve_model("high") == "gpt-5.6-sol"
-        assert backend.resolve_model("max") == "gpt-5.6-sol"
+        assert backend.resolve_model("xhigh") == "gpt-6-astra"
+        assert backend.resolve_model("max") == "gpt-6-astra"
 
     def test_passes_through_direct_slug(self):
         backend = CodexBackend()
@@ -132,7 +110,7 @@ class TestCodexResolveModel:
 
 class TestCodexResolveLaunch:
     def test_tiers_map_to_model_and_effort(self, _stub_discovery):
-        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
+        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra"])
         backend = CodexBackend()
         assert backend.resolve_launch("cheapest", None) == (
             "gpt-5.6-luna",
@@ -141,20 +119,29 @@ class TestCodexResolveLaunch:
         assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
         assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
         assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
-        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "xhigh")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
+        assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
+
+    def test_legacy_luna_env_has_no_effect(self, _stub_discovery, monkeypatch):
+        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra"])
+        monkeypatch.setenv("WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS", "1")
+        backend = CodexBackend()
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
+        assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
     def test_old_ultra_name_uses_raw_slug_passthrough(self, _stub_discovery):
         _stub_discovery(["ultra"])
         assert CodexBackend().resolve_launch("ultra", None) == ("ultra", None)
 
     def test_explicit_effort_ignored_for_tier(self, _stub_discovery):
-        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
+        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra"])
         backend = CodexBackend()
         # A tier owns its effort; a caller-supplied reasoning_effort is
         # silently ignored and the bundled tier effort is used.
         assert backend.resolve_launch("low", "max") == ("gpt-5.6-luna", "high")
         assert backend.resolve_launch("high", "xhigh") == ("gpt-5.6-sol", "medium")
+        assert backend.resolve_launch("xhigh", "max") == ("gpt-6-astra", "low")
 
     def test_blank_model_defers_to_codex_config(self):
         backend = CodexBackend()
@@ -171,13 +158,13 @@ class TestCodexResolveLaunch:
         )
 
     def test_errors_when_sol_tier_unavailable(self, _stub_discovery):
-        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-luna"])  # no Sol
+        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"])
         backend = CodexBackend()
         with pytest.raises(BackendModelUnavailableError):
             backend.resolve_launch("high", None)
 
-    def test_luna_tiers_ok_without_sol(self, _stub_discovery):
-        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-luna"])  # Luna present
+    def test_luna_and_sol_tiers_ok_without_astra(self, _stub_discovery):
+        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
         backend = CodexBackend()
         assert backend.resolve_launch("cheapest", None) == (
             "gpt-5.6-luna",
@@ -185,22 +172,26 @@ class TestCodexResolveLaunch:
         )
         assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
         assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
+        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
 
     def test_errors_when_luna_tier_unavailable(self, _stub_discovery):
-        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-sol"])  # no Luna
+        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"])
         backend = CodexBackend()
         with pytest.raises(BackendModelUnavailableError):
             backend.resolve_launch("medium", None)
 
-    def test_sol_tiers_ok_without_luna(self, _stub_discovery):
-        _stub_discovery(["gpt-5.6-terra", "gpt-5.6-sol"])  # Sol present
+    @pytest.mark.parametrize("tier", ["xhigh", "max"])
+    def test_missing_astra_tier_includes_upgrade_hint(self, _stub_discovery, tier):
+        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
         backend = CodexBackend()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "high")
-        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "xhigh")
+        with pytest.raises(
+            BackendModelUnavailableError,
+            match=r"npm install -g @openai/codex@latest",
+        ):
+            backend.resolve_launch(tier, None)
 
     def test_errors_when_no_5_6_at_all(self, _stub_discovery):
-        _stub_discovery(["gpt-5.5"])  # neither Luna nor Sol
+        _stub_discovery(["gpt-5.5"])
         backend = CodexBackend()
         with pytest.raises(BackendModelUnavailableError):
             backend.resolve_launch("low", None)
@@ -208,90 +199,7 @@ class TestCodexResolveLaunch:
     def test_skips_validation_when_discovery_unavailable(self, _stub_discovery):
         _stub_discovery([])  # cannot determine -> no false error
         backend = CodexBackend()
-        assert backend.resolve_launch("ultra", None) == ("ultra", None)
-
-
-class TestCodexPreferLunaTiers:
-    """The opt-in ladder shifts the top three tiers one step toward Luna."""
-
-    def test_top_tiers_shift_toward_luna(self, _stub_discovery, _prefer_luna):
-        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
-        _prefer_luna()
-        backend = CodexBackend()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-5.6-sol", "medium")
-        assert backend.resolve_launch("max", None) == ("gpt-5.6-sol", "high")
-
-    def test_cheap_tiers_unchanged(self, _stub_discovery, _prefer_luna):
-        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
-        _prefer_luna()
-        backend = CodexBackend()
-        assert backend.resolve_launch("cheapest", None) == ("gpt-5.6-luna", "medium")
-        assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
-        assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
-
-    def test_resolve_model_follows_opt_in(self, _prefer_luna):
-        _prefer_luna()
-        backend = CodexBackend()
-        assert backend.resolve_model("high") == "gpt-5.6-luna"
-        assert backend.resolve_model("xhigh") == "gpt-5.6-sol"
-        assert backend.resolve_model("max") == "gpt-5.6-sol"
-
-    def test_tier_names_and_order_unchanged(self, _prefer_luna):
-        _prefer_luna()
-        backend = CodexBackend()
-        assert backend.supported_models() == [
-            "cheapest",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-            "max",
-        ]
-        assert backend.default_model() == "medium"
-
-    @pytest.mark.parametrize("value", ["0", "", "true", "yes", "2"])
-    def test_only_exactly_one_opts_in(self, _stub_discovery, _prefer_luna, value):
-        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
-        _prefer_luna(value)
-        backend = CodexBackend()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
-
-    def test_surrounding_whitespace_still_opts_in(self, _stub_discovery, _prefer_luna):
-        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
-        _prefer_luna(" 1 ")
-        backend = CodexBackend()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
-
-    def test_read_per_call_not_at_import(self, _stub_discovery, _prefer_luna):
-        # A long-lived server whose env changes mid-process must see the change
-        # without a module reload.
-        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
-        backend = CodexBackend()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-sol", "medium")
-        _prefer_luna()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
-
-    def test_escape_hatches_unaffected(self, _stub_discovery, _prefer_luna):
-        _stub_discovery(["gpt-5.6-terra"])
-        _prefer_luna()
-        backend = CodexBackend()
-        assert backend.resolve_launch("", "high") == ("", "high")
-        assert backend.resolve_launch("gpt-5.6-terra", "xhigh") == (
-            "gpt-5.6-terra",
-            "xhigh",
-        )
-
-    def test_high_tier_errors_without_luna_when_opted_in(
-        self, _stub_discovery, _prefer_luna
-    ):
-        # ``high`` needs Sol by default but Luna under the opt-in, so the
-        # availability check must follow the active ladder.
-        _stub_discovery(["gpt-5.6-sol"])  # no Luna
-        _prefer_luna()
-        backend = CodexBackend()
-        with pytest.raises(BackendModelUnavailableError):
-            backend.resolve_launch("high", None)
+        assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
 
 class TestCodexBuildCommand:
@@ -407,7 +315,7 @@ class TestCodexModelArg:
     ):
         # The default tier's resolved (slug, effort) must survive into argv:
         # tuple-level resolve_launch assertions alone don't prove that.
-        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
+        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra"])
         backend = CodexBackend()
         model, effort = backend.resolve_launch("medium", None)
 
@@ -417,14 +325,14 @@ class TestCodexModelArg:
         assert "model_reasoning_effort=xhigh" in cmd
 
     def test_build_command_emits_max_tier_launch(self, _make_request, _stub_discovery):
-        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol"])
+        _stub_discovery(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra"])
         backend = CodexBackend()
         model, effort = backend.resolve_launch("max", None)
 
         cmd = backend.build_command(_make_request(model=model, reasoning_effort=effort))
 
-        assert "model='gpt-5.6-sol'" in cmd
-        assert "model_reasoning_effort=xhigh" in cmd
+        assert "model='gpt-6-astra'" in cmd
+        assert "model_reasoning_effort=medium" in cmd
 
     def test_build_command_omits_c_model_override_when_blank(self, _make_request):
         backend = CodexBackend()

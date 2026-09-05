@@ -86,28 +86,35 @@ class MyBackend(BaseBackend):
 
 ### Models & capability tiers
 
-The MCP caller picks capability, not a raw model slug. Both `codex` and `pi`
-expose five **tiers** (`low/medium/high/xhigh/ultra`) that each bundle a concrete
+The MCP caller picks capability, not a raw model slug. `codex` and `pi` each
+expose six **tiers** (`cheapest/low/medium/high/xhigh/max`) that bundle a concrete
 model + reasoning effort; `supported_models()` returns the tier names and
 `resolve_launch()` maps a tier to `(model, effort)`:
 
 ```python
-_TIER_LAUNCH = {                       # pi.py:120
-    "low":   ("gpt-5.6-terra", "medium"),
-    "medium":("gpt-5.6-sol",   "low"),
-    ...
+_TIER_LAUNCH = {  # fixed per-backend mapping; Codex shown here
+    "cheapest": ("gpt-5.6-luna", "medium"),
+    "low":      ("gpt-5.6-luna", "high"),
+    "medium":   ("gpt-5.6-luna", "xhigh"),
+    "high":     ("gpt-5.6-sol", "medium"),
+    "xhigh":    ("gpt-6-astra", "low"),
+    "max":      ("gpt-6-astra", "medium"),
 }
+# Pi differs only at high: ("gpt-5.6-luna", "max").
 ```
 
-`resolve_launch(model, effort)` returns the `(model, effort)` pair the spawn uses.
-Two policies to choose from:
+The production ladders are backend-specific at `high`: Codex uses Sol @ medium
+for its 262k context limit, while Pi uses Luna @ max with its 1M window. See the
+README's ladder table for the complete fixed mapping. `resolve_launch(model,
+effort)` returns the `(model, effort)` pair the spawn uses.
 
-- **Hard-fail** (`codex.py` `resolve_launch` / `_require_available`): a tier whose
-  model isn't installed raises `BackendModelUnavailableError` — no silent
-  downgrade.
-- **Soft-fallback** (`pi.py` `resolve_launch`): an unavailable tier model returns
-  `("", effort)` so the CLI uses its own default model. Use this when the user may
-  be logged into a provider whose catalog differs.
+- **Hard-fail tiers** (`codex.py` and `pi.py` `resolve_launch`): when live
+  discovery is non-empty, a tier whose model isn't installed raises
+  `BackendModelUnavailableError` with an upgrade hint — no silent downgrade.
+- **Pi raw-slug soft-fallback** (`pi.py` `resolve_launch`): an unavailable
+  explicit raw slug returns `("", effort)` so the CLI uses its own default
+  model. A raw slug is an explicit provider-specific escape hatch; do not apply
+  this fallback to capability tiers.
 
 Discover the installed models live and cache per process (`codex._discover_codex_model_slugs`,
 `pi._discover_pi_model_ids`); treat an empty discovery result as "unknown → skip

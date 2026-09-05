@@ -20,7 +20,6 @@ from claude_teams.backends.base import (
 from claude_teams.backends.contracts import (
     BackendBinaryNotFoundError,
     BackendModelUnavailableError,
-    prefer_luna_tiers,
 )
 from claude_teams.backends.process_manager import process_manager
 
@@ -42,6 +41,7 @@ _MODEL_DISCOVERY_TIMEOUT_S = 20.0
 # binary path. Populated lazily on first ``supported_models``/tier resolution so
 # a spawn pays at most one ``codex debug models`` subprocess per process.
 _MODEL_SLUG_CACHE: dict[str, list[str]] = {}
+_CODEX_UPGRADE_HINT = "Upgrade codex: npm install -g @openai/codex@latest"
 
 
 def _discover_codex_model_slugs(binary: str) -> list[str]:
@@ -102,54 +102,29 @@ class CodexBackend(BaseBackend):
         return True
 
     # The ONLY model interface exposed to the MCP caller: six capability
-    # tiers, each bundling a concrete GPT-5.6 model with a reasoning effort,
-    # as an ascending cost/quality ladder. Names mirror the effort words the
-    # caller already reasons in (cheapest..max) rather than raw model slugs, which
-    # the caller has no basis to choose between. All targets are GPT-5.6; if the
-    # target model is not available on this codex install the spawn errors (no
-    # silent downgrade). A tier fully determines model + effort; a caller-
-    # supplied ``reasoning_effort`` is silently ignored for tiers.
-    #   cheapest -> Luna @ medium  (cheapest/fastest)
-    #   low    -> Luna  @ high     (dirt cheap, quick/low-stakes)
-    #   medium -> Luna  @ xhigh    (token-efficient general default)
-    #   high   -> Sol   @ medium   (backend dev, code review)
-    #   xhigh  -> Sol   @ high     (genuinely hard problems)
-    #   max    -> Sol   @ xhigh    (top; higher still is diminishing returns)
-    # The cheap end runs Luna rather than Terra or Sol: under the current usage
-    # limits Luna's per-message quota is an order of magnitude larger than
-    # Sol's while a high-effort Luna run costs only a few times the tokens, so
-    # Luna @ xhigh replaces Sol @ low at a fraction of the quota. Terra is no
-    # longer on the ladder (its quota is only ~2x Sol's), but remains reachable
-    # as a raw slug.
+    # tiers, each bundling a concrete model with a reasoning effort, as an
+    # ascending cost/quality ladder. Names mirror the effort words the caller
+    # already reasons in (cheapest..max) rather than raw model slugs. A tier
+    # fully determines model + effort; a caller-supplied ``reasoning_effort``
+    # is silently ignored for tiers, and an unavailable target raises instead
+    # of silently downgrading.
+    #   cheapest -> Luna  @ medium  (cheapest/fastest)
+    #   low      -> Luna  @ high    (quick/low-stakes)
+    #   medium   -> Luna  @ xhigh   (token-efficient general default)
+    #   high     -> Sol   @ medium  (262k-context-safe bridge)
+    #   xhigh    -> Astra @ low
+    #   max      -> Astra @ medium   (top)
+    # Codex caps context at 262k, so Luna @ max cannot finish complex tasks
+    # there; Sol @ medium is the only 262k-safe point between Luna and Astra.
+    # Astra replaces Sol at the top because it dominates Sol above medium at
+    # equal or lower cost. Terra and Sol remain reachable as raw slugs.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
         "cheapest": ("gpt-5.6-luna", "medium"),
         "low": ("gpt-5.6-luna", "high"),
         "medium": ("gpt-5.6-luna", "xhigh"),
         "high": ("gpt-5.6-sol", "medium"),
-        "xhigh": ("gpt-5.6-sol", "high"),
-        "max": ("gpt-5.6-sol", "xhigh"),
-    }
-
-    # Opt-in ladder, selected by ``WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1``.
-    # Luna @ max holds up about as well as Sol @ medium in practice, so the top
-    # three tiers each shift one step toward Luna: ``high`` becomes Luna's
-    # ceiling, and Sol is reserved for ``xhigh``/``max`` -- the genuinely hard
-    # problems that are the only ones worth spending the scarcer Sol quota on.
-    # Tier *names* and their order are identical to the default ladder, so this
-    # changes only what a tier resolves to, never the caller-facing vocabulary.
-    #   cheapest -> Luna @ medium   (unchanged)
-    #   low      -> Luna @ high     (unchanged)
-    #   medium   -> Luna @ xhigh    (unchanged)
-    #   high     -> Luna @ max      (was Sol @ medium)
-    #   xhigh    -> Sol  @ medium   (was Sol @ high)
-    #   max      -> Sol  @ high     (was Sol @ xhigh)
-    _TIER_LAUNCH_PREFER_LUNA: ClassVar[dict[str, tuple[str, str]]] = {
-        "cheapest": ("gpt-5.6-luna", "medium"),
-        "low": ("gpt-5.6-luna", "high"),
-        "medium": ("gpt-5.6-luna", "xhigh"),
-        "high": ("gpt-5.6-luna", "max"),
-        "xhigh": ("gpt-5.6-sol", "medium"),
-        "max": ("gpt-5.6-sol", "high"),
+        "xhigh": ("gpt-6-astra", "low"),
+        "max": ("gpt-6-astra", "medium"),
     }
 
     _REASONING_EFFORT_SPEC: ClassVar[ReasoningEffortSpec] = ReasoningEffortSpec(
@@ -178,30 +153,19 @@ class CodexBackend(BaseBackend):
         """Parse ``[agents.*]`` tables from ``~/.codex/config.toml`` and project."""
         return discover_codex_style_agents(cwd, "codex")
 
-    def _tier_launch(self) -> dict[str, tuple[str, str]]:
-        """Return the tier ladder currently in force.
-
-        The Luna-preferring ladder when
-        ``WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS=1``, otherwise the
-        default. Both ladders carry the same tier names in the same order.
-        """
-        if prefer_luna_tiers():
-            return self._TIER_LAUNCH_PREFER_LUNA
-        return self._TIER_LAUNCH
-
     def supported_models(self) -> list[str]:
         """Return the capability tiers the MCP caller may choose from.
 
         Deliberately the tier names (``cheapest``..``max``), not raw model slugs:
         the caller reasons about how much capability a task needs, not about
-        GPT-5.6 model identities. Each tier maps to a concrete model+effort in
+        GPT model identities. Each tier maps to a concrete model+effort in
         :attr:`_TIER_LAUNCH`.
 
         Returns:
             list[str]: Selectable tier names, cheapest first.
 
         """
-        return list(self._tier_launch())
+        return list(self._TIER_LAUNCH)
 
     def default_model(self) -> str:
         """Return the default capability tier.
@@ -232,7 +196,7 @@ class CodexBackend(BaseBackend):
         key = generic_name.strip()
         if not key:
             return ""
-        tier = self._tier_launch().get(key.lower())
+        tier = self._TIER_LAUNCH.get(key.lower())
         return tier[0] if tier else key
 
     def resolve_launch(
@@ -243,20 +207,20 @@ class CodexBackend(BaseBackend):
         - Blank ``model`` -> ``("", effort)``: no ``-c model`` override is
           emitted and codex uses its own ``config.toml`` default (escape hatch).
         - A capability tier (``cheapest``/``low``/``medium``/``high``/``xhigh``/``max``)
-          resolves to its bundled ``(GPT-5.6 slug, effort)`` from the ladder in
-          force (see :meth:`_tier_launch`); a caller-supplied
+          resolves to its bundled ``(model slug, effort)`` from
+          :attr:`_TIER_LAUNCH`; a caller-supplied
           ``reasoning_effort`` is silently ignored (the tier owns the effort).
         - Any other value is treated as a raw model slug and passes through
           (``reasoning_effort`` still applies here and to blank models).
 
         The resolved model is validated against the models this codex install
-        actually exposes; an unavailable GPT-5.6 model raises
+        actually exposes; an unavailable tier or raw model raises
         :class:`BackendModelUnavailableError` rather than downgrading silently.
         """
         key = model.strip()
         if not key:
             return "", reasoning_effort
-        tier = self._tier_launch().get(key.lower())
+        tier = self._TIER_LAUNCH.get(key.lower())
         if tier is not None:
             slug, tier_effort = tier
             self._require_available(slug)
@@ -282,11 +246,16 @@ class CodexBackend(BaseBackend):
 
         Validation is skipped when discovery yields nothing (cannot determine),
         so a discovery hiccup never blocks a spawn; codex itself would then
-        reject an genuinely-missing model at launch.
+        reject a genuinely-missing model at launch.
         """
         available = self._available_model_slugs()
         if available and slug not in available:
-            raise BackendModelUnavailableError(slug, self._name, available)
+            raise BackendModelUnavailableError(
+                slug,
+                self._name,
+                available,
+                upgrade_hint=_CODEX_UPGRADE_HINT,
+            )
 
     def default_permission_args(self) -> list[str]:
         """Return default permission-bypass arguments for Codex."""
