@@ -493,10 +493,11 @@ session dir, keyed on inbox **cursor** advance) caps a no-progress block loop at
 8-block ceiling). Identity is per-lead: a spawned nested lead resolves its own
 `inbox-<AGENT_NAME>.jsonl`, never a hardcoded `team-lead`.
 
-Server-spawned Claude Code agents get this wiring automatically (it is added as a
-second `Stop` matcher group alongside the state-marker `emit` hook). For a
-**top-level** lead you start yourself, wire it in one step with the
-`install_lead_wake` MCP tool:
+Server-spawned Claude Code agents always get state-marker `emit` hooks. The
+lead-wake group is opt-in: pass `enable_spawned_lead_wake=true` to `spawn_agent`
+only for an agent expected to spawn and wait for its own children. The flag does
+not grant or restrict spawning. For a **top-level** lead you start yourself,
+wire it in one step with the `install_lead_wake` MCP tool:
 
 - `install_lead_wake()` writes the wake `Stop` hook into the project
   `.claude/settings.json` in the lead's cwd (`scope="user"` targets
@@ -511,7 +512,8 @@ Environment tunables:
 
 | Env var | Default | Meaning |
 |---------|---------|---------|
-| `WIN_AGENT_TEAMS_LEAD_WAKE` | `1` | Kill switch. `0` disables the hook at runtime (even for already-wired sessions). |
+| `WIN_AGENT_TEAMS_LEAD_WAKE` | `1` | Kill switch. `0` disables the hook at runtime (even for already-wired sessions). The Claude spawn path sets it to `0` unless `enable_spawned_lead_wake=true`. |
+| `WIN_AGENT_TEAMS_LEAD_WAKE_BASELINE` | inherited | Internal spawn propagation of the operator's lead-wake switch, so nested opt-in can restore wake without overriding an operator-level `0`. |
 | `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_NOPROGRESS` | `3` | Consecutive no-progress blocks before the guard fails open. |
 | `WIN_AGENT_TEAMS_LEAD_WAKE_MAX_WAIT` | `0` | Optional in-hook grace-wait seconds (reserved; default `0` = no in-hook wait). |
 

@@ -147,7 +147,7 @@ appended text, not the raw docstring in the source, is what a calling agent
 actually reads, so a change there changes the contract those agents see. It must
 sit below the `@mcp.tool()` decorator to take effect.
 
-### `spawn_agent(prompt, name, backend, model, cwd, permission_mode, reasoning_effort, expected_outputs)`
+### `spawn_agent(prompt, name, backend, model, cwd, permission_mode, reasoning_effort, expected_outputs, enable_spawned_lead_wake)`
 
 **Mechanically**, under the `agents.json` file lock
 (`src/claude_teams/server_simple.py:1227`):
@@ -165,6 +165,10 @@ sit below the `@mcp.tool()` decorator to take effect.
 5. Writes the per-agent MCP config, materializes the final prompt and its
    transport (`_materialize_prompt`, see §4), and puts the correlation id, the
    optional prompt sidecar path, and the hook wiring into `SpawnRequest.extra`.
+   Claude agents always receive state-marker hooks. The lead-wake `Stop` group
+   is included only when `enable_spawned_lead_wake=true`; the default is false
+   and does not restrict the agent from spawning children. Codex and Pi accept
+   the shared parameter but otherwise ignore it.
 6. Calls `backend.spawn(request)`, which builds argv and starts **a new OS
    process** (`src/claude_teams/backends/process_base.py:82-105`).
 7. Captures a PID creation token from the just-live child and appends the

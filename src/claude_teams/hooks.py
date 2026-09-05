@@ -244,7 +244,9 @@ def _shell_quote_command(argv: list[str]) -> str:
     return " ".join(f'"{part}"' for part in argv)
 
 
-def write_claude_settings(session_dir: Path, agent_name: str) -> Path:
+def write_claude_settings(
+    session_dir: Path, agent_name: str, *, enable_lead_wake: bool = False
+) -> Path:
     """Write a per-agent Claude Code settings file wiring the state hooks.
 
     Returns the path to the written settings JSON file, suitable for passing
@@ -253,14 +255,13 @@ def write_claude_settings(session_dir: Path, agent_name: str) -> Path:
     session_dir = Path(session_dir)
     events = _RUNNING_EVENTS | _WAITING_EVENTS
     hooks_config = {event: [_hook_matcher(session_dir, agent_name)] for event in events}
-    # Only the ``Stop`` event carries a SECOND matcher group: the lead-wake
-    # decision hook, alongside the existing state-marker ``emit`` group. Both
-    # run on every Stop; a ``block`` from either wins and order is irrelevant
-    # (spike probe d), so no merge is needed. Every other event keeps the single
-    # ``emit`` group unchanged.
-    hooks_config["Stop"].append(
-        _wake_hook_matcher(session_dir, agent_name, owner_mode="private")
-    )
+    # A spawned agent gets the SECOND, blocking lead-wake matcher only when its
+    # spawner explicitly says it will lead children. The ordinary state-marker
+    # emit group remains present for every Stop either way.
+    if enable_lead_wake:
+        hooks_config["Stop"].append(
+            _wake_hook_matcher(session_dir, agent_name, owner_mode="private")
+        )
     config = {"hooks": hooks_config}
     path = session_dir / f"hooks-{agent_name}.settings.json"
     path.write_text(json.dumps(config, indent=2), encoding="utf-8")

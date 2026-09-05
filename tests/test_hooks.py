@@ -281,10 +281,21 @@ class TestWriteClaudeSettings:
         assert "worker" in command
         assert tmp_path.as_posix() in command
 
-    def test_write_claude_settings_stop_has_two_matcher_groups(
+    def test_write_claude_settings_default_stop_has_only_emit_group(
         self, tmp_path: Path
     ) -> None:
         path = hooks.write_claude_settings(tmp_path, "worker")
+
+        config = json.loads(path.read_text(encoding="utf-8"))
+        stop_groups = config["hooks"]["Stop"]
+        assert len(stop_groups) == 1
+        assert "claude_teams.hooks" in stop_groups[0]["hooks"][0]["command"]
+        assert "lead_wake" not in stop_groups[0]["hooks"][0]["command"]
+
+    def test_write_claude_settings_opt_in_stop_has_two_matcher_groups(
+        self, tmp_path: Path
+    ) -> None:
+        path = hooks.write_claude_settings(tmp_path, "worker", enable_lead_wake=True)
 
         config = json.loads(path.read_text(encoding="utf-8"))
         stop_groups = config["hooks"]["Stop"]
@@ -311,7 +322,7 @@ class TestWriteClaudeSettings:
     def test_wake_command_references_lead_wake_module_and_reader(
         self, tmp_path: Path
     ) -> None:
-        path = hooks.write_claude_settings(tmp_path, "worker")
+        path = hooks.write_claude_settings(tmp_path, "worker", enable_lead_wake=True)
 
         config = json.loads(path.read_text(encoding="utf-8"))
         wake_group = next(

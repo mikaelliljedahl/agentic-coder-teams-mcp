@@ -19,6 +19,9 @@ def _clear_inherited_agent_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AGENT_SESSION_ID", raising=False)
     monkeypatch.delenv("AGENT_NAME", raising=False)
     monkeypatch.delenv("AGENT_PARENT_NAME", raising=False)
+    monkeypatch.delenv("WIN_AGENT_TEAMS_LEAD_WAKE", raising=False)
+    monkeypatch.delenv("WIN_AGENT_TEAMS_LEAD_WAKE_BASELINE", raising=False)
+    monkeypatch.delenv("WIN_AGENT_TEAMS_MEMBER_WAKE", raising=False)
     from claude_teams import server_simple
 
     monkeypatch.setattr(server_simple, "_AGENT_SESSION_ID", "")

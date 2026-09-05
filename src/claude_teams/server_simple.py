@@ -1621,9 +1621,10 @@ owner-bound — the hook cannot know your PID — and is bounded by the default
 `--timeout` instead; run it exactly as given. The hook writes a small
 `wake-progress-<reader>.json` file under the session dir to bound a no-progress
 block loop and is always fail-open (never makes the lead unstoppable). Disable
-it at runtime with `WIN_AGENT_TEAMS_LEAD_WAKE=0`. Server-spawned agents get this
-wiring automatically; a top-level lead wires it with the `install_lead_wake`
-tool.
+it at runtime with `WIN_AGENT_TEAMS_LEAD_WAKE=0`. Server-spawned Claude agents
+always get state-marker hooks, but get this lead-wake group only when spawned
+with `enable_spawned_lead_wake=true`. A top-level lead wires it with the
+`install_lead_wake` tool.
 """.strip()
 
 
@@ -2847,7 +2848,12 @@ def _pi_wake_extension_dir() -> Path | None:
     return candidate if candidate.exists() else None
 
 
-def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str, str]:
+def _hook_extra(
+    session_id: str,
+    agent_name: str,
+    backend_name: str,
+    enable_spawned_lead_wake: bool = False,
+) -> dict[str, str]:
     """Materialise per-backend hook wiring, added to ``SpawnRequest.extra``.
 
     Claude Code gets a written settings-file path
@@ -2884,8 +2890,15 @@ def _hook_extra(session_id: str, agent_name: str, backend_name: str) -> dict[str
             extra["pi_wake_extension_path"] = str(wake)
         return extra
     if backend_name == "claude-code":
-        settings_path = hooks.write_claude_settings(session_dir, agent_name)
-        return {"hooks_settings_path": str(settings_path)}
+        settings_path = hooks.write_claude_settings(
+            session_dir,
+            agent_name,
+            enable_lead_wake=enable_spawned_lead_wake,
+        )
+        return {
+            "hooks_settings_path": str(settings_path),
+            "enable_spawned_lead_wake": ("1" if enable_spawned_lead_wake else "0"),
+        }
     if backend_name == "codex":
         # On Windows, Codex runs the hook via `cmd /C` and mangles a multi-token
         # double-quoted command; a bare-path launcher in `commandWindows` is the
@@ -3135,6 +3148,7 @@ async def spawn_agent(
     permission_mode: Literal["bypass", "default", "require_approval"] = "bypass",
     reasoning_effort: str = "",
     expected_outputs: list[str] | None = None,
+    enable_spawned_lead_wake: bool = False,
 ) -> dict:
     """Spawn a new agent process.
 
@@ -3172,6 +3186,12 @@ async def spawn_agent(
     expected_outputs (optional): the exact file paths you are instructing the
     agent to create. Echoed back verbatim in the result so you can watch
     those precise paths for completion.
+
+    enable_spawned_lead_wake: set this to ``True`` only when the spawned agent
+    is expected to spawn and wait for its own children. It enables Claude
+    Code's automatic lead-wake watcher support for that spawned process.
+    The default is ``False``. It does not restrict spawning, and Codex/Pi
+    accept but otherwise ignore it.
 
     The result includes the disk-backed coordination contract: an injected
     lifecycle hook writes this agent's state to ``state_marker_path``
@@ -3262,7 +3282,12 @@ async def spawn_agent(
                 "session_dir": str(_session_dir(session_id)),
                 **_correlation_extra(correlation_id),
                 **prompt_extra,
-                **_hook_extra(session_id, agent_name, backend_name),
+                **_hook_extra(
+                    session_id,
+                    agent_name,
+                    backend_name,
+                    enable_spawned_lead_wake,
+                ),
             }
 
             request = SpawnRequest(
@@ -3306,6 +3331,7 @@ async def spawn_agent(
                     "model": resolved_model,
                     "permission_mode": permission_mode,
                     "reasoning_effort": effort,
+                    "enable_spawned_lead_wake": enable_spawned_lead_wake,
                     "create_token": create_token,
                     CORRELATION_FIELD: correlation_id,
                     PROMPT_TRANSPORT_FIELD: _prompt_transport(prompt_extra),
@@ -3940,7 +3966,12 @@ def _build_resume_request(
         "session_dir": str(_session_dir(session_id)),
         **_correlation_extra(correlation_id),
         **prompt_extra,
-        **_hook_extra(session_id, agent_name, backend_name),
+        **_hook_extra(
+            session_id,
+            agent_name,
+            backend_name,
+            agent.get("enable_spawned_lead_wake") is True,
+        ),
     }
     request = SpawnRequest(
         agent_id=f"{agent_name}@{session_id}",
@@ -6452,9 +6483,10 @@ async def install_lead_wake(remove: bool = False, scope: str = "project") -> dic
     watcher is armed, and blocks with an operational instruction to run the
     ``watch_command_bash``/``watch_argv`` as a BACKGROUND task (or to call
     ``read_messages`` when a reply is already unread) rather than trusting the
-    model to remember. Server-spawned agents get this wiring automatically; use
-    this tool to wire a **top-level** lead you started yourself (e.g. an
-    interactive ``claude`` in a repo).
+    model to remember. Server-spawned Claude agents get this wiring only when
+    ``spawn_agent(enable_spawned_lead_wake=true)`` is used; use this tool to
+    wire a **top-level** lead you started yourself (e.g. an interactive
+    ``claude`` in a repo).
 
     - ``scope="project"`` (default) writes the project ``.claude/settings.json``
       in the current working directory; ``scope="user"`` writes

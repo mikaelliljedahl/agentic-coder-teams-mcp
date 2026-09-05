@@ -10,8 +10,8 @@ Setup is always **two parts**:
 1. **Register the MCP server** with your client (Claude Code and/or Codex) so
    the tools (`spawn_agent`, `send_message`, `read_messages`, …) exist.
 2. **Optionally install the lead-wake `Stop` hook** for a top-level Claude Code
-   lead — one `install_lead_wake()` tool call. Spawned agents get it
-   automatically; you only ever run this for a lead you started yourself.
+   lead — one `install_lead_wake()` tool call. For a spawned nested lead, pass
+   `enable_spawned_lead_wake=true` to `spawn_agent` instead.
 
 ---
 
@@ -238,7 +238,7 @@ replies. A `Stop` hook makes that deterministic. Who needs to install what:
 
 | Situation | Action needed |
 |---|---|
-| **Server-spawned** Claude Code agent (any nesting level) | **Nothing.** The spawn path auto-wires the wake hook as a second `Stop` matcher group in the agent's per-agent `hooks-<name>.settings.json` (passed via `--settings`). |
+| **Server-spawned** Claude Code agent expected to spawn and wait for children | Pass `enable_spawned_lead_wake=true` to `spawn_agent`. The wake hook is then a second `Stop` matcher group in the agent's per-agent `hooks-<name>.settings.json` (passed via `--settings`). Ordinary spawned agents default to state-marker hooks only. |
 | **Top-level lead you start yourself** (an interactive `claude` in your repo) | Run the `install_lead_wake` MCP tool **once** (see below). |
 | Codex or Pi lead | Not applicable — the hook is Claude Code-specific. Codex leads use the bounded foreground `watch` loop instead (see README "Coordinating without polling"). |
 
@@ -349,7 +349,11 @@ a per-project approval gate. Use the user-scope `claude mcp add` command
 1. Confirm the hook is present in the settings file `install_lead_wake`
    reported, and that you restarted the `claude` session afterwards.
 2. Confirm `WIN_AGENT_TEAMS_LEAD_WAKE` is not set to `0` in the lead's
-   environment.
+   environment. The spawn path deliberately sets it to `0` for ordinary
+   spawned Claude agents; a nested lead must be spawned with
+   `enable_spawned_lead_wake=true`. The internal
+   `WIN_AGENT_TEAMS_LEAD_WAKE_BASELINE` preserves an operator-level kill switch
+   through deeper nesting.
 3. Scope mismatch: with `scope="project"` the hook lands in the settings of
    the directory the MCP **server** runs in — normally the project where you
    started `claude`. If you registered the server with an explicit `cwd`

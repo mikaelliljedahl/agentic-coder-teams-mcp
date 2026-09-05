@@ -923,6 +923,7 @@ async def test_spawn_agent_persists_output_lookup_metadata(
             "model": "model",
             "permission_mode": "bypass",
             "reasoning_effort": None,
+            "enable_spawned_lead_wake": False,
             "prompt_transport": "argv",
             "spawned_by": "team-lead",
             "spawned_by_source": "spawn",

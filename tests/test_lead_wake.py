@@ -483,6 +483,7 @@ class TestLiveSubagentScoping:
 
         monkeypatch.setattr(lead_wake, "_resolve_session_dir", lambda _arg: tmp_path)
         monkeypatch.setattr(server_simple, "_load_agents", lambda _sid: agents)
+        monkeypatch.setattr(server_simple, "_agent_alive", lambda _agent: True)
 
     def test_leaf_agent_only_self_record_allows(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -558,6 +559,46 @@ class TestLiveSubagentScoping:
                 {"name": "leaf", "status": "killed", "parent": "mid"},
             ],
         )
+
+        result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
+
+        assert result.action == "allow"
+        assert result.code == "D2"
+
+    def test_running_child_with_dead_process_is_not_live(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from claude_teams import server_simple
+
+        monkeypatch.setenv("AGENT_NAME", "mid")
+        self._resolve_with_agents(
+            monkeypatch,
+            tmp_path,
+            [{"name": "leaf", "status": "running", "parent": "mid", "pid": 1}],
+        )
+        monkeypatch.setattr(server_simple, "_agent_alive", lambda _agent: False)
+
+        result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
+
+        assert result.action == "allow"
+        assert result.code == "D2"
+
+    def test_liveness_probe_error_fails_open(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from claude_teams import server_simple
+
+        monkeypatch.setenv("AGENT_NAME", "mid")
+        self._resolve_with_agents(
+            monkeypatch,
+            tmp_path,
+            [{"name": "leaf", "status": "running", "parent": "mid", "pid": 1}],
+        )
+
+        def _raise(_agent: dict) -> bool:
+            raise OSError
+
+        monkeypatch.setattr(server_simple, "_agent_alive", _raise)
 
         result = lead_wake.evaluate(_payload(), reader_arg="team-lead")
 
