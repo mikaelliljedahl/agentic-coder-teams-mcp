@@ -48,6 +48,27 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     say(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}")
 
 
+def _result(raw: str) -> dict:
+    """Return a herdr response's result object, or ``{}`` for an error envelope.
+
+    Closing the last tab can take its workspace with it, after which
+    ``tab list`` answers with an error rather than an empty list -- so the
+    final cleanup check must not assume success.
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    result = parsed.get("result") if isinstance(parsed, dict) else None
+    return result if isinstance(result, dict) else {}
+
+
+def _tab_labels(workspace_id: str) -> list[str]:
+    """Return the labels of every tab in a workspace, tolerating its absence."""
+    result = _result(herdr("tab", "list", "--workspace", workspace_id))
+    return [str(tab.get("label") or "") for tab in result.get("tabs") or []]
+
+
 def herdr(*args: str) -> str:
     """Run a herdr command against the disposable session."""
     done = subprocess.run(  # noqa: S603 - argv is built here, not user input.
@@ -86,16 +107,15 @@ async def run_checks() -> int:
     session_dir = Path(spawned["session_dir"])
     marker = session_dir / f"state-{CHILD}.json"
 
-    workspaces = json.loads(herdr("workspace", "list"))["result"]["workspaces"]
+    workspaces = _result(herdr("workspace", "list")).get("workspaces") or []
     workspace_id = workspaces[0]["workspace_id"] if workspaces else ""
     tabs = json.loads(herdr("tab", "list", "--workspace", workspace_id))["result"][
         "tabs"
     ]
-    labels = [tab.get("label") for tab in tabs]
     check(
         "agent has its own herdr tab",
-        any(CHILD in (label or "") for label in labels),
-        str(labels),
+        any(CHILD in (label or "") for label in tabs),
+        str(tabs),
     )
 
     # Read the pane only after the CLI has had a chance to paint; reading
@@ -137,8 +157,7 @@ async def run_checks() -> int:
 
     say("kill: " + json.dumps(await server.kill_agent(name=CHILD), default=str)[:200])
     await asyncio.sleep(3)
-    tabs_after = json.loads(herdr("tab", "list", "--workspace", workspace_id))
-    labels_after = [tab.get("label") for tab in tabs_after["result"]["tabs"]]
+    labels_after = _tab_labels(workspace_id)
     check(
         "kill closed the tab",
         not any(CHILD in (label or "") for label in labels_after),

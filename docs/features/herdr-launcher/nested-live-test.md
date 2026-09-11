@@ -20,7 +20,7 @@ new launcher.
 | Agent got its own Herdr tab | PASS (`herdr-grandchild@65e3ef04-…`) |
 | Pane showed agent content | PASS (2739 chars) — but see caveat |
 | **`state-herdr-grandchild.json` written** | **PASS** |
-| Grandchild reported upstream | FAIL — see cause below |
+| Grandchild reported upstream | FAIL on run 1 — PASSED on the corrected rerun |
 | Kill closed the tab, marker and process gone | PASS |
 | Test session stopped and deleted | PASS |
 
@@ -79,3 +79,36 @@ demonstrated end-to-end here and should not be claimed.
   could be read, and it never sent its DONE line. This document was written from
   the driver's own captured output instead. The tester's cleanup step is the
   likely culprit; source changes were verified intact afterwards.
+
+
+## Rerun with the corrected driver — full chain proven
+
+Both driver defects were fixed (own-identity inbox, wait before reading the
+pane) and the check was rerun from the repo root, where the identity really is
+`team-lead`. Everything passed, including the round trip:
+
+```
+--- pane ---
+gpt-5.6-luna high · ~/code/github/wt-herdr-launcher · Send grandchild alive message
+--- end pane ---
+PASS  pane shows agent content  1361c
+PASS  state marker written  .../state-herdr-grandchild.json
+marker: {"state": "waiting", "event": "Stop", "ts": 1789154033.0011466}
+PASS  grandchild reported upstream
+kill: {"success": true, "name": "herdr-grandchild"}
+```
+
+The pane's first line is the **codex TUI status bar** — a real agent CLI
+running inside the Herdr pane, not a shell prompt. The marker carries
+`event: "Stop"`, so the agent ran to completion and its lifecycle hook fired.
+And the message reached the lead's inbox, so spawn → run → report → kill works
+end to end under this launcher.
+
+One more driver defect surfaced at the very end: the final "kill closed the tab"
+check crashed with `KeyError: 'result'`, because closing the last tab can take
+its workspace with it, after which `tab list` answers with an error envelope
+rather than an empty list. The driver now tolerates that (`_result` /
+`_tab_labels`). The kill itself had already reported success.
+
+The disposable `nested` session was stopped and deleted afterwards; only
+`default` remains.
