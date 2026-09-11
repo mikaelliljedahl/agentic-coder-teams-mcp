@@ -12,7 +12,9 @@ manager's probe *is* the PID-reuse proof for everything that kills.
 
 import functools
 import json
+import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -267,6 +269,9 @@ def test_run_herdr_routes_through_the_session_prefix(
 # Spawn (plan tests 11-17, 20)
 # --------------------------------------------------------------------------
 
+_DISK_FULL = "disk full"
+_NO_BINARY = "no such file: herdr"
+
 _TAB_CREATED = {
     "type": "tab_created",
     "tab": {"tab_id": "w3:t2", "label": "worker@team"},
@@ -502,10 +507,14 @@ def test_probe_owned_when_everything_matches(
     assert manager._tracked_alive(info) is True
 
 
-def test_probe_identity_mismatch_when_shell_pid_changed(
+def test_probe_pane_gone_when_the_pane_hosts_a_different_process(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The pane is live but now hosts a different process: not ours."""
+    """Our PID/token still match, but the pane is someone else's now.
+
+    That is unmanageable, not dead: reporting IDENTITY_MISMATCH here would
+    let graceful_shutdown claim a still-running agent had exited.
+    """
     manager = pm.HerdrProcessManager()
     info = _track(manager, tmp_path)
     other = {
@@ -514,7 +523,7 @@ def test_probe_identity_mismatch_when_shell_pid_changed(
     }
     _probe_setup(manager, monkeypatch, process_info=other)
 
-    assert manager._probe(info) is pm._HerdrProbe.IDENTITY_MISMATCH
+    assert manager._probe(info) is pm._HerdrProbe.PANE_GONE
     assert manager._tracked_alive(info) is False
 
 
@@ -794,13 +803,14 @@ def test_graceful_shutdown_interrupts_the_pane_when_owned(
     manager = pm.HerdrProcessManager()
     _track(manager, tmp_path)
     calls: list[tuple[str, ...]] = []
-    states = iter([pm._HerdrProbe.OWNED, pm._HerdrProbe.PID_GONE])
-    monkeypatch.setattr(
-        manager, "_probe", lambda info: next(states, pm._HerdrProbe.PID_GONE)
-    )
+    monkeypatch.setattr(manager, "_probe", lambda info: pm._HerdrProbe.OWNED)
     monkeypatch.setattr(
         manager, "_run_herdr", lambda *a, **k: calls.append(a) or {"type": "ok"}
     )
+    # Alive at first, then the process really exits.
+    alive = iter([True, False])
+    monkeypatch.setattr(pm, "_pid_is_live", lambda pid: next(alive, False))
+    monkeypatch.setattr(pm, "creation_token", lambda handle: "token-4242")
 
     assert manager.graceful_shutdown("4242", timeout_s=1.0) is True
     assert calls[0][:2] == ("pane", "send-keys")
@@ -819,10 +829,12 @@ def test_graceful_shutdown_of_a_moved_pane_uses_a_signal(
         manager, "_run_herdr", lambda *a, **k: calls.append(a) or {"type": "ok"}
     )
     monkeypatch.setattr(pm, "creation_token", lambda handle: "token-4242")
+    monkeypatch.setattr(pm, "_pid_is_live", lambda pid: True)
     monkeypatch.setattr(manager, "_interrupt_pid", signalled.append)
 
-    manager.graceful_shutdown("4242", timeout_s=0.2)
-
+    # The process never exits, so the honest answer is False -- a moved pane
+    # is not evidence that our process stopped.
+    assert manager.graceful_shutdown("4242", timeout_s=0.2) is False
     assert calls == []
     assert signalled == ["4242"]
 
@@ -832,7 +844,7 @@ def test_graceful_shutdown_reports_true_when_already_gone(
 ) -> None:
     manager = pm.HerdrProcessManager()
     _track(manager, tmp_path)
-    monkeypatch.setattr(manager, "_probe", lambda info: pm._HerdrProbe.PID_GONE)
+    monkeypatch.setattr(pm, "_pid_is_live", lambda pid: False)
 
     assert manager.graceful_shutdown("4242", timeout_s=0.2) is True
 
@@ -843,12 +855,29 @@ def test_graceful_shutdown_reports_true_when_already_gone(
 
 
 class _FakeChild:
+    """A Popen stand-in rich enough to express cleanup, not just liveness."""
+
     def __init__(self, exits_with: int | None = None) -> None:
         self.returncode = exits_with
         self._exits_with = exits_with
+        self.terminated = False
+        self.killed = False
 
     def poll(self) -> int | None:
         return self._exits_with
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self._exits_with = -15
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.killed = True
+        self._exits_with = -9
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._exits_with if self._exits_with is not None else 0
 
 
 def _status(running: bool, socket: str = "/run/herdr.sock") -> dict:
@@ -1199,9 +1228,9 @@ def test_run_herdr_accepts_a_silent_success(monkeypatch: pytest.MonkeyPatch) -> 
     manager = pm.HerdrProcessManager()
     _fake_run(monkeypatch, _FakeCompleted(returncode=0, stdout="", stderr=""))
 
-    assert manager._run_herdr("pane", "run", "w1:p2", "true", expect="ok") == {
-        "type": "ok"
-    }
+    assert manager._run_herdr(
+        "pane", "run", "w1:p2", "true", expect="ok", allow_empty_success=True
+    ) == {"type": "ok"}
 
 
 def test_run_herdr_still_rejects_silent_failure(
@@ -1225,3 +1254,395 @@ def test_capture_reads_plain_text_not_json(
     _fake_run(monkeypatch, _FakeCompleted(stdout="line one\nline two\n"))
 
     assert manager.capture("4242") == "line one\nline two\n"
+
+
+# --- local-identity-first cross-product (implementation-review-1 MAJOR 1) ---
+
+
+def test_probe_is_indeterminate_when_the_token_is_unreadable_but_pid_lives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A transiently unreadable token must not read as a dead agent.
+
+    This is the false-death case: the pane is healthy and reports our PID,
+    but one unreadable token would previously classify it IDENTITY_MISMATCH
+    and health_check would report a live agent dead.
+    """
+    manager = pm.HerdrProcessManager()
+    info = _track(manager, tmp_path)
+    _probe_setup(manager, monkeypatch, token=None, pid_alive=True)
+    monkeypatch.setattr(pm, "_pid_is_live", lambda pid: True)
+
+    assert manager._probe(info) is pm._HerdrProbe.INDETERMINATE
+    assert manager.health_check("4242")[0] is True
+
+
+def test_probe_is_pid_gone_when_the_pane_times_out_and_the_pid_is_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Herdr timeout must not rescue a process that is provably gone.
+
+    Previously the pane error was consulted first, so a dead PID plus a slow
+    CLI reported "alive, pid still ours".
+    """
+    manager = pm.HerdrProcessManager()
+    info = _track(manager, tmp_path)
+    timeout = pm.HerdrCommandError(["herdr", "pane"], "timeout", "timed out")
+    _probe_setup(manager, monkeypatch, process_info=timeout, token=None)
+    monkeypatch.setattr(pm, "_pid_is_live", lambda pid: False)
+
+    assert manager._probe(info) is pm._HerdrProbe.PID_GONE
+    assert manager.health_check("4242")[0] is False
+
+
+def test_probe_is_identity_mismatch_when_the_token_changed_and_herdr_is_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A recycled PID is settled locally; Herdr being unreachable cannot undo it."""
+    manager = pm.HerdrProcessManager()
+    info = _track(manager, tmp_path)
+    timeout = pm.HerdrCommandError(["herdr", "pane"], "timeout", "timed out")
+    _probe_setup(manager, monkeypatch, process_info=timeout, token="token-recycled")
+
+    assert manager._probe(info) is pm._HerdrProbe.IDENTITY_MISMATCH
+    assert manager.health_check("4242")[0] is False
+
+
+def test_probe_rejects_a_record_with_no_stored_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = pm.HerdrProcessManager()
+    info = _track(manager, tmp_path)
+    object.__setattr__(info, "creation_token", None)
+    _probe_setup(manager, monkeypatch, token="anything")
+
+    assert manager._probe(info) is pm._HerdrProbe.IDENTITY_MISMATCH
+
+
+# --- kill/graceful record lifecycle (implementation-review-1 MAJOR 7-8) ---
+
+
+def test_graceful_shutdown_does_not_claim_success_for_a_live_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pane hosting someone else is not proof that OUR process exited.
+
+    The follow-up path reads True as "no force kill needed" and resumes the
+    agent, so a false True lets the old and resumed workers overlap.
+    """
+    manager = pm.HerdrProcessManager()
+    _track(manager, tmp_path)
+    monkeypatch.setattr(manager, "_probe", lambda info: pm._HerdrProbe.PANE_GONE)
+    monkeypatch.setattr(pm, "_pid_is_live", lambda pid: True)
+    monkeypatch.setattr(pm, "creation_token", lambda handle: "token-4242")
+    monkeypatch.setattr(manager, "_interrupt_pid", lambda handle: None)
+
+    assert manager.graceful_shutdown("4242", timeout_s=0.2) is False
+
+
+def test_kill_keeps_the_record_when_ownership_cannot_be_proven(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unreadable token on a live PID must not look like a successful kill.
+
+    server_simple.kill_agent deletes the durable record when kill_process
+    returns normally, so quietly forgetting the agent here would strand a
+    live worker with nothing left to manage it.
+    """
+    manager = pm.HerdrProcessManager()
+    _track(manager, tmp_path)
+    killed: list[str] = []
+    monkeypatch.setattr(manager, "_probe", lambda info: pm._HerdrProbe.PANE_GONE)
+    monkeypatch.setattr(manager, "_kill_pid", killed.append)
+    monkeypatch.setattr(pm, "creation_token", lambda handle: None)
+    monkeypatch.setattr(pm, "_pid_is_live", lambda pid: True)
+
+    with pytest.raises(pm.HerdrOwnershipUnprovenError):
+        manager.kill_process("4242")
+
+    assert killed == []
+    assert "4242" in manager._processes
+
+
+def test_kill_drops_the_record_once_the_pid_is_proven_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = pm.HerdrProcessManager()
+    _track(manager, tmp_path)
+    killed: list[str] = []
+    monkeypatch.setattr(manager, "_probe", lambda info: pm._HerdrProbe.PANE_GONE)
+    monkeypatch.setattr(manager, "_kill_pid", killed.append)
+    monkeypatch.setattr(pm, "creation_token", lambda handle: None)
+    monkeypatch.setattr(pm, "_pid_is_live", lambda pid: False)
+
+    manager.kill_process("4242")
+
+    assert killed == []
+    assert "4242" not in manager._processes
+
+
+def test_silent_success_is_not_generalised_to_other_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only commands observed to answer silently may be assumed successful.
+
+    ``pane run`` prints nothing on success; ``tab close`` and friends answer.
+    Treating any empty exit-0 response as the requested result would let a
+    response-bearing command fabricate the semantics we asked for.
+    """
+    manager = pm.HerdrProcessManager()
+    _fake_run(monkeypatch, _FakeCompleted(returncode=0, stdout="", stderr=""))
+
+    with pytest.raises(pm.HerdrCommandError):
+        manager._run_herdr("tab", "close", "w1:t1", expect="ok")
+
+
+def test_an_error_on_stderr_wins_over_a_success_on_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returning the first parseable object would hide a reported error."""
+    manager = pm.HerdrProcessManager()
+    _fake_run(
+        monkeypatch,
+        _FakeCompleted(
+            returncode=0,
+            stdout=json.dumps({"result": {"type": "ok"}}),
+            stderr=json.dumps({"error": {"code": "not_found", "message": "gone"}}),
+        ),
+    )
+
+    with pytest.raises(pm.HerdrCommandError) as excinfo:
+        manager._run_herdr("tab", "close", "w1:t1", expect="ok")
+
+    assert excinfo.value.code == "not_found"
+
+
+# --- server child lifecycle (implementation-review-1 MAJOR 5) ---
+
+
+def test_a_server_that_never_becomes_ready_is_not_leaked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Raising while our half-started daemon keeps running leaves a mess.
+
+    The lock is released on the way out, so the next process would race a
+    server nobody is tracking.
+    """
+    manager = pm.HerdrProcessManager()
+    monkeypatch.setattr(manager, "_start_lock_path", lambda: tmp_path / "herdr.lock")
+    monkeypatch.setattr(manager, "_run_herdr_raw", lambda *a, **k: _status(False))
+    child = _FakeChild()
+    monkeypatch.setattr(manager, "_popen_herdr_server", lambda: child)
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pm, "_HERDR_START_TIMEOUT_SECONDS", 0.0)
+
+    with pytest.raises(pm.HerdrServerUnavailableError):
+        manager._ensure_server()
+
+    assert child.terminated is True
+    assert manager._server_child is None
+
+
+def test_a_failed_launch_is_reported_as_server_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing binary must not surface as a bare OSError from Popen."""
+    manager = pm.HerdrProcessManager()
+    monkeypatch.setattr(manager, "_start_lock_path", lambda: tmp_path / "herdr.lock")
+    monkeypatch.setattr(manager, "_run_herdr_raw", lambda *a, **k: _status(False))
+
+    def _boom() -> object:
+        raise OSError(_NO_BINARY)
+
+    monkeypatch.setattr(manager, "_popen_herdr_server", _boom)
+
+    with pytest.raises(pm.HerdrServerUnavailableError, match="could not launch"):
+        manager._ensure_server()
+
+
+def test_an_exited_server_child_is_reaped_on_the_next_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = pm.HerdrProcessManager()
+    manager._server_child = cast("subprocess.Popen[bytes]", _FakeChild(exits_with=0))
+    monkeypatch.setattr(manager, "_run_herdr_raw", lambda *a, **k: _status(True))
+
+    manager._ensure_server()
+
+    assert manager._server_child is None
+
+
+def test_a_status_query_failure_never_authorises_starting_a_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ "Could not tell" is not "confirmed absent".
+
+    A timeout against a busy live server would otherwise start a second
+    daemon beside a perfectly healthy one.
+    """
+    manager = pm.HerdrProcessManager()
+    monkeypatch.setattr(manager, "_start_lock_path", lambda: tmp_path / "herdr.lock")
+    started: list[str] = []
+
+    def _raise(*args: str, **kw: object) -> dict:
+        raise pm.HerdrCommandError(["herdr", "status"], "timeout", "timed out")
+
+    monkeypatch.setattr(manager, "_run_herdr_raw", _raise)
+    monkeypatch.setattr(
+        manager, "_popen_herdr_server", lambda: (started.append("x"), _FakeChild())[1]
+    )
+
+    with pytest.raises(pm.HerdrCommandError):
+        manager._ensure_server()
+
+    assert started == []
+
+
+def test_a_malformed_status_object_is_not_read_as_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = pm.HerdrProcessManager()
+    monkeypatch.setattr(manager, "_run_herdr_raw", lambda *a, **k: {})
+
+    with pytest.raises(pm.HerdrCommandError):
+        manager._server_socket()
+
+
+def test_socket_path_comes_from_session_list_not_a_guess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real layout is <config>/sessions/<name>/herdr.sock, which a
+    hand-built path got wrong -- and it moves with HERDR_CONFIG_PATH."""
+    monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_SESSION", "nested")
+    manager = pm.HerdrProcessManager()
+    real = "/home/u/.config/herdr/sessions/nested/herdr.sock"
+
+    def _raw(*args: str, **kw: object) -> dict:
+        if args[0] == "status":
+            return {"status": "running", "running": True}
+        return {"sessions": [{"name": "nested", "socket_path": real}]}
+
+    monkeypatch.setattr(manager, "_run_herdr_raw", _raw)
+
+    assert manager._server_socket() == real
+
+
+def test_a_cached_endpoint_is_revalidated_on_the_next_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that died since the last spawn must be noticed, not cached."""
+    manager = pm.HerdrProcessManager()
+    manager.socket_endpoint = "/run/old.sock"
+    monkeypatch.setattr(
+        manager, "_run_herdr_raw", lambda *a, **k: _status(True, "/run/new.sock")
+    )
+
+    assert manager._ensure_server() == "/run/new.sock"
+    assert manager.socket_endpoint == "/run/new.sock"
+
+
+# --- spawn rollback scope (implementation-review-1 MAJOR 6) ---
+
+
+def test_a_partial_create_response_still_closes_the_created_tab(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real tab id with a malformed pane must not raise past cleanup."""
+    calls: list[tuple[str, ...]] = []
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        calls.append(args)
+        if args[:2] == ("tab", "create"):
+            return {"type": "tab_created", "tab": {"tab_id": "w1:t7"}}  # no root_pane
+        return {"type": "ok"}
+
+    monkeypatch.setattr(_manager, "_run_herdr", _run)
+
+    with pytest.raises(pm.HerdrCommandError):
+        _manager.spawn_process(
+            _request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code"
+        )
+
+    assert ("tab", "close", "w1:t7") in calls
+    assert _manager._processes == {}
+
+
+def test_a_failing_provenance_write_rolls_the_spawn_back(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller sees a failed spawn, so no live agent may be left behind."""
+    herdr = _Herdr()
+    closed: list[tuple[str, ...]] = []
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        if args[:2] == ("tab", "close"):
+            closed.append(args)
+            return {"type": "ok"}
+        return herdr(*args, expect=expect, **kw)
+
+    monkeypatch.setattr(_manager, "_run_herdr", _run)
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError(_DISK_FULL)
+
+    monkeypatch.setattr(_manager, "_write_provenance", _boom)
+
+    with pytest.raises(OSError, match="disk full"):
+        _spawn(_manager, _request, herdr)
+
+    assert closed
+    assert _manager._processes == {}
+
+
+def test_a_cleanup_failure_is_attached_not_masked(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The original cause must survive; the cleanup problem rides along."""
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        if args[:2] == ("tab", "create"):
+            return {"type": "tab_created", "tab": {"tab_id": "w1:t9"}}
+        raise pm.HerdrCommandError(["herdr", "tab", "close"], "error", "cannot close")
+
+    monkeypatch.setattr(_manager, "_run_herdr", _run)
+
+    with pytest.raises(pm.HerdrCommandError) as excinfo:
+        _manager.spawn_process(
+            _request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code"
+        )
+
+    assert "no pane" in str(excinfo.value)
+    assert any("could not close herdr tab w1:t9" in n for n in excinfo.value.__notes__)
+
+
+def test_a_refused_operation_records_its_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Silence with no explanation is indistinguishable from a bug."""
+    manager = pm.HerdrProcessManager()
+    info = _track(manager, tmp_path)
+    info.log_path.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(manager, "_probe", lambda i: pm._HerdrProbe.PANE_GONE)
+    monkeypatch.setattr(manager, "_run_herdr", lambda *a, **k: {"type": "ok"})
+
+    manager.send("4242", "hello")
+
+    assert "refused send on pane w3:p2: pane_gone" in info.log_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_the_start_lock_follows_herdr_config_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A relocated Herdr config must not silently split the lock in two."""
+    monkeypatch.setenv("HERDR_CONFIG_PATH", str(tmp_path / "cfg"))
+    monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_SESSION", "shared")
+
+    assert pm.HerdrProcessManager()._start_lock_path().parent == tmp_path / "cfg"

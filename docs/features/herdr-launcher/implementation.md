@@ -119,3 +119,51 @@ The smoke run used a plain `bash` process, not the three real agent CLIs, and it
 did not exercise `pane move`, `herdr --handoff` (either shape), capture with an
 attached client, or a follow-up/resume. Those remain outstanding from the plan's
 live matrix.
+
+
+## Implementation review round 1 — 0 blockers, 8 majors, all fixed
+
+`implementation-review-1.md` (Codex) found no blockers but eight real defects.
+The two that mattered most were both cases of the code not doing what its own
+documentation claimed:
+
+1. **False death and false life (MAJOR 1).** `_probe`'s docstring said PID/token
+   identity was settled before the pane was consulted. It was not: the pane was
+   read first, so one transiently unreadable creation token classified a healthy
+   agent `IDENTITY_MISMATCH` and `health_check` reported a **live agent dead** —
+   while a dead PID plus a slow CLI reported "alive, pid still ours". Local
+   identity is now triaged first (`_local_identity`), which also made
+   `IDENTITY_MISMATCH` mean exactly one thing (a recycled PID), and that in turn
+   fixed MAJOR 8 for free.
+2. **Abandoned agents (MAJOR 7).** `kill_process` dropped the in-memory record
+   before the stop had settled. If the token became unreadable at that moment no
+   signal was sent, yet `server_simple.kill_agent` still deleted the durable
+   record — a live agent with nothing left managing it. It now raises
+   `HerdrOwnershipUnprovenError` and keeps the record.
+
+The rest: rebinding was unreachable in production because the endpoint was
+cached forever (MAJOR 2, fixed by revalidating per spawn); silent success was
+generalised from `pane run` to every command and only one stream was parsed
+(MAJOR 3); any status-query failure authorised auto-start, and the named-session
+socket path was guessed wrongly — the real layout is
+`<config>/sessions/<name>/herdr.sock` (MAJOR 4); a server that missed its
+readiness deadline was leaked and retained children were never reaped (MAJOR 5);
+a partial create response could raise past cleanup, and a failing provenance
+write could leave a live agent the caller believed never started (MAJOR 6).
+Minors: refusals are now logged, and the start lock lives under Herdr's config
+directory honouring `HERDR_CONFIG_PATH`.
+
+**On test quality.** The review's sharpest point was that several tests "fake
+below the behaviour they claim to establish" — the fake server child had only
+`poll()`, so it *could not* express cleanup, and the rebinding test set the
+cached field by hand instead of scripting discovery. That criticism is correct
+and is the same lesson the live run taught. The fakes were rebuilt accordingly;
+the suite is now 101 tests.
+
+## Nested live test
+
+See `nested-live-test.md`: a spawned agent drove the real server spawn path with
+the Herdr launcher and spawned a codex child into a Herdr tab. Five of six
+checks passed, including the decisive one — the `state-<agent>.json` marker,
+which only a hook running *inside* the spawned agent can write. The failing
+check was a bug in the test driver, not the launcher.
