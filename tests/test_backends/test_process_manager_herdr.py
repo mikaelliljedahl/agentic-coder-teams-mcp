@@ -1681,3 +1681,36 @@ def test_a_live_process_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pm, "_pid_is_zombie", lambda pid: False)
 
     assert pm._pid_is_live(4242) is True
+
+
+def test_pane_text_is_decoded_tolerantly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Terminal output is display text, not a protocol we parse.
+
+    A stray byte from an arbitrary program's TUI should show as U+FFFD, not
+    fail the read the way malformed JSON rightly does.
+    """
+    manager = pm.HerdrProcessManager()
+    seen: dict[str, object] = {}
+
+    def _run(argv: list[str], **kwargs: object) -> object:
+        seen.update(kwargs)
+        return _FakeCompleted(stdout="ok")
+
+    monkeypatch.setattr(pm.subprocess, "run", _run)
+    manager._run_herdr_text("pane", "read", "w1:p1")
+
+    assert seen["errors"] == "replace"
+
+
+def test_json_calls_stay_strict(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = pm.HerdrProcessManager()
+    seen: dict[str, object] = {}
+
+    def _run(argv: list[str], **kwargs: object) -> object:
+        seen.update(kwargs)
+        return _FakeCompleted(stdout=json.dumps({"result": {"type": "ok"}}))
+
+    monkeypatch.setattr(pm.subprocess, "run", _run)
+    manager._run_herdr("tab", "list", expect="ok")
+
+    assert seen["errors"] == "strict"

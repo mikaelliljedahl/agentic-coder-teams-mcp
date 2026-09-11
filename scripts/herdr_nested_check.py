@@ -48,6 +48,15 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     say(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}")
 
 
+def _marker_is_fresh(marker: Path, started_at: float) -> bool:
+    """Whether the marker exists, parses, and was written after ``started_at``."""
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(payload.get("event")) and float(payload.get("ts", 0)) >= started_at
+
+
 def _result(raw: str) -> dict:
     """Return a herdr response's result object, or ``{}`` for an error envelope.
 
@@ -63,10 +72,26 @@ def _result(raw: str) -> dict:
     return result if isinstance(result, dict) else {}
 
 
-def _tab_labels(workspace_id: str) -> list[str]:
-    """Return the labels of every tab in a workspace, tolerating its absence."""
-    result = _result(herdr("tab", "list", "--workspace", workspace_id))
+def _tab_labels(workspace_id: str) -> list[str] | None:
+    """Return every tab label in a workspace, or ``None`` if Herdr did not answer.
+
+    ``None`` matters: mapping an error to "no tabs" would make the cleanup
+    check pass merely because Herdr became unavailable.
+    """
+    raw = herdr("tab", "list", "--workspace", workspace_id)
+    result = _result(raw)
+    if not result:
+        return None
     return [str(tab.get("label") or "") for tab in result.get("tabs") or []]
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` still exists."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def herdr(*args: str) -> str:
@@ -90,6 +115,9 @@ async def run_checks() -> int:
         type(pm.process_manager).__name__,
     )
 
+    # Anchor every artifact check to this moment: a marker or inbox line left
+    # by an earlier run must not be able to satisfy this one.
+    started_at = time.time()
     spawned = await server.spawn_agent(
         prompt=(
             "You are a test agent. Do exactly one thing: use the win-agent-teams "
@@ -144,7 +172,7 @@ async def run_checks() -> int:
     deadline = time.monotonic() + REPORT_TIMEOUT_SECONDS
     got_marker = got_message = False
     while time.monotonic() < deadline:
-        got_marker = got_marker or marker.exists()
+        got_marker = got_marker or _marker_is_fresh(marker, started_at)
         if inbox.exists() and "GRANDCHILD ALIVE" in inbox.read_text(encoding="utf-8"):
             got_message = True
             break
@@ -160,9 +188,12 @@ async def run_checks() -> int:
     labels_after = _tab_labels(workspace_id)
     check(
         "kill closed the tab",
-        not any(CHILD in (label or "") for label in labels_after),
+        labels_after is not None
+        and not any(CHILD in (label or "") for label in labels_after),
         str(labels_after),
     )
+    check("kill removed the state marker", not marker.exists())
+    check("killed process is gone", not _pid_alive(int(spawned["pid"])))
 
     failed = [name for name, ok in _results if not ok]
     say("\nSUMMARY: " + ("ALL PASS" if not failed else f"FAILED: {failed}"))

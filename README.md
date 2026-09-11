@@ -277,8 +277,10 @@ idle/working/blocked view works on agents spawned this way.
 | `WIN_AGENT_TEAMS_LINUX_LAUNCHER=herdr` | Select the launcher. Opt-in only: running inside Herdr does **not** switch launchers by itself. |
 | `WIN_AGENT_TEAMS_HERDR_SESSION=<name>` | Pin a named Herdr session. Unset uses the default session. |
 
-A running Herdr server is reused — including the session you are sitting in, so
-agent tabs appear in your window. If nothing answers, a headless server is
+A running Herdr server is reused. When that server is the session you are
+attached to, agent tabs appear in your window; when it is a headless server with
+no client attached, the tabs exist but nothing displays them until you attach.
+If nothing answers at all, a headless server is
 started (serialized across processes, so two MCP servers cannot both launch
 one); attach to it later with `herdr session attach <name>`.
 

@@ -2427,9 +2427,13 @@ class HerdrProcessManager(_PidOwnershipMixin):
         )
 
     def _invoke(
-        self, args: tuple[str, ...], timeout: float
+        self, args: tuple[str, ...], timeout: float, errors: str = "strict"
     ) -> tuple[list[str], subprocess.CompletedProcess[str]]:
-        """Run one herdr command, mapping process-level failures to our error."""
+        """Run one herdr command, mapping process-level failures to our error.
+
+        ``errors`` is the decode policy: strict for JSON (a machine protocol
+        we parse), replace for terminal display text.
+        """
         argv = self._herdr_argv(*args)
         try:
             completed = subprocess.run(  # noqa: S603 - argv is built internally.
@@ -2438,10 +2442,7 @@ class HerdrProcessManager(_PidOwnershipMixin):
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                # Strict, deliberately: this is a machine protocol, not display
-                # text. errors="replace" would smuggle U+FFFD into JSON we then
-                # parse and act on, so undecodable output is a failed call.
-                errors="strict",
+                errors=errors,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
@@ -2478,8 +2479,14 @@ class HerdrProcessManager(_PidOwnershipMixin):
 
         ``pane read`` emits the terminal snapshot itself on stdout -- there is
         no envelope to validate, so this seam returns the text as-is.
+
+        Decoding is deliberately TOLERANT here, unlike the JSON path: this is
+        display text from an arbitrary program's terminal, so a stray byte
+        should show as U+FFFD rather than fail the whole read. The strict
+        policy exists to protect a protocol we parse and act on; nothing acts
+        on this.
         """
-        argv, completed = self._invoke(args, timeout)
+        argv, completed = self._invoke(args, timeout, errors="replace")
         if completed.returncode != 0:
             raise HerdrCommandError(argv, "error", completed.stderr.strip())
         return completed.stdout or ""

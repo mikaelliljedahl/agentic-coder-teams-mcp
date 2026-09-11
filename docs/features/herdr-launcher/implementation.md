@@ -64,10 +64,10 @@ All four gates, whole repository, on Linux:
 uv run ruff format --check .   # 80 files already formatted
 uv run ruff check .            # All checks passed!
 uv run ty check                # All checks passed!
-uv run pytest                  # 1461 passed, 4 skipped
+uv run pytest                  # see the final tally below
 ```
 
-73 of those tests are new and specific to this launcher.
+The launcher's own tests are counted in the final tally below, not here.
 
 ## Live verification — and the four real bugs it caught
 
@@ -158,12 +158,37 @@ below the behaviour they claim to establish" — the fake server child had only
 `poll()`, so it *could not* express cleanup, and the rebinding test set the
 cached field by hand instead of scripting discovery. That criticism is correct
 and is the same lesson the live run taught. The fakes were rebuilt accordingly;
-the suite is now 101 tests.
+the suite grew accordingly.
 
 ## Nested live test
 
-See `nested-live-test.md`: a spawned agent drove the real server spawn path with
-the Herdr launcher and spawned a codex child into a Herdr tab. Five of six
-checks passed, including the decisive one — the `state-<agent>.json` marker,
-which only a hook running *inside* the spawned agent can write. The failing
-check was a bug in the test driver, not the launcher.
+See `nested-live-test.md`. A spawned agent drove the real server spawn path with
+the Herdr launcher and spawned a codex child into a Herdr tab. The first run
+failed two checks, both defects in the test driver rather than the launcher; the
+corrected rerun passed everything, including the decisive evidence — a fresh
+`state-<agent>.json` carrying `event: "Stop"`, which only a hook running
+*inside* the spawned agent can write, plus the codex TUI status bar visible in
+the pane and the child's message arriving in the lead's inbox.
+
+## Final validation
+
+All four gates, whole repository, on Linux:
+
+```
+uv run ruff format --check .   # 81 files already formatted
+uv run ruff check .            # All checks passed!
+uv run ty check                # All checks passed!
+uv run pytest                  # 1493 passed, 4 skipped
+```
+
+105 of those tests are new and specific to this launcher.
+
+## Surfaced, not fixed here
+
+Implementation review round 2 raised one blocker that lives **outside** this
+work: `server_simple.kill_agent` collapses `INDETERMINATE` ownership to a
+boolean, skips the kill (correctly) but deletes the durable record anyway,
+abandoning a live agent. It dates from July (PR #36) and affects every backend.
+Recorded in `docs/features/ownership-indeterminate-kill/finding.md` and left for
+its own feature, by the repository owner's decision, rather than expanding a
+launcher PR into shared lifecycle semantics.
