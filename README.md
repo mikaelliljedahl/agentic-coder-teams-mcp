@@ -246,7 +246,7 @@ ambient-tool isolation is unavailable on that client.
 
 Display mode is selected automatically:
 - Windows uses native processes. When Windows Terminal (`wt.exe`) is available, interactive agents open as **tabs grouped in one window per team** (`wt -w wt-team-<team>`), each tab titled `<agent>@<team>`; the tab closes when the agent exits or is killed. If `wt.exe` is not on PATH, each interactive agent falls back to its own console window. Set `WIN_AGENT_TEAMS_NO_WT_TABS=1` to force the classic one-window-per-agent console even when `wt.exe` is present.
-- Linux/POSIX defaults to spawning each agent in its own terminal emulator window. Set `WIN_AGENT_TEAMS_LINUX_LAUNCHER=tmux` to use `tmux` instead. In tmux mode, if the MCP server is already inside tmux, agents are spawned as split panes by default (set `USE_TMUX_WINDOWS=1` to use tmux windows); if the server is not inside tmux, agents are spawned into a detached session named `win-agent-teams-<session>`.
+- Linux/POSIX defaults to spawning each agent in its own terminal emulator window. Set `WIN_AGENT_TEAMS_LINUX_LAUNCHER=tmux` to use `tmux`, or `=herdr` to use [Herdr](https://herdr.dev) tabs. In tmux mode, if the MCP server is already inside tmux, agents are spawned as split panes by default (set `USE_TMUX_WINDOWS=1` to use tmux windows); if the server is not inside tmux, agents are spawned into a detached session named `win-agent-teams-<session>`.
 
 If your MCP client does not pass its `TMUX` environment variable through to the
 MCP server, set `WIN_AGENT_TEAMS_TMUX_TARGET` to an existing session or pane,
@@ -263,6 +263,32 @@ common terminals such as `qterminal` (the LXQt/Lubuntu default),
 `WIN_AGENT_TEAMS_LINUX_TERMINAL` to force a specific terminal command. Set
 `WIN_AGENT_TEAMS_LINUX_LAUNCHER=tmux` only if you are running the server inside a
 tmux session and prefer panes/windows.
+
+### Herdr launcher (`WIN_AGENT_TEAMS_LINUX_LAUNCHER=herdr`)
+
+[Herdr](https://herdr.dev) is a terminal workspace manager built for coding
+agents; it ships with Omarchy. In this mode each agent gets its **own Herdr
+tab**, labelled `<agent>@<team>` — the Linux counterpart of the Windows Terminal
+tab grouping. Herdr also recognises the agent inside the pane, so its own
+idle/working/blocked view works on agents spawned this way.
+
+| Setting | Effect |
+| --- | --- |
+| `WIN_AGENT_TEAMS_LINUX_LAUNCHER=herdr` | Select the launcher. Opt-in only: running inside Herdr does **not** switch launchers by itself. |
+| `WIN_AGENT_TEAMS_HERDR_SESSION=<name>` | Pin a named Herdr session. Unset uses the default session. |
+
+A running Herdr server is reused — including the session you are sitting in, so
+agent tabs appear in your window. If nothing answers, a headless server is
+started (serialized across processes, so two MCP servers cannot both launch
+one); attach to it later with `herdr session attach <name>`.
+
+Two behaviours worth knowing: killing the Herdr **server** kills every pane
+process, so every agent dies with it — this launcher never calls
+`herdr server stop`, and `kill_agent` only closes the agent's own tab. And
+because Herdr gives a **moved** pane a new id, moving an agent's tab between
+workspaces does not kill it or mark it dead; it stays alive but temporarily
+unmanaged through Herdr, and `kill_agent` still stops it by signalling the
+process.
 
 > Note: `qterminal` may hand launches to an already-running instance via D-Bus.
 > The auto-discovery path skips it when one is already running and falls through

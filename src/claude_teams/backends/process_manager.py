@@ -9,13 +9,16 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import IO, Any, ClassVar, cast
 
 from claude_teams.agent_output import CORRELATION_FIELD, correlation_marker_token
 from claude_teams.backends.contracts import SpawnRequest, SpawnResult
+from claude_teams.filelock import file_lock
 
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_NAME_LEN = 64
@@ -56,6 +59,19 @@ _LINUX_LAUNCHER_ENV = "WIN_AGENT_TEAMS_LINUX_LAUNCHER"
 _LINUX_TERMINAL_ENV = "WIN_AGENT_TEAMS_LINUX_TERMINAL"
 _TERMINAL_LAUNCHER_VALUE = "terminal"
 _TMUX_LAUNCHER_VALUE = "tmux"
+_HERDR_LAUNCHER_VALUE = "herdr"
+_HERDR_SESSION_ENV = "WIN_AGENT_TEAMS_HERDR_SESSION"
+#: Herdr session names are a CLI argument and a path component, so the
+#: language is deliberately narrow: no whitespace, no separators, no leading
+#: dash that argv would read as a flag.
+_HERDR_SESSION_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$")
+_HERDR_CALL_TIMEOUT_SECONDS = 15.0
+#: clap exits 2 for a usage error: our argv is wrong, not Herdr's state.
+_HERDR_USAGE_EXIT_CODE = 2
+_HERDR_START_TIMEOUT_SECONDS = 20.0
+_HERDR_START_POLL_SECONDS = 0.2
+#: Herdr error codes that settle "that object no longer exists".
+_HERDR_NOT_FOUND_CODES = frozenset({"not_found", "pane_not_found", "tab_not_found"})
 _LINUX_TERMINAL_PID_GRACE_SECONDS = 5.0
 _LINUX_DESKTOP_ENV_KEYS = (
     "DISPLAY",
@@ -2210,6 +2226,632 @@ def read_log_tail(path: Path, lines: int | None = None) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
+class HerdrCommandError(RuntimeError):
+    """A Herdr CLI call failed, or answered with something we cannot trust.
+
+    Carries the machine-readable ``code`` when Herdr supplied one so callers
+    can tell "that object is gone" (settled) from "the control plane is
+    unavailable" (indeterminate) without re-parsing text.
+    """
+
+    def __init__(self, argv: list[str], code: str, detail: str) -> None:
+        """Build the message from the command, Herdr's error code and detail."""
+        self.code = code
+        self.detail = detail
+        super().__init__(f"herdr {' '.join(argv[1:])!r} failed [{code}]: {detail}")
+
+
+def _require_creation_token(handle: str) -> str:
+    """Return a non-empty creation token for ``handle``, or refuse to continue.
+
+    A null token cannot prove ownership later: ``_probe`` compares stored and
+    live tokens, and ``None == None`` would forge a match for a PID we know
+    nothing about.
+    """
+    token = creation_token(handle)
+    if not token:
+        msg = (
+            f"could not read a creation token for pane PID {handle}; refusing "
+            "to register an agent whose ownership cannot be proven"
+        )
+        raise HerdrSpawnError(msg)
+    return token
+
+
+class HerdrServerUnavailableError(RuntimeError):
+    """No Herdr server could be reached or started for the selected session."""
+
+
+class HerdrSpawnError(RuntimeError):
+    """A Herdr tab was created but the agent could not be safely registered."""
+
+
+class _HerdrProbe(Enum):
+    """What we can actually prove about a tracked Herdr agent right now.
+
+    A bool cannot carry this: a control-plane hiccup and a dead process must
+    lead to opposite answers for ``health_check`` (stay alive) and for
+    anything that kills (refuse to act).
+    """
+
+    OWNED = "owned"
+    #: The pane is gone but the process is not: Herdr gives a *moved* pane a
+    #: new workspace-qualified id, so the agent outlives our stored pane id.
+    PANE_GONE = "pane_gone"
+    PID_GONE = "pid_gone"
+    IDENTITY_MISMATCH = "identity_mismatch"
+    INDETERMINATE = "indeterminate"
+
+
+@dataclass
+class HerdrProcessInfo:
+    """Runtime information for an agent spawned into a Herdr tab."""
+
+    pid: int
+    #: Never ``None``: a null token would make the later equality check
+    #: ``None == None`` and forge ownership of a reused PID.
+    creation_token: str
+    session_name: str | None
+    socket_endpoint: str | None
+    name: str
+    agent_id: str
+    team_name: str
+    backend: str
+    tab_id: str
+    pane_id: str
+    workspace_id: str
+    log_path: Path
+    started_at: float
+
+
+class HerdrProcessManager(_PidOwnershipMixin):
+    """Manage spawned agent CLIs as tabs in a Herdr workspace."""
+
+    def __init__(self) -> None:
+        """Capture the configured session name. Pure: no probe, no subprocess.
+
+        The manager is constructed at import time, so resolving the socket
+        endpoint here would make importing this module start talking to (or
+        starting) a Herdr server. The endpoint is resolved on first spawn.
+        """
+        self._processes: dict[str, HerdrProcessInfo] = {}
+        self._session = self._configured_session()
+        self.socket_endpoint: str | None = None
+
+    @staticmethod
+    def _configured_session() -> str | None:
+        """Return the pinned session name, or ``None`` when unpinned."""
+        raw = os.environ.get(_HERDR_SESSION_ENV, "").strip()
+        if not raw:
+            return None
+        if not _HERDR_SESSION_RE.match(raw):
+            msg = (
+                f"Invalid Herdr session name: {raw!r}. Expected "
+                f"{_HERDR_SESSION_RE.pattern}."
+            )
+            raise ValueError(msg)
+        return raw
+
+    def _herdr_argv(self, *args: str) -> list[str]:
+        """Build a Herdr command, routed to our session.
+
+        ``--session`` is a TOP-LEVEL prefix, not a per-subcommand flag, and
+        every call must go through here: pane and tab ids only mean anything
+        within one session, so an unrouted ``tab close`` could shut a tab
+        belonging to the user.
+        """
+        base = [self._binary()]
+        if self._session:
+            base += ["--session", self._session]
+        return [*base, *args]
+
+    @staticmethod
+    def _binary() -> str:
+        """Return the herdr binary name (resolved by PATH at call time)."""
+        return "herdr"
+
+    def _run_herdr(
+        self, *args: str, expect: str, timeout: float = _HERDR_CALL_TIMEOUT_SECONDS
+    ) -> dict[str, Any]:
+        """Run one finite Herdr control command and return its validated result.
+
+        Every failure mode gets a distinguishable ``code`` because callers act
+        on the difference: ``not_found`` is settled ("that object is gone"),
+        while ``timeout`` and friends are indeterminate and must never be
+        allowed to read as a dead agent.
+        """
+        argv = self._herdr_argv(*args)
+        try:
+            completed = subprocess.run(  # noqa: S603 - argv is built internally.
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                # Strict, deliberately: this is a machine protocol, not display
+                # text. errors="replace" would smuggle U+FFFD into JSON we then
+                # parse and act on, so undecodable output is a failed call.
+                errors="strict",
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HerdrCommandError(argv, "timeout", str(exc)) from exc
+        except UnicodeDecodeError as exc:
+            raise HerdrCommandError(argv, "malformed", str(exc)) from exc
+        except OSError as exc:
+            raise HerdrCommandError(argv, "unavailable", str(exc)) from exc
+
+        envelope = self._parse_envelope(argv, completed)
+        error = envelope.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or "error")
+            raise HerdrCommandError(argv, code, str(error.get("message") or ""))
+        if completed.returncode == _HERDR_USAGE_EXIT_CODE:
+            raise HerdrCommandError(argv, "cli_usage", completed.stderr.strip())
+        if completed.returncode != 0:
+            raise HerdrCommandError(argv, "error", completed.stderr.strip())
+
+        result = envelope.get("result")
+        if not isinstance(result, dict):
+            raise HerdrCommandError(argv, "malformed", "response has no result object")
+        if result.get("type") != expect:
+            raise HerdrCommandError(
+                argv,
+                "malformed",
+                f"expected result type {expect!r}, got {result.get('type')!r}",
+            )
+        return result
+
+    def _ensure_server(self) -> str:
+        """Return the canonical socket path for our session, starting one if needed.
+
+        Reuses whatever is already running -- including the session the user is
+        sitting in -- and only starts a server when nothing answers. Startup is
+        serialized with this project's one advisory lock so two MCP servers
+        targeting the same session cannot both launch a daemon.
+        """
+        if self.socket_endpoint is not None:
+            return self.socket_endpoint
+        endpoint = self._server_socket()
+        if endpoint is not None:
+            self.socket_endpoint = endpoint
+            return endpoint
+
+        # POSIX flock blocks; only the readiness poll below is bounded.
+        with file_lock(self._start_lock_path()):
+            endpoint = self._server_socket()  # another process may have won
+            if endpoint is None:
+                endpoint = self._start_server()
+        self.socket_endpoint = endpoint
+        return endpoint
+
+    def _server_socket(self) -> str | None:
+        """Return the running server's socket path, or ``None`` if none answers."""
+        try:
+            status = self._run_herdr(
+                "status", "server", "--json", expect="server_status"
+            )
+        except HerdrCommandError:
+            return None
+        if not status.get("running"):
+            return None
+        socket = status.get("socket")
+        return str(socket) if socket else self._session_socket_hint()
+
+    def _start_server(self) -> str:
+        """Start a headless Herdr server and wait, bounded, for it to answer."""
+        child = self._popen_herdr_server()
+        deadline = time.monotonic() + _HERDR_START_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if child.poll() is not None:
+                msg = (
+                    f"herdr server exited immediately (rc={child.returncode}) for "
+                    f"session {self._session or 'default'}"
+                )
+                raise HerdrServerUnavailableError(msg)
+            endpoint = self._server_socket()
+            if endpoint is not None:
+                self._server_child = child
+                return endpoint
+            time.sleep(_HERDR_START_POLL_SECONDS)
+        msg = (
+            "herdr server did not become ready within "
+            f"{_HERDR_START_TIMEOUT_SECONDS:.0f}s for session "
+            f"{self._session or 'default'}; start it with "
+            f"{' '.join(self._herdr_argv('server'))}"
+        )
+        raise HerdrServerUnavailableError(msg)
+
+    def _popen_herdr_server(self) -> subprocess.Popen[bytes]:
+        """Launch the long-running daemon.
+
+        Its own seam, separate from ``_run_herdr``: ``subprocess.run`` would
+        block for the server's whole lifetime and yields no JSON to validate.
+        """
+        return subprocess.Popen(  # noqa: S603 - argv is built internally.
+            self._herdr_argv("server"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def _start_lock_path(self) -> Path:
+        """Return the lock path shared by everyone targeting this session.
+
+        Keyed by the Herdr session, not by our own session directory: two
+        unrelated team sessions aiming at the same server must contend for the
+        same lock, and it has to exist before the server does.
+        """
+        root = Path(
+            os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+        ).expanduser()
+        return root / f"win-agent-teams-herdr-{self._session or 'default'}.lock"
+
+    def _session_socket_hint(self) -> str:
+        """Best-effort canonical socket path when status reports none."""
+        return str(
+            Path.home() / ".config" / "herdr" / f"{self._session or 'herdr'}.sock"
+        )
+
+    def spawn_process(
+        self,
+        request: SpawnRequest,
+        cmd: list[str],
+        env: dict[str, str],
+        backend_type: str,
+        *,
+        is_interactive: bool = False,
+    ) -> SpawnResult:
+        """Start an agent in a fresh Herdr tab and return its pane PID handle."""
+        _ = is_interactive
+        if backend_type == "claude-code":
+            cmd = self._with_debug_file(
+                cmd, self.log_path(request.team_name, request.name)
+            )
+
+        log_path = self.log_path(request.team_name, request.name)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        endpoint = self._ensure_server()
+        command = _build_posix_shell_command(request.cwd, cmd, env)
+
+        created = self._run_herdr(
+            *self._tab_create_args(request, env), expect="tab_created"
+        )
+        pane = created.get("root_pane")
+        tab = created.get("tab")
+        if not isinstance(pane, dict) or not isinstance(tab, dict):
+            msg = "herdr tab create returned no pane"
+            raise HerdrCommandError(["herdr", "tab", "create"], "malformed", msg)
+        pane_id = str(pane.get("pane_id") or "")
+        tab_id = str(tab.get("tab_id") or pane.get("tab_id") or "")
+        if not pane_id or not tab_id:
+            msg = "herdr tab create returned no pane_id/tab_id"
+            raise HerdrCommandError(["herdr", "tab", "create"], "malformed", msg)
+
+        # From here on a tab exists, so every failure must close it again
+        # rather than leave an orphan in the user's workspace.
+        try:
+            self._run_herdr("pane", "run", pane_id, command, expect="ok")
+            pid = self._pane_shell_pid(pane_id)
+            handle = str(pid)
+            token = _require_creation_token(handle)
+        except BaseException:
+            self._close_tab_quietly(tab_id)
+            raise
+
+        self._processes[handle] = HerdrProcessInfo(
+            pid=pid,
+            creation_token=token,
+            session_name=self._session,
+            socket_endpoint=endpoint,
+            name=request.name,
+            agent_id=request.agent_id,
+            team_name=request.team_name,
+            backend=backend_type,
+            tab_id=tab_id,
+            pane_id=pane_id,
+            workspace_id=str(pane.get("workspace_id") or ""),
+            log_path=log_path,
+            started_at=time.time(),
+        )
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(
+                f"[herdr] session={self._session or 'default'} tab={tab_id} "
+                f"pane={pane_id} pid={handle}\n"
+            )
+        return SpawnResult(process_handle=handle, backend_type=backend_type)
+
+    def _probe(self, info: HerdrProcessInfo) -> _HerdrProbe:
+        """Classify what we can prove about ``info`` right now.
+
+        Order matters. PID/token liveness is settled BEFORE anything is
+        concluded from the pane, because Herdr gives a moved pane a new
+        workspace-qualified id: a missing pane is not a dead agent.
+        """
+        stored_token = info.creation_token
+        live_token = creation_token(str(info.pid))
+        # Two unreadable tokens are not a match. ``None == None`` is true in
+        # Python, and letting that through would forge ownership of a PID we
+        # have proven nothing about -- which ``ownership_probe`` then trusts
+        # without a second check.
+        token_matches = bool(stored_token) and stored_token == live_token
+
+        try:
+            pid = self._pane_shell_pid(info.pane_id)
+        except HerdrCommandError as exc:
+            if exc.code in _HERDR_NOT_FOUND_CODES:
+                if token_matches:
+                    return _HerdrProbe.PANE_GONE
+                return (
+                    _HerdrProbe.PID_GONE
+                    if not self._pid_alive(str(info.pid))
+                    else _HerdrProbe.IDENTITY_MISMATCH
+                )
+            return _HerdrProbe.INDETERMINATE
+
+        if pid != info.pid or not token_matches:
+            return _HerdrProbe.IDENTITY_MISMATCH
+        # The pane, the PID and the token all check out. If the endpoint moved
+        # underneath us (a supported ``herdr --handoff`` keeps panes alive),
+        # that is the proof needed to rebind -- and it is the same immutable
+        # session selector, because every call went through _herdr_argv.
+        if info.socket_endpoint != self.socket_endpoint:
+            self._log_rebind(info, self.socket_endpoint)
+            info.socket_endpoint = self.socket_endpoint
+        return _HerdrProbe.OWNED
+
+    @staticmethod
+    def _log_rebind(info: HerdrProcessInfo, new_endpoint: str | None) -> None:
+        """Record an endpoint rebind: it is a real lifecycle event."""
+        with (
+            contextlib.suppress(OSError),
+            info.log_path.open("a", encoding="utf-8") as handle,
+        ):
+            handle.write(
+                f"[herdr] rebound {info.name} from {info.socket_endpoint} to "
+                f"{new_endpoint} (pane={info.pane_id} pid={info.pid} "
+                "token matched)\n"
+            )
+
+    def _tracked_alive(self, info: object) -> bool:
+        """Ownership proof for the mixin's in-memory short-circuit.
+
+        ``ownership_probe`` returns OURS without re-reading the token the
+        moment this is true, so only a fully proven ``OWNED`` may pass.
+        """
+        return self._probe(cast(HerdrProcessInfo, info)) is _HerdrProbe.OWNED
+
+    def health_check(
+        self, handle: str, expected_token: str | None = None
+    ) -> tuple[bool, str]:
+        """Report liveness, without turning control-plane trouble into death."""
+        info = self._processes.get(handle)
+        if info is None:
+            return self._pid_health_with_token(handle, expected_token)
+        state = self._probe(info)
+        if state is _HerdrProbe.OWNED:
+            return True, f"herdr pane {info.pane_id} alive"
+        if state in (_HerdrProbe.PANE_GONE, _HerdrProbe.INDETERMINATE):
+            # The process and its token still match; only Herdr's view of it
+            # is unavailable (a moved pane, a timed-out CLI).
+            return True, f"degraded: {state.value}; pid {info.pid} still ours"
+        return False, f"herdr agent {state.value}"
+
+    def send(self, handle: str, text: str, *, enter: bool = True) -> None:
+        """Type into the agent's pane -- only when the pane is provably ours."""
+        info = self._owned_info(handle)
+        if info is None:
+            return
+        self._run_herdr("pane", "send-text", info.pane_id, text, expect="ok")
+        if enter:
+            self._run_herdr("pane", "send-keys", info.pane_id, "enter", expect="ok")
+
+    def capture(self, handle: str, lines: int | None = None) -> str:
+        """Read recent pane output, or ``""`` when the pane is not provably ours."""
+        if lines is not None and lines <= 0:
+            return ""
+        info = self._owned_info(handle)
+        if info is None:
+            return ""
+        for source in ("recent-unwrapped", "visible"):
+            args = ["pane", "read", info.pane_id, "--source", source]
+            if lines is not None:
+                args += ["--lines", str(lines)]
+            result = self._run_herdr(*args, expect="pane_output")
+            text = str(result.get("output") or "")
+            if text:
+                return text
+        return ""
+
+    def kill_process(self, handle: str, timeout_s: float = 10.0) -> None:
+        """Stop an agent, scoping each action to what is actually proven.
+
+        Closing the tab is a Herdr *object* operation, so it needs proven
+        object identity; signalling the PID needs only a matching creation
+        token. Those are different proofs, and conflating them is how a
+        recycled PID gets killed or a moved-pane agent gets orphaned.
+        """
+        info = self._processes.get(handle)
+        if info is None:
+            self._kill_pid(handle)
+            return
+        state = self._probe(info)
+        if state is _HerdrProbe.OWNED:
+            self._processes.pop(handle, None)
+            with contextlib.suppress(HerdrCommandError):
+                self._run_herdr("tab", "close", info.tab_id, expect="ok")
+            if not self._wait_pid_exit(info.pid, timeout_s):
+                self._kill_if_still_ours(handle, info)
+            return
+        self._processes.pop(handle, None)
+        if state in (_HerdrProbe.PANE_GONE, _HerdrProbe.INDETERMINATE):
+            # No tab operation: the id we hold may no longer be ours.
+            self._kill_if_still_ours(handle, info)
+
+    def _kill_if_still_ours(self, handle: str, info: HerdrProcessInfo) -> None:
+        """Force-kill only while the PID still carries our creation token."""
+        if creation_token(handle) == info.creation_token:
+            self._kill_pid(handle)
+
+    def graceful_shutdown(self, handle: str, timeout_s: float = 10.0) -> bool:
+        """Ask the agent to stop, by pane when owned and by signal otherwise."""
+        info = self._processes.get(handle)
+        if info is None:
+            return not self._pid_alive(handle)
+        state = self._probe(info)
+        if state in (_HerdrProbe.PID_GONE, _HerdrProbe.IDENTITY_MISMATCH):
+            return state is _HerdrProbe.PID_GONE
+        if state is _HerdrProbe.OWNED:
+            with contextlib.suppress(HerdrCommandError):
+                self._run_herdr(
+                    "pane", "send-keys", info.pane_id, "ctrl+c", expect="ok"
+                )
+        elif creation_token(handle) == info.creation_token:
+            self._interrupt_pid(handle)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self._probe(info) in (
+                _HerdrProbe.PID_GONE,
+                _HerdrProbe.IDENTITY_MISMATCH,
+            ):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _interrupt_pid(self, handle: str) -> None:
+        """Send SIGINT to a PID we have just re-proven is ours."""
+        with contextlib.suppress(ProcessLookupError, ValueError, OSError):
+            os.kill(int(handle), signal.SIGINT)
+
+    def _pid_alive(self, handle: str) -> bool:
+        """Whether the PID exists and is not a zombie."""
+        try:
+            pid = int(handle)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return not self._pid_is_zombie(pid)
+
+    @staticmethod
+    def _pid_is_zombie(pid: int) -> bool:
+        """Whether ``pid`` is a reaped-but-unwaited zombie."""
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return False
+        closing = stat.rfind(")")
+        if closing == -1:
+            return False
+        fields = stat[closing + 1 :].split()
+        return bool(fields) and fields[0] == "Z"
+
+    def _wait_pid_exit(self, pid: int, timeout_s: float) -> bool:
+        """Wait, bounded, for ``pid`` to leave the process table."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self._pid_alive(str(pid)):
+                return True
+            time.sleep(0.1)
+        return not self._pid_alive(str(pid))
+
+    def _kill_pid(self, handle: str) -> None:
+        """Force-kill a PID, best-effort."""
+        _force_kill_pid(handle)
+
+    def _owned_info(self, handle: str) -> HerdrProcessInfo | None:
+        """Return the tracked record only when its pane is provably ours."""
+        info = self._processes.get(handle)
+        if info is None:
+            return None
+        return info if self._probe(info) is _HerdrProbe.OWNED else None
+
+    def _tab_create_args(self, request: SpawnRequest, env: dict[str, str]) -> list[str]:
+        """Build ``tab create`` arguments.
+
+        Env keys arrive already validated by ``process_base._spawn_with_command``
+        against ``_SAFE_ENV_KEY``; values are passed as single argv tokens, so
+        spaces, quotes and newlines need no escaping here.
+        """
+        args = [
+            "tab",
+            "create",
+            "--cwd",
+            request.cwd,
+            "--label",
+            f"{request.name}@{request.team_name}",
+            "--no-focus",
+        ]
+        for key, value in env.items():
+            args += ["--env", f"{key}={value}"]
+        return args
+
+    def _pane_shell_pid(self, pane_id: str) -> int:
+        """Return the pane's shell PID, which ``exec`` makes the agent itself."""
+        result = self._run_herdr(
+            "pane", "process-info", "--pane", pane_id, expect="pane_process_info"
+        )
+        info = result.get("process_info")
+        if not isinstance(info, dict):
+            msg = "process-info returned no process_info object"
+            raise HerdrCommandError(["herdr", "pane", "process-info"], "malformed", msg)
+        raw = info.get("shell_pid")
+        if not isinstance(raw, int) or raw <= 0:
+            msg = f"process-info returned a non-usable shell_pid: {raw!r}"
+            raise HerdrCommandError(["herdr", "pane", "process-info"], "malformed", msg)
+        return raw
+
+    def _close_tab_quietly(self, tab_id: str) -> None:
+        """Close a tab during cleanup without masking the original failure."""
+        with contextlib.suppress(HerdrCommandError):
+            self._run_herdr("tab", "close", tab_id, expect="ok")
+
+    def _with_debug_file(self, cmd: list[str], log_path: Path) -> list[str]:
+        """Mirror the tmux manager's claude-code debug-file wiring."""
+        return [*cmd, "--debug-file", str(log_path)]
+
+    def log_path(self, team_name: str, agent_name: str) -> Path:
+        """Return the log file path for a team member."""
+        safe_team = _validate_safe_name(team_name, "team name")
+        safe_agent = _validate_safe_name(agent_name, "agent name")
+        override = os.environ.get("WIN_AGENT_TEAMS_LOG_DIR")
+        if override:
+            return Path(override).expanduser() / safe_team / f"{safe_agent}.log"
+        return (
+            Path.home() / ".claude" / "teams" / safe_team / "logs" / f"{safe_agent}.log"
+        )
+
+    @staticmethod
+    def _parse_envelope(
+        argv: list[str], completed: subprocess.CompletedProcess[str]
+    ) -> dict[str, Any]:
+        """Decode the JSON envelope, which rides stdout on success, stderr on error."""
+        for stream in (completed.stdout, completed.stderr):
+            text = (stream or "").strip()
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        if completed.returncode == _HERDR_USAGE_EXIT_CODE:
+            return {}
+        raise HerdrCommandError(
+            argv, "malformed", (completed.stdout or completed.stderr or "").strip()
+        )
+
+
 class _IoCounters(ctypes.Structure):
     _fields_ = [
         ("ReadOperationCount", ctypes.c_uint64),
@@ -2246,9 +2888,24 @@ class _JobObjectExtendedLimitInformation(ctypes.Structure):
     ]
 
 
+def _select_linux_manager(launcher: str) -> type:
+    """Map the configured launcher value to its manager class.
+
+    Pure and total, so selection can be tested without reloading the
+    module-level singleton. Note what is NOT here: ``HERDR_ENV``. Running
+    inside a Herdr pane is caller context, not consent to make Herdr this
+    server's launcher, and auto-detecting it would silently change behavior
+    for existing deployments.
+    """
+    value = launcher.strip().lower()
+    if value == _HERDR_LAUNCHER_VALUE:
+        return HerdrProcessManager
+    if value == _TMUX_LAUNCHER_VALUE:
+        return TmuxProcessManager
+    return LinuxTerminalProcessManager
+
+
 if os.name == "nt":
     process_manager = WindowsProcessManager()
-elif os.environ.get(_LINUX_LAUNCHER_ENV, "").strip().lower() == _TMUX_LAUNCHER_VALUE:
-    process_manager = TmuxProcessManager()
 else:
-    process_manager = LinuxTerminalProcessManager()
+    process_manager = _select_linux_manager(os.environ.get(_LINUX_LAUNCHER_ENV, ""))()
