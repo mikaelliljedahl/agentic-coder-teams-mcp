@@ -72,6 +72,8 @@ _HERDR_START_TIMEOUT_SECONDS = 20.0
 _HERDR_START_POLL_SECONDS = 0.2
 #: Herdr error codes that settle "that object no longer exists".
 _HERDR_NOT_FOUND_CODES = frozenset({"not_found", "pane_not_found", "tab_not_found"})
+#: A never-attached server has no workspace to put a tab in yet.
+_HERDR_NO_WORKSPACE_CODES = frozenset({"workspace_not_found", "no_active_workspace"})
 _LINUX_TERMINAL_PID_GRACE_SECONDS = 5.0
 _LINUX_DESKTOP_ENV_KEYS = (
     "DISPLAY",
@@ -2360,6 +2362,14 @@ class HerdrProcessManager(_PidOwnershipMixin):
         while ``timeout`` and friends are indeterminate and must never be
         allowed to read as a dead agent.
         """
+        argv, completed = self._invoke(args, timeout)
+        envelope = self._parse_envelope(argv, completed)
+        return self._validated_result(argv, completed, envelope, expect)
+
+    def _invoke(
+        self, args: tuple[str, ...], timeout: float
+    ) -> tuple[list[str], subprocess.CompletedProcess[str]]:
+        """Run one herdr command, mapping process-level failures to our error."""
         argv = self._herdr_argv(*args)
         try:
             completed = subprocess.run(  # noqa: S603 - argv is built internally.
@@ -2380,8 +2390,48 @@ class HerdrProcessManager(_PidOwnershipMixin):
             raise HerdrCommandError(argv, "malformed", str(exc)) from exc
         except OSError as exc:
             raise HerdrCommandError(argv, "unavailable", str(exc)) from exc
+        return argv, completed
 
+    def _run_herdr_raw(
+        self, *args: str, timeout: float = _HERDR_CALL_TIMEOUT_SECONDS
+    ) -> dict[str, Any]:
+        """Run a ``--json`` query that answers with a bare object.
+
+        ``status server``/``status client``/``session list`` return plain
+        objects rather than the ``{"id", "result": {"type": ...}}`` envelope
+        the control commands use.
+        """
+        argv, completed = self._invoke(args, timeout)
         envelope = self._parse_envelope(argv, completed)
+        error = envelope.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or "error")
+            raise HerdrCommandError(argv, code, str(error.get("message") or ""))
+        if completed.returncode != 0:
+            raise HerdrCommandError(argv, "error", completed.stderr.strip())
+        return envelope
+
+    def _run_herdr_text(
+        self, *args: str, timeout: float = _HERDR_CALL_TIMEOUT_SECONDS
+    ) -> str:
+        """Run a command that prints plain text rather than JSON.
+
+        ``pane read`` emits the terminal snapshot itself on stdout -- there is
+        no envelope to validate, so this seam returns the text as-is.
+        """
+        argv, completed = self._invoke(args, timeout)
+        if completed.returncode != 0:
+            raise HerdrCommandError(argv, "error", completed.stderr.strip())
+        return completed.stdout or ""
+
+    @staticmethod
+    def _validated_result(
+        argv: list[str],
+        completed: subprocess.CompletedProcess[str],
+        envelope: dict[str, Any],
+        expect: str,
+    ) -> dict[str, Any]:
+        """Validate an enveloped control response and return its result object."""
         error = envelope.get("error")
         if isinstance(error, dict):
             code = str(error.get("code") or "error")
@@ -2392,6 +2442,8 @@ class HerdrProcessManager(_PidOwnershipMixin):
             raise HerdrCommandError(argv, "error", completed.stderr.strip())
 
         result = envelope.get("result")
+        if result is None and not envelope and completed.returncode == 0:
+            return {"type": expect}
         if not isinstance(result, dict):
             raise HerdrCommandError(argv, "malformed", "response has no result object")
         if result.get("type") != expect:
@@ -2426,11 +2478,15 @@ class HerdrProcessManager(_PidOwnershipMixin):
         return endpoint
 
     def _server_socket(self) -> str | None:
-        """Return the running server's socket path, or ``None`` if none answers."""
+        """Return the running server's socket path, or ``None`` if none answers.
+
+        ``status --json`` is NOT enveloped like the control commands: it
+        answers with a bare object, so it is read through ``_run_herdr_raw``.
+        Validating it as an envelope made every probe look malformed, so the
+        launcher never found a server and timed out starting a new one.
+        """
         try:
-            status = self._run_herdr(
-                "status", "server", "--json", expect="server_status"
-            )
+            status = self._run_herdr_raw("status", "server", "--json")
         except HerdrCommandError:
             return None
         if not status.get("running"):
@@ -2515,9 +2571,7 @@ class HerdrProcessManager(_PidOwnershipMixin):
         endpoint = self._ensure_server()
         command = _build_posix_shell_command(request.cwd, cmd, env)
 
-        created = self._run_herdr(
-            *self._tab_create_args(request, env), expect="tab_created"
-        )
+        created = self._create_tab(request, env)
         pane = created.get("root_pane")
         tab = created.get("tab")
         if not isinstance(pane, dict) or not isinstance(tab, dict):
@@ -2658,8 +2712,7 @@ class HerdrProcessManager(_PidOwnershipMixin):
             args = ["pane", "read", info.pane_id, "--source", source]
             if lines is not None:
                 args += ["--lines", str(lines)]
-            result = self._run_herdr(*args, expect="pane_output")
-            text = str(result.get("output") or "")
+            text = self._run_herdr_text(*args)
             if text:
                 return text
         return ""
@@ -2775,6 +2828,35 @@ class HerdrProcessManager(_PidOwnershipMixin):
             return None
         return info if self._probe(info) is _HerdrProbe.OWNED else None
 
+    def _create_tab(self, request: SpawnRequest, env: dict[str, str]) -> dict[str, Any]:
+        """Create the agent's tab, creating the workspace first if there is none.
+
+        A freshly started headless server has no workspace at all
+        (``workspaces: []``) and answers ``tab create`` with
+        ``workspace_not_found``. ``workspace create`` takes the same options
+        and yields the same ``root_pane``/``tab``, so the first agent on a new
+        server simply creates the workspace it needs.
+        """
+        args = self._tab_create_args(request, env)
+        try:
+            return self._run_herdr(*args, expect="tab_created")
+        except HerdrCommandError as exc:
+            if exc.code not in _HERDR_NO_WORKSPACE_CODES:
+                raise
+        created = self._run_herdr(*["workspace", *args[1:]], expect="workspace_created")
+        # The workspace's own tab is labelled "1"; restore the agent label.
+        tab = created.get("tab")
+        if isinstance(tab, dict) and tab.get("tab_id"):
+            with contextlib.suppress(HerdrCommandError):
+                self._run_herdr(
+                    "tab",
+                    "rename",
+                    str(tab["tab_id"]),
+                    f"{request.name}@{request.team_name}",
+                    expect="ok",
+                )
+        return created
+
     def _tab_create_args(self, request: SpawnRequest, env: dict[str, str]) -> list[str]:
         """Build ``tab create`` arguments.
 
@@ -2846,6 +2928,11 @@ class HerdrProcessManager(_PidOwnershipMixin):
             if isinstance(parsed, dict):
                 return parsed
         if completed.returncode == _HERDR_USAGE_EXIT_CODE:
+            return {}
+        if completed.returncode == 0 and not (completed.stdout or completed.stderr):
+            # Some mutating commands (``pane run``) succeed silently. Silence
+            # is only success when the exit code agrees; a non-zero exit with
+            # no payload is still a failure below.
             return {}
         raise HerdrCommandError(
             argv, "malformed", (completed.stdout or completed.stderr or "").strip()

@@ -664,7 +664,7 @@ def test_capture_reads_nothing_unless_owned(
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(manager, "_probe", lambda info: state)
     monkeypatch.setattr(
-        manager, "_run_herdr", lambda *a, **k: calls.append(a) or {"type": "ok"}
+        manager, "_run_herdr_text", lambda *a, **k: (calls.append(a), "x")[1]
     )
 
     assert manager.capture("4242") == ""
@@ -852,7 +852,12 @@ class _FakeChild:
 
 
 def _status(running: bool, socket: str = "/run/herdr.sock") -> dict:
-    return {"type": "server_status", "running": running, "socket": socket}
+    """A bare ``status server --json`` object, as 0.8.2 really answers."""
+    return {
+        "status": "running" if running else "not_running",
+        "running": running,
+        "socket": socket,
+    }
 
 
 def test_ensure_server_reuses_a_running_server(
@@ -861,7 +866,7 @@ def test_ensure_server_reuses_a_running_server(
     """The user's own session is reused, never restarted."""
     manager = pm.HerdrProcessManager()
     started: list[str] = []
-    monkeypatch.setattr(manager, "_run_herdr", lambda *a, **k: _status(True))
+    monkeypatch.setattr(manager, "_run_herdr_raw", lambda *a, **k: _status(True))
     monkeypatch.setattr(
         manager,
         "_popen_herdr_server",
@@ -879,7 +884,7 @@ def test_ensure_server_starts_one_when_nothing_answers(
     monkeypatch.setattr(manager, "_start_lock_path", lambda: tmp_path / "herdr.lock")
     answers = iter([_status(False), _status(False), _status(True)])
     monkeypatch.setattr(
-        manager, "_run_herdr", lambda *a, **k: next(answers, _status(True))
+        manager, "_run_herdr_raw", lambda *a, **k: next(answers, _status(True))
     )
     monkeypatch.setattr(manager, "_popen_herdr_server", _FakeChild)
     monkeypatch.setattr(pm.time, "sleep", lambda s: None)
@@ -896,7 +901,7 @@ def test_ensure_server_rechecks_inside_the_lock(
     started: list[str] = []
     answers = iter([_status(False), _status(True)])
     monkeypatch.setattr(
-        manager, "_run_herdr", lambda *a, **k: next(answers, _status(True))
+        manager, "_run_herdr_raw", lambda *a, **k: next(answers, _status(True))
     )
     monkeypatch.setattr(
         manager,
@@ -914,7 +919,7 @@ def test_ensure_server_reports_a_server_that_exits_immediately(
 ) -> None:
     manager = pm.HerdrProcessManager()
     monkeypatch.setattr(manager, "_start_lock_path", lambda: tmp_path / "herdr.lock")
-    monkeypatch.setattr(manager, "_run_herdr", lambda *a, **k: _status(False))
+    monkeypatch.setattr(manager, "_run_herdr_raw", lambda *a, **k: _status(False))
     monkeypatch.setattr(
         manager, "_popen_herdr_server", functools.partial(_FakeChild, exits_with=1)
     )
@@ -929,7 +934,7 @@ def test_ensure_server_error_names_the_command_to_run(
     """A never-ready server must tell the user how to start one themselves."""
     manager = pm.HerdrProcessManager()
     monkeypatch.setattr(manager, "_start_lock_path", lambda: tmp_path / "herdr.lock")
-    monkeypatch.setattr(manager, "_run_herdr", lambda *a, **k: _status(False))
+    monkeypatch.setattr(manager, "_run_herdr_raw", lambda *a, **k: _status(False))
     monkeypatch.setattr(manager, "_popen_herdr_server", _FakeChild)
     monkeypatch.setattr(pm.time, "sleep", lambda s: None)
     monkeypatch.setattr(pm, "_HERDR_START_TIMEOUT_SECONDS", 0.0)
@@ -1033,13 +1038,13 @@ def test_capture_prefers_recent_then_falls_back_to_visible(
     _track(manager, tmp_path)
     seen: list[str] = []
 
-    def _run(*args: str, expect: str, **kw: object) -> dict:
+    def _read(*args: str, **kw: object) -> str:
         source = args[args.index("--source") + 1]
         seen.append(source)
-        return {"type": "pane_output", "output": "" if source != "visible" else "hi"}
+        return "" if source != "visible" else "hi"
 
     monkeypatch.setattr(manager, "_probe", lambda info: pm._HerdrProbe.OWNED)
-    monkeypatch.setattr(manager, "_run_herdr", _run)
+    monkeypatch.setattr(manager, "_run_herdr_text", _read)
 
     assert manager.capture("4242") == "hi"
     assert seen == ["recent-unwrapped", "visible"]
@@ -1053,12 +1058,12 @@ def test_capture_omits_lines_when_none_and_passes_it_otherwise(
     _track(manager, tmp_path)
     calls: list[tuple[str, ...]] = []
 
-    def _run(*args: str, expect: str, **kw: object) -> dict:
+    def _read(*args: str, **kw: object) -> str:
         calls.append(args)
-        return {"type": "pane_output", "output": "x"}
+        return "x"
 
     monkeypatch.setattr(manager, "_probe", lambda info: pm._HerdrProbe.OWNED)
-    monkeypatch.setattr(manager, "_run_herdr", _run)
+    monkeypatch.setattr(manager, "_run_herdr_text", _read)
 
     manager.capture("4242")
     assert "--lines" not in calls[0]
@@ -1089,3 +1094,134 @@ def test_run_herdr_treats_undecodable_output_as_malformed(
         manager._run_herdr("tab", "list", expect="tab_list")
 
     assert excinfo.value.code == "malformed"
+
+
+def test_status_json_is_read_as_a_bare_object_not_an_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``status --json`` answers with a plain object, unlike control commands.
+
+    Real 0.8.2 output::
+
+        {"status":"running","running":true,"socket":"/.../herdr.sock", ...}
+
+    There is no ``result``/``type`` envelope, so validating it as one made
+    every server probe look malformed and the launcher never found a server.
+    """
+    manager = pm.HerdrProcessManager()
+    raw = json.dumps(
+        {
+            "status": "running",
+            "running": True,
+            "socket": "/home/u/.config/herdr/sessions/s/herdr.sock",
+            "session": "s",
+        }
+    )
+    _fake_run(monkeypatch, _FakeCompleted(stdout=raw))
+
+    assert manager._server_socket() == "/home/u/.config/herdr/sessions/s/herdr.sock"
+
+
+def test_server_socket_is_none_when_not_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = pm.HerdrProcessManager()
+    raw = json.dumps({"status": "not_running", "running": False, "socket": "/x.sock"})
+    _fake_run(monkeypatch, _FakeCompleted(stdout=raw))
+
+    assert manager._server_socket() is None
+
+
+def test_spawn_creates_a_workspace_on_a_fresh_server(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-attached Herdr server has no workspace, so ``tab create`` fails.
+
+    Observed on 0.8.2: a freshly started headless server reports
+    ``workspaces: []`` and answers ``tab create`` with
+    ``workspace_not_found: no active workspace``. The first agent must
+    therefore create the workspace, which yields the same root pane.
+    """
+    calls: list[tuple[str, ...]] = []
+    workspace_created = {
+        "type": "workspace_created",
+        "tab": {"tab_id": "w1:t1", "label": "1"},
+        "root_pane": {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+    }
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        calls.append(args)
+        if args[:2] == ("tab", "create"):
+            raise pm.HerdrCommandError(
+                ["herdr", "tab", "create"], "workspace_not_found", "no active workspace"
+            )
+        if expect == "workspace_created":
+            return workspace_created
+        if expect == "pane_process_info":
+            return _PROCESS_INFO
+        return {"type": "ok"}
+
+    monkeypatch.setattr(_manager, "_run_herdr", _run)
+
+    result = _manager.spawn_process(
+        _request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code"
+    )
+
+    assert result.process_handle == "4242"
+    assert _manager._processes["4242"].pane_id == "w1:p1"
+    kinds = [c[:2] for c in calls]
+    assert ("workspace", "create") in kinds
+    # The workspace's tab is labelled "1", so the agent label is restored.
+    assert ("tab", "rename") in kinds
+
+
+def test_spawn_does_not_create_a_workspace_when_one_exists(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    herdr = _Herdr()
+    monkeypatch.setattr(_manager, "_run_herdr", herdr)
+
+    _spawn(_manager, _request, herdr)
+
+    assert herdr.argv_for("workspace", "create") is None
+
+
+def test_run_herdr_accepts_a_silent_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Some mutating commands answer with exit 0 and no payload at all.
+
+    Observed on 0.8.2: ``pane run`` prints nothing on success. Demanding an
+    envelope turned every successful spawn into a ``malformed`` error.
+    """
+    manager = pm.HerdrProcessManager()
+    _fake_run(monkeypatch, _FakeCompleted(returncode=0, stdout="", stderr=""))
+
+    assert manager._run_herdr("pane", "run", "w1:p2", "true", expect="ok") == {
+        "type": "ok"
+    }
+
+
+def test_run_herdr_still_rejects_silent_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silence is only success when the exit code says so."""
+    manager = pm.HerdrProcessManager()
+    _fake_run(monkeypatch, _FakeCompleted(returncode=1, stdout="", stderr=""))
+
+    with pytest.raises(pm.HerdrCommandError):
+        manager._run_herdr("pane", "run", "w1:p2", "true", expect="ok")
+
+
+def test_capture_reads_plain_text_not_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``pane read`` prints terminal text on stdout; there is no JSON envelope."""
+    manager = pm.HerdrProcessManager()
+    _track(manager, tmp_path)
+    monkeypatch.setattr(manager, "_probe", lambda info: pm._HerdrProbe.OWNED)
+    _fake_run(monkeypatch, _FakeCompleted(stdout="line one\nline two\n"))
+
+    assert manager.capture("4242") == "line one\nline two\n"

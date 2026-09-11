@@ -69,10 +69,53 @@ uv run pytest                  # 1461 passed, 4 skipped
 
 73 of those tests are new and specific to this launcher.
 
-## Not yet verified (live matrix still outstanding)
+## Live verification — and the four real bugs it caught
 
-Everything above is unit-level against faked seams. The plan's live matrix —
-real spawns of claude-code, codex and pi into real Herdr tabs, `pane move`
-behaviour, `shell_pid` survival through `exec`, both handoff shapes, and capture
-with and without an attached client — has **not** been run yet. Until it is, the
-launcher should be treated as unproven against a real Herdr server.
+A live smoke run against a real Herdr 0.8.2 server (disposable named session
+`actest`, deleted afterwards) found **four defects that every unit test had
+passed over**, because each was a wrong assumption about the CLI that the fakes
+faithfully reproduced:
+
+1. **`status --json` is not enveloped.** It answers with a bare object
+   (`{"status":"running","running":true,"socket":...}`), not
+   `{"id",...,"result":{"type":...}}`. Validating it as an envelope made every
+   server probe look malformed, so the launcher never found a running server and
+   timed out starting a new one. Fixed with a separate `_run_herdr_raw` seam.
+2. **A fresh headless server has no workspace at all.** `workspaces: []`, and
+   `tab create` fails `workspace_not_found: no active workspace`. The earlier
+   manual probe only worked because the default session already had a workspace
+   from prior use. The first agent now creates the workspace (same options, same
+   `root_pane`) and renames the resulting tab back to `<agent>@<team>`.
+3. **`pane run` succeeds silently.** Exit 0, no payload. Demanding an envelope
+   turned every successful spawn into `malformed`. Silence is now accepted as
+   success only when the exit code agrees.
+4. **`pane read` prints plain text, not JSON.** Capture was parsing an envelope
+   that never existed; it now reads stdout through a `_run_herdr_text` seam.
+
+Each fix was driven by a failing unit test written first, and two pre-existing
+tests were corrected because they had encoded the wrong assumption.
+
+### End-to-end result
+
+```
+ensure_server -> /home/mikael/.config/herdr/sessions/actest/herdr.sock
+spawned handle = 1472390        tab/pane = w1:t4 w1:p4
+probe      = _HerdrProbe.OWNED
+health     = (True, 'herdr pane w1:p4 alive')
+capture    = "... SMOKE_ALIVE_smoke ..."     # --env injection confirmed live
+after send = "... # hello from send"         # send reached the pane
+tracked after kill = False                   # tab closed, process gone
+```
+
+`owns_process(handle, "bogus-token")` returns `True` here, which is correct and
+not a hole: `ownership_probe` treats in-memory ownership of a live, fully proven
+pane as authority without a second token read (`process_manager.py:332-334`) —
+the same contract the tmux manager relies on. The dangerous case, a recycled
+PID, is covered by `test_ownership_probe_is_not_fooled_by_a_recycled_pid`.
+
+### Still unproven
+
+The smoke run used a plain `bash` process, not the three real agent CLIs, and it
+did not exercise `pane move`, `herdr --handoff` (either shape), capture with an
+attached client, or a follow-up/resume. Those remain outstanding from the plan's
+live matrix.
