@@ -20,6 +20,7 @@ import pytest
 
 from claude_teams.backends import process_manager as pm
 from claude_teams.backends.contracts import SpawnRequest, SpawnResult
+from claude_teams.filelock import file_lock
 
 
 @pytest.fixture
@@ -492,7 +493,10 @@ def _probe_setup(
 
     monkeypatch.setattr(manager, "_run_herdr", _run)
     monkeypatch.setattr(pm, "creation_token", lambda handle: token)
-    monkeypatch.setattr(manager, "_pid_alive", lambda handle: pid_alive)
+    # Patch the boundary the code actually consults. Patching the manager's
+    # _pid_alive instead left these tests quietly depending on host PID 4242
+    # being absent.
+    monkeypatch.setattr(pm, "_pid_is_live", lambda pid: pid_alive)
     monkeypatch.setattr(manager, "_ensure_server", lambda: "/run/herdr.sock")
 
 
@@ -1641,8 +1645,39 @@ def test_a_refused_operation_records_its_reason(
 def test_the_start_lock_follows_herdr_config_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A relocated Herdr config must not silently split the lock in two."""
-    monkeypatch.setenv("HERDR_CONFIG_PATH", str(tmp_path / "cfg"))
+    """A relocated Herdr config must not silently split the lock in two.
+
+    HERDR_CONFIG_PATH names the config FILE, so the lock belongs beside it.
+    Reading it as a directory would try to mkdir inside an existing file.
+    """
+    config_file = tmp_path / "cfg" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("HERDR_CONFIG_PATH", str(config_file))
     monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_SESSION", "shared")
 
-    assert pm.HerdrProcessManager()._start_lock_path().parent == tmp_path / "cfg"
+    lock_path = pm.HerdrProcessManager()._start_lock_path()
+
+    assert lock_path.parent == config_file.parent
+    # It must be usable: the real lock, on the real path.
+    with file_lock(lock_path):
+        assert lock_path.exists()
+
+
+def test_a_zombie_is_not_a_live_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zombie answers kill(pid, 0) and keeps a readable /proc token.
+
+    Without the zombie check a dead agent reads as owned-and-alive, and a
+    graceful shutdown waits out its whole timeout on a corpse.
+    """
+    monkeypatch.setattr(pm.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(pm, "_pid_is_zombie", lambda pid: True)
+
+    assert pm._pid_is_live(4242) is False
+
+
+def test_a_live_process_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pm.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(pm, "_pid_is_zombie", lambda pid: False)
+
+    assert pm._pid_is_live(4242) is True

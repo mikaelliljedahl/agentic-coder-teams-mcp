@@ -2256,7 +2256,13 @@ def _require_pane(created: dict[str, Any], tab_id: str) -> dict[str, Any]:
 
 
 def _pid_is_live(pid: int) -> bool:
-    """Whether ``pid`` exists (a permission error still means it exists)."""
+    """Whether ``pid`` is a live, non-zombie process.
+
+    The zombie check is not optional: a reaped-but-unwaited process still
+    answers ``kill(pid, 0)`` AND still has a readable ``/proc`` creation
+    token, so without it a dead agent reads as owned-and-alive -- and a
+    graceful shutdown would wait out its entire timeout on a corpse.
+    """
     if pid <= 0:
         return False
     try:
@@ -2264,10 +2270,23 @@ def _pid_is_live(pid: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        return not _pid_is_zombie(pid)
     except OSError:
         return False
-    return True
+    return not _pid_is_zombie(pid)
+
+
+def _pid_is_zombie(pid: int) -> bool:
+    """Whether ``pid`` is a reaped-but-unwaited zombie."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    closing = stat.rfind(")")
+    if closing == -1:
+        return False
+    fields = stat[closing + 1 :].split()
+    return bool(fields) and fields[0] == "Z"
 
 
 def _require_creation_token(handle: str) -> str:
@@ -2625,6 +2644,9 @@ class HerdrProcessManager(_PidOwnershipMixin):
             return
         with contextlib.suppress(OSError):
             child.kill()
+        # Reap it, or the force-killed child lingers as a zombie.
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            child.wait(timeout=_HERDR_TERMINATE_TIMEOUT_SECONDS)
 
     def _popen_herdr_server(self) -> subprocess.Popen[bytes]:
         """Launch the long-running daemon.
@@ -2650,8 +2672,15 @@ class HerdrProcessManager(_PidOwnershipMixin):
         does not silently split the lock in two.
         """
         config = os.environ.get("HERDR_CONFIG_PATH")
+        # HERDR_CONFIG_PATH "overrides config file path" (herdr --help): it
+        # names the config FILE, so the directory is its parent. Treating it
+        # as a directory would make file_lock's mkdir fail inside an existing
+        # file -- or, when it does not exist yet, create a directory exactly
+        # where Herdr later wants to write its config.
         root = (
-            Path(config).expanduser() if config else Path.home() / ".config" / "herdr"
+            Path(config).expanduser().parent
+            if config
+            else Path.home() / ".config" / "herdr"
         )
         return root / f"win-agent-teams-{self._session or 'default'}.start.lock"
 
@@ -2937,35 +2966,16 @@ class HerdrProcessManager(_PidOwnershipMixin):
             os.kill(int(handle), signal.SIGINT)
 
     def _pid_alive(self, handle: str) -> bool:
-        """Whether the PID exists and is not a zombie."""
+        """Whether the PID exists and is not a zombie.
+
+        One definition, shared with ``_pid_is_live``: two liveness helpers
+        that disagree about zombies is how a dead agent reads as alive.
+        """
         try:
             pid = int(handle)
         except (TypeError, ValueError):
             return False
-        if pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return not self._pid_is_zombie(pid)
-
-    @staticmethod
-    def _pid_is_zombie(pid: int) -> bool:
-        """Whether ``pid`` is a reaped-but-unwaited zombie."""
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        except OSError:
-            return False
-        closing = stat.rfind(")")
-        if closing == -1:
-            return False
-        fields = stat[closing + 1 :].split()
-        return bool(fields) and fields[0] == "Z"
+        return _pid_is_live(pid)
 
     def _wait_pid_exit(self, pid: int, timeout_s: float) -> bool:
         """Wait, bounded, for ``pid`` to leave the process table."""
