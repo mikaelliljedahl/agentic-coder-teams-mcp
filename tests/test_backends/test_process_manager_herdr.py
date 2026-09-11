@@ -12,6 +12,7 @@ manager's probe *is* the PID-reuse proof for everything that kills.
 
 import functools
 import json
+import shlex
 import subprocess
 from pathlib import Path
 from typing import cast
@@ -386,7 +387,9 @@ def test_spawn_runs_the_posix_shell_command_in_the_pane(
     assert argv[2] == "w3:p2"
     assert "exec claude --print" in argv[3]
     assert "export AGENT_NAME=worker;" in argv[3]
-    assert argv[3].startswith(f"cd {_request.cwd} &&")
+    # Quote the way the builder does: on Windows tmp_path is a C:\... path,
+    # which shlex.quote wraps, so an unquoted comparison only holds on POSIX.
+    assert argv[3].startswith(f"cd {shlex.quote(_request.cwd)} &&")
 
 
 def test_spawn_passes_awkward_env_values_as_single_tokens(
