@@ -1047,23 +1047,23 @@ class TestPlatformProcessManagerSelection:
                 process_manager_mod.process_manager,
                 process_manager_mod.WindowsProcessManager,
             )
-        elif (
-            process_manager_mod.os.environ.get(
-                process_manager_mod._LINUX_LAUNCHER_ENV, ""
-            )
-            .strip()
-            .lower()
-            == process_manager_mod._TMUX_LAUNCHER_VALUE
-        ):
-            assert isinstance(
-                process_manager_mod.process_manager,
-                process_manager_mod.TmuxProcessManager,
-            )
         else:
-            assert isinstance(
-                process_manager_mod.process_manager,
-                process_manager_mod.LinuxTerminalProcessManager,
+            launcher = (
+                process_manager_mod.os.environ.get(
+                    process_manager_mod._LINUX_LAUNCHER_ENV, ""
+                )
+                .strip()
+                .lower()
             )
+            expected = {
+                process_manager_mod._TMUX_LAUNCHER_VALUE: (
+                    process_manager_mod.TmuxProcessManager
+                ),
+                process_manager_mod._HERDR_LAUNCHER_VALUE: (
+                    process_manager_mod.HerdrProcessManager
+                ),
+            }.get(launcher, process_manager_mod.LinuxTerminalProcessManager)
+            assert isinstance(process_manager_mod.process_manager, expected)
 
 
 class TestTmuxProcessManager:
