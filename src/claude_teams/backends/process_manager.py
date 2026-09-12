@@ -2063,6 +2063,7 @@ class LinuxTerminalProcessManager(_PidOwnershipMixin):
             "konsole",
             "mate-terminal",
             "lxterminal",
+            "foot",
             "xterm",
         ):
             if candidate == "qterminal" and self._process_name_running(candidate):
