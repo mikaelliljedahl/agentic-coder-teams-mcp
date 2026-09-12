@@ -1524,3 +1524,134 @@ class TestLinuxTerminalProcessManager:
             "-lc",
             "exec worker",
         ]
+
+    def test_discovers_foot_when_no_other_terminal_is_installed(self, monkeypatch):
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+
+        def fake_which(name: str) -> str | None:
+            return "/usr/bin/foot" if name == "foot" else None
+
+        monkeypatch.delenv("WIN_AGENT_TEAMS_LINUX_TERMINAL", raising=False)
+        monkeypatch.setattr(process_manager_mod.shutil, "which", fake_which)
+
+        assert manager._discover_terminal() == "/usr/bin/foot"
+
+    def test_prefers_foot_over_xterm(self, monkeypatch):
+        """foot deliberately displaces xterm, the last-resort fallback."""
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        terminal_paths = {"foot": "/usr/bin/foot", "xterm": "/usr/bin/xterm"}
+
+        monkeypatch.delenv("WIN_AGENT_TEAMS_LINUX_TERMINAL", raising=False)
+        monkeypatch.setattr(process_manager_mod.shutil, "which", terminal_paths.get)
+
+        assert manager._discover_terminal() == "/usr/bin/foot"
+
+    @pytest.mark.parametrize(
+        "earlier",
+        [
+            "gnome-terminal",
+            "x-terminal-emulator",
+            "xfce4-terminal",
+            "konsole",
+            "mate-terminal",
+            "lxterminal",
+        ],
+    )
+    def test_prefers_established_terminal_over_foot(self, earlier, monkeypatch):
+        """Every candidate ahead of foot still wins, so only xterm is displaced.
+
+        ``qterminal`` is excluded: it has its own already-running skip rule,
+        covered by its own test.
+        """
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        terminal_paths = {earlier: f"/usr/bin/{earlier}", "foot": "/usr/bin/foot"}
+
+        monkeypatch.delenv("WIN_AGENT_TEAMS_LINUX_TERMINAL", raising=False)
+        monkeypatch.setattr(process_manager_mod.shutil, "which", terminal_paths.get)
+        monkeypatch.setattr(manager, "_process_name_running", lambda name: False)
+
+        assert manager._discover_terminal() == f"/usr/bin/{earlier}"
+
+    def test_foot_command_uses_generic_title_and_shell_form(self):
+        """Characterization of the argv validated by a live foot 1.28 probe.
+
+        ``foot`` documents ``-e`` as ignored for xterm compatibility, so the
+        generic fallback form is correct for it. This pins that argv; it does
+        not by itself establish that foot executes it.
+        """
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+
+        command = manager._terminal_command(
+            "/usr/bin/foot",
+            "worker@team",
+            "exec worker",
+        )
+
+        assert command == [
+            "/usr/bin/foot",
+            "-T",
+            "worker@team",
+            "-e",
+            "bash",
+            "-lc",
+            "exec worker",
+        ]
+
+    def test_spawn_through_foot_builds_full_argv_and_shell_command(
+        self, _make_spawn_request, monkeypatch, tmp_path
+    ):
+        """``Popen`` is mocked, so this establishes command *construction*.
+
+        That the constructed command actually runs under foot is established
+        by the live probe recorded in the feature's implementation notes, not
+        here.
+        """
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        process = MagicMock(pid=4242)
+        popen_mock = MagicMock(return_value=process)
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LOG_DIR", str(tmp_path))
+        monkeypatch.setattr(manager, "_discover_terminal", lambda: "/usr/bin/foot")
+        monkeypatch.setattr(process_manager_mod.subprocess, "Popen", popen_mock)
+
+        result = manager.spawn_process(
+            _make_spawn_request(),
+            ["codex", "exec", "do stuff"],
+            {"AGENT_NAME": "worker"},
+            "codex",
+            is_interactive=True,
+        )
+
+        assert result.process_handle == "4242"
+        command = popen_mock.call_args.args[0]
+        shell_command = command[-1]
+        assert command == [
+            "/usr/bin/foot",
+            "-T",
+            "worker@team",
+            "-e",
+            "bash",
+            "-lc",
+            shell_command,
+        ]
+        assert "printf '%s\\n' \"$$\"" in shell_command
+        assert str(tmp_path / "team" / "worker.pid") in shell_command
+        assert "AGENT_NAME=worker" in shell_command
+        assert "exec codex exec 'do stuff'" in shell_command
+
+    def test_desktop_env_preserves_wayland_keys_without_display(self, monkeypatch):
+        """A Wayland-only session has no DISPLAY; nothing here requires one."""
+        manager = process_manager_mod.LinuxTerminalProcessManager()
+        monkeypatch.setattr(manager, "_read_process_env", lambda pid: {})
+
+        env = manager._desktop_env(
+            {
+                "WAYLAND_DISPLAY": "wayland-1",
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            }
+        )
+
+        assert env["WAYLAND_DISPLAY"] == "wayland-1"
+        assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+        assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
+        assert "DISPLAY" not in env

@@ -259,8 +259,13 @@ visible terminal emulator window. This is the recommended mode when running from
 **Claude Desktop**, which is not attached to a tmux session — tmux mode would
 spawn agents into a detached session you would never see. The launcher probes
 common terminals such as `qterminal` (the LXQt/Lubuntu default),
-`gnome-terminal`, `x-terminal-emulator`, `xfce4-terminal`, and `xterm`; set
-`WIN_AGENT_TEAMS_LINUX_TERMINAL` to force a specific terminal command. Set
+`gnome-terminal`, `x-terminal-emulator`, `xfce4-terminal`, `foot` (the Wayland
+terminal Omarchy ships), and `xterm`; set `WIN_AGENT_TEAMS_LINUX_TERMINAL` to
+force a specific terminal command. Discovery is PATH-only and not session-aware:
+if an **earlier** X11-only candidate is installed, discovery may select it and
+the terminal launch can then fail without `DISPLAY` — set
+`WIN_AGENT_TEAMS_LINUX_TERMINAL=foot` there. `footclient` is not auto-discovered
+because it needs a running `foot --server`, but works as an explicit override. Set
 `WIN_AGENT_TEAMS_LINUX_LAUNCHER=tmux` only if you are running the server inside a
 tmux session and prefer panes/windows.
 
