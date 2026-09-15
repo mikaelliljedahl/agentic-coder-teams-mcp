@@ -167,27 +167,37 @@ class PiBackend(BaseBackend):
         """
         return True
 
-    # The model interface exposed to the MCP caller: six capability tiers,
-    # each bundling a concrete model with a ``--thinking`` level, as an
+    # The model interface exposed to the MCP caller: six shared capability tiers
+    # plus two pi-only ``-fast`` subtiers, each bundling a concrete model with a
+    # ``--thinking`` level, as an
     # ascending cost/quality ladder. Names mirror the effort words the caller
     # already reasons in (cheapest..max), while the ladder is tuned for Pi's
     # 1M context window. A tier owns its model and thinking level; if discovery
     # exposes a non-empty catalog without that model, the tier errors rather
     # than silently falling back to Pi's configured default.
-    #   cheapest -> Luna  @ medium
-    #   low      -> Luna  @ high
-    #   medium   -> Luna  @ xhigh   (token-efficient general default)
-    #   high     -> Luna  @ max     (1M-context bridge)
-    #   xhigh    -> Astra @ low
-    #   max      -> Astra @ medium   (top)
-    # Astra replaces Sol at the top; Sol and Terra remain reachable as raw
-    # slugs. See the Codex ladder for the 262k-context rationale for the
-    # backends' one intentional difference at ``high``.
+    #   cheapest    -> Luna  @ medium
+    #   low         -> Luna  @ high
+    #   medium      -> Luna  @ xhigh   (token-efficient general default)
+    #   medium-fast -> Terra @ high    (pi only; latency sibling of ``medium``)
+    #   high        -> Luna  @ max     (1M-context bridge)
+    #   high-fast   -> Sol   @ medium  (pi only; latency sibling of ``high``)
+    #   xhigh       -> Astra @ low
+    #   max         -> Astra @ medium   (top)
+    # Astra replaces Sol at the top. See the Codex ladder for the 262k-context
+    # rationale for the backends' one intentional difference at ``high``.
+    #
+    # The two ``-fast`` subtiers exist only here. Terra and Sol run roughly 3-4x
+    # faster than Luna and benchmark close to the tier each one sits beside, so
+    # they are the low-latency pick when turnaround dominates — not a claim that
+    # they are interchangeable with it on every input. Codex deliberately does
+    # not expose them: its own ``high`` is already Sol @ medium.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
         "cheapest": ("gpt-5.6-luna", "medium"),
         "low": ("gpt-5.6-luna", "high"),
         "medium": ("gpt-5.6-luna", "xhigh"),
+        "medium-fast": ("gpt-5.6-terra", "high"),
         "high": ("gpt-5.6-luna", "max"),
+        "high-fast": ("gpt-5.6-sol", "medium"),
         "xhigh": ("gpt-6-astra", "low"),
         "max": ("gpt-6-astra", "medium"),
     }
@@ -199,7 +209,8 @@ class PiBackend(BaseBackend):
     def supported_models(self) -> list[str]:
         """Return the capability tiers the MCP caller may choose from.
 
-        Deliberately the tier names (``cheapest``..``max``), not raw model slugs.
+        Deliberately the tier names (``cheapest``..``max``, plus the pi-only
+        ``medium-fast``/``high-fast``), not raw model slugs.
 
         Returns:
             list[str]: Selectable tier names, cheapest first.

@@ -108,10 +108,12 @@ in mind whenever you touch `backends/`:
   truncates argv at the first newline and mangles `< > | & ^`. Bypass the shim
   (launch the native exe / `node <entry>` directly) or transport the prompt in a
   file — never pass a multi-line prompt through the shim.
-- **Model tiers**, not raw slugs: `low/medium/high/xhigh/ultra` bundling model +
-  effort. Codex hard-fails on a missing model; Pi soft-falls-back to the CLI
-  default. Discover installed models live and skip validation when discovery is
-  empty.
+- **Model tiers**, not raw slugs: `cheapest/low/medium/high/xhigh/max` bundling
+  model + effort, shared by Codex and Pi; Pi adds the low-latency subtiers
+  `medium-fast` and `high-fast`. A tier whose model is missing hard-fails on
+  both backends — the soft fallback to the CLI default is Pi's behavior for an
+  unavailable *raw slug* only. Discover installed models live and skip
+  validation when discovery is empty.
 - **A new backend is not done** until: registered in
   `registry._BUILTIN_BACKENDS`; server glue wires MCP identity + `_hook_extra`;
   a `read_<name>_output` reader + `_read_agent_output` branch exist; it writes

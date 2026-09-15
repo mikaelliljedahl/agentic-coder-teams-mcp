@@ -652,7 +652,7 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 | `prompt` | required | Task prompt for the agent |
 | `name` | auto (`agent-1`) | Agent name |
 | `backend` | `claude-code` | Spawn backends: `claude-code`, `codex`, or `pi`. `external` is a joined registry label, not a valid spawn backend. |
-| `model` | backend default | Model to use. For `codex`/`pi`, a capability tier (`cheapest`/`low`/`medium`/`high`/`xhigh`/`max`) that bundles a model + effort. Both backends error when live discovery cannot find a tier model; pi raw slugs retain a soft fallback to its configured default. |
+| `model` | backend default | Model to use. For `codex`/`pi`, a capability tier (`cheapest`/`low`/`medium`/`high`/`xhigh`/`max`, plus the pi-only `medium-fast`/`high-fast`) that bundles a model + effort. Both backends error when live discovery cannot find a tier model; pi raw slugs retain a soft fallback to its configured default. |
 | `reasoning_effort` | none | `low`/`medium`/`high`/`xhigh` (codex), `low`/`medium`/`high`/`xhigh`/`max` (claude-code). Ignored for `codex`/`pi` tiers (the tier owns the effort). |
 | `permission_mode` | `bypass` | `bypass`, `default`, or `require_approval` |
 | `cwd` | server cwd | Working directory for the agent |
@@ -669,9 +669,17 @@ backend has a fixed ladder tuned to its context window:
 | `cheapest` | Luna @ medium | Luna @ medium |
 | `low` | Luna @ high | Luna @ high |
 | `medium` | Luna @ xhigh | Luna @ xhigh |
+| `medium-fast` | — | **Terra @ high** |
 | `high` | **Sol @ medium** | **Luna @ max** |
+| `high-fast` | — | **Sol @ medium** |
 | `xhigh` | Astra @ low | Astra @ low |
 | `max` | Astra @ medium | Astra @ medium |
+
+The two `-fast` subtiers are pi-only. Terra and Sol run roughly 3–4x faster
+than Luna and benchmark close to the tier each sits beside, so they are the
+low-latency pick when turnaround dominates — a different model, not a drop-in
+for their neighbour on every input. Codex does not expose them: its own `high`
+is already Sol @ medium.
 
 Codex caps context at 262k, so Luna @ max cannot finish complex tasks there;
 Sol @ medium is the only 262k-safe point between Luna and Astra. Pi runs Luna

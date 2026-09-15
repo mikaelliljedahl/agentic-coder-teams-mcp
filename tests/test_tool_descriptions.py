@@ -184,3 +184,25 @@ async def test_agent_watch_paths_registered_description_has_disk_contract() -> N
     description = await _registered_description("agent_watch_paths")
 
     _assert_disk_contract_note(description)
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_description_documents_pi_fast_subtiers() -> None:
+    description = await _registered_description("spawn_agent")
+
+    # The consuming agent only ever reads the registered tool description, so
+    # the pi-only subtiers must be discoverable from there alone — and each
+    # tier's model AND effort must be pinned together, not merely be present
+    # somewhere in the text, or a swapped effort would still pass.
+    assert "pi only" in description
+    assert "faster" in description
+    for tier, slug, effort in (
+        ("medium-fast", "gpt-5.6-terra", "high"),
+        ("high-fast", "gpt-5.6-sol", "medium"),
+    ):
+        line = next(
+            (ln for ln in description.splitlines() if f"``{tier}``" in ln), None
+        )
+        assert line is not None, f"{tier} missing from the registered description"
+        assert f"``{slug}``" in line
+        assert f"@ {effort}" in line

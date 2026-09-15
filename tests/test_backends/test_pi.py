@@ -101,7 +101,9 @@ class TestPiModels:
             "cheapest",
             "low",
             "medium",
+            "medium-fast",
             "high",
+            "high-fast",
             "xhigh",
             "max",
         ]
@@ -114,7 +116,9 @@ class TestPiModels:
         assert backend.resolve_model("cheapest") == "gpt-5.6-luna"
         assert backend.resolve_model("low") == "gpt-5.6-luna"
         assert backend.resolve_model("medium") == "gpt-5.6-luna"
+        assert backend.resolve_model("medium-fast") == "gpt-5.6-terra"
         assert backend.resolve_model("high") == "gpt-5.6-luna"
+        assert backend.resolve_model("high-fast") == "gpt-5.6-sol"
         assert backend.resolve_model("xhigh") == "gpt-6-astra"
         assert backend.resolve_model("max") == "gpt-6-astra"
 
@@ -134,7 +138,9 @@ class TestPiResolveLaunch:
         )
         assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
         assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
+        assert backend.resolve_launch("medium-fast", None) == ("gpt-5.6-terra", "high")
         assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
+        assert backend.resolve_launch("high-fast", None) == ("gpt-5.6-sol", "medium")
         assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
@@ -145,15 +151,47 @@ class TestPiResolveLaunch:
         assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
-    def test_backend_ladders_differ_only_at_high(self):
+    def test_shared_ladder_tiers_differ_only_at_high(self):
         pi_ladder = PiBackend()._TIER_LAUNCH
         codex_ladder = CodexBackend()._TIER_LAUNCH
-        assert pi_ladder != codex_ladder
-        assert set(pi_ladder) == set(codex_ladder)
+        assert set(codex_ladder) < set(pi_ladder)
         differences = [
-            tier for tier in pi_ladder if pi_ladder[tier] != codex_ladder[tier]
+            tier for tier in codex_ladder if pi_ladder[tier] != codex_ladder[tier]
         ]
         assert differences == ["high"]
+
+    def test_shared_ladder_keeps_codex_order(self):
+        pi_ladder = PiBackend()._TIER_LAUNCH
+        codex_ladder = CodexBackend()._TIER_LAUNCH
+        shared = [tier for tier in pi_ladder if tier in codex_ladder]
+        assert shared == list(codex_ladder)
+
+    def test_fast_subtiers_are_pi_only(self):
+        extra = set(PiBackend()._TIER_LAUNCH) - set(CodexBackend()._TIER_LAUNCH)
+        assert extra == {"medium-fast", "high-fast"}
+        assert CodexBackend().supported_models() == [
+            "cheapest",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        ]
+
+    def test_subtier_owns_thinking_ignoring_caller(self, _models):
+        backend = PiBackend()
+        assert backend.resolve_launch("medium-fast", "low") == (
+            "gpt-5.6-terra",
+            "high",
+        )
+        assert backend.resolve_launch("high-fast", "max") == ("gpt-5.6-sol", "medium")
+
+    def test_errors_when_subtier_model_absent(self, _models):
+        _models(["gpt-5.6-luna", "gpt-6-astra"])
+        with pytest.raises(BackendModelUnavailableError, match=r"gpt-5\.6-terra"):
+            PiBackend().resolve_launch("medium-fast", None)
+        with pytest.raises(BackendModelUnavailableError, match=r"gpt-5\.6-sol"):
+            PiBackend().resolve_launch("high-fast", None)
 
     def test_old_ultra_name_uses_raw_slug_behavior(self, _models):
         _models(["ultra"])
@@ -246,6 +284,21 @@ class TestPiBuildCommand:
         )
         assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-5.6-luna"
         assert cmd[cmd.index("--thinking") + 1] == "medium"
+
+    def test_fast_subtier_launches_reach_argv(
+        self, _make_request, _direct_launch, _tty, _models
+    ):
+        backend = PiBackend()
+        for tier, slug, thinking in (
+            ("medium-fast", "gpt-5.6-terra", "high"),
+            ("high-fast", "gpt-5.6-sol", "medium"),
+        ):
+            model, effort = backend.resolve_launch(tier, None)
+            cmd = backend.build_command(
+                _make_request(model=model, reasoning_effort=effort)
+            )
+            assert cmd[cmd.index("--model") + 1] == f"openai-codex/{slug}"
+            assert cmd[cmd.index("--thinking") + 1] == thinking
 
     def test_no_model_arg_when_blank(
         self, _make_request, _direct_launch, _tty, _models

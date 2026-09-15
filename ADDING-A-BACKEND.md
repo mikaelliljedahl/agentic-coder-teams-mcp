@@ -87,7 +87,8 @@ class MyBackend(BaseBackend):
 ### Models & capability tiers
 
 The MCP caller picks capability, not a raw model slug. `codex` and `pi` each
-expose six **tiers** (`cheapest/low/medium/high/xhigh/max`) that bundle a concrete
+expose six shared **tiers** (`cheapest/low/medium/high/xhigh/max`) — pi adds two
+of its own, `medium-fast` and `high-fast` — that bundle a concrete
 model + reasoning effort; `supported_models()` returns the tier names and
 `resolve_launch()` maps a tier to `(model, effort)`:
 
@@ -100,11 +101,17 @@ _TIER_LAUNCH = {  # fixed per-backend mapping; Codex shown here
     "xhigh":    ("gpt-6-astra", "low"),
     "max":      ("gpt-6-astra", "medium"),
 }
-# Pi differs only at high: ("gpt-5.6-luna", "max").
+# Pi differs at high: ("gpt-5.6-luna", "max"), and adds two pi-only
+# low-latency subtiers: "medium-fast" -> ("gpt-5.6-terra", "high") and
+# "high-fast" -> ("gpt-5.6-sol", "medium").
 ```
 
 The production ladders are backend-specific at `high`: Codex uses Sol @ medium
-for its 262k context limit, while Pi uses Luna @ max with its 1M window. See the
+for its 262k context limit, while Pi uses Luna @ max with its 1M window. Pi
+additionally exposes `medium-fast`/`high-fast`, the low-latency neighbours of
+`medium`/`high` (Terra and Sol run ~3-4x faster than Luna and benchmark close
+to them). A backend's tier set need not match another's — only
+`supported_models()` and `_TIER_LAUNCH` define it. See the
 README's ladder table for the complete fixed mapping. `resolve_launch(model,
 effort)` returns the `(model, effort)` pair the spawn uses.
 
