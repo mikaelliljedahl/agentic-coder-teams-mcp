@@ -277,10 +277,18 @@ tab**, labelled `<agent>@<team>` — the Linux counterpart of the Windows Termin
 tab grouping. Herdr also recognises the agent inside the pane, so its own
 idle/working/blocked view works on agents spawned this way.
 
+Tabs are grouped **one workspace per repository**: an agent's tab goes into the
+workspace labelled after the repo its `cwd` belongs to (the *main* checkout, so
+every git worktree of one repo shares that repo's workspace), creating it if it
+does not exist. A workspace you created yourself with that label is reused, so
+agents land beside your own tabs rather than in a second space. Outside a git
+repo the folder name is used.
+
 | Setting | Effect |
 | --- | --- |
 | `WIN_AGENT_TEAMS_LINUX_LAUNCHER=herdr` | Select the launcher. Opt-in only: running inside Herdr does **not** switch launchers by itself. |
 | `WIN_AGENT_TEAMS_HERDR_SESSION=<name>` | Pin a named Herdr session. Unset uses the default session. |
+| `WIN_AGENT_TEAMS_HERDR_WORKSPACE=<label>` | Put every agent of this process in one workspace instead of one per repo. `-` restores the old behaviour (whatever workspace is active). |
 
 A running Herdr server is reused. When that server is the session you are
 attached to, agent tabs appear in your window; when it is a headless server with

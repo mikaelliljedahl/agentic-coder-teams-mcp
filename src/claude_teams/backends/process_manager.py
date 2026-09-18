@@ -2,6 +2,7 @@
 
 import contextlib
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -64,6 +66,15 @@ _HERDR_SESSION_ENV = "WIN_AGENT_TEAMS_HERDR_SESSION"
 #: language is deliberately narrow: no whitespace, no separators, no leading
 #: dash that argv would read as a flag.
 _HERDR_SESSION_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$")
+#: Pin every agent of this process to one workspace label, or opt back out to
+#: the pre-per-repo behaviour ("the active workspace") with the sentinel.
+_HERDR_WORKSPACE_ENV = "WIN_AGENT_TEAMS_HERDR_WORKSPACE"
+_HERDR_ACTIVE_WORKSPACE_SENTINEL = "-"
+#: Labels are free-form display text, not a path component or a selector, so
+#: the session language would be far too narrow here. Only the things that
+#: would break a terminal, an argv parser or a filesystem are excluded.
+_HERDR_LABEL_MAX_LEN = 128
+_HERDR_DEFAULT_LABEL = "agents"
 _HERDR_CALL_TIMEOUT_SECONDS = 15.0
 #: clap exits 2 for a usage error: our argv is wrong, not Herdr's state.
 _HERDR_USAGE_EXIT_CODE = 2
@@ -2336,6 +2347,22 @@ class _HerdrProbe(Enum):
     INDETERMINATE = "indeterminate"
 
 
+class _WorkspaceLookup(Enum):
+    """What a ``workspace list`` actually told us about a label.
+
+    "No such workspace" and "could not read the listing" demand opposite
+    actions -- create one, versus leave the routing to Herdr -- so they must
+    never collapse into a single falsy answer.
+    """
+
+    #: A workspace carries this label; its id is usable.
+    MATCH = "match"
+    #: The listing parsed and authoritatively holds no such label.
+    EMPTY = "empty"
+    #: The listing failed or could not be trusted. Not evidence of absence.
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class HerdrProcessInfo:
     """Runtime information for an agent spawned into a Herdr tab."""
@@ -2369,6 +2396,7 @@ class HerdrProcessManager(_PidOwnershipMixin):
         """
         self._processes: dict[str, HerdrProcessInfo] = {}
         self._session = self._configured_session()
+        self._workspace_override = self._configured_workspace()
         self.socket_endpoint: str | None = None
         #: A server WE started, retained so it can be reaped.
         self._server_child: subprocess.Popen[bytes] | None = None
@@ -2386,6 +2414,37 @@ class HerdrProcessManager(_PidOwnershipMixin):
             )
             raise ValueError(msg)
         return raw
+
+    @staticmethod
+    def _configured_workspace() -> str | None:
+        """Return the pinned workspace label, the sentinel, or ``None``.
+
+        Unlike a session name, a label is display text passed as one argv
+        token, so ``repo.name`` or ``my repo`` are perfectly ordinary and must
+        be accepted. Only what would corrupt a terminal, be read as a flag, or
+        overflow a filesystem is refused -- and only for an EXPLICIT override:
+        a label derived from a folder is sanitised instead (a repo may not be
+        renamed just to be spawnable).
+        """
+        raw = os.environ.get(_HERDR_WORKSPACE_ENV, "")
+        if not raw.strip():
+            return None
+        label = raw.strip()
+        if label == _HERDR_ACTIVE_WORKSPACE_SENTINEL:
+            return label
+        if (
+            label.startswith("-")
+            or len(label) > _HERDR_LABEL_MAX_LEN
+            or not label.isprintable()
+        ):
+            msg = (
+                f"Invalid Herdr workspace label: {raw!r}. Expected 1-"
+                f"{_HERDR_LABEL_MAX_LEN} printable characters, no leading '-' "
+                f"(use {_HERDR_ACTIVE_WORKSPACE_SENTINEL!r} for the active "
+                "workspace)."
+            )
+            raise ValueError(msg)
+        return label
 
     def _herdr_argv(self, *args: str) -> list[str]:
         """Build a Herdr command, routed to our session.
@@ -2679,18 +2738,154 @@ class HerdrProcessManager(_PidOwnershipMixin):
         the server does. Honours ``HERDR_CONFIG_PATH`` so a relocated config
         does not silently split the lock in two.
         """
+        return self._config_root() / (
+            f"win-agent-teams-{self._session or 'default'}.start.lock"
+        )
+
+    def _config_root(self) -> Path:
+        """Return Herdr's config directory, honouring ``HERDR_CONFIG_PATH``.
+
+        HERDR_CONFIG_PATH "overrides config file path" (herdr --help): it names
+        the config FILE, so the directory is its parent. Treating it as a
+        directory would make file_lock's mkdir fail inside an existing file --
+        or, when it does not exist yet, create a directory exactly where Herdr
+        later wants to write its config.
+        """
         config = os.environ.get("HERDR_CONFIG_PATH")
-        # HERDR_CONFIG_PATH "overrides config file path" (herdr --help): it
-        # names the config FILE, so the directory is its parent. Treating it
-        # as a directory would make file_lock's mkdir fail inside an existing
-        # file -- or, when it does not exist yet, create a directory exactly
-        # where Herdr later wants to write its config.
-        root = (
+        return (
             Path(config).expanduser().parent
             if config
             else Path.home() / ".config" / "herdr"
         )
-        return root / f"win-agent-teams-{self._session or 'default'}.start.lock"
+
+    def _workspace_lock_path(self, label: str) -> Path:
+        """Return the lock shared by everyone creating this repo's workspace.
+
+        A label is free-form text -- it can hold ``/``, ``..``, spaces or 128
+        characters of Unicode -- so it is hashed rather than interpolated: a
+        raw label would otherwise escape the directory or overflow the name
+        limit. The session is encoded in the name the same way
+        ``_start_lock_path`` does it, so two Herdr sessions working on the same
+        repo do not serialise against each other.
+        """
+        digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+        session = self._session or "default"
+        return self._config_root() / f"win-agent-teams-{session}.ws-{digest}.lock"
+
+    def _workspace_label(self, cwd: str) -> str | None:
+        """Return the workspace label for an agent working in ``cwd``.
+
+        ``None`` means "do not route at all": the sentinel restores the
+        pre-per-repo behaviour of using whatever workspace is active.
+        """
+        override = self._workspace_override
+        if override == _HERDR_ACTIVE_WORKSPACE_SENTINEL:
+            return None
+        if override:
+            return override
+        return self._sanitise_label(self._repo_name(cwd))
+
+    def _repo_name(self, cwd: str) -> str:
+        """Name the repository ``cwd`` belongs to, else the folder itself.
+
+        The git common dir is the MAIN checkout's, so every worktree of one
+        repo answers with the same name and therefore shares one workspace --
+        which is what the user asked for. Everything about this is best-effort:
+        a missing, broken or slow git must degrade to the folder name, never
+        fail a spawn.
+        """
+        common_dir = self._git_common_dir(cwd)
+        if common_dir:
+            path = Path(common_dir)
+            # A normal repo's common dir is "<checkout>/.git"; a bare one is
+            # the repository itself, conventionally "<name>.git".
+            # removesuffix, not .stem: a bare repo named "portal.data" keeps
+            # its name, while "portal.git" loses only the git suffix.
+            name = (
+                path.parent.name
+                if path.name == ".git"
+                else path.name.removesuffix(".git")
+            )
+            if name:
+                return name
+        return Path(cwd).name
+
+    @staticmethod
+    def _git_common_dir(cwd: str) -> str | None:
+        """Ask git which repository ``cwd`` belongs to, or give up quietly."""
+        # Resolved through PATH at call time, exactly like the herdr binary:
+        # pinning an absolute path would break every non-standard install.
+        argv = [
+            "git",
+            "-C",
+            cwd,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ]
+        try:
+            completed = subprocess.run(  # noqa: S603 - argv is built internally.
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                # Strict, unlike the terminal-display reads: a path we cannot
+                # decode is a failed probe, not a label full of U+FFFD.
+                errors="strict",
+                timeout=_HERDR_CALL_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            return None
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.strip() or None
+
+    @staticmethod
+    def _sanitise_label(raw: str) -> str:
+        """Coerce a derived name into a label Herdr and a lock file can hold."""
+        cleaned = "".join(ch for ch in raw if ch.isprintable()).strip()
+        cleaned = cleaned.lstrip("-").strip()
+        return cleaned[:_HERDR_LABEL_MAX_LEN] or _HERDR_DEFAULT_LABEL
+
+    def _resolve_workspace(self, label: str) -> tuple[_WorkspaceLookup, str | None]:
+        """Find the workspace carrying ``label``, or say why we cannot.
+
+        Herdr allows duplicate labels, so the choice must be deterministic --
+        otherwise repeated spawns of one repo would scatter across the
+        duplicates. Anything unreadable degrades to ``UNKNOWN``: only a
+        listing we fully understood may be read as absence, because absence is
+        what makes us create a workspace.
+        """
+        try:
+            listing = self._run_herdr("workspace", "list", expect="workspace_list")
+        except HerdrCommandError:
+            return _WorkspaceLookup.UNKNOWN, None
+        workspaces = listing.get("workspaces")
+        if not isinstance(workspaces, list):
+            return _WorkspaceLookup.UNKNOWN, None
+
+        candidates: list[tuple[int, str]] = []
+        for entry in workspaces:
+            if not isinstance(entry, dict):
+                return _WorkspaceLookup.UNKNOWN, None
+            if entry.get("label") != label:
+                continue
+            workspace_id = entry.get("workspace_id")
+            if not isinstance(workspace_id, str) or not workspace_id:
+                # The one candidate we cannot read is exactly the one that must
+                # not be mistaken for absence: creating would duplicate it.
+                return _WorkspaceLookup.UNKNOWN, None
+            number = entry.get("number")
+            key = (
+                number
+                if isinstance(number, int) and not isinstance(number, bool)
+                else sys.maxsize
+            )
+            candidates.append((key, workspace_id))
+        if not candidates:
+            return _WorkspaceLookup.EMPTY, None
+        return _WorkspaceLookup.MATCH, min(candidates)[1]
 
     def spawn_process(
         self,
@@ -2713,7 +2908,8 @@ class HerdrProcessManager(_PidOwnershipMixin):
         endpoint = self._ensure_server()
         command = _build_posix_shell_command(request.cwd, cmd, env)
 
-        created = self._create_tab(request, env)
+        label = self._workspace_label(request.cwd)
+        created = self._create_tab(request, env, label)
         # The rollback scope opens HERE, the moment a tab may exist -- BEFORE
         # the response is validated. A malformed create response that still
         # carried a real tab id would otherwise raise straight past cleanup and
@@ -2723,6 +2919,7 @@ class HerdrProcessManager(_PidOwnershipMixin):
         try:
             pane = _require_pane(created, tab_id)
             pane_id = str(pane["pane_id"])
+            workspace_id = str(pane.get("workspace_id") or "")
 
             self._run_herdr(
                 "pane", "run", pane_id, command, expect="ok", allow_empty_success=True
@@ -2733,7 +2930,9 @@ class HerdrProcessManager(_PidOwnershipMixin):
             # Provenance is written BEFORE the record is committed, so a failing
             # log write cannot leave a live agent the caller believes never
             # started.
-            self._write_provenance(log_path, tab_id, pane_id, handle)
+            self._write_provenance(
+                log_path, tab_id, pane_id, handle, workspace_id, label
+            )
         except BaseException as exc:
             self._rollback_tab(tab_id, exc)
             raise
@@ -2749,7 +2948,7 @@ class HerdrProcessManager(_PidOwnershipMixin):
             backend=backend_type,
             tab_id=tab_id,
             pane_id=pane_id,
-            workspace_id=str(pane.get("workspace_id") or ""),
+            workspace_id=workspace_id,
             log_path=log_path,
             started_at=time.time(),
         )
@@ -3020,21 +3219,73 @@ class HerdrProcessManager(_PidOwnershipMixin):
             )
         return None
 
-    def _create_tab(self, request: SpawnRequest, env: dict[str, str]) -> dict[str, Any]:
-        """Create the agent's tab, creating the workspace first if there is none.
+    def _create_tab(
+        self, request: SpawnRequest, env: dict[str, str], label: str | None
+    ) -> dict[str, Any]:
+        """Create the agent's tab in its repository's workspace.
 
-        A freshly started headless server has no workspace at all
-        (``workspaces: []``) and answers ``tab create`` with
-        ``workspace_not_found``. ``workspace create`` takes the same options
-        and yields the same ``root_pane``/``tab``, so the first agent on a new
-        server simply creates the workspace it needs.
+        Routing by repository is the point: without ``--workspace`` Herdr puts
+        every agent in whatever workspace happens to be active, so agents from
+        three repos pile into one. An authoritative absence therefore CREATES
+        the repo's workspace rather than falling through to an unqualified
+        create -- the fall-through would silently land in someone else's.
         """
-        args = self._tab_create_args(request, env)
+        outcome, workspace_id = (
+            (_WorkspaceLookup.UNKNOWN, None)
+            if label is None
+            else self._resolve_workspace(label)
+        )
+        if outcome is _WorkspaceLookup.EMPTY:
+            return self._create_in_new_workspace(request, env, label)
         try:
-            return self._run_herdr(*args, expect="tab_created")
+            return self._run_herdr(
+                *self._tab_create_args(request, env, workspace_id),
+                expect="tab_created",
+            )
         except HerdrCommandError as exc:
             if exc.code not in _HERDR_NO_WORKSPACE_CODES:
                 raise
+        # Either the workspace we matched was closed underneath us, or (on the
+        # unrouted path) this is a freshly started headless server with no
+        # workspace at all. Both are Herdr's own word for "there is nothing to
+        # put a tab in", which is the one thing that licenses creating one.
+        return self._create_in_new_workspace(request, env, label)
+
+    def _create_in_new_workspace(
+        self, request: SpawnRequest, env: dict[str, str], label: str | None
+    ) -> dict[str, Any]:
+        """Create the repo's workspace, once, even under parallel spawns.
+
+        ``workspace create`` takes the same options as ``tab create`` and
+        yields the same ``root_pane``/``tab``, so the agent's tab IS the new
+        workspace's root tab.
+        """
+        if label is None:
+            # Unrouted: nothing to serialise on and nothing to re-check.
+            return self._workspace_create(request, env, label=None)
+        with file_lock(self._workspace_lock_path(label)):
+            # Someone may have created it while we waited; and a listing we
+            # cannot read is never grounds for creating a second one.
+            outcome, workspace_id = self._resolve_workspace(label)
+            if outcome is not _WorkspaceLookup.EMPTY:
+                try:
+                    return self._run_herdr(
+                        *self._tab_create_args(request, env, workspace_id),
+                        expect="tab_created",
+                    )
+                except HerdrCommandError as exc:
+                    if exc.code not in _HERDR_NO_WORKSPACE_CODES:
+                        raise
+            return self._workspace_create(request, env, label)
+
+    def _workspace_create(
+        self, request: SpawnRequest, env: dict[str, str], label: str | None
+    ) -> dict[str, Any]:
+        """Create a workspace and adopt its root tab as the agent's tab."""
+        args = self._tab_create_args(request, env, None)
+        if label is not None:
+            # The WORKSPACE is named after the repo; the tab keeps the agent.
+            args[args.index("--label") + 1] = label
         created = self._run_herdr(*["workspace", *args[1:]], expect="workspace_created")
         # The workspace's own tab is labelled "1"; restore the agent label.
         tab = created.get("tab")
@@ -3049,16 +3300,19 @@ class HerdrProcessManager(_PidOwnershipMixin):
                 )
         return created
 
-    def _tab_create_args(self, request: SpawnRequest, env: dict[str, str]) -> list[str]:
+    def _tab_create_args(
+        self, request: SpawnRequest, env: dict[str, str], workspace_id: str | None
+    ) -> list[str]:
         """Build ``tab create`` arguments.
 
         Env keys arrive already validated by ``process_base._spawn_with_command``
         against ``_SAFE_ENV_KEY``; values are passed as single argv tokens, so
         spaces, quotes and newlines need no escaping here.
         """
-        args = [
-            "tab",
-            "create",
+        args = ["tab", "create"]
+        if workspace_id:
+            args += ["--workspace", workspace_id]
+        args += [
             "--cwd",
             request.cwd,
             "--label",
@@ -3096,13 +3350,26 @@ class HerdrProcessManager(_PidOwnershipMixin):
         return ""
 
     def _write_provenance(
-        self, log_path: Path, tab_id: str, pane_id: str, handle: str
+        self,
+        log_path: Path,
+        tab_id: str,
+        pane_id: str,
+        handle: str,
+        workspace_id: str = "",
+        label: str | None = None,
     ) -> None:
-        """Record where this agent lives, for anyone debugging it later."""
+        """Record where this agent lives, for anyone debugging it later.
+
+        The workspace id is the one Herdr actually returned; the label is only
+        what we ASKED for, which on the unrouted path is deliberately not the
+        active workspace's own label -- so it is named as a request, not as a
+        fact about that workspace.
+        """
         with log_path.open("a", encoding="utf-8") as log_handle:
             log_handle.write(
                 f"[herdr] session={self._session or 'default'} tab={tab_id} "
-                f"pane={pane_id} pid={handle}\n"
+                f"pane={pane_id} pid={handle} workspace={workspace_id or '?'} "
+                f"requested_label={label or _HERDR_ACTIVE_WORKSPACE_SENTINEL}\n"
             )
 
     def _rollback_tab(self, tab_id: str, original: BaseException) -> None:
