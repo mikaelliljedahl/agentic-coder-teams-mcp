@@ -532,9 +532,12 @@ only for an agent expected to spawn and wait for its own children. The flag does
 not grant or restrict spawning. For a **top-level** lead you start yourself,
 wire it in one step with the `install_lead_wake` MCP tool:
 
-- `install_lead_wake()` writes the wake `Stop` hook into the project
-  `.claude/settings.json` in the lead's cwd (`scope="user"` targets
-  `~/.claude/settings.json`). It writes only the wake group, is idempotent, and
+- `install_lead_wake()` writes the wake `Stop` hook into the personal,
+  git-ignored `.claude/settings.local.json` in the lead's cwd (`scope="user"`
+  targets `~/.claude/settings.json`) — never the checked-in
+  `.claude/settings.json`, because the hook bakes machine-specific paths and a
+  PID. A group an older version left in `.claude/settings.json` is migrated
+  out on the next install. It writes only the wake group, is idempotent, and
   preserves unrelated hooks.
 - `install_lead_wake(remove=true)` removes only the wake group.
 
@@ -574,7 +577,7 @@ drives the decision function with faked payloads). Run it with your own Claude
 Code and model configuration; record harness version, model, sender, and wake
 content per run — do not treat this document as evidence the run occurred.
 
-1. In a repo cwd, run `install_lead_wake` and confirm `.claude/settings.json` has
+1. In a repo cwd, run `install_lead_wake` and confirm `.claude/settings.local.json` has
    the `Stop` wake group and `win-agent-teams session-dir` reports the lead
    identity.
 2. Start an interactive `claude` lead; `spawn_agent` a worker; go idle.

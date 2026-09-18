@@ -252,8 +252,14 @@ install_lead_wake()
 ```
 
 - Default scope (`scope="project"`) writes the `Stop` wake group into
-  **`.claude/settings.json` in the lead's working directory** — i.e. the
+  **`.claude/settings.local.json` in the lead's working directory** — i.e. the
   project where you started `claude`. This is the right choice almost always.
+  It is deliberately the personal, git-ignored file and not the checked-in
+  `.claude/settings.json`: the hook bakes this machine's absolute paths and the
+  lead's PID, so a committed copy breaks every other clone and worktree (a
+  Windows install shows up as a `Stop hook error` on Linux). A wake group an
+  older version left in `.claude/settings.json` is removed on the next
+  install — commit that removal.
 - `install_lead_wake(scope="user")` writes it into **`~/.claude/settings.json`**
   instead (applies to every project; usually more than you want).
 
