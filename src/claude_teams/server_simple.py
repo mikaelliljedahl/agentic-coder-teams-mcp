@@ -6542,6 +6542,7 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
         errors="replace",
         check=False,
         timeout=10,
+        stdin=subprocess.DEVNULL,
     )
 
 

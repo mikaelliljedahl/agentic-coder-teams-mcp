@@ -154,6 +154,7 @@ def _force_kill_pid(handle: str) -> None:
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         return
     with contextlib.suppress(OSError):
@@ -966,6 +967,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
         subprocess.Popen(  # noqa: S603 - opens log tail in Windows Terminal only.
             command,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            stdin=subprocess.DEVNULL,
         )
 
     def _spawn_in_terminal_tab(
@@ -1296,6 +1298,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         stdout = result.stdout.strip()
         if not stdout:
@@ -1408,6 +1411,7 @@ class WindowsProcessManager(_PidOwnershipMixin):
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         pids: list[int] = []
         for token in result.stdout.split():
@@ -1469,6 +1473,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             text=True,
             errors="replace",
             env=merged_env,
+            stdin=subprocess.DEVNULL,
         )
         window_id, pane_id, pid = self._parse_tmux_spawn_output(result.stdout)
         target_id = window_id if target_kind == "window" else pane_id
@@ -1531,6 +1536,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -1557,6 +1563,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
             return ""
@@ -1574,6 +1581,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         if enter:
             subprocess.run(  # noqa: S603 - tmux argv is built internally.
@@ -1582,6 +1590,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
                 capture_output=True,
                 text=True,
                 errors="replace",
+                stdin=subprocess.DEVNULL,
             )
 
     def log_path(self, team_name: str, agent_name: str) -> Path:
@@ -1722,6 +1731,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
             return False, result.stderr.strip() or "tmux target not found"
@@ -1747,6 +1757,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
 
     def _kill_pid(self, handle: str) -> None:
@@ -1793,6 +1804,7 @@ class TmuxProcessManager(_PidOwnershipMixin):
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         return result.returncode == 0
 
@@ -2169,6 +2181,7 @@ class LinuxTerminalProcessManager(_PidOwnershipMixin):
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         return result.returncode == 0
 
@@ -2504,6 +2517,7 @@ class HerdrProcessManager(_PidOwnershipMixin):
                 encoding="utf-8",
                 errors=errors,
                 timeout=timeout,
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired as exc:
             raise HerdrCommandError(argv, "timeout", str(exc)) from exc
@@ -2834,6 +2848,7 @@ class HerdrProcessManager(_PidOwnershipMixin):
                 # decode is a failed probe, not a label full of U+FFFD.
                 errors="strict",
                 timeout=_HERDR_CALL_TIMEOUT_SECONDS,
+                stdin=subprocess.DEVNULL,
             )
         except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
             return None

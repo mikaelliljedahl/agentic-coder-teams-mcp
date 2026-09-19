@@ -150,6 +150,7 @@ class BaseBackend:
                 capture_output=True,
                 text=True,
                 errors="replace",
+                stdin=subprocess.DEVNULL,
             )
         except (OSError, subprocess.SubprocessError):
             return False
@@ -174,6 +175,7 @@ class BaseBackend:
             text=True,
             errors="replace",
             env=os.environ.copy(),
+            stdin=subprocess.DEVNULL,
         )
         return {
             "output": completed.stdout + completed.stderr,

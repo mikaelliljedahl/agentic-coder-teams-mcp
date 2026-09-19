@@ -13,6 +13,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -476,3 +477,29 @@ class TestGitIgnoreLayouts:
 
         assert result["git_ignore"] == "excluded"
         assert _is_ignored(linked, linked / ".claude" / "settings.local.json")
+
+    def test_git_calls_detach_stdin(
+        self, _isolated: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """git must not inherit the stdio MCP server's JSON-RPC stdin.
+
+        On Windows an inherited protocol pipe makes git block until the call's
+        10 s timeout, which stalled one ``install_lead_wake`` call for that long
+        (it runs in a ``run_blocking`` worker thread, so the event loop was not
+        affected) and made it report ``git_ignore: "failed"``.
+        """
+        _git(_isolated.work, "init", "-q")
+        real_run = subprocess.run
+        seen: list[object] = []
+
+        def _spy(*args: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs.get("stdin"))
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(ss.subprocess, "run", _spy)
+
+        result = ss._ensure_locally_ignored(_isolated.local)
+
+        assert result == "excluded"
+        assert seen
+        assert all(stdin == subprocess.DEVNULL for stdin in seen)

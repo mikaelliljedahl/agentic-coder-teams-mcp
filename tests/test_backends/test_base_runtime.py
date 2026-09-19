@@ -206,6 +206,7 @@ class TestBaseBackendWaitIdle:
             capture_output=True,
             text=True,
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
 
 
@@ -1011,6 +1012,11 @@ class TestWindowsTerminalTail:
             "worker@team",
         ]
         assert f"Get-Content -LiteralPath '{log_path}' -Wait -Tail 80" in command
+        # The tail only displays a file; inheriting this server's stdin would
+        # hand a long-lived child the JSON-RPC pipe. The stdin ratchet in
+        # tests/test_subprocess_stdin.py covers subprocess.run only, so this
+        # Popen is pinned here.
+        assert popen_mock.call_args.kwargs["stdin"] == subprocess.DEVNULL
 
     @pytest.mark.parametrize("value", ["0", "false", "no", "off"])
     def test_env_can_disable_windows_terminal_tail(self, monkeypatch, tmp_path, value):
@@ -1333,6 +1339,7 @@ class TestTmuxProcessManager:
             "capture_output": True,
             "text": True,
             "errors": "replace",
+            "stdin": subprocess.DEVNULL,
         }
 
 
