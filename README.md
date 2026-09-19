@@ -401,7 +401,7 @@ Agent `state` is hook-driven when possible: a small hook command
 agents (`--settings <path>`, on by default; disable with
 `WIN_AGENT_TEAMS_STATE_HOOKS=0`) and writes a per-agent marker file
 (`state-{name}.json`) mapping `SessionStart`/`UserPromptSubmit`/
-`PreToolUse`/`PostToolUse` → `running` and `Stop`/`SubagentStop` →
+`PreToolUse`/`PostToolUse` → `running` and `Stop` →
 `waiting`. Codex agents get the same marker via an inline `-c` hook override
 plus `--dangerously-bypass-hook-trust` (Codex silently skips injected hooks
 without that flag); this is **on by default** — set
@@ -459,11 +459,16 @@ The loop:
    and exits only for actionable work: unread lead inbox data, a selected output
    change, or a marker that settles as `waiting`. Two writes are treated as
    churn and never wake on their own: `running` lifecycle transitions, and
-   `SubagentStop` (a worker's own internal Task subagent finishing while the
-   worker keeps going). A `waiting` marker must also *persist* as waiting for a
-   short settle window (`WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`, default `1.5`)
+   legacy `SubagentStop` markers (a worker's own internal Task subagent
+   finishing while the worker keeps going; current emitters write nothing for
+   it). A `waiting` marker must also *persist* as waiting for a
+   short settle window (`WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`, default `15`)
    before it wakes — one that flips back to `running` inside the window is
-   suppressed as a brief park. A genuine `waiting` that arrives in the final
+   suppressed as a brief park. Arming late is safe: a marker that was already
+   `waiting` when the watch started wakes it too (after the settle window),
+   once per reader — delivered parks are acknowledged in
+   `<session_dir>/.watch/ack-<reader>.json` (at-least-once; `--no-parked`
+   restores edge-only behavior). A genuine `waiting` that arrives in the final
    settle window can fall past the deadline and surface as `exit 2`; the
    mandated status re-check after a timeout recovers it. Each watch is
    one-shot and exits on the first signal, so re-arm it after every wake.

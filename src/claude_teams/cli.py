@@ -1,11 +1,15 @@
 """Minimal CLI for win-agent-teams."""
 
 import fnmatch
+import hashlib
 import json
 import math
 import os
 import signal
 import time
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 import typer
@@ -23,6 +27,7 @@ from claude_teams.backends.process_manager import (
     process_manager,
 )
 from claude_teams.backends.registry import registry
+from claude_teams.filelock import FileLockTimeoutError, file_lock
 from claude_teams.hooks import _SAFE_AGENT_RE
 from claude_teams.messaging import (
     load_inbox_cursors,
@@ -33,6 +38,13 @@ from claude_teams.server_simple import mcp
 
 _WATCH_POLL_SECONDS = 0.5
 _WATCH_DEFAULT_PATTERN = "state-*.json"
+# Per-reader acknowledgement store for delivered parks lives in a subdirectory
+# so ``_snapshot_mtimes`` (files directly in the session dir only) can never
+# classify an ack write as an output edge, whatever ``--pattern`` says.
+_WATCH_ACK_DIRNAME = ".watch"
+# Bounded so a stuck same-reader watcher (Windows lock path) degrades to a
+# logged ack failure, never a hung wake. POSIX ``flock`` still blocks.
+_WATCH_ACK_LOCK_TIMEOUT_SECONDS = 5.0
 
 # Waiting markers written by these hook events are NOT coordinator-actionable:
 # ``SubagentStop`` fires when one of an agent's OWN built-in Task subagents
@@ -442,21 +454,38 @@ def _path_identity(path: Path) -> tuple[int, int] | None:
     return stat.st_mtime_ns, stat.st_size
 
 
-def _waiting_agent(path: Path) -> str | None:
-    """Return the agent name for a coordinator-actionable waiting marker.
+@dataclass(frozen=True)
+class _Parked:
+    """One parse of a coordinator-actionable waiting marker.
+
+    ``gen`` is the marker's generation: its ``gen`` field when the emitter wrote
+    one, else the SHA-256 of the file bytes (markers from older installs). The
+    same record is both acknowledged and reported, so the wake can never name a
+    different park than the one it acks.
+    """
+
+    agent: str
+    gen: str
+    path: Path
+
+
+def _parked_candidate(path: Path) -> _Parked | None:
+    """Return the parked record for a coordinator-actionable waiting marker.
 
     Returns ``None`` when ``path`` is not such a marker. A marker is actionable
     only when its state is ``waiting`` AND the hook event
     that produced it is not in :data:`_NON_ACTIONABLE_WAITING_EVENTS`. This
-    filters out ``SubagentStop`` churn (an agent's own Task subagent finishing)
-    the same way the caller already ignores ``running`` transitions. Markers with
-    no recorded ``event`` are treated as actionable for backward compatibility.
+    filters out ``SubagentStop`` churn written by older emitters (an agent's own
+    Task subagent finishing) the same way the caller already ignores ``running``
+    transitions. Markers with no recorded ``event`` are treated as actionable
+    for backward compatibility.
     """
     if not (path.name.startswith("state-") and path.suffix == ".json"):
         return None
     try:
-        marker = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = path.read_bytes()
+        marker = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError):
         return None
     if not isinstance(marker, dict) or marker.get("state") != "waiting":
         return None
@@ -466,7 +495,73 @@ def _waiting_agent(path: Path) -> str | None:
     # missing or non-string event is treated as actionable.
     if isinstance(event, str) and event in _NON_ACTIONABLE_WAITING_EVENTS:
         return None
-    return path.stem.removeprefix("state-")
+    gen = marker.get("gen")
+    if not isinstance(gen, str) or not gen:
+        gen = hashlib.sha256(raw).hexdigest()
+    return _Parked(agent=path.stem.removeprefix("state-"), gen=gen, path=path)
+
+
+def _waiting_agent(path: Path) -> str | None:
+    """Return the agent name for a coordinator-actionable waiting marker."""
+    parked = _parked_candidate(path)
+    return None if parked is None else parked.agent
+
+
+def _ack_path(session_dir: Path, reader: str) -> Path:
+    return session_dir / _WATCH_ACK_DIRNAME / f"ack-{reader}.json"
+
+
+def _read_acked(ack_path: Path) -> dict[str, str]:
+    """Return ``{marker file name: acked gen}``; a missing/corrupt file is empty."""
+    try:
+        value = json.loads(ack_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    acked = value.get("acked") if isinstance(value, dict) else None
+    if not isinstance(acked, dict):
+        return {}
+    return {k: v for k, v in acked.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _acknowledge(ack_path: Path, parked: _Parked) -> None:
+    """Record ``parked.gen`` as delivered to this reader (locked read-modify-write).
+
+    Locked load/merge, then a unique same-directory temp file and an atomic
+    replace, so a crash can never leave a torn file that would discard every
+    earlier entry. Raises ``OSError`` on failure (lock timeout included); the
+    caller treats that as non-fatal.
+    """
+    ack_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ack_path.with_name(f"{ack_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with file_lock(
+            ack_path.with_name(f"{ack_path.name}.lock"),
+            timeout_s=_WATCH_ACK_LOCK_TIMEOUT_SECONDS,
+        ):
+            acked = _read_acked(ack_path)
+            acked[parked.path.name] = parked.gen
+            tmp.write_text(json.dumps({"acked": acked}), encoding="utf-8")
+            tmp.replace(ack_path)
+    except FileLockTimeoutError as exc:
+        raise OSError(str(exc)) from exc
+    finally:
+        with suppress(OSError):
+            tmp.unlink()
+
+
+def _emit_parked_wake(ack_path: Path, parked: _Parked) -> None:
+    """Print the wake record, then acknowledge ``parked`` (best effort).
+
+    Print first: a crash between the two at worst re-delivers this park on the
+    next watch (at-least-once). Acking first would let a crash after the ack
+    swallow the wake for good.
+    """
+    _emit_wake({"reason": "waiting", "agent": parked.agent, "path": str(parked.path)})
+    try:
+        _acknowledge(ack_path, parked)
+    except OSError as exc:
+        typer.echo(f"warning: could not write watch ack {ack_path}: {exc}", err=True)
+    raise typer.Exit(code=0)
 
 
 def _emit_wake(payload: dict) -> None:
@@ -525,6 +620,17 @@ def watch(
         "-p",
         help="Glob pattern (relative to session_dir) to watch, e.g. state-*.json.",
     ),
+    parked: bool = typer.Option(
+        True,
+        "--parked/--no-parked",
+        help=(
+            "Also wake for a marker that was already waiting before the watch "
+            "started. A delivered park is acknowledged in "
+            ".watch/ack-<reader>.json and suppressed on this reader's later "
+            "watches (at-least-once: duplicates remain possible after an "
+            "interrupted wake or an ack failure)."
+        ),
+    ),
     watch_inbox: bool = typer.Option(
         True,
         "--inbox/--no-inbox",
@@ -565,10 +671,12 @@ def watch(
 
     Success prints one JSON object with ``reason`` equal to ``message``,
     ``waiting``, or ``output``. Timeout prints nothing and exits 2; re-check
-    status after exit 2 because a waiting transition may precede the initial
-    marker snapshot, or a genuine waiting edge may still be inside its settle
-    window at the deadline. Canonical commands bind the watcher to the
-    coordinator process with ``--owner-pid`` plus ``--owner-token``; owner exit
+    status after exit 2 because a genuine waiting edge may still be inside its
+    settle window at the deadline, a park this reader already acknowledged is
+    deliberately silent, and under ``--no-parked`` a transition that preceded
+    the initial marker snapshot is never seen. Canonical commands bind the
+    watcher to the coordinator process with ``--owner-pid`` plus
+    ``--owner-token``; owner exit
     (including PID reuse) exits 4 so a detached shell cannot leave the watcher
     behind.
     """
@@ -578,15 +686,19 @@ def watch(
     deadline = time.monotonic() + timeout
     before = _snapshot_mtimes(directory, pattern)
 
-    if reader is not None:
-        try:
-            _require_safe_reader(reader)
-        except ValueError as exc:
-            typer.echo(str(exc), err=True)
-            raise typer.Exit(code=1) from exc
-        reader_name = reader
-    else:
-        reader_name = os.environ.get("AGENT_NAME", "").strip() or "team-lead"
+    reader_name = (
+        reader
+        if reader is not None
+        else os.environ.get("AGENT_NAME", "").strip() or "team-lead"
+    )
+    # Validate whichever source the identity came from: it names files we
+    # create (the ack store), not only files we read.
+    try:
+        _require_safe_reader(reader_name)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    ack_path = _ack_path(directory, reader_name)
     inbox_path = directory / f"inbox-{reader_name}.jsonl"
     cursor_path = directory / f"inbox-{reader_name}.pos.json"
     inbox_before = _path_identity(inbox_path)
@@ -609,6 +721,28 @@ def watch(
     # each settle independently; a single slot would drop one when another arrives
     # or resumes. Value is the first-seen monotonic time.
     pending_waits: dict[str, float] = {}
+
+    # A watch armed after an agent parked sees no edge, so seed the settle
+    # queue with every actionable marker whose generation this reader has not
+    # acknowledged yet. It then competes under the same message > output >
+    # waiting priority as an edge-triggered wait.
+    # Generations this reader already delivered. Consulted for start-up seeding
+    # AND for every later edge/settle, so a touch or byte-identical rewrite of
+    # an acknowledged marker never re-delivers it. ``--no-parked`` is the raw
+    # edge-only mode and deliberately bypasses the ack entirely.
+    acked = _read_acked(ack_path) if parked else {}
+
+    def _unacked(path: Path) -> _Parked | None:
+        candidate = _parked_candidate(path)
+        if candidate is None or acked.get(candidate.path.name) == candidate.gen:
+            return None
+        return candidate
+
+    if parked:
+        start = time.monotonic()
+        for marker_path in before:
+            if _unacked(Path(marker_path)) is not None:
+                pending_waits[marker_path] = start
 
     while True:
         if _owner_gone(owner_pid, owner_token):
@@ -638,9 +772,9 @@ def watch(
         for changed_path in changed:
             path = Path(changed_path)
             if path.name.startswith("state-") and path.suffix == ".json":
-                agent = _waiting_agent(path)
-                if agent is not None:
-                    waiting.append((agent, changed_path))
+                candidate = _unacked(path)
+                if candidate is not None:
+                    waiting.append((candidate.agent, changed_path))
             else:
                 outputs.append(changed_path)
 
@@ -667,12 +801,11 @@ def watch(
         # window, and wake on the first that has stayed waiting long enough.
         # Iterate in insertion order so the earliest-seen settled wait wins.
         for wpath in list(pending_waits):
-            current = _waiting_agent(Path(wpath))
+            current = _unacked(Path(wpath))
             if current is None:
                 del pending_waits[wpath]
             elif now - pending_waits[wpath] >= _WATCH_SETTLE_SECONDS:
-                _emit_wake({"reason": "waiting", "agent": current, "path": wpath})
-                raise typer.Exit(code=0)
+                _emit_parked_wake(ack_path, current)
         if time.monotonic() >= deadline:
             raise typer.Exit(code=2)
         time.sleep(_WATCH_POLL_SECONDS)

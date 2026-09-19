@@ -19,7 +19,13 @@ from pathlib import Path
 _RUNNING_EVENTS: frozenset[str] = frozenset(
     {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"}
 )
-_WAITING_EVENTS: frozenset[str] = frozenset({"Stop", "SubagentStop"})
+_WAITING_EVENTS: frozenset[str] = frozenset({"Stop"})
+# ``SubagentStop`` is deliberately NOT mapped: it fires when one of the agent's
+# own Task subagents finishes (the agent keeps working), and Claude Code can
+# also fire it in an agent that already parked (e.g. an "away summary" minutes
+# after ``Stop``). Mapping it to ``waiting`` either lied to ``agent_status`` or
+# overwrote the parked ``Stop`` marker with one the watch ignores as churn, so a
+# finished agent could never wake its coordinator. It now writes nothing.
 
 _HOOK_MODULE = "claude_teams.hooks"
 
@@ -102,7 +108,14 @@ def emit(session_dir: Path, agent: str) -> None:
     if state is None:
         return
 
-    marker = {"state": state, "event": event_name, "ts": time.time()}
+    # ``gen`` identifies this exact write so a watcher can acknowledge one park
+    # and still wake for the next one (equality, never timestamp ordering).
+    marker = {
+        "state": state,
+        "event": event_name,
+        "ts": time.time(),
+        "gen": uuid.uuid4().hex,
+    }
     _write_marker_atomic(_marker_file(Path(session_dir), agent), marker)
 
 

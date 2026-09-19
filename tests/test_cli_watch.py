@@ -257,13 +257,17 @@ def test_watch_running_transition_alone_times_out(tmp_path: Path, monkeypatch) -
     assert result.stdout == ""
 
 
-def test_watch_preexisting_waiting_marker_is_not_a_new_edge(
+def test_watch_no_parked_treats_preexisting_waiting_marker_as_no_edge(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """Edge-only mode (``--no-parked``); the default delivers such a marker once
+    per reader — see tests/test_cli_watch_parked.py."""
     monkeypatch.setattr(cli, "_WATCH_POLL_SECONDS", 0.02)
     (tmp_path / "state-worker.json").write_text('{"state":"waiting","event":"Stop"}')
 
-    result = runner.invoke(app, ["watch", str(tmp_path), "--timeout", "0.15"])
+    result = runner.invoke(
+        app, ["watch", str(tmp_path), "--timeout", "0.15", "--no-parked"]
+    )
 
     assert result.exit_code == 2
     assert result.stdout == ""
