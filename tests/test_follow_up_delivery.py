@@ -21,6 +21,7 @@ from typer.testing import CliRunner
 
 from claude_teams import cli, leases, server_simple
 from claude_teams.agent_output import BINDING_BOUND, AgentOutput, BindingResult
+from claude_teams.backends import process_manager
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.process_manager import (
     OWNERSHIP_OURS,
@@ -111,15 +112,36 @@ def _append(path: Path, record: dict) -> None:
 
 
 @pytest.fixture
-def exited_pid() -> int:
-    """PID of a real process that has genuinely exited.
+def exited_child() -> SimpleNamespace:
+    """A real process that has genuinely exited, plus its creation token.
 
-    A real poll/exit-code transition, not a stubbed "dead" — the A3 signal is
-    only worth anything if it is driven by an actual process ending.
+    A real process termination, not a stubbed "dead" — the A3 signal is only
+    worth anything if it is driven by an actual process ending. The token must
+    be captured while the child's liveness is still guaranteed (it holds the
+    pipe open until we close it), so every liveness probe in the test can be
+    pinned to THIS process: once the PID is recycled by an unrelated process —
+    which a host spawning many agents does — the token no longer matches and
+    the probe reports dead rather than inheriting a stranger's liveness.
     """
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    proc.wait()
-    return proc.pid
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE
+    )
+    try:
+        token = process_manager.creation_token(str(proc.pid))
+        assert token, "the creation token must be readable while the child is live"
+    finally:
+        # Reap on the failure path too, so a platform whose token read breaks
+        # does not also leak the child.
+        if proc.stdin is not None:
+            proc.stdin.close()
+        proc.wait()
+    pid = proc.pid
+    # Windows keeps the process object alive while ANY handle to it is open,
+    # and ``Popen`` holds one until it is collected — a probe would then read
+    # the exited child's creation time and call it live. Drop the last
+    # reference here rather than relying on the fixture's frame going away.
+    del proc
+    return SimpleNamespace(pid=pid, token=token)
 
 
 @pytest.fixture
@@ -219,6 +241,38 @@ def _record() -> dict:
     return server_simple._load_agents(SESSION)[0]
 
 
+def _repoint_record_at(child: SimpleNamespace) -> None:
+    """Make the stored record describe ``child`` -- PID *and* creation token.
+
+    Without the token the record's numeric PID is probed bare, so an unrelated
+    live process owning that number on the host reads as our agent.
+    """
+    agent = _record()
+    agent["pid"] = child.pid
+    agent["create_token"] = child.token
+    server_simple._save_agents(SESSION, [agent])
+
+
+def _pin_liveness_to(monkeypatch: pytest.MonkeyPatch, child: SimpleNamespace) -> None:
+    """Supply ``child``'s token to probes that would otherwise go bare.
+
+    The confirmation loop probes the resumed PID without a token (the real
+    backends' handles are tracked in-memory by the process manager; this
+    file's fake backend's are not), which on a PID-recycling host is the one
+    remaining way a stranger's liveness could leak in. Delegates to the real
+    probe -- the exit itself is never faked -- and refuses any handle the test
+    did not set up.
+    """
+    real_health_check = server_simple.process_manager.health_check
+    handle = str(child.pid)
+
+    def health_check(probed: str, expected_token: str | None = None):
+        assert probed == handle, f"unexpected liveness probe for {probed!r}"
+        return real_health_check(probed, expected_token or child.token)
+
+    monkeypatch.setattr(server_simple.process_manager, "health_check", health_check)
+
+
 # ==========================================================================
 # A3 — child liveness as an early-failure signal only
 # ==========================================================================
@@ -226,16 +280,27 @@ def _record() -> dict:
 
 @pytest.mark.asyncio
 async def test_immediately_exiting_child_is_not_confirmed_and_leaves_the_record(
-    env, exited_pid: int, monkeypatch: pytest.MonkeyPatch
+    env, exited_child: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A real process exit drives this, not a mocked confirmation.
+    """A real process termination drives this, not a mocked confirmation.
 
     ``claude --resume <bad-id>`` exits within a second; the returned PID is
     not evidence of anything, so the resume must fail fast and the agent
     record must be left exactly as it was.
+
+    Both liveness decisions are pinned to the fixture's own exited process:
+    the record carries that PID **and** its creation token, so the
+    pre-existing-child probe reads the real termination instead of whatever
+    unrelated process happens to own the record's numeric PID on this host,
+    and the post-resume probe is given the same token so a recycled PID
+    cannot masquerade as our child. Nothing about the outcome is stubbed --
+    ``confirm_delivery`` still observes a genuinely dead child with no
+    receipt on disk.
     """
-    backend = _FakeResumeBackend(handle=str(exited_pid))
+    _repoint_record_at(exited_child)
+    backend = _FakeResumeBackend(handle=str(exited_child.pid))
     _install(monkeypatch, backend)
+    _pin_liveness_to(monkeypatch, exited_child)
     before = dict(_record())
 
     result = await server_simple.follow_up_agent(AGENT, "next prompt", "k22")
@@ -247,6 +312,32 @@ async def test_immediately_exiting_child_is_not_confirmed_and_leaves_the_record(
     assert after["pid"] == before["pid"], "a failed resume must not repoint the record"
     assert after.get("create_token") == before.get("create_token")
     assert server_simple.PENDING_DELIVERY_FIELD not in after
+
+
+@pytest.mark.asyncio
+async def test_a_recycled_pid_cannot_masquerade_as_the_exited_child(
+    env, exited_child: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hardening above, asserted rather than only reasoned about.
+
+    A host spawning many agents can hand our exited child's PID to an
+    unrelated live process. Simulated here at its worst -- the PID is alive
+    AND readable, it just reports someone else's creation token -- the
+    outcome must still be the A3 one. Without the token pinning, this is the
+    intermittent ``agent_busy`` / ``delivery_unconfirmed`` the test used to
+    produce on a busy host.
+    """
+    _repoint_record_at(exited_child)
+    _install(monkeypatch, _FakeResumeBackend(handle=str(exited_child.pid)))
+    _pin_liveness_to(monkeypatch, exited_child)
+    monkeypatch.setattr(process_manager, "creation_token", lambda handle: "a-stranger")
+    monkeypatch.setattr(
+        type(server_simple.process_manager), "_pid_alive", lambda self, handle: True
+    )
+
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k22")
+
+    assert result["reason"] == "resume_not_confirmed"
 
 
 # ==========================================================================

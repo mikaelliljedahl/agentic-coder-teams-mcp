@@ -1573,7 +1573,8 @@ def _watch_command_powershell(
 _DISK_CONTRACT_NOTE = """
 Disk contract: each agent's state is written by an injected lifecycle hook
 to `state-{name}.json` under the session dir, schema
-`{"state": "running" | "waiting", "event": "<hook>", "ts": <float epoch>}`.
+`{"state": "running" | "waiting", "event": "<hook>", "ts": <float epoch>,
+"gen": "<uuid hex, unique per write>"}` (older markers may lack `gen`).
 This file is on disk and survives MCP server restarts; this tool is cheap
 and auto-restarts the server if it had died from host idle timeout. Do not
 tight-poll this tool — use the watch recipe below instead.
@@ -1587,15 +1588,28 @@ that exact command as one harness-tracked task. Never put it in `while true`,
 returned command is already bound to this coordinator's PID and exits when
 that owner disappears. Re-arm only from the live coordinator after a wake.
 The watcher ignores non-actionable churn — `running` hook transitions and
-`SubagentStop` (a worker's own internal Task subagent finishing) — and emits
-one JSON wake record: `reason="message"` for unread inbox data,
-`reason="waiting"` for a marker that settles as waiting, or `reason="output"`
-for a selected output. A waiting marker must persist for a short settle window
+legacy `SubagentStop` markers (a worker's own internal Task subagent finishing;
+current emitters write nothing for that event) — and emits one JSON wake
+record: `reason="message"` for unread inbox data, `reason="waiting"` for a
+marker that settles as waiting, or `reason="output"` for a selected output.
+Priority when several land together: message > output > waiting. A waiting
+marker must persist for a short settle window
 (`WIN_AGENT_TEAMS_WATCH_SETTLE_SECONDS`, default 15s) before it wakes; one that
-resumes `running` within the window is suppressed as a brief park. On a message,
-call `read_messages`; on waiting, call `agent_status` or `check_agent` for the
-status delta. Watch is one-shot: it exits on the first signal, so re-arm it
-after every wake.
+resumes `running` within the window is suppressed as a brief park. A marker
+that was ALREADY waiting when the watch started also wakes it (after the same
+settle window): each park carries a generation id, and a generation this
+reader has delivered is recorded in `<session_dir>/.watch/ack-<reader>.json`
+and suppressed on that reader's later watches (edge or start-up alike), so
+arming late never misses a finished worker and re-arming never re-fires on a
+park you already handled. Delivery is at-least-once, not exactly-once: a
+duplicate is possible after an interrupted wake, an ack write failure (logged
+to stderr, exit still 0), or two concurrent watches for the same reader
+(unsupported — run one). `--no-parked` restores
+edge-only behavior. The reader is the watching agent's own identity
+(`--reader`, else `AGENT_NAME`, else `team-lead`), so a nested lead keeps its
+own ack file. On a message, call `read_messages`; on waiting, call
+`agent_status` or `check_agent` for the status delta. Watch is one-shot: it
+exits on the first signal, so re-arm it after every wake.
 
 - Claude Code coordinator: run the watch as a BACKGROUND command. Its
   completion triggers a harness wake for the idle coordinator; branch on the
@@ -1606,10 +1620,9 @@ after every wake.
   A marker read is useful for `reason="waiting"`; `reason="message"` requires
   `read_messages` because no state marker need have changed.
 
-Timeout exit 2 means no actionable edge settled; re-check status before
-starting the next watch because an agent may already be waiting due to the
-small status-check/watch-baseline race, or a genuine waiting edge may have
-arrived inside the final unfinished settle window.
+Timeout exit 2 means no unacknowledged park settled and no message/output
+arrived; a genuine waiting edge may still have landed inside the final
+unfinished settle window, so re-check status before starting the next watch.
 
 Claude Code lead wake: a `Stop` hook now verifies watcher arming from the
 harness's own `background_tasks` on every lead turn end. When a worker reply is
@@ -3239,7 +3252,14 @@ async def spawn_agent(
     Codex. Never wrap it in a detached or self-restarting shell loop. The
     watcher is one-shot and owner-bound, so the live coordinator re-arms it
     after every wake. Re-check status after timeout exit 2 before mounting the
-    next watch.
+    next watch. Arming late is safe: a marker that was ALREADY waiting when the
+    watch started still wakes it (after the settle window); each park carries
+    a generation id and a generation this reader has delivered is recorded in
+    ``<session_dir>/.watch/ack-<reader>.json`` and suppressed on that reader's
+    later watches. Delivery is at-least-once (a duplicate is possible after an
+    interrupted wake or an ack failure); ``--no-parked`` restores edge-only
+    behavior; wake priority is message > output > waiting; the reader is your
+    own identity, so a nested lead keeps its own ack file.
     """
 
     def _do_spawn() -> dict:

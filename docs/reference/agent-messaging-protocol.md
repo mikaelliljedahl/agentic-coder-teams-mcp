@@ -602,6 +602,7 @@ Everything lives under `~/.claude/agent-sessions/<session-uuid>/`
 | `inbox-{name}.jsonl` | an agent's upstream `send_message` (append); since C3 only the owner's own children can write it (`src/claude_teams/server_simple.py:1332-1333`) | the owner's `read_messages`; watcher (`src/claude_teams/cli.py:223`) |
 | `inbox-{name}.pos.json` | the owner's `read_messages` (`src/claude_teams/server_simple.py:1475`) | owner; watcher (read-only) |
 | `state-{name}.json` | the **worker's own** lifecycle hook process (`src/claude_teams/hooks.py:88-89`) | server status tools; watcher |
+| `.watch/ack-{reader}.json` (+ `.lock`) | the watcher, after delivering a `reason="waiting"` wake | that reader's later watches (suppresses re-delivery of an acknowledged park) |
 | `prompts/{name}.<nonce>.prompt.txt` | server, before a claude-code spawn/resume (`_materialize_prompt`) | the worker itself, as a file read |
 | `operation-leases.json` | server, temp-file + atomic replace (`src/claude_teams/leases.py:save_leases`) | server |
 | `deliveries.json` | server, under `deliveries.lock`, temp-file + atomic replace (`src/claude_teams/delivery_store.py:save_records`) | server (`delivery_status`, `deliver_pending`) |
@@ -1519,6 +1520,31 @@ finishing, while the agent itself is still mid-task.
 non-string `event`, is treated as actionable for backward compatibility
 (`src/claude_teams/cli.py:168-173`).
 
+Current emitters never write a `SubagentStop` marker at all (it is inert in
+`hooks.emit`, see the marker table below); the filter remains for markers left
+by older installs.
+
+### Parked markers and the per-reader acknowledgement
+
+The watch is edge-driven, but a coordinator often arms it *after* a worker
+already parked. So at start (unless `--no-parked`) every marker that matches
+`--pattern` and is actionable per the rule above is registered as a pending
+wait, **unless this reader has already delivered its generation**. Each marker
+written by `hooks.emit` carries `"gen": <uuid hex>`; a legacy marker without
+one is identified by the SHA-256 of its bytes. Delivered generations are kept
+in `<session_dir>/.watch/ack-{reader}.json` as
+`{"acked": {"state-<agent>.json": "<gen>"}}`, updated under a file lock
+(`.lock` sidecar, unique temp file + atomic replace). The ack is written
+**after** the wake JSON is printed, so a crash in between can only cause a
+duplicate, never a lost wake: delivery is **at-least-once**. An ack write
+failure (including a lock timeout) is logged to stderr and does not change the
+exit code. Edge-triggered waits are acknowledged the same way, so a re-armed
+watch never re-fires on a park it already delivered. The ack file lives in a
+subdirectory precisely so no `--pattern`, `*` included, can classify an ack
+write as `reason="output"`. `reader` is the watching agent's own identity
+(`--reader`, else `AGENT_NAME`, else `team-lead`), validated before any path
+is built; a nested lead therefore owns its own ack file.
+
 ### Settle window
 
 An actionable waiting marker is registered with its first-seen monotonic time
@@ -1552,9 +1578,9 @@ drained will re-wake every subsequent watch immediately.
   - `{"reason":"waiting","agent":"<name>","path":"<marker path>"}`
 - **Exit 2** — deadline reached, **nothing printed**
   (`src/claude_teams/cli.py:307-308`). Exit 2 does not mean nothing happened:
-  the docstring notes a waiting transition may precede the initial snapshot, or
-  a genuine edge may still be inside its settle window at the deadline
-  (`src/claude_teams/cli.py:214-216`). Re-check status after exit 2.
+  a genuine edge may still be inside its settle window at the deadline, and a
+  park this reader already acknowledged is deliberately silent. Re-check
+  status after exit 2.
 
 ### `reason="output"` requires a non-default `--pattern`
 
@@ -1582,7 +1608,7 @@ CLI configuration. The hook runs `python -m claude_teams.hooks emit
 | `PreToolUse` | `running` |
 | `PostToolUse` | `running` |
 | `Stop` | `waiting` |
-| `SubagentStop` | `waiting` |
+| `SubagentStop` | *nothing written* |
 
 (`src/claude_teams/hooks.py:19-22`, `44-50`.)
 
@@ -1590,12 +1616,18 @@ Any unrecognized event name writes **nothing** and leaves the prior marker
 intact, as does empty, non-JSON, or non-dict stdin
 (`src/claude_teams/hooks.py:61-89`).
 
-Note the asymmetry that the watcher exists to handle: `SubagentStop` writes a
-`waiting` marker on disk, but the watcher filters it out as non-actionable
-(section 5). Status tools do **not** filter it — `check_agent` and
-`agent_status` will report `state: "waiting"` for a `SubagentStop` marker,
-because `_resolve_agent_state` looks only at `state`, never at `event`
-(`src/claude_teams/server_simple.py:154-182`).
+`SubagentStop` is deliberately inert: it fires when one of the agent's own
+Task subagents finishes (the agent keeps working), and Claude Code can also
+fire it in an agent that already parked (observed: an "away summary" 16
+minutes after `Stop`). Writing `waiting` for it either made `agent_status`
+report a working agent as waiting or overwrote the parked `Stop` marker with
+one the watcher filters out, so a finished agent could never wake its
+coordinator. Markers from older installs may still carry
+`event: "SubagentStop"`; the watcher filters those (section 5) while status
+tools report their `state` as-is.
+
+Every marker also carries `"gen"`, a per-write uuid used by the watcher's
+per-reader acknowledgement (section 5).
 
 ### Wiring per backend
 

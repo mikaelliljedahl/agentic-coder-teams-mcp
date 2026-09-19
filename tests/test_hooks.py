@@ -94,16 +94,17 @@ class TestEmit:
         marker = _read_marker(tmp_path, "worker")
         assert marker["state"] == "waiting"
 
-    def test_emit_maps_subagentstop_to_waiting(
+    def test_emit_subagentstop_writes_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Own-Task-subagent churn (and a late SubagentStop after a park) never
+        touches the marker; see tests/test_hooks_parked_marker.py."""
         payload = json.dumps({"hook_event_name": "SubagentStop"})
         monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
 
         hooks.emit(session_dir=tmp_path, agent="worker")
 
-        marker = _read_marker(tmp_path, "worker")
-        assert marker["state"] == "waiting"
+        assert not _marker_path(tmp_path, "worker").exists()
 
     @pytest.mark.parametrize(
         "event_name", ["PreToolUse", "PostToolUse", "UserPromptSubmit"]
@@ -265,7 +266,6 @@ class TestWriteClaudeSettings:
             "PreToolUse",
             "PostToolUse",
             "Stop",
-            "SubagentStop",
         ):
             assert event in config["hooks"]
 
@@ -312,7 +312,6 @@ class TestWriteClaudeSettings:
             "UserPromptSubmit",
             "PreToolUse",
             "PostToolUse",
-            "SubagentStop",
         ):
             assert len(config["hooks"][event]) == 1, event
             assert (
@@ -397,7 +396,6 @@ class TestCodexHookOverrides:
             "PreToolUse",
             "PostToolUse",
             "Stop",
-            "SubagentStop",
         }
         seen_events = set()
         for value in values:
@@ -491,7 +489,6 @@ _EVENTS = (
     "PreToolUse",
     "PostToolUse",
     "Stop",
-    "SubagentStop",
 )
 
 

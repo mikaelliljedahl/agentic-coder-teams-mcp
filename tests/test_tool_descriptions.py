@@ -188,6 +188,25 @@ async def test_agent_watch_paths_registered_description_has_disk_contract() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["spawn_agent", "agent_watch_paths"])
+async def test_watch_contract_documents_parked_marker_delivery(tool_name: str) -> None:
+    """A coordinator that arms its watch late must learn from the description
+    alone that a parked worker still wakes it, once per reader, at-least-once."""
+    # Docstrings wrap at 79 columns; compare on collapsed whitespace.
+    description = " ".join((await _registered_description(tool_name)).split())
+
+    assert "ALREADY waiting when the watch started" in description
+    assert ".watch/ack-<reader>.json" in description
+    # The qualified sentence, not just the keyword: a consumer must not read
+    # "once per park" as exactly-once.
+    assert "Delivery is at-least-once" in description
+    assert "duplicate is possible after an interrupted wake" in description
+    assert "--no-parked" in description
+    assert "message > output > waiting" in description
+    assert "nested lead keeps its own ack file" in description
+
+
+@pytest.mark.asyncio
 async def test_spawn_agent_description_documents_pi_fast_subtiers() -> None:
     description = await _registered_description("spawn_agent")
 
