@@ -135,6 +135,7 @@ def _discover_pi_model_ids(launcher: list[str]) -> list[str]:
             errors="replace",
             timeout=_MODEL_DISCOVERY_TIMEOUT_S,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
         for line in proc.stdout.splitlines():
             parts = line.split()

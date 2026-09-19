@@ -234,6 +234,7 @@ def _windows_command_lines() -> dict[int, tuple[str, ...]]:
             encoding="utf-8",
             errors="replace",
             timeout=10,
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
         return {}

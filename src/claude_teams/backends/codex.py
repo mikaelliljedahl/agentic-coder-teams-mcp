@@ -65,6 +65,7 @@ def _discover_codex_model_slugs(binary: str) -> list[str]:
             errors="replace",
             timeout=_MODEL_DISCOVERY_TIMEOUT_S,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
         data = json.loads(proc.stdout)
         for model in data.get("models", []):
