@@ -10,10 +10,13 @@ short-circuits to "ours" the moment ``_tracked_alive`` is true, so this
 manager's probe *is* the PID-reuse proof for everything that kills.
 """
 
+import contextlib
 import functools
 import json
 import shlex
 import subprocess
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 
@@ -284,6 +287,12 @@ _TAB_CREATED = {
         "cwd": "/work",
     },
 }
+#: The label every spawn test derives, pinned by the ``_manager`` fixture.
+_REPO_LABEL = "repo"
+_REPO_WORKSPACE_LIST = {
+    "type": "workspace_list",
+    "workspaces": [{"workspace_id": "w3", "label": _REPO_LABEL, "number": 1}],
+}
 _PROCESS_INFO = {
     "type": "pane_process_info",
     "process_info": {
@@ -302,6 +311,10 @@ class _Herdr:
         self.replies: dict[str, dict | BaseException] = {
             "tab_created": _TAB_CREATED,
             "pane_process_info": _PROCESS_INFO,
+            # The default server already holds the agent's repo workspace, so
+            # an ordinary spawn reuses w3 -- the workspace _TAB_CREATED lives
+            # in. Tests that need absence or a read failure override this.
+            "workspace_list": _REPO_WORKSPACE_LIST,
             "ok": {"type": "ok"},
             **replies,
         }
@@ -326,6 +339,11 @@ def _manager(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> pm.HerdrProcess
     monkeypatch.setattr(manager, "log_path", lambda team, agent: tmp_path / "agent.log")
     monkeypatch.setattr(manager, "_ensure_server", lambda: "/run/herdr.sock")
     monkeypatch.setattr(pm, "creation_token", lambda handle: f"token-{handle}")
+    # Pin the derived label: spawn tests are about routing, not about git.
+    monkeypatch.setattr(manager, "_workspace_label", lambda cwd: _REPO_LABEL)
+    monkeypatch.setattr(
+        manager, "_workspace_lock_path", lambda label: tmp_path / f"{label}.lock"
+    )
     return manager
 
 
@@ -1717,3 +1735,703 @@ def test_json_calls_stay_strict(monkeypatch: pytest.MonkeyPatch) -> None:
     manager._run_herdr("tab", "list", expect="ok")
 
     assert seen["errors"] == "strict"
+
+
+# --------------------------------------------------------------------------
+# One workspace per repo (herdr-workspace-per-repo plan tests 1-15)
+# --------------------------------------------------------------------------
+
+
+def _git_says(monkeypatch: pytest.MonkeyPatch, result: object) -> list[list[str]]:
+    """Answer (or raise) ``result`` for the git common-dir probe.
+
+    Label derivation is the only subprocess these tests allow: anything else
+    reaching this seam is the bug, so it fails loudly rather than escaping to
+    the real host.
+
+    The decode policy is asserted here rather than in one case, because it is
+    what makes the undecodable-output fallback reachable at all: under
+    ``errors="replace"`` a broken path would quietly become a label of U+FFFD.
+    """
+    seen: list[list[str]] = []
+
+    def _run(argv: list[str], **kwargs: object) -> object:
+        assert argv, "a subprocess was started with no argv"
+        assert argv[0] == "git", f"unexpected subprocess: {argv}"
+        assert kwargs.get("errors") == "strict", "the git probe must decode strictly"
+        seen.append(argv)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(pm.subprocess, "run", _run)
+    return seen
+
+
+def test_label_is_the_main_checkout_for_a_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worktree must join its repo's workspace, not get one per branch."""
+    manager = pm.HerdrProcessManager()
+    _git_says(monkeypatch, _FakeCompleted(stdout="/home/me/code/portal/.git\n"))
+
+    label = manager._workspace_label("/home/me/code/portal/.claude/worktrees/feat")
+
+    assert label == "portal"
+
+
+def test_label_strips_dot_git_from_a_bare_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare common dir is the repo itself, so only its suffix comes off."""
+    manager = pm.HerdrProcessManager()
+    _git_says(monkeypatch, _FakeCompleted(stdout="/srv/git/portal.git\n"))
+
+    assert manager._workspace_label("/srv/git/portal.git") == "portal"
+
+
+def test_label_keeps_a_dotted_repo_name_that_is_not_dot_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a terminal ``.git`` comes off -- not any suffix at all."""
+    manager = pm.HerdrProcessManager()
+    _git_says(monkeypatch, _FakeCompleted(stdout="/srv/git/portal.data\n"))
+
+    assert manager._workspace_label("/srv/git/portal.data") == "portal.data"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        _FakeCompleted(returncode=128, stderr="not a git repository"),
+        FileNotFoundError("no git"),
+        subprocess.TimeoutExpired(cmd="git", timeout=15.0),
+        _FakeCompleted(stdout="   \n"),
+        # Undecodable path bytes must fall back, not become a label of U+FFFD.
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_label_falls_back_to_the_folder_name(
+    monkeypatch: pytest.MonkeyPatch, answer: object
+) -> None:
+    """Broken or absent git degrades to the folder name, never to a failure."""
+    manager = pm.HerdrProcessManager()
+    _git_says(monkeypatch, answer)
+
+    assert manager._workspace_label("/home/me/scratch/notes") == "notes"
+
+
+def test_label_of_a_rootless_path_is_the_house_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = pm.HerdrProcessManager()
+    _git_says(monkeypatch, FileNotFoundError("no git"))
+
+    assert manager._workspace_label("/") == "agents"
+
+
+@pytest.mark.parametrize(
+    ("folder", "expected"),
+    [
+        ("-weird", "weird"),
+        ("od\x07d", "odd"),
+        ("x" * 300, "x" * 128),
+    ],
+)
+def test_derived_labels_are_sanitised_never_rejected(
+    monkeypatch: pytest.MonkeyPatch, folder: str, expected: str
+) -> None:
+    """A repo cannot be named in a way that fails a spawn (review-2 finding 7)."""
+    manager = pm.HerdrProcessManager()
+    _git_says(monkeypatch, FileNotFoundError("no git"))
+
+    assert manager._workspace_label(f"/home/me/{folder}") == expected
+
+
+def _listing(*entries: object) -> dict:
+    return {"type": "workspace_list", "workspaces": list(entries)}
+
+
+def _ws(workspace_id: str, label: str, number: object = 1) -> dict:
+    return {"workspace_id": workspace_id, "label": label, "number": number}
+
+
+def _resolve(
+    manager: pm.HerdrProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    reply: object,
+    label: str = "portal",
+) -> tuple[object, str | None]:
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        if isinstance(reply, BaseException):
+            raise reply
+        return cast(dict, reply)
+
+    monkeypatch.setattr(manager, "_run_herdr", _run)
+    return manager._resolve_workspace(label)
+
+
+def test_resolution_matches_a_workspace_by_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = pm.HerdrProcessManager()
+    reply = _listing(_ws("w1", "other", 1), _ws("w2", "portal", 2))
+
+    assert _resolve(manager, monkeypatch, reply) == (pm._WorkspaceLookup.MATCH, "w2")
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected"),
+    [
+        # Duplicate labels: the lowest number wins, so repeated spawns converge.
+        ((_ws("w5", "portal", 3), _ws("w2", "portal", 1)), "w2"),
+        # Equal numbers are broken by id, so the choice never flaps.
+        ((_ws("w7", "portal", 1), _ws("w3", "portal", 1)), "w3"),
+        # A number we cannot order by sorts last instead of raising.
+        ((_ws("w9", "portal", None), _ws("w4", "portal", 2)), "w4"),
+        ((_ws("w9", "portal", True), _ws("w4", "portal", 2)), "w4"),
+        ((_ws("w9", "portal", "2"), _ws("w4", "portal", 5)), "w4"),
+    ],
+)
+def test_resolution_is_deterministic_among_duplicates(
+    monkeypatch: pytest.MonkeyPatch, entries: tuple[dict, ...], expected: str
+) -> None:
+    manager = pm.HerdrProcessManager()
+
+    outcome, chosen = _resolve(manager, monkeypatch, _listing(*entries))
+
+    assert (outcome, chosen) == (pm._WorkspaceLookup.MATCH, expected)
+
+
+def test_resolution_reports_an_authoritative_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = pm.HerdrProcessManager()
+    reply = _listing(_ws("w1", "other", 1))
+
+    assert _resolve(manager, monkeypatch, reply) == (pm._WorkspaceLookup.EMPTY, None)
+
+
+def test_resolution_reports_an_empty_server_as_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = pm.HerdrProcessManager()
+
+    assert _resolve(manager, monkeypatch, _listing()) == (
+        pm._WorkspaceLookup.EMPTY,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pm.HerdrCommandError(["herdr", "workspace", "list"], "timeout", "slow"),
+        pm.HerdrCommandError(["herdr", "workspace", "list"], "cli_usage", "bad argv"),
+        pm.HerdrCommandError(["herdr", "workspace", "list"], "malformed", "junk"),
+        {"type": "workspace_list"},
+        {"type": "workspace_list", "workspaces": "nonsense"},
+    ],
+)
+def test_resolution_reports_what_it_could_not_read_as_unknown(
+    monkeypatch: pytest.MonkeyPatch, reply: object
+) -> None:
+    """A listing we could not read is not evidence of absence."""
+    manager = pm.HerdrProcessManager()
+
+    assert _resolve(manager, monkeypatch, reply) == (
+        pm._WorkspaceLookup.UNKNOWN,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        # The one candidate we cannot read is exactly the one that must not
+        # read as absence: creating would duplicate it.
+        (_ws("", "portal", 1),),
+        ({"label": "portal", "number": 1},),
+        ({"workspace_id": 17, "label": "portal", "number": 1},),
+        ("not-an-object",),
+    ],
+)
+def test_an_unreadable_candidate_is_unknown_not_absent(
+    monkeypatch: pytest.MonkeyPatch, entries: tuple[object, ...]
+) -> None:
+    manager = pm.HerdrProcessManager()
+
+    outcome, chosen = _resolve(manager, monkeypatch, _listing(*entries))
+
+    assert (outcome, chosen) == (pm._WorkspaceLookup.UNKNOWN, None)
+
+
+def _workspace_created(workspace_id: str = "w1") -> dict:
+    """The real 0.8.2 shape: the id lives on ``root_pane``, not a workspace key."""
+    return {
+        "type": "workspace_created",
+        "tab": {"tab_id": f"{workspace_id}:t1", "label": "1"},
+        "root_pane": {
+            "pane_id": f"{workspace_id}:p1",
+            "tab_id": f"{workspace_id}:t1",
+            "workspace_id": workspace_id,
+        },
+    }
+
+
+def test_spawn_routes_the_tab_into_the_repo_workspace(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point: an agent's tab lands in its own repo's workspace."""
+    herdr = _Herdr()
+    monkeypatch.setattr(_manager, "_run_herdr", herdr)
+
+    _spawn(_manager, _request, herdr)
+
+    argv = herdr.argv_for("tab", "create")
+    assert argv is not None
+    assert "--workspace" in argv
+    assert argv[argv.index("--workspace") + 1] == "w3"
+    assert _manager._processes["4242"].workspace_id == "w3"
+
+
+def test_spawn_creates_the_repo_workspace_when_another_one_is_active(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bug being fixed: an unqualified create would join the active one.
+
+    A server holding only *someone else's* workspace answers an unqualified
+    ``tab create`` happily -- in the wrong workspace. Absence must therefore
+    create, not fall through.
+    """
+    herdr = _Herdr(workspace_list=_listing(_ws("w8", "other-repo", 1)))
+    herdr.replies["workspace_created"] = _workspace_created("w1")
+    monkeypatch.setattr(_manager, "_run_herdr", herdr)
+
+    _spawn(_manager, _request, herdr)
+
+    create = herdr.argv_for("workspace", "create")
+    assert create is not None
+    assert create[create.index("--label") + 1] == _REPO_LABEL
+    # The agent's tab keeps the agent label; only the workspace is the repo.
+    rename = herdr.argv_for("tab", "rename")
+    assert rename is not None
+    assert rename[-1] == "worker@team"
+    assert herdr.argv_for("tab", "create") is None
+
+
+def test_an_unreadable_listing_keeps_the_legacy_behaviour(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A control-plane hiccup degrades to today's spawn, never to a failure."""
+    herdr = _Herdr(
+        workspace_list=pm.HerdrCommandError(
+            ["herdr", "workspace", "list"], "timeout", "slow"
+        )
+    )
+    monkeypatch.setattr(_manager, "_run_herdr", herdr)
+
+    result = _spawn(_manager, _request, herdr)
+
+    argv = herdr.argv_for("tab", "create")
+    assert argv is not None
+    assert "--workspace" not in argv
+    assert result.process_handle == "4242"
+
+
+def test_an_unreadable_listing_on_a_fresh_server_still_spawns(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """UNKNOWN plus no workspace at all must still reach ``workspace create``."""
+    calls: list[tuple[str, ...]] = []
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        calls.append(args)
+        if args[:2] == ("workspace", "list"):
+            raise pm.HerdrCommandError(
+                ["herdr", "workspace", "list"], "timeout", "slow"
+            )
+        if args[:2] == ("tab", "create"):
+            raise pm.HerdrCommandError(
+                ["herdr", "tab", "create"], "workspace_not_found", "no active workspace"
+            )
+        if expect == "workspace_created":
+            return _workspace_created("w1")
+        if expect == "pane_process_info":
+            return _PROCESS_INFO
+        return {"type": "ok"}
+
+    monkeypatch.setattr(_manager, "_run_herdr", _run)
+
+    result = _manager.spawn_process(
+        _request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code"
+    )
+
+    assert result.process_handle == "4242"
+    assert ("workspace", "create") in [c[:2] for c in calls]
+
+
+def test_an_unreadable_relist_does_not_create_a_duplicate(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EMPTY outside the lock, UNKNOWN inside it: creating could duplicate."""
+    listings: list[object] = [
+        _listing(_ws("w8", "other-repo", 1)),
+        pm.HerdrCommandError(["herdr", "workspace", "list"], "timeout", "slow"),
+    ]
+    calls: list[tuple[str, ...]] = []
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        calls.append(args)
+        if args[:2] == ("workspace", "list"):
+            reply = listings.pop(0) if listings else _listing()
+            if isinstance(reply, BaseException):
+                raise reply
+            return cast(dict, reply)
+        if args[:2] == ("tab", "create"):
+            return _TAB_CREATED
+        if expect == "pane_process_info":
+            return _PROCESS_INFO
+        return {"type": "ok"}
+
+    monkeypatch.setattr(_manager, "_run_herdr", _run)
+
+    _manager.spawn_process(
+        _request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code"
+    )
+
+    assert ("workspace", "create") not in [c[:2] for c in calls]
+
+
+def test_a_non_workspace_error_from_a_targeted_create_propagates(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    herdr = _Herdr(
+        tab_created=pm.HerdrCommandError(
+            ["herdr", "tab", "create"], "error", "disk on fire"
+        )
+    )
+    monkeypatch.setattr(_manager, "_run_herdr", herdr)
+
+    with pytest.raises(pm.HerdrCommandError, match="disk on fire"):
+        _spawn(_manager, _request, herdr)
+
+    assert herdr.argv_for("workspace", "create") is None
+
+
+def test_a_workspace_closed_underneath_us_is_recreated(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The listed workspace can be gone by the time we create the tab."""
+    calls: list[tuple[str, ...]] = []
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        calls.append(args)
+        if args[:2] == ("workspace", "list"):
+            return cast(dict, _REPO_WORKSPACE_LIST)
+        if args[:2] == ("tab", "create"):
+            raise pm.HerdrCommandError(
+                ["herdr", "tab", "create"], "workspace_not_found", "workspace w3 gone"
+            )
+        if expect == "workspace_created":
+            return _workspace_created("w1")
+        if expect == "pane_process_info":
+            return _PROCESS_INFO
+        return {"type": "ok"}
+
+    monkeypatch.setattr(_manager, "_run_herdr", _run)
+
+    result = _manager.spawn_process(
+        _request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code"
+    )
+
+    assert result.process_handle == "4242"
+    assert _manager._processes["4242"].workspace_id == "w1"
+    # It re-listed under the lock before deciding to create.
+    assert [c[:2] for c in calls].count(("workspace", "list")) == 2
+
+
+def test_two_concurrent_spawns_create_one_workspace(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Parallel first-spawns for one repo must not each create a workspace.
+
+    The interleaving is forced, not timed. A barrier on the FIRST listing
+    (outside the lock) makes both threads observe absence; the winner then
+    holds ``workspace create`` open until the loser has *reached the lock*, and
+    the instrumented lock signals exactly that. So the correct implementation
+    never sleeps and never deadlocks, while removing the lock makes the signal
+    impossible: the loser re-lists while w1 is still unpublished and creates a
+    rival. Verified by mutation -- a ``nullcontext`` in place of the file_lock
+    fails this test.
+    """
+    created: list[str] = []
+    tab_creates: list[tuple[str, ...]] = []
+    state = threading.Lock()
+    both_saw_absence = threading.Barrier(2)
+    loser_reached_the_lock = threading.Event()
+    lock_waiters: list[int] = []
+    existing: list[dict] = []
+    seen_first_listing: set[int] = set()
+    queued: list[bool] = []
+    real_file_lock = pm.file_lock
+
+    @contextlib.contextmanager
+    def _instrumented_lock(path: Path, **kwargs: object) -> Iterator[None]:
+        with state:
+            lock_waiters.append(threading.get_ident())
+            second = len(lock_waiters) == 2
+        if second:
+            # Announced BEFORE blocking, so the winner can publish knowing the
+            # loser is queued behind the lock rather than racing it.
+            loser_reached_the_lock.set()
+        with real_file_lock(path):
+            yield
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        if args[:2] == ("workspace", "list"):
+            with state:
+                first = threading.get_ident() not in seen_first_listing
+                seen_first_listing.add(threading.get_ident())
+                listing = _listing(*existing)
+            if first:
+                # Deterministic: neither thread proceeds until both have been
+                # told the workspace does not exist.
+                both_saw_absence.wait(timeout=10)
+            return listing
+        if args[:2] == ("workspace", "create"):
+            # Publish only once the rival is provably queued on the lock. With
+            # no lock nothing ever signals, the bounded wait expires, and the
+            # rival has long since created its own workspace.
+            queued.append(loser_reached_the_lock.wait(timeout=5))
+            with state:
+                workspace_id = f"w{len(created) + 1}"
+                created.append(workspace_id)
+                existing.append(_ws(workspace_id, _REPO_LABEL, len(created)))
+            return _workspace_created(workspace_id)
+        if args[:2] == ("tab", "create"):
+            with state:
+                tab_creates.append(args)
+            return _TAB_CREATED
+        if expect == "pane_process_info":
+            return _PROCESS_INFO
+        return {"type": "ok"}
+
+    monkeypatch.setattr(_manager, "_run_herdr", _run)
+    monkeypatch.setattr(pm, "file_lock", _instrumented_lock)
+    monkeypatch.setattr(pm, "creation_token", lambda handle: f"token-{handle}")
+    failures: list[BaseException] = []
+
+    def _go() -> None:
+        try:
+            _manager.spawn_process(
+                _request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code"
+            )
+        except BaseException as exc:
+            with state:
+                failures.append(exc)
+
+    threads = [threading.Thread(target=_go) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not failures, failures
+    assert not [thread for thread in threads if thread.is_alive()]
+    assert queued == [True], "the second spawn never queued on the creation lock"
+    assert created == ["w1"]
+    # The loser did not create a rival: it joined the workspace that won.
+    assert len(tab_creates) == 1
+    argv = tab_creates[0]
+    assert argv[argv.index("--workspace") + 1] == "w1"
+
+
+def test_the_lock_path_is_a_digest_inside_the_config_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A label is free-form text: it must never become a path component."""
+    monkeypatch.setenv("HERDR_CONFIG_PATH", str(tmp_path / "config.toml"))
+    manager = pm.HerdrProcessManager()
+
+    paths = [
+        manager._workspace_lock_path(label)
+        for label in ("../other", "a/b", "my repo", "räksmörgås", "a/b")
+    ]
+
+    assert all(path.parent == paths[0].parent for path in paths)
+    assert all(path.parent == tmp_path for path in paths)
+    assert len({path.name for path in paths}) == 4  # the repeat shares its path
+    assert all(len(path.name) < 64 for path in paths)
+
+
+def test_the_lock_is_not_shared_across_herdr_sessions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two sessions working on one repo are different servers, not rivals."""
+    monkeypatch.setenv("HERDR_CONFIG_PATH", str(tmp_path / "config.toml"))
+    monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_SESSION", "alpha")
+    alpha = pm.HerdrProcessManager()._workspace_lock_path("portal")
+    monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_SESSION", "beta")
+    beta = pm.HerdrProcessManager()._workspace_lock_path("portal")
+
+    assert alpha != beta
+    assert alpha.parent == beta.parent
+
+
+def test_rollback_closes_the_tab_of_a_workspace_we_created(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Herdr drops a workspace with its last tab, so closing the tab suffices.
+
+    Closing the *workspace* instead would take a tab that another spawn had
+    legitimately added to it in the meantime.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        calls.append(args)
+        if args[:2] == ("workspace", "list"):
+            return _listing(_ws("w8", "other-repo", 1))
+        if expect == "workspace_created":
+            return _workspace_created("w1")
+        if args[:2] == ("pane", "run"):
+            raise pm.HerdrCommandError(["herdr", "pane", "run"], "error", "no shell")
+        return {"type": "ok"}
+
+    monkeypatch.setattr(_manager, "_run_herdr", _run)
+
+    with pytest.raises(pm.HerdrCommandError, match="no shell"):
+        _manager.spawn_process(
+            _request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code"
+        )
+
+    assert ("tab", "close", "w1:t1") in calls
+    assert ("workspace", "close") not in [c[:2] for c in calls]
+    assert _manager._processes == {}
+
+
+def test_provenance_records_the_workspace_and_the_label(
+    _manager: pm.HerdrProcessManager,
+    _request: SpawnRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    herdr = _Herdr()
+    monkeypatch.setattr(_manager, "_run_herdr", herdr)
+
+    _spawn(_manager, _request, herdr)
+
+    log = (tmp_path / "agent.log").read_text(encoding="utf-8")
+    assert "workspace=w3" in log
+    assert f"requested_label={_REPO_LABEL}" in log
+
+
+# --- the escape hatch ---
+
+
+def test_the_sentinel_restores_the_active_workspace_behaviour(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _request: SpawnRequest
+) -> None:
+    """``-`` opts out entirely: no listing, no --workspace, today's spawn."""
+    monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_WORKSPACE", "-")
+    manager = pm.HerdrProcessManager()
+    monkeypatch.setattr(manager, "log_path", lambda team, agent: tmp_path / "agent.log")
+    monkeypatch.setattr(manager, "_ensure_server", lambda: "/run/herdr.sock")
+    monkeypatch.setattr(pm, "creation_token", lambda handle: f"token-{handle}")
+    herdr = _Herdr()
+    monkeypatch.setattr(manager, "_run_herdr", herdr)
+
+    manager.spawn_process(_request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code")
+
+    assert herdr.argv_for("workspace", "list") is None
+    argv = herdr.argv_for("tab", "create")
+    assert argv is not None
+    assert "--workspace" not in argv
+
+
+def test_the_sentinel_on_a_fresh_server_uses_the_legacy_labelling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _request: SpawnRequest
+) -> None:
+    """Opting out must opt out of the repo label too, not half of it."""
+    monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_WORKSPACE", "-")
+    manager = pm.HerdrProcessManager()
+    monkeypatch.setattr(manager, "log_path", lambda team, agent: tmp_path / "agent.log")
+    monkeypatch.setattr(manager, "_ensure_server", lambda: "/run/herdr.sock")
+    monkeypatch.setattr(pm, "creation_token", lambda handle: f"token-{handle}")
+    calls: list[tuple[str, ...]] = []
+
+    def _run(*args: str, expect: str, **kw: object) -> dict:
+        calls.append(args)
+        if args[:2] == ("tab", "create"):
+            raise pm.HerdrCommandError(
+                ["herdr", "tab", "create"], "workspace_not_found", "no active workspace"
+            )
+        if expect == "workspace_created":
+            return _workspace_created("w1")
+        if expect == "pane_process_info":
+            return _PROCESS_INFO
+        return {"type": "ok"}
+
+    monkeypatch.setattr(manager, "_run_herdr", _run)
+
+    result = manager.spawn_process(
+        _request, ["claude"], {"AGENT_NAME": "worker"}, "claude-code"
+    )
+
+    assert result.process_handle == "4242"
+    assert ("workspace", "list") not in [c[:2] for c in calls]
+    create = next(c for c in calls if c[:2] == ("workspace", "create"))
+    assert create[create.index("--label") + 1] == "worker@team"
+
+
+def test_an_override_pins_the_label_a_session_name_would_reject(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Labels are free-form text, so the narrow session language is wrong here."""
+    monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_WORKSPACE", "repo.name")
+    manager = pm.HerdrProcessManager()
+
+    assert manager._workspace_label(str(tmp_path)) == "repo.name"
+
+
+@pytest.mark.parametrize("bad", ["-lead", "wi\x07th", "wi\tth", "x" * 129])
+def test_an_invalid_override_is_rejected_at_construction(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    """An explicit override is a typo the operator wants to hear about."""
+    monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_WORKSPACE", bad)
+
+    with pytest.raises(ValueError, match="workspace"):
+        pm.HerdrProcessManager()
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_override_means_unset(
+    monkeypatch: pytest.MonkeyPatch, blank: str, tmp_path: Path
+) -> None:
+    """Blank is absence, not an invalid label -- as for the session name."""
+    monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_WORKSPACE", blank)
+    manager = pm.HerdrProcessManager()
+    _git_says(monkeypatch, FileNotFoundError("no git"))
+
+    assert manager._workspace_label("/home/me/portal") == "portal"

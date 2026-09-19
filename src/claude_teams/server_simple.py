@@ -15,11 +15,12 @@ import math
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -6357,9 +6358,14 @@ def _wake_binding_status() -> dict[str, str]:
 
     States: ``bound`` (a group names this host process), ``stale`` (a group
     exists but names another process, typically after a restart), ``legacy``
-    (a group with no owner binding at all), ``absent`` (no group in either
-    scope), ``not_applicable`` (this lead is not Claude-hosted, and the hook is
+    (a group with no owner binding at all), ``absent`` (no group in any scanned
+    file), ``not_applicable`` (this lead is not Claude-hosted, and the hook is
     Claude-only), or ``unknown`` (ownership could not be determined).
+
+    Scanned files: the project ``.claude/settings.local.json``, the legacy
+    checked-in project ``.claude/settings.json`` (older installs), and the user
+    ``~/.claude/settings.json``. The file a group sits in never changes its
+    classification.
 
     Purely diagnostic and never raises: every failure degrades to ``unknown``.
     """
@@ -6373,8 +6379,12 @@ def _wake_binding_status() -> dict[str, str]:
             return {"state": "unknown"}
 
         best = "absent"
-        for scope in ("project", "user"):
-            config = _read_json_object(_lead_wake_settings_path(scope))
+        for settings_path in (
+            _lead_wake_settings_path("project"),
+            _legacy_project_settings_path(),
+            _lead_wake_settings_path("user"),
+        ):
+            config = _read_json_object(settings_path)
             groups = (config.get("hooks") or {}).get("Stop") or []
             if not isinstance(groups, list):
                 continue
@@ -6482,9 +6492,107 @@ def _install_member_wake_hook(
 
 
 def _lead_wake_settings_path(scope: str) -> Path:
-    """Return the settings path for ``scope`` (``project`` cwd or ``user`` home)."""
-    base = Path.home() if scope == "user" else Path.cwd()
-    return base / ".claude" / "settings.json"
+    """Return the settings path for ``scope`` (``project`` cwd or ``user`` home).
+
+    Project scope is the personal ``.claude/settings.local.json``, never the
+    checked-in ``.claude/settings.json``: a wake group bakes this machine's
+    absolute paths (and, for the lead, one process's PID/token), so committing
+    it breaks the hook for every other clone and worktree.
+    """
+    if scope == "user":
+        return Path.home() / ".claude" / "settings.json"
+    return Path.cwd() / ".claude" / "settings.local.json"
+
+
+def _legacy_project_settings_path() -> Path:
+    """Return the checked-in project settings older installs wrote into."""
+    return Path.cwd() / ".claude" / "settings.json"
+
+
+def _strip_legacy_project_group(
+    has_group: Callable[[object], bool],
+    strip: Callable[[dict[str, Any]], dict[str, Any]],
+) -> dict[str, str]:
+    """Remove one tool's wake group from the legacy project settings file.
+
+    Returns the additive result fields: ``migrated_from`` when a group was
+    removed, ``legacy_cleanup``/``legacy_path`` when the rewrite failed, and
+    nothing when the file holds no such group — in which case it is not
+    rewritten (or created), so its bytes are untouched.
+    """
+    path = _legacy_project_settings_path()
+    try:
+        config = _read_json_object(path)
+        hooks_map = config.get("hooks")
+        groups = hooks_map.get("Stop") if isinstance(hooks_map, dict) else None
+        if not isinstance(groups, list) or not any(has_group(g) for g in groups):
+            return {}
+        _write_json_object_atomic(path, strip(config))
+    except (OSError, UnicodeDecodeError):
+        return {"legacy_cleanup": "failed", "legacy_path": str(path)}
+    return {"migrated_from": str(path)}
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603
+        ["git", *args],  # noqa: S607
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+        timeout=10,
+    )
+
+
+def _ensure_locally_ignored(path: Path) -> str:
+    """Best-effort: keep ``path`` out of git via the repo-local exclude file.
+
+    Returns ``already_ignored``, ``excluded`` (a pattern was appended to
+    ``.git/info/exclude`` — local, never committed, shared by worktrees),
+    ``tracked`` (the file is already in the index, where no ignore rule
+    applies), ``not_a_repo``, or ``failed``. Never raises.
+    """
+    try:
+        cwd = path.parent.parent
+        top = _git(cwd, "rev-parse", "--show-toplevel")
+        if top.returncode != 0:
+            return "not_a_repo"
+        if _git(cwd, "ls-files", "--error-unmatch", str(path)).returncode == 0:
+            return "tracked"
+        if _git(cwd, "check-ignore", "-q", str(path)).returncode == 0:
+            return "already_ignored"
+        exclude = _git(cwd, "rev-parse", "--git-path", "info/exclude")
+        if exclude.returncode != 0:
+            return "failed"
+        exclude_path = (cwd / exclude.stdout.strip()).resolve()
+        pattern = (
+            "/"
+            + path.resolve().relative_to(Path(top.stdout.strip()).resolve()).as_posix()
+        )
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = (
+            exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+        )
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        exclude_path.write_text(f"{existing}{separator}{pattern}\n", encoding="utf-8")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "failed"
+    return "excluded"
+
+
+def _project_scope_extras(
+    path: Path,
+    has_group: Callable[[object], bool],
+    strip: Callable[[dict[str, Any]], dict[str, Any]],
+    *,
+    ignore: bool,
+) -> dict[str, str]:
+    """Run the project-scope follow-ups after the local file was written."""
+    extras = _strip_legacy_project_group(has_group, strip)
+    if ignore:
+        extras["git_ignore"] = _ensure_locally_ignored(path)
+    return extras
 
 
 def _process_chain_rows(resolution: procinfo.HostResolution) -> list[dict[str, Any]]:
@@ -6522,9 +6630,20 @@ async def install_lead_wake(remove: bool = False, scope: str = "project") -> dic
     wire a **top-level** lead you started yourself (e.g. an interactive
     ``claude`` in a repo).
 
-    - ``scope="project"`` (default) writes the project ``.claude/settings.json``
-      in the current working directory; ``scope="user"`` writes
-      ``~/.claude/settings.json``.
+    - ``scope="project"`` (default) writes the personal, git-ignored
+      ``.claude/settings.local.json`` in the current working directory — NOT the
+      checked-in ``.claude/settings.json``, because the hook bakes this
+      machine's absolute paths and this process's PID and must never be
+      committed. ``scope="user"`` writes ``~/.claude/settings.json``.
+    - Project scope also migrates: a wake group an older version left in the
+      checked-in ``.claude/settings.json`` is removed (``migrated_from`` in the
+      result; commit that removal). If that rewrite fails the install still
+      succeeds with ``legacy_cleanup: "failed"`` + ``legacy_path`` and the next
+      call retries. ``git_ignore`` reports ``already_ignored``, ``excluded``
+      (added to the local ``.git/info/exclude``), ``not_a_repo``, ``failed``,
+      or ``tracked`` — the file is already committed, so no ignore rule helps:
+      tell the user to ``git rm --cached .claude/settings.local.json``.
+      ``remove=True`` never creates a settings file that does not exist.
     - Writes ONLY the ``Stop`` wake group (never the state-marker ``emit`` hooks,
       which are for server-spawned agents). Idempotent: re-running replaces the
       existing wake group in place and never duplicates it; unrelated hooks are
@@ -6555,6 +6674,16 @@ async def install_lead_wake(remove: bool = False, scope: str = "project") -> dic
     if scope not in {"project", "user"}:
         return {"error": f"scope must be 'project' or 'user', got {scope!r}"}
 
+    def _lead_extras(path: Path, *, ignore: bool) -> dict[str, str]:
+        if scope != "project":
+            return {}
+        return _project_scope_extras(
+            path,
+            _group_has_wake_token,
+            lambda config: _install_wake_hook(config, {}, remove=True),
+            ignore=ignore,
+        )
+
     def _do_install() -> dict:  # noqa: PLR0911 - stable refusal/result matrix.
         identity = IDENTITY
 
@@ -6564,7 +6693,8 @@ async def install_lead_wake(remove: bool = False, scope: str = "project") -> dic
             path = _lead_wake_settings_path(scope)
             updated = _install_wake_hook(_read_json_object(path), {}, remove=True)
             try:
-                _write_json_object_atomic(path, updated)
+                if path.exists():
+                    _write_json_object_atomic(path, updated)
             except OSError:
                 return {"success": False, "reason": "settings_write_failed"}
             return {
@@ -6573,6 +6703,7 @@ async def install_lead_wake(remove: bool = False, scope: str = "project") -> dic
                 "path": str(path),
                 "reader": identity,
                 "scope": scope,
+                **_lead_extras(path, ignore=False),
             }
 
         # Resolve every ownership/session prerequisite before computing,
@@ -6637,6 +6768,7 @@ async def install_lead_wake(remove: bool = False, scope: str = "project") -> dic
                 "This binding is conversation-scoped and does not survive a "
                 "restart; re-run install_lead_wake after restarting the lead."
             ),
+            **_lead_extras(path, ignore=True),
         }
 
     return await run_blocking(_do_install)
@@ -6668,8 +6800,19 @@ async def install_member_wake(
       and the joined session dir, never the ``member_token``.
     - ``scope="user"`` (default) writes ``~/.claude/settings.json`` — the file
       an interactive/Desktop member session actually reads. ``scope="project"``
-      writes ``.claude/settings.json`` under the MCP server's cwd, which is
-      only correct when the member session runs in that same repo.
+      writes the personal, git-ignored ``.claude/settings.local.json`` under
+      the MCP server's cwd (never the checked-in ``.claude/settings.json`` —
+      the hook bakes machine-specific paths), which is only correct when the
+      member session runs in that same repo. It also removes a member group an
+      older version left in ``.claude/settings.json`` (``migrated_from``;
+      ``legacy_cleanup: "failed"`` + ``legacy_path`` when that rewrite fails;
+      the next call retries) and reports ``git_ignore``: ``already_ignored``,
+      ``excluded`` (added to the local ``.git/info/exclude``), ``not_a_repo``,
+      ``failed``, or ``tracked`` (already committed — the user must
+      ``git rm --cached`` it).
+    - ``remove=True`` needs only a well-formed ``joined_session_id``; the
+      joined session may already be gone. A settings I/O failure returns
+      ``{"success": false, "reason": "settings_write_failed"}``.
     - Shared-home caveat: at ``scope="user"`` this hook fires in EVERY Claude
       session under that OS home. If the lead runs under the same home as the
       member, the hook also fires in the lead's own session (it cannot tell it
@@ -6696,7 +6839,11 @@ async def install_member_wake(
 
     def _do_install() -> dict:
         sid, refusal = _validate_join_session_id(joined_session_id)
-        if refusal is not None:
+        # Removal needs only a well-formed id: a stale hook is exactly the case
+        # where the joined session may already be gone.
+        if refusal is not None and not (
+            remove and refusal.get("reason") == "session_not_found"
+        ):
             return refusal
         joined_dir = _session_dir(sid)
         wake_matcher = hooks._member_wake_hook_matcher(joined_dir, member)
@@ -6704,14 +6851,26 @@ async def install_member_wake(
         updated = _install_member_wake_hook(
             _read_json_object(path), wake_matcher, remove=remove
         )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+        try:
+            if not remove or path.exists():
+                _write_json_object_atomic(path, updated)
+        except OSError:
+            return {"success": False, "reason": "settings_write_failed"}
+        extras: dict[str, str] = {}
+        if scope == "project":
+            extras = _project_scope_extras(
+                path,
+                _group_has_member_wake_token,
+                lambda config: _install_member_wake_hook(config, {}, remove=True),
+                ignore=not remove,
+            )
         return {
             "action": "removed" if remove else "installed",
             "path": str(path),
             "member": member,
             "joined_session_dir": str(joined_dir),
             "scope": scope,
+            **extras,
         }
 
     return await run_blocking(_do_install)

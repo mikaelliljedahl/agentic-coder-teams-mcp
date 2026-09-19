@@ -277,10 +277,18 @@ tab**, labelled `<agent>@<team>` — the Linux counterpart of the Windows Termin
 tab grouping. Herdr also recognises the agent inside the pane, so its own
 idle/working/blocked view works on agents spawned this way.
 
+Tabs are grouped **one workspace per repository**: an agent's tab goes into the
+workspace labelled after the repo its `cwd` belongs to (the *main* checkout, so
+every git worktree of one repo shares that repo's workspace), creating it if it
+does not exist. A workspace you created yourself with that label is reused, so
+agents land beside your own tabs rather than in a second space. Outside a git
+repo the folder name is used.
+
 | Setting | Effect |
 | --- | --- |
 | `WIN_AGENT_TEAMS_LINUX_LAUNCHER=herdr` | Select the launcher. Opt-in only: running inside Herdr does **not** switch launchers by itself. |
 | `WIN_AGENT_TEAMS_HERDR_SESSION=<name>` | Pin a named Herdr session. Unset uses the default session. |
+| `WIN_AGENT_TEAMS_HERDR_WORKSPACE=<label>` | Put every agent of this process in one workspace instead of one per repo. `-` restores the old behaviour (whatever workspace is active). |
 
 A running Herdr server is reused. When that server is the session you are
 attached to, agent tabs appear in your window; when it is a headless server with
@@ -537,9 +545,12 @@ only for an agent expected to spawn and wait for its own children. The flag does
 not grant or restrict spawning. For a **top-level** lead you start yourself,
 wire it in one step with the `install_lead_wake` MCP tool:
 
-- `install_lead_wake()` writes the wake `Stop` hook into the project
-  `.claude/settings.json` in the lead's cwd (`scope="user"` targets
-  `~/.claude/settings.json`). It writes only the wake group, is idempotent, and
+- `install_lead_wake()` writes the wake `Stop` hook into the personal,
+  git-ignored `.claude/settings.local.json` in the lead's cwd (`scope="user"`
+  targets `~/.claude/settings.json`) — never the checked-in
+  `.claude/settings.json`, because the hook bakes machine-specific paths and a
+  PID. A group an older version left in `.claude/settings.json` is migrated
+  out on the next install. It writes only the wake group, is idempotent, and
   preserves unrelated hooks.
 - `install_lead_wake(remove=true)` removes only the wake group.
 
@@ -579,7 +590,7 @@ drives the decision function with faked payloads). Run it with your own Claude
 Code and model configuration; record harness version, model, sender, and wake
 content per run — do not treat this document as evidence the run occurred.
 
-1. In a repo cwd, run `install_lead_wake` and confirm `.claude/settings.json` has
+1. In a repo cwd, run `install_lead_wake` and confirm `.claude/settings.local.json` has
    the `Stop` wake group and `win-agent-teams session-dir` reports the lead
    identity.
 2. Start an interactive `claude` lead; `spawn_agent` a worker; go idle.

@@ -206,6 +206,58 @@ class TestWakeBindingStatus:
 
         assert status["state"] == "bound"
 
+    @pytest.mark.parametrize(
+        ("owner_pid", "token", "expected"),
+        [(4242, "tok", "bound"), (19412, "other", "stale"), (None, None, "legacy")],
+    )
+    def test_project_local_file_is_scanned_with_unchanged_classification(
+        self,
+        scopes: SimpleNamespace,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        owner_pid: int | None,
+        token: str | None,
+        expected: str,
+    ) -> None:
+        monkeypatch.setattr(procinfo, "resolve_nearest_host", _claude_host)
+        monkeypatch.setattr(
+            server_simple.process_manager_module,
+            "creation_token",
+            lambda _pid: "tok",
+        )
+        _install_group(
+            scopes.project / ".claude" / "settings.local.json",
+            session_dir=tmp_path,
+            owner_pid=owner_pid,
+            token=token,
+        )
+
+        assert server_simple._wake_binding_status()["state"] == expected
+
+    def test_bound_local_group_wins_over_stale_legacy_project_group(
+        self, scopes: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(procinfo, "resolve_nearest_host", _claude_host)
+        monkeypatch.setattr(
+            server_simple.process_manager_module,
+            "creation_token",
+            lambda _pid: "tok",
+        )
+        _install_group(
+            scopes.project / ".claude" / "settings.json",
+            session_dir=tmp_path,
+            owner_pid=19412,
+            token="other",
+        )
+        _install_group(
+            scopes.project / ".claude" / "settings.local.json",
+            session_dir=tmp_path,
+            owner_pid=4242,
+            token="tok",
+        )
+
+        assert server_simple._wake_binding_status()["state"] == "bound"
+
     def test_non_claude_host_is_not_applicable(
         self, scopes: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
     ) -> None:

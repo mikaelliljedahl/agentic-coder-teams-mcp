@@ -122,7 +122,8 @@ def test_disk_contract_note_documents_lead_wake_hook() -> None:
 def test_install_lead_wake_description_documents_contract() -> None:
     description = server_simple.install_lead_wake.__doc__ or ""
 
-    assert ".claude/settings.json" in description
+    assert ".claude/settings.local.json" in description
+    assert "migrated_from" in description
     assert "Idempotent" in description
     assert "remove=True" in description
     assert "WIN_AGENT_TEAMS_LEAD_WAKE=0" in description
@@ -225,3 +226,19 @@ async def test_spawn_agent_description_documents_pi_fast_subtiers() -> None:
         assert line is not None, f"{tier} missing from the registered description"
         assert f"``{slug}``" in line
         assert f"@ {effort}" in line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["install_lead_wake", "install_member_wake"])
+async def test_wake_install_descriptions_document_local_project_file(
+    tool_name: str,
+) -> None:
+    description = await _registered_description(tool_name)
+
+    assert ".claude/settings.local.json" in description
+    assert "migrated_from" in description
+    assert "legacy_cleanup" in description
+    assert "git_ignore" in description
+    assert "tracked" in description
+    assert "~/.claude/settings.json" in description
+    assert "settings_write_failed" in description
