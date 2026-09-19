@@ -561,7 +561,9 @@ class TestInstallMemberWakeTool:
 
         result = asyncio.run(ss.install_member_wake(sid, MEMBER, scope="project"))
 
-        assert Path(result["path"]) == _isolated.work / ".claude" / "settings.json"
+        assert Path(result["path"]) == (
+            _isolated.work / ".claude" / "settings.local.json"
+        )
 
     def test_invalid_session_id_errors(self, _isolated: SimpleNamespace) -> None:
         # Case 12: bad joined_session_id -> error, nothing written.

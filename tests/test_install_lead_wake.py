@@ -109,7 +109,7 @@ class TestInstallLeadWakeTool:
     ) -> None:
         result = asyncio.run(ss.install_lead_wake())
 
-        settings = _isolated.work / ".claude" / "settings.json"
+        settings = _isolated.work / ".claude" / "settings.local.json"
         assert settings.exists()
         assert result["success"] is True
         assert Path(result["path"]) == settings
@@ -163,7 +163,9 @@ class TestInstallLeadWakeTool:
         asyncio.run(ss.install_lead_wake())
 
         config = json.loads(
-            (_isolated.work / ".claude" / "settings.json").read_text(encoding="utf-8")
+            (_isolated.work / ".claude" / "settings.local.json").read_text(
+                encoding="utf-8"
+            )
         )
         wake = [c for c in _stop_commands(config) if "claude_teams.lead_wake" in c]
         assert len(wake) == 1
@@ -174,7 +176,9 @@ class TestInstallLeadWakeTool:
 
         assert result["action"] == "removed"
         config = json.loads(
-            (_isolated.work / ".claude" / "settings.json").read_text(encoding="utf-8")
+            (_isolated.work / ".claude" / "settings.local.json").read_text(
+                encoding="utf-8"
+            )
         )
         stop = config.get("hooks", {}).get("Stop", [])
         assert not any(
@@ -351,7 +355,7 @@ class TestInstallLeadWakeTool:
     def test_reinstall_hands_ownership_to_last_successful_installer(
         self, _isolated: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        settings = _isolated.work / ".claude" / "settings.json"
+        settings = _isolated.work / ".claude" / "settings.local.json"
         settings.parent.mkdir()
         settings.write_text(
             json.dumps(
@@ -392,7 +396,7 @@ class TestInstallLeadWakeTool:
         self, _isolated: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         asyncio.run(ss.install_lead_wake())
-        settings = _isolated.work / ".claude" / "settings.json"
+        settings = _isolated.work / ".claude" / "settings.local.json"
         original = settings.read_bytes()
         original_replace = Path.replace
         replace_failure = OSError("replace failed")
