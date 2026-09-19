@@ -24,36 +24,46 @@ Two unpinned real-OS probes leak into the test:
    where PID 123 is a live process the caller may signal (containers, low-PID
    reuse), it reads *alive*, no `waiting` marker exists, so prep returns
    `_FollowUpPrep(wait_reason="agent_busy")` — exactly the observed failure.
-2. **Post-resume child liveness.** `exited_pid` is a genuinely exited PID, and
+2. **Post-resume child liveness (in this test double only).** `exited_pid` is
+   a genuinely exited PID, and
    `confirm_delivery(child_alive=lambda: process_manager.health_check(str(new_pid))[0])`
    passes **no** `expected_token`, so a PID reused by a live process between
-   `proc.wait()` and the probe reads alive → `scan_expired`/`unconfirmed`
-   instead of `resume_not_confirmed`. Not the reason seen, but the same class
-   of flake and reachable on the same busy host.
+   `proc.wait()` and the probe reads alive → `scan_expired`/`delivery_unconfirmed`
+   instead of `resume_not_confirmed`. This is **not** a demonstrated production
+   defect: the built-in backends resume through `process_manager.spawn_process`,
+   which tracks the child in `_processes`, so confirmation hits the tracked
+   `Popen.poll()`/pane branch before the bare-PID fallback. It is reachable
+   here because `_FakeResumeBackend` returns an untracked handle. Test-only
+   fix; no production change (see plan-review finding 5).
 
 ## Proposed design
 
 Keep the real process exit (the docstring's intent), pin the two probes:
 
-- Change the `exited_pid` fixture to capture the child's `creation_token`
-  **while it is still alive**, and return `(pid, token)` — or keep returning
-  the pid and expose the token via a small `SimpleNamespace`. The token is read
-  from `/proc/<pid>` start time on Linux, so it must be read before `wait()`.
-- In the test, install a `health_check` wrapper on
-  `server_simple.process_manager` that:
-  - returns `(False, "dead")` for the stale record handle `"123"` (matching
-    `_dead_agent`, the convention the rest of the file already uses), and
-  - delegates to the **real** `process_manager.health_check(handle,
-    expected_token=<captured token>)` for the exited child handle.
+Keep a real process termination, pin both probes to *that* process (revised
+per plan-review findings 2 and 3):
 
-  With the token pinned, a reused PID reports dead (`pid reused (token
-  mismatch)`), and the real `poll`/exit transition still drives the result.
+- Rename the fixture to `exited_child` and have it capture the child's
+  `creation_token` **while it is still alive** (the token is unreadable once
+  the process is gone), returning `SimpleNamespace(pid, token)`. Assert the
+  token is non-`None` rather than silently degrading to bare-PID liveness.
+- **Repoint the agent record** at that process — `pid` *and* `create_token` —
+  before the call. `_agent_alive` then probes with a token, so the ambient
+  occupant of an unrelated numeric PID is never consulted; the fixture's own
+  real termination decides. No special-casing of the unrelated `"123"`
+  sentinel, and no stub on that path at all.
+- For the confirmation probe, which calls `health_check` without a token,
+  install a narrow wrapper that captures the **original bound**
+  `health_check` first (otherwise delegation recurses), supplies the captured
+  token when none was passed, and asserts the probed handle is the expected
+  one rather than inventing answers for unexpected handles.
 
-Fallback if the token cannot be read on some platform (`creation_token`
-returns `None` before `wait()`): the delegate then behaves as today's bare PID
-liveness; to stay deterministic we assert the token was captured in the
-fixture (`pytest.skip` is not needed — token read is supported on both CI
-platforms).
+With the token pinned, a recycled PID reports dead (`pid reused (token
+mismatch)`). The A3 property retained is "a real child was created, really
+terminated, and confirmation observed it dead with no receipt" — it exercises
+the token-aware OS-PID fallback, not the manager's tracked-`Popen` branch
+(the fixture process is not registered in `_processes`). Token parsing and
+reuse semantics themselves are covered by `tests/test_pid_reuse.py`.
 
 ## Files affected
 
@@ -67,9 +77,14 @@ platforms).
 
 ## Test cases
 
-- The hardened test still passes and still fails if `confirm_delivery`'s
-  settle-window branch is broken.
-- Repeat runs (`-n` repeats / `--count`-style loop by rerunning pytest) stay
-  green.
-- Simulated reuse: with the token pinned, a live PID substituted for the
-  exited one still yields `resume_not_confirmed`.
+- **Red evidence (scratch, not committed):** with the ambient record PID
+  forced alive, the unmodified test yields `agent_busy` — the exact observed
+  failure; with the post-resume probe forced alive, it yields
+  `delivery_unconfirmed`.
+- The hardened test still passes and still asserts the resume was attempted,
+  the record's `pid`/`create_token` are unchanged, and no pending-delivery
+  field was left behind.
+- **Green evidence:** with `creation_token` returning a stranger's token and
+  `_pid_alive` forced `True` (a fully recycled PID), the hardened test still
+  yields `resume_not_confirmed`.
+- Repeat runs stay green; the full suite and all four gates are green.
