@@ -53,3 +53,25 @@ uv run ruff check .            # All checks passed!
 uv run ty check                # All checks passed!
 uv run pytest                  # 1636 passed, 4 skipped
 ```
+
+## CI follow-up (Windows)
+
+The first CI run on this branch was red on `tests-windows` — and so was the
+run on `624a476`, before any of this work. `tests/test_cli_watch_parked.py`
+stacked two `skipif` decorators:
+
+```python
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+```
+
+`skipif` conditions are evaluated at **import** time, so `os.geteuid` — which
+does not exist on Windows — raised during collection before the `os.name`
+skip could apply, and the whole suite failed to collect (1610 items / 1
+error). Merged into a single guard using `getattr(os, "geteuid", ...)`;
+behaviour on POSIX is unchanged.
+
+Windows-specific hardening of the fixture itself: after `wait()` the `Popen`
+still holds a process handle, and Windows keeps the process object (and its
+readable creation time) alive while any handle is open — a probe would then
+read our exited child as live. The fixture drops that reference explicitly.

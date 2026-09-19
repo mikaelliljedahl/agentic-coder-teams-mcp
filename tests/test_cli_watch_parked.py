@@ -232,8 +232,13 @@ class TestAckStore:
         _expect_wake(_watch(tmp_path), tmp_path)
         assert _ack(tmp_path) == {"acked": {"state-worker.json": "g1"}}
 
-    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+    # One guard, not two: ``skipif`` conditions are evaluated at import time,
+    # and ``os.geteuid`` does not exist on Windows — a second decorator would
+    # raise during collection before the ``os.name`` skip could apply.
+    @pytest.mark.skipif(
+        os.name == "nt" or getattr(os, "geteuid", lambda: -1)() == 0,
+        reason="POSIX permission bits, and root ignores them",
+    )
     def test_ack_write_failure_never_suppresses_the_wake(self, tmp_path: Path) -> None:
         _park(tmp_path)
         ack_dir = tmp_path / ".watch"

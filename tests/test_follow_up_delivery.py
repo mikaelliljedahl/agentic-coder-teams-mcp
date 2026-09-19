@@ -135,7 +135,13 @@ def exited_child() -> SimpleNamespace:
         if proc.stdin is not None:
             proc.stdin.close()
         proc.wait()
-    return SimpleNamespace(pid=proc.pid, token=token)
+    pid = proc.pid
+    # Windows keeps the process object alive while ANY handle to it is open,
+    # and ``Popen`` holds one until it is collected — a probe would then read
+    # the exited child's creation time and call it live. Drop the last
+    # reference here rather than relying on the fixture's frame going away.
+    del proc
+    return SimpleNamespace(pid=pid, token=token)
 
 
 @pytest.fixture
