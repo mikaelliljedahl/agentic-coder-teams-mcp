@@ -38,14 +38,14 @@ Two unpinned real-OS probes leak into the test:
 
 ## Proposed design
 
-Keep the real process exit (the docstring's intent), pin the two probes:
-
 Keep a real process termination, pin both probes to *that* process (revised
 per plan-review findings 2 and 3):
 
 - Rename the fixture to `exited_child` and have it capture the child's
-  `creation_token` **while it is still alive** (the token is unreadable once
-  the process is gone), returning `SimpleNamespace(pid, token)`. Assert the
+  `creation_token` **while its liveness is still guaranteed** (the child
+  holds a pipe open until the fixture closes it; after exit the token may
+  become unreadable, and on Windows can linger only while a process handle is
+  retained), returning `SimpleNamespace(pid, token)`. Assert the
   token is non-`None` rather than silently degrading to bare-PID liveness.
 - **Repoint the agent record** at that process — `pid` *and* `create_token` —
   before the call. `_agent_alive` then probes with a token, so the ambient
@@ -67,13 +67,15 @@ reuse semantics themselves are covered by `tests/test_pid_reuse.py`.
 
 ## Files affected
 
-- `tests/test_follow_up_delivery.py` (fixture + one test)
+- `tests/test_follow_up_delivery.py` (fixture, two helpers, one hardened
+  test, one new regression test)
 
 ## Risks
 
 - Over-stubbing would turn the test into a mock-driven one, losing the A3
   signal. Mitigated by delegating to the real `health_check` for the child.
-- The `"123"` sentinel is duplicated; kept consistent with `_dead_agent`.
+- All `"123"`-sentinel special-casing is deliberately absent: the record is
+  repointed instead, so no probe consults an ambient host PID.
 
 ## Test cases
 
@@ -87,4 +89,6 @@ reuse semantics themselves are covered by `tests/test_pid_reuse.py`.
 - **Green evidence:** with `creation_token` returning a stranger's token and
   `_pid_alive` forced `True` (a fully recycled PID), the hardened test still
   yields `resume_not_confirmed`.
+- **Committed regression test:** `test_a_recycled_pid_cannot_masquerade_as_the_exited_child`
+  makes the green evidence durable instead of narrative.
 - Repeat runs stay green; the full suite and all four gates are green.

@@ -116,21 +116,25 @@ def exited_child() -> SimpleNamespace:
     """A real process that has genuinely exited, plus its creation token.
 
     A real process termination, not a stubbed "dead" — the A3 signal is only
-    worth anything if it is driven by an actual process ending. The token is
-    read while the child is still live (it is unreadable afterwards) so every
-    liveness probe in the test can be pinned to THIS process: once the PID is
-    recycled by an unrelated process — which a host spawning many agents does
-    — the token no longer matches and the probe reports dead rather than
-    inheriting a stranger's liveness.
+    worth anything if it is driven by an actual process ending. The token must
+    be captured while the child's liveness is still guaranteed (it holds the
+    pipe open until we close it), so every liveness probe in the test can be
+    pinned to THIS process: once the PID is recycled by an unrelated process —
+    which a host spawning many agents does — the token no longer matches and
+    the probe reports dead rather than inheriting a stranger's liveness.
     """
     proc = subprocess.Popen(
         [sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE
     )
-    token = process_manager.creation_token(str(proc.pid))
-    assert token, "the creation token must be readable while the child is live"
-    if proc.stdin is not None:
-        proc.stdin.close()
-    proc.wait()
+    try:
+        token = process_manager.creation_token(str(proc.pid))
+        assert token, "the creation token must be readable while the child is live"
+    finally:
+        # Reap on the failure path too, so a platform whose token read breaks
+        # does not also leak the child.
+        if proc.stdin is not None:
+            proc.stdin.close()
+        proc.wait()
     return SimpleNamespace(pid=proc.pid, token=token)
 
 
@@ -302,6 +306,32 @@ async def test_immediately_exiting_child_is_not_confirmed_and_leaves_the_record(
     assert after["pid"] == before["pid"], "a failed resume must not repoint the record"
     assert after.get("create_token") == before.get("create_token")
     assert server_simple.PENDING_DELIVERY_FIELD not in after
+
+
+@pytest.mark.asyncio
+async def test_a_recycled_pid_cannot_masquerade_as_the_exited_child(
+    env, exited_child: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hardening above, asserted rather than only reasoned about.
+
+    A host spawning many agents can hand our exited child's PID to an
+    unrelated live process. Simulated here at its worst -- the PID is alive
+    AND readable, it just reports someone else's creation token -- the
+    outcome must still be the A3 one. Without the token pinning, this is the
+    intermittent ``agent_busy`` / ``delivery_unconfirmed`` the test used to
+    produce on a busy host.
+    """
+    _repoint_record_at(exited_child)
+    _install(monkeypatch, _FakeResumeBackend(handle=str(exited_child.pid)))
+    _pin_liveness_to(monkeypatch, exited_child)
+    monkeypatch.setattr(process_manager, "creation_token", lambda handle: "a-stranger")
+    monkeypatch.setattr(
+        type(server_simple.process_manager), "_pid_alive", lambda self, handle: True
+    )
+
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "k22")
+
+    assert result["reason"] == "resume_not_confirmed"
 
 
 # ==========================================================================

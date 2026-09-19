@@ -12,6 +12,9 @@ finding 5).
   `create_token` to the exited child's, so `_agent_alive` probes
   token-aware and never consults whatever process owns the old `123`
   sentinel on the host.
+- `test_a_recycled_pid_cannot_masquerade_as_the_exited_child`: the reuse
+  simulation as a permanent test — the PID alive and readable but reporting a
+  stranger's token — still expecting `resume_not_confirmed`.
 - `_pin_liveness_to(monkeypatch, child)`: captures the **original bound**
   `health_check` before patching (no recursion), supplies the captured token
   when the confirmation loop probes without one, and asserts the probed
@@ -37,7 +40,7 @@ may signal it.
 
 ## Deviations from the plan
 
-Adopted plan-review findings 2–5: record repointing instead of special-casing
+Adopted plan-review findings 2–6: record repointing instead of special-casing
 `"123"`, original-`health_check` capture, unexpected-handle assertion, an
 asserted-non-`None` token, and no production change. The plan was revised in
 place before coding.
@@ -48,5 +51,5 @@ place before coding.
 uv run ruff format --check .   # 85 files already formatted
 uv run ruff check .            # All checks passed!
 uv run ty check                # All checks passed!
-uv run pytest                  # 1635 passed, 4 skipped
+uv run pytest                  # 1636 passed, 4 skipped
 ```
