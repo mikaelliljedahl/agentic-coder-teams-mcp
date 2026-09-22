@@ -76,3 +76,17 @@ An additional isolated tmux server (`-L watnestedfix`, session `smoke`) hosted
 `1.2`. The child registry record has `spawned_by: nested-tmux-parent`, confirming
 that inherited `TMUX` and target context kept the second-level spawn on the same
 server.
+
+## Follow-up: Windows CI fix
+
+`tests-windows` failed six Linux-propagation tests (Codex `-c` env override and
+the Claude/Pi MCP config writers). `nested_linux_launcher_env()` is deliberately
+empty on Windows, so those tests were asserting POSIX-host behaviour on a
+Windows runner. The shared TOML escaping and config-writer paths are
+platform-independent, so rather than skipping them on Windows, the host check
+moved behind a private `_launcher_host_is_windows()` seam and the tests pin it
+via a `posix_launcher_host` fixture (`tests/conftest.py`). The Windows-disabled
+test now patches the same seam instead of `os.name`, which would also flip
+unrelated call-time checks such as `filelock`. Red: the fixture raised
+`AttributeError` before the seam existed; green: 90/90 focused, full suite
+1684 passed / 4 skipped, and all four gates clean on Linux.

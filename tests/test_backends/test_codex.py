@@ -439,6 +439,7 @@ class TestCodexMcpIdentity:
             "AGENT_PARENT_NAME": request.lead_session_id,
         }
 
+    @pytest.mark.usefixtures("posix_launcher_host")
     def test_build_resume_command_injects_identity_env_override(
         self, _make_request, monkeypatch
     ):
@@ -453,6 +454,7 @@ class TestCodexMcpIdentity:
         assert 'WIN_AGENT_TEAMS_LINUX_LAUNCHER = "herdr"' in token
         assert "codex-session-123" in cmd
 
+    @pytest.mark.usefixtures("posix_launcher_host")
     def test_identity_override_inherits_nested_launcher_env(
         self, _make_request, monkeypatch
     ):
@@ -471,6 +473,7 @@ class TestCodexMcpIdentity:
         assert parsed["AGENT_NAME"] == "worker"
         assert parsed["AGENT_SESSION_ID"] == "team"
 
+    @pytest.mark.usefixtures("posix_launcher_host")
     def test_launcher_override_supports_toml_special_characters(
         self, _make_request, monkeypatch
     ):
@@ -487,6 +490,7 @@ class TestCodexMcpIdentity:
         assert parsed["WIN_AGENT_TEAMS_HERDR_WORKSPACE"] == workspace
         assert parsed["AGENT_NAME"] == "worker"
 
+    @pytest.mark.usefixtures("posix_launcher_host")
     def test_launcher_override_rejects_non_unicode_scalar(
         self, _make_request, monkeypatch
     ):

@@ -28,3 +28,17 @@ def _clear_inherited_agent_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "")
     monkeypatch.setattr(server_simple, "IDENTITY", server_simple.ROOT_LEAD_NAME)
     monkeypatch.setattr(server_simple, "_IDENTITY_UNRESOLVED", False)
+
+
+@pytest.fixture
+def posix_launcher_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Treat the host as POSIX for nested Linux-launcher env propagation.
+
+    ``nested_linux_launcher_env`` is deliberately empty on Windows, so tests of
+    the Linux propagation path must pin the host predicate instead of relying
+    on the CI runner's OS. Patching ``os.name`` itself would also flip
+    unrelated call-time checks (e.g. ``filelock``) and break on Windows.
+    """
+    from claude_teams.backends import process_manager
+
+    monkeypatch.setattr(process_manager, "_launcher_host_is_windows", lambda: False)

@@ -116,6 +116,7 @@ def test_pi_config_distinct_from_claude_config(isolated):
     assert "CLAUDE_TEAMS_PERMISSION_MODE" not in centry["env"]
 
 
+@pytest.mark.usefixtures("posix_launcher_host")
 @pytest.mark.parametrize("writer", [ss._write_mcp_config, ss._write_pi_mcp_config])
 def test_worker_mcp_config_inherits_nested_launcher_env(isolated, monkeypatch, writer):
     sid = str(uuid.uuid4())
@@ -156,7 +157,9 @@ def test_worker_mcp_config_omits_unset_launcher_env(isolated, monkeypatch, write
 
 def test_nested_launcher_env_is_disabled_on_windows(monkeypatch):
     monkeypatch.setenv("WIN_AGENT_TEAMS_LINUX_LAUNCHER", "herdr")
-    monkeypatch.setattr(process_manager_module.os, "name", "nt")
+    monkeypatch.setattr(
+        process_manager_module, "_launcher_host_is_windows", lambda: True
+    )
 
     assert process_manager_module.nested_linux_launcher_env() == {}
 

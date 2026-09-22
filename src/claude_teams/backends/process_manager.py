@@ -110,9 +110,14 @@ _NESTED_LINUX_LAUNCHER_ENV_KEYS = (
 )
 
 
+def _launcher_host_is_windows() -> bool:
+    """Return whether this host ignores the Linux launcher policy."""
+    return os.name == "nt"
+
+
 def nested_linux_launcher_env() -> dict[str, str]:
     """Return Linux launcher settings that a nested MCP server must inherit."""
-    if os.name == "nt":
+    if _launcher_host_is_windows():
         return {}
     return {
         key: os.environ[key]
