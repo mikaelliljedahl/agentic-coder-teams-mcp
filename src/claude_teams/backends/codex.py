@@ -21,7 +21,10 @@ from claude_teams.backends.contracts import (
     BackendBinaryNotFoundError,
     BackendModelUnavailableError,
 )
-from claude_teams.backends.process_manager import process_manager
+from claude_teams.backends.process_manager import (
+    nested_linux_launcher_env,
+    process_manager,
+)
 
 _LOCAL_PATH_CLS = type(Path.cwd())
 
@@ -490,16 +493,35 @@ class CodexBackend(BaseBackend):
         precedence) keeps identity bound to this exact Codex process via its
         own argv, with no shared mutable file and no race window.
         """
+        launcher_env = nested_linux_launcher_env()
         env = {
+            **launcher_env,
             "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
             "AGENT_NAME": request.name,
             "AGENT_SESSION_ID": request.team_name,
             "AGENT_PARENT_NAME": request.lead_session_id,
         }
+
+        def render_value(key: str, value: str) -> str:
+            if key in launcher_env:
+                return self._toml_basic_string(value, key)
+            return self._toml_literal(value)
+
         pairs = ", ".join(
-            f"{key} = {self._toml_literal(value)}" for key, value in env.items()
+            f"{key} = {render_value(key, value)}" for key, value in env.items()
         )
         return ["-c", f"mcp_servers.{self._MCP_SERVER_NAME}.env={{ {pairs} }}"]
+
+    @staticmethod
+    def _toml_basic_string(value: str, key: str) -> str:
+        """Render launcher config as TOML, rejecting non-scalar Unicode."""
+        if any("\ud800" <= char <= "\udfff" for char in value):
+            msg = f"launcher environment {key} contains a non-Unicode scalar value"
+            raise ValueError(msg)
+        # JSON's string escapes are valid TOML basic-string escapes, except
+        # that DEL is left literal. Keep non-BMP scalars literal: JSON's
+        # ensure_ascii mode would emit surrogate pairs, which TOML forbids.
+        return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
     @staticmethod
     def _toml_literal(value: str) -> str:

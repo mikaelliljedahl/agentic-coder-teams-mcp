@@ -52,21 +52,27 @@ is therefore always `team-lead`.
 
 ### How a worker receives its identity
 
-The two backends inject identity differently, because Codex does not propagate
-process environment to its MCP servers.
+The backends inject identity differently, because Codex does not propagate
+process environment to its MCP servers. Generated per-agent MCP configurations
+also carry an allowlisted Linux launcher policy. This keeps nested delegation in
+the parent's terminal, tmux server, or Herdr session when a launcher daemon did
+not pass the original MCP server environment to the new pane.
 
 - **claude-code**: the server writes a per-agent MCP config file containing
   `AGENT_SESSION_ID` / `AGENT_NAME` / `AGENT_PARENT_NAME` in its `env` block
-  (`src/claude_teams/server_simple.py:1107-1124`), passed as
+  (`src/claude_teams/server_simple.py:2595`), passed as
   `--mcp-config <path>` (`src/claude_teams/backends/claude_code.py:173-175`).
   The same three variables are also set in the child process environment
   (`src/claude_teams/backends/claude_code.py:283-289`).
 - **codex**: identity is passed as a per-process config override,
   `-c mcp_servers.win-agent-teams.env={ ... }`
-  (`src/claude_teams/backends/codex.py:465-487`). The comment there is explicit
+  (`src/claude_teams/backends/codex.py:483`). The comment there is explicit
   that writing to the shared `~/.codex/config.toml` would be racy. The same
   variables also go into the child's own environment
-  (`src/claude_teams/backends/codex.py:558-570`).
+  (`src/claude_teams/backends/codex.py:601`).
+- **pi**: a literal per-agent MCP config carries identity and launcher policy;
+  the shared machine-global pi MCP config remains launcher-agnostic so unrelated
+  sessions are not pinned to one launcher.
 
 `AGENT_PARENT_NAME` is set from `request.lead_session_id`, which `spawn_agent`
 fills with the spawner's `IDENTITY` (`src/claude_teams/server_simple.py:1261`).
