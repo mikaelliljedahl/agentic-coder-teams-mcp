@@ -6,6 +6,7 @@ import pytest
 
 from claude_teams.agent_output import CORRELATION_FIELD, correlation_marker_token
 from claude_teams.backends import codex as codex_module
+from claude_teams.backends import process_manager as process_manager_module
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.codex import CodexBackend
 from claude_teams.backends.contracts import BackendModelUnavailableError
@@ -414,7 +415,11 @@ class TestCodexMcpIdentity:
             arg for arg in cmd if arg.startswith("mcp_servers.win-agent-teams.env=")
         )
 
-    def test_build_command_injects_identity_env_override(self, _make_request):
+    def test_build_command_injects_identity_env_override(
+        self, _make_request, monkeypatch
+    ):
+        for key in process_manager_module._NESTED_LINUX_LAUNCHER_ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
         backend = CodexBackend()
         request = _make_request(name="worker", team_name="sess-uuid")
 
@@ -434,7 +439,11 @@ class TestCodexMcpIdentity:
             "AGENT_PARENT_NAME": request.lead_session_id,
         }
 
-    def test_build_resume_command_injects_identity_env_override(self, _make_request):
+    @pytest.mark.usefixtures("posix_launcher_host")
+    def test_build_resume_command_injects_identity_env_override(
+        self, _make_request, monkeypatch
+    ):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LINUX_LAUNCHER", "herdr")
         backend = CodexBackend()
         request = _make_request(name="worker", team_name="sess-uuid")
 
@@ -442,7 +451,53 @@ class TestCodexMcpIdentity:
 
         token = self._identity_token(cmd)
         assert "AGENT_SESSION_ID = 'sess-uuid'" in token
+        assert 'WIN_AGENT_TEAMS_LINUX_LAUNCHER = "herdr"' in token
         assert "codex-session-123" in cmd
+
+    @pytest.mark.usefixtures("posix_launcher_host")
+    def test_identity_override_inherits_nested_launcher_env(
+        self, _make_request, monkeypatch
+    ):
+        monkeypatch.setenv("WIN_AGENT_TEAMS_LINUX_LAUNCHER", "herdr")
+        monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_SESSION", "agents")
+        backend = CodexBackend()
+
+        token = self._identity_token(backend.build_command(_make_request()))
+
+        import tomllib
+
+        _, _, value = token.partition("=")
+        parsed = tomllib.loads("x=" + value)["x"]
+        assert parsed["WIN_AGENT_TEAMS_LINUX_LAUNCHER"] == "herdr"
+        assert parsed["WIN_AGENT_TEAMS_HERDR_SESSION"] == "agents"
+        assert parsed["AGENT_NAME"] == "worker"
+        assert parsed["AGENT_SESSION_ID"] == "team"
+
+    @pytest.mark.usefixtures("posix_launcher_host")
+    def test_launcher_override_supports_toml_special_characters(
+        self, _make_request, monkeypatch
+    ):
+        workspace = "Mikael's\nrepo\x01\x7fräksmörgås 🚀"
+        monkeypatch.setenv("WIN_AGENT_TEAMS_HERDR_WORKSPACE", workspace)
+        backend = CodexBackend()
+
+        token = self._identity_token(backend.build_command(_make_request()))
+
+        import tomllib
+
+        _, _, value = token.partition("=")
+        parsed = tomllib.loads("x=" + value)["x"]
+        assert parsed["WIN_AGENT_TEAMS_HERDR_WORKSPACE"] == workspace
+        assert parsed["AGENT_NAME"] == "worker"
+
+    @pytest.mark.usefixtures("posix_launcher_host")
+    def test_launcher_override_rejects_non_unicode_scalar(
+        self, _make_request, monkeypatch
+    ):
+        monkeypatch.setenv("HERDR_CONFIG_PATH", "bad\udcffpath")
+
+        with pytest.raises(ValueError, match="HERDR_CONFIG_PATH"):
+            CodexBackend().build_command(_make_request())
 
     def test_rejects_single_quote_in_identity(self, _make_request):
         backend = CodexBackend()

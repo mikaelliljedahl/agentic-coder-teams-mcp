@@ -70,6 +70,7 @@ _HERDR_SESSION_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$")
 #: the pre-per-repo behaviour ("the active workspace") with the sentinel.
 _HERDR_WORKSPACE_ENV = "WIN_AGENT_TEAMS_HERDR_WORKSPACE"
 _HERDR_ACTIVE_WORKSPACE_SENTINEL = "-"
+
 #: Labels are free-form display text, not a path component or a selector, so
 #: the session language would be far too narrow here. Only the things that
 #: would break a terminal, an argv parser or a filesystem are excluded.
@@ -85,6 +86,8 @@ _HERDR_TERMINATE_TIMEOUT_SECONDS = 5.0
 _HERDR_NOT_FOUND_CODES = frozenset({"not_found", "pane_not_found", "tab_not_found"})
 #: A never-attached server has no workspace to put a tab in yet.
 _HERDR_NO_WORKSPACE_CODES = frozenset({"workspace_not_found", "no_active_workspace"})
+
+
 _LINUX_TERMINAL_PID_GRACE_SECONDS = 5.0
 _LINUX_DESKTOP_ENV_KEYS = (
     "DISPLAY",
@@ -92,6 +95,35 @@ _LINUX_DESKTOP_ENV_KEYS = (
     "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS",
 )
+# Herdr and tmux panes are created by long-lived daemons, so spawned agents do
+# not necessarily inherit the MCP server's launcher environment. Carry the
+# explicit Linux launcher policy in every generated per-agent MCP config.
+_NESTED_LINUX_LAUNCHER_ENV_KEYS = (
+    _LINUX_LAUNCHER_ENV,
+    _LINUX_TERMINAL_ENV,
+    "WIN_AGENT_TEAMS_TMUX_TARGET",
+    "USE_TMUX_WINDOWS",
+    "TMUX",
+    _HERDR_SESSION_ENV,
+    _HERDR_WORKSPACE_ENV,
+    "HERDR_CONFIG_PATH",
+)
+
+
+def _launcher_host_is_windows() -> bool:
+    """Return whether this host ignores the Linux launcher policy."""
+    return os.name == "nt"
+
+
+def nested_linux_launcher_env() -> dict[str, str]:
+    """Return Linux launcher settings that a nested MCP server must inherit."""
+    if _launcher_host_is_windows():
+        return {}
+    return {
+        key: os.environ[key]
+        for key in _NESTED_LINUX_LAUNCHER_ENV_KEYS
+        if key in os.environ
+    }
 
 
 def _validate_safe_name(name: str, label: str = "name") -> str:

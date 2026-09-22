@@ -2593,17 +2593,19 @@ def _create_session() -> str:
 
 
 def _write_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Path:
-    """Write per-agent MCP config (used by Claude Code via --mcp-config)."""
+    """Write Claude's per-agent MCP config with identity and launcher policy."""
+    env = {
+        **process_manager_module.nested_linux_launcher_env(),
+        "AGENT_SESSION_ID": session_id,
+        "AGENT_NAME": agent_name,
+        "AGENT_PARENT_NAME": parent_name,
+    }
     config = {
         "mcpServers": {
             "win-agent-teams": {
                 "command": sys.executable,
                 "args": ["-m", "claude_teams.server_simple"],
-                "env": {
-                    "AGENT_SESSION_ID": session_id,
-                    "AGENT_NAME": agent_name,
-                    "AGENT_PARENT_NAME": parent_name,
-                },
+                "env": env,
             }
         }
     }
@@ -2629,17 +2631,19 @@ def _write_pi_mcp_config(session_id: str, agent_name: str, parent_name: str) -> 
     ``AGENT_*`` env block in those sources would still shallow-override it (that
     is what the fail-loud identity guard defends against).
     """
+    env = {
+        **process_manager_module.nested_linux_launcher_env(),
+        "AGENT_SESSION_ID": session_id,
+        "AGENT_NAME": agent_name,
+        "AGENT_PARENT_NAME": parent_name,
+        "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
+    }
     config = {
         "mcpServers": {
             "win-agent-teams": {
                 "command": sys.executable,
                 "args": ["-m", "claude_teams.server_simple"],
-                "env": {
-                    "AGENT_SESSION_ID": session_id,
-                    "AGENT_NAME": agent_name,
-                    "AGENT_PARENT_NAME": parent_name,
-                    "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
-                },
+                "env": env,
                 "directTools": True,
             }
         }
@@ -2794,8 +2798,10 @@ def _ensure_pi_mcp_config() -> None:
     moves) a ``win-agent-teams`` entry whose ``env`` uses ``${AGENT_*}``
     interpolation — resolved from each pi process's own environment
     (``PiBackend.build_env``) — so one shared static file binds every agent to
-    its own identity with no per-spawn file and no race. Any other user-defined
-    ``mcpServers`` in the file are preserved.
+    its own identity with no per-spawn file and no race. Launcher settings stay
+    out of this machine-global file because unrelated pi sessions share it;
+    the literal per-agent config carries those settings instead. Any other
+    user-defined ``mcpServers`` in the file are preserved.
     """
     desired = {
         "command": sys.executable,

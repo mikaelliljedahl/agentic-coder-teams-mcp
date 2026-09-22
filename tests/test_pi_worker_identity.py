@@ -20,6 +20,7 @@ import pytest
 
 from claude_teams import server_simple as ss
 from claude_teams.backends import pi as pi_module
+from claude_teams.backends import process_manager as process_manager_module
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.pi import PiBackend
 
@@ -113,6 +114,54 @@ def test_pi_config_distinct_from_claude_config(isolated):
     centry = cdata["mcpServers"]["win-agent-teams"]
     assert "directTools" not in centry
     assert "CLAUDE_TEAMS_PERMISSION_MODE" not in centry["env"]
+
+
+@pytest.mark.usefixtures("posix_launcher_host")
+@pytest.mark.parametrize("writer", [ss._write_mcp_config, ss._write_pi_mcp_config])
+def test_worker_mcp_config_inherits_nested_launcher_env(isolated, monkeypatch, writer):
+    sid = str(uuid.uuid4())
+    (isolated.base / sid / "mcp").mkdir(parents=True)
+    inherited = {
+        "WIN_AGENT_TEAMS_LINUX_LAUNCHER": "herdr",
+        "WIN_AGENT_TEAMS_LINUX_TERMINAL": "foot",
+        "TMUX": f"{isolated.work}/tmux/default,1,0",
+        "WIN_AGENT_TEAMS_HERDR_SESSION": "agents",
+        "WIN_AGENT_TEAMS_HERDR_WORKSPACE": "repo",
+        "HERDR_CONFIG_PATH": str(isolated.work / "herdr config"),
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+
+    path = writer(sid, "worker-1", "team-lead")
+    env = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["win-agent-teams"][
+        "env"
+    ]
+
+    assert env.items() >= inherited.items()
+
+
+@pytest.mark.parametrize("writer", [ss._write_mcp_config, ss._write_pi_mcp_config])
+def test_worker_mcp_config_omits_unset_launcher_env(isolated, monkeypatch, writer):
+    for key in process_manager_module._NESTED_LINUX_LAUNCHER_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    sid = str(uuid.uuid4())
+    (isolated.base / sid / "mcp").mkdir(parents=True)
+
+    path = writer(sid, "worker-1", "team-lead")
+    env = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["win-agent-teams"][
+        "env"
+    ]
+
+    assert env.keys().isdisjoint(process_manager_module._NESTED_LINUX_LAUNCHER_ENV_KEYS)
+
+
+def test_nested_launcher_env_is_disabled_on_windows(monkeypatch):
+    monkeypatch.setenv("WIN_AGENT_TEAMS_LINUX_LAUNCHER", "herdr")
+    monkeypatch.setattr(
+        process_manager_module, "_launcher_host_is_windows", lambda: True
+    )
+
+    assert process_manager_module.nested_linux_launcher_env() == {}
 
 
 # ---------------------------------------------------------------------------
