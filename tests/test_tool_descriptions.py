@@ -217,8 +217,8 @@ async def test_spawn_agent_description_documents_pi_fast_subtiers() -> None:
     assert "pi only" in description
     assert "faster" in description
     for tier, slug, effort in (
-        ("medium-fast", "gpt-5.6-terra", "high"),
-        ("high-fast", "gpt-5.6-sol", "medium"),
+        ("medium-fast", "gpt-6-sol", "low"),
+        ("high-fast", "gpt-6-sol", "medium"),
     ):
         line = next(
             (ln for ln in description.splitlines() if f"``{tier}``" in ln), None
@@ -226,6 +226,21 @@ async def test_spawn_agent_description_documents_pi_fast_subtiers() -> None:
         assert line is not None, f"{tier} missing from the registered description"
         assert f"``{slug}``" in line
         assert f"@ {effort}" in line
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_description_documents_gpt6_ladder() -> None:
+    description = " ".join((await _registered_description("spawn_agent")).split())
+
+    # The ladder runs on GPT-6 only; a stale 5.6 slug in the description would
+    # tell the consuming agent the wrong model. The minimum pi release that
+    # exposes GPT-6 Sol/Luna must be stated so a hard-fail is actionable.
+    for slug in ("gpt-6-luna", "gpt-6-sol", "gpt-6-astra"):
+        assert f"``{slug}``" in description
+    assert "gpt-5.6" not in description
+    # The fast-subtier speed multiplier was measured on GPT-5.6 Terra/Sol.
+    assert "3-4x" not in description
+    assert "0.87.1" in description
 
 
 @pytest.mark.asyncio

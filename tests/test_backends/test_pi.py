@@ -23,6 +23,8 @@ _ALL_MODELS = [
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
 ]
 
 
@@ -113,12 +115,12 @@ class TestPiModels:
 
     def test_resolve_model_tier_to_slug(self):
         backend = PiBackend()
-        assert backend.resolve_model("cheapest") == "gpt-5.6-luna"
-        assert backend.resolve_model("low") == "gpt-5.6-luna"
-        assert backend.resolve_model("medium") == "gpt-5.6-luna"
-        assert backend.resolve_model("medium-fast") == "gpt-5.6-terra"
-        assert backend.resolve_model("high") == "gpt-5.6-luna"
-        assert backend.resolve_model("high-fast") == "gpt-5.6-sol"
+        assert backend.resolve_model("cheapest") == "gpt-6-luna"
+        assert backend.resolve_model("low") == "gpt-6-luna"
+        assert backend.resolve_model("medium") == "gpt-6-luna"
+        assert backend.resolve_model("medium-fast") == "gpt-6-sol"
+        assert backend.resolve_model("high") == "gpt-6-luna"
+        assert backend.resolve_model("high-fast") == "gpt-6-sol"
         assert backend.resolve_model("xhigh") == "gpt-6-astra"
         assert backend.resolve_model("max") == "gpt-6-astra"
 
@@ -133,21 +135,21 @@ class TestPiResolveLaunch:
     def test_tier_maps_to_model_and_thinking(self, _models):
         backend = PiBackend()
         assert backend.resolve_launch("cheapest", None) == (
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             "medium",
         )
-        assert backend.resolve_launch("low", None) == ("gpt-5.6-luna", "high")
-        assert backend.resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
-        assert backend.resolve_launch("medium-fast", None) == ("gpt-5.6-terra", "high")
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
-        assert backend.resolve_launch("high-fast", None) == ("gpt-5.6-sol", "medium")
+        assert backend.resolve_launch("low", None) == ("gpt-6-luna", "high")
+        assert backend.resolve_launch("medium", None) == ("gpt-6-luna", "xhigh")
+        assert backend.resolve_launch("medium-fast", None) == ("gpt-6-sol", "low")
+        assert backend.resolve_launch("high", None) == ("gpt-6-luna", "max")
+        assert backend.resolve_launch("high-fast", None) == ("gpt-6-sol", "medium")
         assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
     def test_legacy_luna_env_has_no_effect(self, _models, monkeypatch):
         monkeypatch.setenv("WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS", "1")
         backend = PiBackend()
-        assert backend.resolve_launch("high", None) == ("gpt-5.6-luna", "max")
+        assert backend.resolve_launch("high", None) == ("gpt-6-luna", "max")
         assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
@@ -180,17 +182,17 @@ class TestPiResolveLaunch:
 
     def test_subtier_owns_thinking_ignoring_caller(self, _models):
         backend = PiBackend()
-        assert backend.resolve_launch("medium-fast", "low") == (
-            "gpt-5.6-terra",
-            "high",
+        assert backend.resolve_launch("medium-fast", "max") == (
+            "gpt-6-sol",
+            "low",
         )
-        assert backend.resolve_launch("high-fast", "max") == ("gpt-5.6-sol", "medium")
+        assert backend.resolve_launch("high-fast", "max") == ("gpt-6-sol", "medium")
 
     def test_errors_when_subtier_model_absent(self, _models):
-        _models(["gpt-5.6-luna", "gpt-6-astra"])
-        with pytest.raises(BackendModelUnavailableError, match=r"gpt-5\.6-terra"):
+        _models(["gpt-6-luna", "gpt-6-astra"])
+        with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-sol"):
             PiBackend().resolve_launch("medium-fast", None)
-        with pytest.raises(BackendModelUnavailableError, match=r"gpt-5\.6-sol"):
+        with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-sol"):
             PiBackend().resolve_launch("high-fast", None)
 
     def test_old_ultra_name_uses_raw_slug_behavior(self, _models):
@@ -198,7 +200,7 @@ class TestPiResolveLaunch:
         assert PiBackend().resolve_launch("ultra", None) == ("ultra", None)
 
     def test_tier_owns_thinking_ignoring_caller(self, _models):
-        assert PiBackend().resolve_launch("high", "low") == ("gpt-5.6-luna", "max")
+        assert PiBackend().resolve_launch("high", "low") == ("gpt-6-luna", "max")
 
     def test_blank_defers_to_pi_default(self):
         assert PiBackend().resolve_launch("", None) == ("", None)
@@ -214,11 +216,45 @@ class TestPiResolveLaunch:
     def test_partial_catalog_errors_for_absent_tier(self, _models):
         # A stale/partial catalog must fail rather than dropping the model or
         # substituting a different provider model.
-        _models(["gpt-5.6-sol"])
-        with pytest.raises(BackendModelUnavailableError, match=r"gpt-5\.6-luna"):
+        _models(["gpt-6-sol"])
+        with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-luna"):
             PiBackend().resolve_launch("low", None)
-        with pytest.raises(BackendModelUnavailableError, match=r"gpt-5\.6-luna"):
+        with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-luna"):
             PiBackend().resolve_launch("high", None)
+
+    @pytest.mark.parametrize(
+        ("tier", "slug"),
+        [
+            ("cheapest", "gpt-6-luna"),
+            ("low", "gpt-6-luna"),
+            ("medium", "gpt-6-luna"),
+            ("medium-fast", "gpt-6-sol"),
+            ("high", "gpt-6-luna"),
+            ("high-fast", "gpt-6-sol"),
+        ],
+    )
+    def test_stale_pi_catalog_errors_with_minimum_version(self, _models, tier, slug):
+        # pi 0.87.0 lists the GPT-5.6 family and Astra but no GPT-6 Sol/Luna.
+        _models(
+            [
+                "openai-codex/gpt-5.5",
+                "openai-codex/gpt-5.6-luna",
+                "openai-codex/gpt-5.6-sol",
+                "openai-codex/gpt-5.6-terra",
+                "openai-codex/gpt-6-astra",
+            ]
+        )
+        with pytest.raises(BackendModelUnavailableError) as excinfo:
+            PiBackend().resolve_launch(tier, None)
+        message = str(excinfo.value)
+        assert slug in message
+        assert "0.87.1" in message
+
+    def test_raw_gpt56_slug_still_passes_through(self, _models):
+        assert PiBackend().resolve_launch("gpt-5.6-terra", "high") == (
+            "gpt-5.6-terra",
+            "high",
+        )
 
     def test_provider_prefixed_catalog_entry_is_available(self, _models):
         _models(["openai-codex/gpt-6-astra"])
@@ -228,12 +264,12 @@ class TestPiResolveLaunch:
         assert PiBackend().resolve_launch("gpt-5.5", "high") == ("gpt-5.5", "high")
 
     def test_raw_slug_soft_fallback_when_unavailable(self, _models):
-        _models(["gpt-5.6-sol"])
+        _models(["gpt-6-sol"])
         assert PiBackend().resolve_launch("nope", "high") == ("", "high")
 
     def test_skips_validation_when_discovery_empty(self, _models):
         _models([])
-        assert PiBackend().resolve_launch("medium", None) == ("gpt-5.6-luna", "xhigh")
+        assert PiBackend().resolve_launch("medium", None) == ("gpt-6-luna", "xhigh")
 
 
 class TestPiBuildCommand:
@@ -271,7 +307,7 @@ class TestPiBuildCommand:
         cmd = backend.build_command(
             _make_request(model=model, reasoning_effort=thinking)
         )
-        assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-5.6-luna"
+        assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-6-luna"
         assert cmd[cmd.index("--thinking") + 1] == "xhigh"
 
     def test_cheapest_tier_launch_reaches_argv(
@@ -282,7 +318,7 @@ class TestPiBuildCommand:
         cmd = backend.build_command(
             _make_request(model=model, reasoning_effort=thinking)
         )
-        assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-5.6-luna"
+        assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-6-luna"
         assert cmd[cmd.index("--thinking") + 1] == "medium"
 
     def test_fast_subtier_launches_reach_argv(
@@ -290,8 +326,8 @@ class TestPiBuildCommand:
     ):
         backend = PiBackend()
         for tier, slug, thinking in (
-            ("medium-fast", "gpt-5.6-terra", "high"),
-            ("high-fast", "gpt-5.6-sol", "medium"),
+            ("medium-fast", "gpt-6-sol", "low"),
+            ("high-fast", "gpt-6-sol", "medium"),
         ):
             model, effort = backend.resolve_launch(tier, None)
             cmd = backend.build_command(

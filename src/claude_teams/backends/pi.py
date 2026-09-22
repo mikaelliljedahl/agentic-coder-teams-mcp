@@ -35,7 +35,8 @@ _LOCAL_PATH_CLS = type(Path.cwd())
 _PI_PROVIDER = "openai-codex"
 _PI_UPGRADE_HINT = (
     "Upgrade pi: npm install -g @earendil-works/pi-coding-agent@latest "
-    "(or add the model to your provider config)"
+    "(GPT-6 Sol/Luna need pi >= 0.87.1; or add the model to your provider "
+    "config)"
 )
 
 # ``pi``'s npm bin script hands off to this entry under the package root. We
@@ -115,8 +116,8 @@ def _discover_pi_model_ids(launcher: list[str]) -> list[str]:
     is the model id::
 
         provider      model                context  max-out  thinking  images
-        openai-codex  gpt-5.6-sol          372K     128K     yes       yes
         openai-codex  gpt-6-astra          272K     128K     yes       yes
+        openai-codex  gpt-6-luna           272K     128K     yes       yes
 
     Only the model column is kept. Any failure (binary missing, timeout, not
     logged in) yields ``[]`` so callers treat the set as unknown and skip
@@ -172,33 +173,34 @@ class PiBackend(BaseBackend):
     # plus two pi-only ``-fast`` subtiers, each bundling a concrete model with a
     # ``--thinking`` level, as an
     # ascending cost/quality ladder. Names mirror the effort words the caller
-    # already reasons in (cheapest..max), while the ladder is tuned for Pi's
-    # 1M context window. A tier owns its model and thinking level; if discovery
-    # exposes a non-empty catalog without that model, the tier errors rather
-    # than silently falling back to Pi's configured default.
+    # already reasons in (cheapest..max). A tier owns its model and thinking
+    # level; if discovery exposes a non-empty catalog without that model, the
+    # tier errors rather than silently falling back to Pi's configured default.
     #   cheapest    -> Luna  @ medium
     #   low         -> Luna  @ high
     #   medium      -> Luna  @ xhigh   (token-efficient general default)
-    #   medium-fast -> Terra @ high    (pi only; latency sibling of ``medium``)
-    #   high        -> Luna  @ max     (1M-context bridge)
+    #   medium-fast -> Sol   @ low     (pi only; latency sibling of ``medium``)
+    #   high        -> Luna  @ max
     #   high-fast   -> Sol   @ medium  (pi only; latency sibling of ``high``)
     #   xhigh       -> Astra @ low
     #   max         -> Astra @ medium   (top)
-    # Astra replaces Sol at the top. See the Codex ladder for the 262k-context
-    # rationale for the backends' one intentional difference at ``high``.
+    # Luna and Sol are the GPT-6 models (``gpt-6-luna``/``gpt-6-sol``, pi >=
+    # 0.87.1), an effort-preserving substitution for GPT-5.6 not yet
+    # re-benchmarked. See the Codex ladder for why codex uses Sol @ medium at
+    # ``high`` instead.
     #
-    # The two ``-fast`` subtiers exist only here. Terra and Sol run roughly 3-4x
-    # faster than Luna and benchmark close to the tier each one sits beside, so
-    # they are the low-latency pick when turnaround dominates — not a claim that
-    # they are interchangeable with it on every input. Codex deliberately does
-    # not expose them: its own ``high`` is already Sol @ medium.
+    # The two ``-fast`` subtiers exist only here. Sol runs faster than Luna, so
+    # they are the low-latency pick when turnaround dominates — a different
+    # model, not interchangeable with the tier beside it on every input. Codex
+    # deliberately does not expose them: its own ``high`` is already Sol @
+    # medium.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
-        "cheapest": ("gpt-5.6-luna", "medium"),
-        "low": ("gpt-5.6-luna", "high"),
-        "medium": ("gpt-5.6-luna", "xhigh"),
-        "medium-fast": ("gpt-5.6-terra", "high"),
-        "high": ("gpt-5.6-luna", "max"),
-        "high-fast": ("gpt-5.6-sol", "medium"),
+        "cheapest": ("gpt-6-luna", "medium"),
+        "low": ("gpt-6-luna", "high"),
+        "medium": ("gpt-6-luna", "xhigh"),
+        "medium-fast": ("gpt-6-sol", "low"),
+        "high": ("gpt-6-luna", "max"),
+        "high-fast": ("gpt-6-sol", "medium"),
         "xhigh": ("gpt-6-astra", "low"),
         "max": ("gpt-6-astra", "medium"),
     }

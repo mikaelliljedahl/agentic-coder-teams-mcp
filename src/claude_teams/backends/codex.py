@@ -115,18 +115,21 @@ class CodexBackend(BaseBackend):
     #   cheapest -> Luna  @ medium  (cheapest/fastest)
     #   low      -> Luna  @ high    (quick/low-stakes)
     #   medium   -> Luna  @ xhigh   (token-efficient general default)
-    #   high     -> Sol   @ medium  (262k-context-safe bridge)
+    #   high     -> Sol   @ medium  (272k-context-safe bridge)
     #   xhigh    -> Astra @ low
     #   max      -> Astra @ medium   (top)
-    # Codex caps context at 262k, so Luna @ max cannot finish complex tasks
-    # there; Sol @ medium is the only 262k-safe point between Luna and Astra.
-    # Astra replaces Sol at the top because it dominates Sol above medium at
-    # equal or lower cost. Terra and Sol remain reachable as raw slugs.
+    # Luna and Sol are the GPT-6 models (``gpt-6-luna``/``gpt-6-sol``), a
+    # straight effort-preserving substitution for GPT-5.6 not yet re-benchmarked.
+    # Codex runs with a 272k default context window (its 872k maximum is not
+    # enabled here), so Luna @ max cannot finish complex tasks there; Sol @
+    # medium is the 272k-safe point between Luna and Astra. Astra sits at the
+    # top because it dominated Sol above medium at equal or lower cost. The
+    # GPT-5.6 models remain reachable as raw slugs.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
-        "cheapest": ("gpt-5.6-luna", "medium"),
-        "low": ("gpt-5.6-luna", "high"),
-        "medium": ("gpt-5.6-luna", "xhigh"),
-        "high": ("gpt-5.6-sol", "medium"),
+        "cheapest": ("gpt-6-luna", "medium"),
+        "low": ("gpt-6-luna", "high"),
+        "medium": ("gpt-6-luna", "xhigh"),
+        "high": ("gpt-6-sol", "medium"),
         "xhigh": ("gpt-6-astra", "low"),
         "max": ("gpt-6-astra", "medium"),
     }
