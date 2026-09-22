@@ -678,38 +678,44 @@ The Claude orchestrator spawned a passive Codex target, observed its base answer
 Tiers are the only model interface exposed to the caller for the GPT-backed
 backends: each bundles a GPT model with a reasoning effort, forming an
 ascending cost/quality ladder. The tier names and order are stable, while each
-backend has a fixed ladder tuned to its context window:
+backend has its own fixed ladder:
 
-| Tier | codex (262k ctx) | pi (Luna @ 1M) |
+All tiers run GPT-6 models: Luna = `gpt-6-luna`, Sol = `gpt-6-sol`,
+Astra = `gpt-6-astra`.
+
+| Tier | codex (272k default ctx) | pi |
 | --- | --- | --- |
 | `cheapest` | Luna @ medium | Luna @ medium |
 | `low` | Luna @ high | Luna @ high |
 | `medium` | Luna @ xhigh | Luna @ xhigh |
-| `medium-fast` | — | **Terra @ high** |
+| `medium-fast` | — | **Sol @ low** |
 | `high` | **Sol @ medium** | **Luna @ max** |
 | `high-fast` | — | **Sol @ medium** |
 | `xhigh` | Astra @ low | Astra @ low |
 | `max` | Astra @ medium | Astra @ medium |
 
-The two `-fast` subtiers are pi-only. Terra and Sol run roughly 3–4x faster
-than Luna and benchmark close to the tier each sits beside, so they are the
-low-latency pick when turnaround dominates — a different model, not a drop-in
-for their neighbour on every input. Codex does not expose them: its own `high`
-is already Sol @ medium.
+The two `-fast` subtiers are pi-only. Sol runs faster than Luna, so they are
+the low-latency pick when turnaround dominates — a different model, not a
+drop-in for their neighbour on every input. Codex does not expose them: its own
+`high` is already Sol @ medium.
 
-Codex caps context at 262k, so Luna @ max cannot finish complex tasks there;
-Sol @ medium is the only 262k-safe point between Luna and Astra. Pi runs Luna
-with a 1M window, so Luna @ max preserves the same capability step. Astra
-(`gpt-6-astra`) replaces Sol at the top because it dominates every Sol point
-above Sol @ medium at equal or lower cost. Sol and Terra remain available when
-passed as raw model slugs.
+The GPT-6 ladder is an effort-preserving substitution of the earlier GPT-5.6
+ladder (Terra, which has no GPT-6 successor, is replaced by Sol @ low); it has
+not yet been re-benchmarked. Codex runs with a 272k default context window, so
+Luna @ max cannot finish complex tasks there; Sol @ medium is the 272k-safe
+point between Luna and Astra. Pi uses Luna @ max at `high`.
+
+Astra sits at the top because it dominated every Sol point above Sol @ medium
+at equal or lower cost. The GPT-5.6 models (Luna, Sol, Terra) remain available
+when passed as raw model slugs.
 
 When live discovery is non-empty and a tier's model is absent, both `codex` and
 `pi` raise `BackendModelUnavailableError` rather than silently downgrading.
 The error includes a backend-specific upgrade hint: `codex` suggests
 `npm install -g @openai/codex@latest`, while `pi` suggests
 `npm install -g @earendil-works/pi-coding-agent@latest` (or adding the model to
-provider config). Empty discovery skips validation. Explicit raw slugs remain
+provider config). GPT-6 Sol/Luna need pi >= 0.87.1; on pi 0.87.0 every tier
+except `xhigh`/`max` fails until pi is upgraded. Empty discovery skips validation. Explicit raw slugs remain
 an escape hatch; pi soft-falls to its configured default when such a slug is
 absent.
 

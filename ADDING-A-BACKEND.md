@@ -94,23 +94,23 @@ model + reasoning effort; `supported_models()` returns the tier names and
 
 ```python
 _TIER_LAUNCH = {  # fixed per-backend mapping; Codex shown here
-    "cheapest": ("gpt-5.6-luna", "medium"),
-    "low":      ("gpt-5.6-luna", "high"),
-    "medium":   ("gpt-5.6-luna", "xhigh"),
-    "high":     ("gpt-5.6-sol", "medium"),
+    "cheapest": ("gpt-6-luna", "medium"),
+    "low":      ("gpt-6-luna", "high"),
+    "medium":   ("gpt-6-luna", "xhigh"),
+    "high":     ("gpt-6-sol", "medium"),
     "xhigh":    ("gpt-6-astra", "low"),
     "max":      ("gpt-6-astra", "medium"),
 }
-# Pi differs at high: ("gpt-5.6-luna", "max"), and adds two pi-only
-# low-latency subtiers: "medium-fast" -> ("gpt-5.6-terra", "high") and
-# "high-fast" -> ("gpt-5.6-sol", "medium").
+# Pi differs at high: ("gpt-6-luna", "max"), and adds two pi-only
+# low-latency subtiers: "medium-fast" -> ("gpt-6-sol", "low") and
+# "high-fast" -> ("gpt-6-sol", "medium").
 ```
 
 The production ladders are backend-specific at `high`: Codex uses Sol @ medium
-for its 262k context limit, while Pi uses Luna @ max with its 1M window. Pi
+within its 272k default context window, while Pi uses Luna @ max. Pi
 additionally exposes `medium-fast`/`high-fast`, the low-latency neighbours of
-`medium`/`high` (Terra and Sol run ~3-4x faster than Luna and benchmark close
-to them). A backend's tier set need not match another's — only
+`medium`/`high` (Sol runs faster than Luna; not yet benchmarked against its
+neighbour on GPT-6). A backend's tier set need not match another's — only
 `supported_models()` and `_TIER_LAUNCH` define it. See the
 README's ladder table for the complete fixed mapping. `resolve_launch(model,
 effort)` returns the `(model, effort)` pair the spawn uses.

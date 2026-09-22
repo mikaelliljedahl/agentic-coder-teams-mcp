@@ -3189,24 +3189,26 @@ async def spawn_agent(
       - ``high``   -> backend development, code review
       - ``xhigh``  -> genuinely hard problems
       - ``max``    -> the hardest problems (top tier)
+    All tiers run GPT-6 models: Luna (``gpt-6-luna``) @ medium/high/xhigh for
+    ``cheapest``/``low``/``medium``, Sol (``gpt-6-sol``) or Luna at ``high``
+    (see below), and Astra (``gpt-6-astra``) @ low/medium for ``xhigh``/``max``.
     pi only, two extra low-latency subtiers sit beside the tier they are named
-    after, each roughly 3-4x faster and benchmarking close to it:
-      - ``medium-fast`` -> Terra (``gpt-5.6-terra``) @ high, beside ``medium``
-      - ``high-fast``   -> Sol (``gpt-5.6-sol``) @ medium, beside ``high``
+    after; Sol runs faster than Luna:
+      - ``medium-fast`` -> Sol (``gpt-6-sol``) @ low, beside ``medium``
+      - ``high-fast``   -> Sol (``gpt-6-sol``) @ medium, beside ``high``
     Reach for one when turnaround dominates. They are a different model, not a
     drop-in for their neighbour on every input, and codex does not offer them.
     Across the six tiers both backends share, the ladders differ only at
-    ``high``: codex uses Sol @ medium
-    (the 262k-context-safe bridge), while pi uses Luna @ max (its 1M context
-    window). Both use Astra (``gpt-6-astra``) @ low/medium for ``xhigh``/``max``.
+    ``high``: codex uses Sol @ medium, while pi uses Luna @ max.
     If live model discovery is non-empty and a required tier model is
     unavailable, both codex
     and pi raise ``BackendModelUnavailableError`` with a backend-specific
     upgrade command (``npm install -g @openai/codex@latest`` or
-    ``npm install -g @earendil-works/pi-coding-agent@latest``); tiers never
-    silently downgrade. Raw slugs pass through; pi retains its soft fallback
-    for an unavailable raw slug. For claude-code, ``model`` is
-    haiku/sonnet/opus/fable and defaults to ``opus`` when omitted.
+    ``npm install -g @earendil-works/pi-coding-agent@latest``; GPT-6 Sol/Luna
+    need pi >= 0.87.1); tiers never silently downgrade. Raw slugs pass
+    through; pi retains its soft fallback for an unavailable raw slug. For
+    claude-code, ``model`` is haiku/sonnet/opus/fable and defaults to ``opus``
+    when omitted.
 
     reasoning_effort: for claude-code, sets the effort (low/medium/high/xhigh/
     max). For codex/pi it is silently ignored when ``model`` is a capability

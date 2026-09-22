@@ -19,8 +19,8 @@ from claude_teams.backends.pi import PiBackend
 from claude_teams.backends.registry import canonical_backend_name
 
 PAIRS = [
-    ("medium-fast", "gpt-5.6-terra", "high"),
-    ("high-fast", "gpt-5.6-sol", "medium"),
+    ("medium-fast", "gpt-6-sol", "low"),
+    ("high-fast", "gpt-6-sol", "medium"),
 ]
 
 
