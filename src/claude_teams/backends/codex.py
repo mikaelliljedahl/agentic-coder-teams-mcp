@@ -112,25 +112,31 @@ class CodexBackend(BaseBackend):
     # fully determines model + effort; a caller-supplied ``reasoning_effort``
     # is silently ignored for tiers, and an unavailable target raises instead
     # of silently downgrading.
-    #   cheapest -> Luna  @ medium  (cheapest/fastest)
-    #   low      -> Luna  @ high    (quick/low-stakes)
-    #   medium   -> Luna  @ xhigh   (token-efficient general default)
-    #   high     -> Sol   @ medium  (272k-context-safe bridge)
-    #   xhigh    -> Astra @ low
-    #   max      -> Astra @ medium   (top)
-    # Luna and Sol are the GPT-6 models (``gpt-6-luna``/``gpt-6-sol``), a
-    # straight effort-preserving substitution for GPT-5.6 not yet re-benchmarked.
+    #   cheapest -> Luna  @ high    (cheapest/fastest)
+    #   low      -> Luna  @ xhigh   (quick/low-stakes)
+    #   medium   -> Luna  @ max     (token-efficient general default)
+    #   high     -> Sol   @ high
+    #   xhigh    -> Sol   @ xhigh
+    #   max      -> Astra @ medium  (top)
+    # Luna, Sol and Astra are the GPT-6 models (``gpt-6-luna``/``gpt-6-sol``/
+    # ``gpt-6-astra``). GPT-6 needs more reasoning effort than GPT-5.6 did at
+    # the same tier, so ``cheapest``..``high`` each sit one effort step above
+    # their GPT-5.6 predecessor on the same model (DeepSWE v1.1: Sol @ medium
+    # 56.6% vs Sol @ high 65.3%).
+    # ``xhigh`` is Sol @ xhigh rather than Astra: Astra costs 5x Sol per token
+    # and Astra @ low only matches Sol @ xhigh on coding (67.0% vs 66.6%) at
+    # ~1.6x the cost per task; Sol @ max buys ~2 points for ~2.7x the cost.
+    # Astra @ medium (72.8%) is the clear jump and stays the top tier.
     # Codex runs with a 272k default context window (its 872k maximum is not
-    # enabled here), so Luna @ max cannot finish complex tasks there; Sol @
-    # medium is the 272k-safe point between Luna and Astra. Astra sits at the
-    # top because it dominated Sol above medium at equal or lower cost. The
-    # GPT-5.6 models remain reachable as raw slugs.
+    # enabled here); Luna @ max at ``medium`` is untested against that window
+    # on long, complex tasks — reach for ``high`` (Sol) when Luna runs out.
+    # The GPT-5.6 models remain reachable as raw slugs.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
-        "cheapest": ("gpt-6-luna", "medium"),
-        "low": ("gpt-6-luna", "high"),
-        "medium": ("gpt-6-luna", "xhigh"),
-        "high": ("gpt-6-sol", "medium"),
-        "xhigh": ("gpt-6-astra", "low"),
+        "cheapest": ("gpt-6-luna", "high"),
+        "low": ("gpt-6-luna", "xhigh"),
+        "medium": ("gpt-6-luna", "max"),
+        "high": ("gpt-6-sol", "high"),
+        "xhigh": ("gpt-6-sol", "xhigh"),
         "max": ("gpt-6-astra", "medium"),
     }
 

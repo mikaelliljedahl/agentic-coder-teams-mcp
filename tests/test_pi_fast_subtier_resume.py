@@ -1,7 +1,7 @@
-"""Regression: pi fast subtiers survive spawn persistence and follow-up.
+"""Regression: the pi fast subtier survives spawn persistence and follow-up.
 
 A tier name must never be persisted or re-resolved. ``spawn_agent`` resolves
-``medium-fast``/``high-fast`` to a concrete ``(slug, thinking)`` pair before
+``medium-fast`` to a concrete ``(slug, thinking)`` pair before
 building the request, records those concrete values in ``agents.json``, and
 ``_build_resume_request`` deliberately reuses them verbatim rather than
 resolving the tier a second time. These tests walk the real server path —
@@ -19,8 +19,7 @@ from claude_teams.backends.pi import PiBackend
 from claude_teams.backends.registry import canonical_backend_name
 
 PAIRS = [
-    ("medium-fast", "gpt-6-sol", "low"),
-    ("high-fast", "gpt-6-sol", "medium"),
+    ("medium-fast", "gpt-6-sol", "medium"),
 ]
 
 

@@ -87,30 +87,31 @@ class MyBackend(BaseBackend):
 ### Models & capability tiers
 
 The MCP caller picks capability, not a raw model slug. `codex` and `pi` each
-expose six shared **tiers** (`cheapest/low/medium/high/xhigh/max`) — pi adds two
-of its own, `medium-fast` and `high-fast` — that bundle a concrete
+expose six shared **tiers** (`cheapest/low/medium/high/xhigh/max`) — pi adds one
+of its own, `medium-fast` — that bundle a concrete
 model + reasoning effort; `supported_models()` returns the tier names and
 `resolve_launch()` maps a tier to `(model, effort)`:
 
 ```python
 _TIER_LAUNCH = {  # fixed per-backend mapping; Codex shown here
-    "cheapest": ("gpt-6-luna", "medium"),
-    "low":      ("gpt-6-luna", "high"),
-    "medium":   ("gpt-6-luna", "xhigh"),
-    "high":     ("gpt-6-sol", "medium"),
-    "xhigh":    ("gpt-6-astra", "low"),
+    "cheapest": ("gpt-6-luna", "high"),
+    "low":      ("gpt-6-luna", "xhigh"),
+    "medium":   ("gpt-6-luna", "max"),
+    "high":     ("gpt-6-sol", "high"),
+    "xhigh":    ("gpt-6-sol", "xhigh"),
     "max":      ("gpt-6-astra", "medium"),
 }
-# Pi differs at high: ("gpt-6-luna", "max"), and adds two pi-only
-# low-latency subtiers: "medium-fast" -> ("gpt-6-sol", "low") and
-# "high-fast" -> ("gpt-6-sol", "medium").
+# Pi uses the same six pairs and adds one pi-only low-latency subtier:
+# "medium-fast" -> ("gpt-6-sol", "medium"). Its former "high-fast" is
+# listed in pi's _RETIRED_TIERS and raises RetiredTierError.
 ```
 
-The production ladders are backend-specific at `high`: Codex uses Sol @ medium
-within its 272k default context window, while Pi uses Luna @ max. Pi
-additionally exposes `medium-fast`/`high-fast`, the low-latency neighbours of
-`medium`/`high` (Sol runs faster than Luna; not yet benchmarked against its
-neighbour on GPT-6). A backend's tier set need not match another's — only
+The production ladders are identical on the six shared tiers. Pi
+additionally exposes `medium-fast`, the low-latency neighbour of `medium` (Sol
+runs faster than Luna; not benchmarked against its neighbour on GPT-6). When a
+tier is removed, add it to the backend's `_RETIRED_TIERS` so a stale caller
+gets `RetiredTierError` instead of falling through to raw-slug handling.
+A backend's tier set need not match another's — only
 `supported_models()` and `_TIER_LAUNCH` define it. See the
 README's ladder table for the complete fixed mapping. `resolve_launch(model,
 effort)` returns the `(model, effort)` pair the spawn uses.

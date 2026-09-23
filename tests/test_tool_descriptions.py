@@ -206,26 +206,55 @@ async def test_watch_contract_documents_parked_marker_delivery(tool_name: str) -
     assert "nested lead keeps its own ack file" in description
 
 
+def _tier_line(description: str, tier: str) -> str | None:
+    """Return the bullet line that defines ``tier`` in the description."""
+    return next(
+        (
+            ln
+            for ln in description.splitlines()
+            if ln.strip().startswith(f"- ``{tier}``")
+        ),
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_description_documents_tier_ladder() -> None:
+    description = await _registered_description("spawn_agent")
+
+    # The consuming agent only ever reads the registered tool description, so
+    # every tier's model AND effort must be pinned together on its own line,
+    # not merely be present somewhere in the text, or a swapped effort would
+    # still pass.
+    for tier, slug, effort in (
+        ("cheapest", "gpt-6-luna", "high"),
+        ("low", "gpt-6-luna", "xhigh"),
+        ("medium", "gpt-6-luna", "max"),
+        ("high", "gpt-6-sol", "high"),
+        ("xhigh", "gpt-6-sol", "xhigh"),
+        ("max", "gpt-6-astra", "medium"),
+    ):
+        line = _tier_line(description, tier)
+        assert line is not None, f"{tier} missing from the registered description"
+        assert f"(``{slug}``) @ {effort} " in line
+
+
 @pytest.mark.asyncio
 async def test_spawn_agent_description_documents_pi_fast_subtiers() -> None:
     description = await _registered_description("spawn_agent")
 
-    # The consuming agent only ever reads the registered tool description, so
-    # the pi-only subtiers must be discoverable from there alone — and each
-    # tier's model AND effort must be pinned together, not merely be present
-    # somewhere in the text, or a swapped effort would still pass.
+    # The pi-only subtier must be discoverable from the description alone;
+    # the retired ``high-fast`` must not be offered as a tier, only named as
+    # removed so a stale caller learns its replacement.
     assert "pi only" in description
     assert "faster" in description
-    for tier, slug, effort in (
-        ("medium-fast", "gpt-6-sol", "low"),
-        ("high-fast", "gpt-6-sol", "medium"),
-    ):
-        line = next(
-            (ln for ln in description.splitlines() if f"``{tier}``" in ln), None
-        )
-        assert line is not None, f"{tier} missing from the registered description"
-        assert f"``{slug}``" in line
-        assert f"@ {effort}" in line
+    line = _tier_line(description, "medium-fast")
+    assert line is not None, "medium-fast missing from the registered description"
+    assert "(``gpt-6-sol``) @ medium " in line
+    assert _tier_line(description, "high-fast") is None
+    flat = " ".join(description.split())
+    assert "``high-fast`` was removed" in flat
+    assert "RetiredTierError" in flat
 
 
 @pytest.mark.asyncio

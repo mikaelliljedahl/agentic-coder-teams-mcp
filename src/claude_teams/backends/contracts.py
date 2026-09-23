@@ -71,6 +71,24 @@ class UnsupportedBackendModelError(ValueError):
         )
 
 
+class RetiredTierError(UnsupportedBackendModelError):
+    """Raised when a caller names a capability tier that has been removed."""
+
+    def __init__(
+        self,
+        tier: str,
+        replacement: str,
+        backend_name: str,
+        supported: Iterable[str],
+    ) -> None:
+        """Build the message from the retired tier and its replacement."""
+        ValueError.__init__(
+            self,
+            f"Tier {tier!r} was removed from {backend_name}; use "
+            f"{replacement!r} instead. Supported: {', '.join(supported)}",
+        )
+
+
 class BackendModelUnavailableError(RuntimeError):
     """Raised when a resolved model is not available on this backend install.
 

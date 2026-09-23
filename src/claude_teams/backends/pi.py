@@ -23,6 +23,7 @@ from claude_teams.backends.base import (
 from claude_teams.backends.contracts import (
     BackendBinaryNotFoundError,
     BackendModelUnavailableError,
+    RetiredTierError,
 )
 from claude_teams.backends.process_manager import process_manager
 
@@ -170,40 +171,41 @@ class PiBackend(BaseBackend):
         return True
 
     # The model interface exposed to the MCP caller: six shared capability tiers
-    # plus two pi-only ``-fast`` subtiers, each bundling a concrete model with a
-    # ``--thinking`` level, as an
-    # ascending cost/quality ladder. Names mirror the effort words the caller
-    # already reasons in (cheapest..max). A tier owns its model and thinking
-    # level; if discovery exposes a non-empty catalog without that model, the
-    # tier errors rather than silently falling back to Pi's configured default.
-    #   cheapest    -> Luna  @ medium
-    #   low         -> Luna  @ high
-    #   medium      -> Luna  @ xhigh   (token-efficient general default)
-    #   medium-fast -> Sol   @ low     (pi only; latency sibling of ``medium``)
-    #   high        -> Luna  @ max
-    #   high-fast   -> Sol   @ medium  (pi only; latency sibling of ``high``)
-    #   xhigh       -> Astra @ low
-    #   max         -> Astra @ medium   (top)
-    # Luna and Sol are the GPT-6 models (``gpt-6-luna``/``gpt-6-sol``, pi >=
-    # 0.87.1), an effort-preserving substitution for GPT-5.6 not yet
-    # re-benchmarked. See the Codex ladder for why codex uses Sol @ medium at
-    # ``high`` instead.
+    # plus the pi-only ``medium-fast`` subtier, each bundling a concrete model
+    # with a ``--thinking`` level, as an ascending cost/quality ladder. Names
+    # mirror the effort words the caller already reasons in (cheapest..max). A
+    # tier owns its model and thinking level; if discovery exposes a non-empty
+    # catalog without that model, the tier errors rather than silently falling
+    # back to Pi's configured default.
+    #   cheapest    -> Luna  @ high
+    #   low         -> Luna  @ xhigh
+    #   medium      -> Luna  @ max     (token-efficient general default)
+    #   medium-fast -> Sol   @ medium  (pi only; latency sibling of ``medium``)
+    #   high        -> Sol   @ high
+    #   xhigh       -> Sol   @ xhigh
+    #   max         -> Astra @ medium  (top)
+    # The six shared tiers are identical to the Codex ladder; see there for why
+    # the Luna/Sol tiers moved up one effort step, ``xhigh`` left Astra for Sol
+    # and ``max`` stayed Astra @ medium. Luna and Sol need pi >= 0.87.1.
     #
-    # The two ``-fast`` subtiers exist only here. Sol runs faster than Luna, so
-    # they are the low-latency pick when turnaround dominates — a different
-    # model, not interchangeable with the tier beside it on every input. Codex
-    # deliberately does not expose them: its own ``high`` is already Sol @
-    # medium.
+    # ``medium-fast`` exists only here. Sol runs faster than Luna, so it is the
+    # low-latency pick when turnaround dominates — a different model, not
+    # interchangeable with ``medium`` on every input. Codex does not expose it.
     _TIER_LAUNCH: ClassVar[dict[str, tuple[str, str]]] = {
-        "cheapest": ("gpt-6-luna", "medium"),
-        "low": ("gpt-6-luna", "high"),
-        "medium": ("gpt-6-luna", "xhigh"),
-        "medium-fast": ("gpt-6-sol", "low"),
-        "high": ("gpt-6-luna", "max"),
-        "high-fast": ("gpt-6-sol", "medium"),
-        "xhigh": ("gpt-6-astra", "low"),
+        "cheapest": ("gpt-6-luna", "high"),
+        "low": ("gpt-6-luna", "xhigh"),
+        "medium": ("gpt-6-luna", "max"),
+        "medium-fast": ("gpt-6-sol", "medium"),
+        "high": ("gpt-6-sol", "high"),
+        "xhigh": ("gpt-6-sol", "xhigh"),
         "max": ("gpt-6-astra", "medium"),
     }
+
+    # Removed tier -> the tier to use instead. A retired name must fail loudly:
+    # left alone it would fall through to the raw-slug path and silently run
+    # pi's default model. ``high-fast`` (Sol beside a Luna ``high``) went away
+    # when ``high`` itself became Sol.
+    _RETIRED_TIERS: ClassVar[dict[str, str]] = {"high-fast": "high"}
 
     _THINKING_OPTIONS: ClassVar[frozenset[str]] = frozenset(
         {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
@@ -213,7 +215,7 @@ class PiBackend(BaseBackend):
         """Return the capability tiers the MCP caller may choose from.
 
         Deliberately the tier names (``cheapest``..``max``, plus the pi-only
-        ``medium-fast``/``high-fast``), not raw model slugs.
+        ``medium-fast``), not raw model slugs.
 
         Returns:
             list[str]: Selectable tier names, cheapest first.
@@ -228,13 +230,15 @@ class PiBackend(BaseBackend):
     def resolve_model(self, generic_name: str) -> str:
         """Map a tier (or raw slug) to a pi model id (no availability check).
 
-        A tier resolves to its bundled model slug; blank stays blank; any other
-        value passes through unchanged. Availability is validated only in
+        A tier resolves to its bundled model slug; blank stays blank; a
+        retired tier raises :class:`RetiredTierError`; any other value passes
+        through unchanged. Availability is validated only in
         :meth:`resolve_launch`.
         """
         key = generic_name.strip()
         if not key:
             return ""
+        self._reject_retired_tier(key)
         tier = self._TIER_LAUNCH.get(key.lower())
         return tier[0] if tier else key
 
@@ -245,6 +249,8 @@ class PiBackend(BaseBackend):
 
         - Blank ``model`` -> ``("", effort)``: no ``--model`` override, pi uses
           its own default model.
+        - A retired tier (``high-fast``) raises :class:`RetiredTierError`
+          naming its replacement, never reaching the raw-slug path.
         - A capability tier resolves to its bundled ``(slug, thinking)``; the
           caller-supplied ``reasoning_effort`` is ignored (the tier owns it).
           An unavailable tier model raises :class:`BackendModelUnavailableError`
@@ -260,6 +266,7 @@ class PiBackend(BaseBackend):
         key = model.strip()
         if not key:
             return "", reasoning_effort
+        self._reject_retired_tier(key)
         tier = self._TIER_LAUNCH.get(key.lower())
         if tier is not None:
             slug, tier_effort = tier
@@ -273,6 +280,14 @@ class PiBackend(BaseBackend):
                 )
             return slug, tier_effort
         return (key if self._model_available(key) else ""), reasoning_effort
+
+    def _reject_retired_tier(self, key: str) -> None:
+        """Raise :class:`RetiredTierError` when ``key`` names a removed tier."""
+        replacement = self._RETIRED_TIERS.get(key.lower())
+        if replacement is not None:
+            raise RetiredTierError(
+                key, replacement, self._name, self.supported_models()
+            )
 
     def _model_available(self, model: str) -> bool:
         """Return whether ``model`` is exposed by this pi login (soft check).
