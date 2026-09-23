@@ -109,8 +109,8 @@ in mind whenever you touch `backends/`:
   (launch the native exe / `node <entry>` directly) or transport the prompt in a
   file — never pass a multi-line prompt through the shim.
 - **Model tiers**, not raw slugs: `cheapest/low/medium/high/xhigh/max` bundling
-  model + effort, shared by Codex and Pi; Pi adds the low-latency subtiers
-  `medium-fast` and `high-fast`. A tier whose model is missing hard-fails on
+  model + effort, shared by Codex and Pi; Pi adds the low-latency subtier
+  `medium-fast` (its former `high-fast` is retired and raises). A tier whose model is missing hard-fails on
   both backends — the soft fallback to the CLI default is Pi's behavior for an
   unavailable *raw slug* only. Discover installed models live and skip
   validation when discovery is empty.

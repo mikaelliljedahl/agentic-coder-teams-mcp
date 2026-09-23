@@ -3183,23 +3183,19 @@ async def spawn_agent(
     model: pick by how much capability the task needs, not by a model name.
     For codex and pi, choose one capability tier (each maps to a concrete GPT
     model at a fixed reasoning effort), cheapest first:
-      - ``cheapest`` -> fastest/cheapest tasks
-      - ``low``    -> quick, low-stakes tasks
-      - ``medium`` -> token-efficient general default
-      - ``high``   -> backend development, code review
-      - ``xhigh``  -> genuinely hard problems
-      - ``max``    -> the hardest problems (top tier)
-    All tiers run GPT-6 models: Luna (``gpt-6-luna``) @ medium/high/xhigh for
-    ``cheapest``/``low``/``medium``, Sol (``gpt-6-sol``) or Luna at ``high``
-    (see below), and Astra (``gpt-6-astra``) @ low/medium for ``xhigh``/``max``.
-    pi only, two extra low-latency subtiers sit beside the tier they are named
-    after; Sol runs faster than Luna:
-      - ``medium-fast`` -> Sol (``gpt-6-sol``) @ low, beside ``medium``
-      - ``high-fast``   -> Sol (``gpt-6-sol``) @ medium, beside ``high``
-    Reach for one when turnaround dominates. They are a different model, not a
-    drop-in for their neighbour on every input, and codex does not offer them.
-    Across the six tiers both backends share, the ladders differ only at
-    ``high``: codex uses Sol @ medium, while pi uses Luna @ max.
+      - ``cheapest`` -> Luna (``gpt-6-luna``) @ high : fastest/cheapest tasks
+      - ``low``      -> Luna (``gpt-6-luna``) @ xhigh : quick, low-stakes tasks
+      - ``medium``   -> Luna (``gpt-6-luna``) @ max : token-efficient default
+      - ``high``     -> Sol (``gpt-6-sol``) @ high : backend dev, code review
+      - ``xhigh``    -> Sol (``gpt-6-sol``) @ xhigh : genuinely hard problems
+      - ``max``      -> Astra (``gpt-6-astra``) @ medium : hardest (top tier)
+    codex and pi use this identical ladder. pi only, one extra low-latency
+    subtier sits beside ``medium``; Sol runs faster than Luna:
+      - ``medium-fast`` -> Sol (``gpt-6-sol``) @ medium : beside ``medium``
+    Reach for it when turnaround dominates. It is a different model, not a
+    drop-in for ``medium`` on every input, and codex does not offer it. The
+    former pi tier ``high-fast`` was removed (``high`` is now Sol itself);
+    passing it raises ``RetiredTierError`` naming ``high``.
     If live model discovery is non-empty and a required tier model is
     unavailable, both codex
     and pi raise ``BackendModelUnavailableError`` with a backend-specific
@@ -3293,7 +3289,7 @@ async def spawn_agent(
 
             effort = reasoning_effort.strip() or None
             # A backend may bundle a reasoning effort into a model tier (e.g.
-            # Codex ``high`` -> Sol @ medium), so resolve model and effort
+            # Codex ``high`` -> Sol @ high), so resolve model and effort
             # together. For codex tiers the bundled effort wins and any caller
             # ``reasoning_effort`` is ignored; other backends still honor it.
             resolved_model, effort = b.resolve_launch(model, effort)

@@ -11,7 +11,11 @@ from claude_teams.agent_output import read_pi_output
 from claude_teams.backends import pi as pi_module
 from claude_teams.backends.base import SpawnRequest
 from claude_teams.backends.codex import CodexBackend
-from claude_teams.backends.contracts import BackendModelUnavailableError
+from claude_teams.backends.contracts import (
+    BackendModelUnavailableError,
+    RetiredTierError,
+    UnsupportedBackendModelError,
+)
 from claude_teams.backends.pi import PiBackend
 
 _ALL_MODELS = [
@@ -105,7 +109,6 @@ class TestPiModels:
             "medium",
             "medium-fast",
             "high",
-            "high-fast",
             "xhigh",
             "max",
         ]
@@ -119,10 +122,15 @@ class TestPiModels:
         assert backend.resolve_model("low") == "gpt-6-luna"
         assert backend.resolve_model("medium") == "gpt-6-luna"
         assert backend.resolve_model("medium-fast") == "gpt-6-sol"
-        assert backend.resolve_model("high") == "gpt-6-luna"
-        assert backend.resolve_model("high-fast") == "gpt-6-sol"
-        assert backend.resolve_model("xhigh") == "gpt-6-astra"
+        assert backend.resolve_model("high") == "gpt-6-sol"
+        assert backend.resolve_model("xhigh") == "gpt-6-sol"
         assert backend.resolve_model("max") == "gpt-6-astra"
+
+    def test_resolve_model_rejects_retired_high_fast(self):
+        # A removed tier must not fall through to the raw-slug passthrough.
+        with pytest.raises(RetiredTierError, match=r"'high'") as excinfo:
+            PiBackend().resolve_model("high-fast")
+        assert isinstance(excinfo.value, UnsupportedBackendModelError)
 
     def test_resolve_model_passthrough(self):
         assert PiBackend().resolve_model("some-model") == "some-model"
@@ -134,33 +142,26 @@ class TestPiModels:
 class TestPiResolveLaunch:
     def test_tier_maps_to_model_and_thinking(self, _models):
         backend = PiBackend()
-        assert backend.resolve_launch("cheapest", None) == (
-            "gpt-6-luna",
-            "medium",
-        )
-        assert backend.resolve_launch("low", None) == ("gpt-6-luna", "high")
-        assert backend.resolve_launch("medium", None) == ("gpt-6-luna", "xhigh")
-        assert backend.resolve_launch("medium-fast", None) == ("gpt-6-sol", "low")
-        assert backend.resolve_launch("high", None) == ("gpt-6-luna", "max")
-        assert backend.resolve_launch("high-fast", None) == ("gpt-6-sol", "medium")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
+        assert backend.resolve_launch("cheapest", None) == ("gpt-6-luna", "high")
+        assert backend.resolve_launch("low", None) == ("gpt-6-luna", "xhigh")
+        assert backend.resolve_launch("medium", None) == ("gpt-6-luna", "max")
+        assert backend.resolve_launch("medium-fast", None) == ("gpt-6-sol", "medium")
+        assert backend.resolve_launch("high", None) == ("gpt-6-sol", "high")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-sol", "xhigh")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
     def test_legacy_luna_env_has_no_effect(self, _models, monkeypatch):
         monkeypatch.setenv("WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS", "1")
         backend = PiBackend()
-        assert backend.resolve_launch("high", None) == ("gpt-6-luna", "max")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
+        assert backend.resolve_launch("high", None) == ("gpt-6-sol", "high")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-sol", "xhigh")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
-    def test_shared_ladder_tiers_differ_only_at_high(self):
+    def test_shared_ladder_tiers_match_codex(self):
         pi_ladder = PiBackend()._TIER_LAUNCH
         codex_ladder = CodexBackend()._TIER_LAUNCH
         assert set(codex_ladder) < set(pi_ladder)
-        differences = [
-            tier for tier in codex_ladder if pi_ladder[tier] != codex_ladder[tier]
-        ]
-        assert differences == ["high"]
+        assert {tier: pi_ladder[tier] for tier in codex_ladder} == codex_ladder
 
     def test_shared_ladder_keeps_codex_order(self):
         pi_ladder = PiBackend()._TIER_LAUNCH
@@ -170,7 +171,7 @@ class TestPiResolveLaunch:
 
     def test_fast_subtiers_are_pi_only(self):
         extra = set(PiBackend()._TIER_LAUNCH) - set(CodexBackend()._TIER_LAUNCH)
-        assert extra == {"medium-fast", "high-fast"}
+        assert extra == {"medium-fast"}
         assert CodexBackend().supported_models() == [
             "cheapest",
             "low",
@@ -184,15 +185,20 @@ class TestPiResolveLaunch:
         backend = PiBackend()
         assert backend.resolve_launch("medium-fast", "max") == (
             "gpt-6-sol",
-            "low",
+            "medium",
         )
-        assert backend.resolve_launch("high-fast", "max") == ("gpt-6-sol", "medium")
 
     def test_errors_when_subtier_model_absent(self, _models):
         _models(["gpt-6-luna", "gpt-6-astra"])
         with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-sol"):
             PiBackend().resolve_launch("medium-fast", None)
-        with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-sol"):
+
+    @pytest.mark.parametrize("catalog", [[], ["gpt-6-luna", "gpt-6-sol"]])
+    def test_retired_high_fast_fails_loudly(self, _models, catalog):
+        # Removed tier: never a raw-slug passthrough (empty discovery) nor a
+        # soft fallback to pi's default model (non-empty discovery).
+        _models(catalog)
+        with pytest.raises(RetiredTierError, match=r"high-fast.*'high'"):
             PiBackend().resolve_launch("high-fast", None)
 
     def test_old_ultra_name_uses_raw_slug_behavior(self, _models):
@@ -200,7 +206,7 @@ class TestPiResolveLaunch:
         assert PiBackend().resolve_launch("ultra", None) == ("ultra", None)
 
     def test_tier_owns_thinking_ignoring_caller(self, _models):
-        assert PiBackend().resolve_launch("high", "low") == ("gpt-6-luna", "max")
+        assert PiBackend().resolve_launch("high", "low") == ("gpt-6-sol", "high")
 
     def test_blank_defers_to_pi_default(self):
         assert PiBackend().resolve_launch("", None) == ("", None)
@@ -219,8 +225,8 @@ class TestPiResolveLaunch:
         _models(["gpt-6-sol"])
         with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-luna"):
             PiBackend().resolve_launch("low", None)
-        with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-luna"):
-            PiBackend().resolve_launch("high", None)
+        with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-astra"):
+            PiBackend().resolve_launch("max", None)
 
     @pytest.mark.parametrize(
         ("tier", "slug"),
@@ -229,8 +235,8 @@ class TestPiResolveLaunch:
             ("low", "gpt-6-luna"),
             ("medium", "gpt-6-luna"),
             ("medium-fast", "gpt-6-sol"),
-            ("high", "gpt-6-luna"),
-            ("high-fast", "gpt-6-sol"),
+            ("high", "gpt-6-sol"),
+            ("xhigh", "gpt-6-sol"),
         ],
     )
     def test_stale_pi_catalog_errors_with_minimum_version(self, _models, tier, slug):
@@ -258,7 +264,7 @@ class TestPiResolveLaunch:
 
     def test_provider_prefixed_catalog_entry_is_available(self, _models):
         _models(["openai-codex/gpt-6-astra"])
-        assert PiBackend().resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
+        assert PiBackend().resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
     def test_raw_slug_passthrough_when_available(self, _models):
         assert PiBackend().resolve_launch("gpt-5.5", "high") == ("gpt-5.5", "high")
@@ -269,7 +275,7 @@ class TestPiResolveLaunch:
 
     def test_skips_validation_when_discovery_empty(self, _models):
         _models([])
-        assert PiBackend().resolve_launch("medium", None) == ("gpt-6-luna", "xhigh")
+        assert PiBackend().resolve_launch("medium", None) == ("gpt-6-luna", "max")
 
 
 class TestPiBuildCommand:
@@ -308,7 +314,7 @@ class TestPiBuildCommand:
             _make_request(model=model, reasoning_effort=thinking)
         )
         assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-6-luna"
-        assert cmd[cmd.index("--thinking") + 1] == "xhigh"
+        assert cmd[cmd.index("--thinking") + 1] == "max"
 
     def test_cheapest_tier_launch_reaches_argv(
         self, _make_request, _direct_launch, _tty, _models
@@ -319,15 +325,15 @@ class TestPiBuildCommand:
             _make_request(model=model, reasoning_effort=thinking)
         )
         assert cmd[cmd.index("--model") + 1] == "openai-codex/gpt-6-luna"
-        assert cmd[cmd.index("--thinking") + 1] == "medium"
+        assert cmd[cmd.index("--thinking") + 1] == "high"
 
     def test_fast_subtier_launches_reach_argv(
         self, _make_request, _direct_launch, _tty, _models
     ):
         backend = PiBackend()
         for tier, slug, thinking in (
-            ("medium-fast", "gpt-6-sol", "low"),
-            ("high-fast", "gpt-6-sol", "medium"),
+            ("medium-fast", "gpt-6-sol", "medium"),
+            ("high", "gpt-6-sol", "high"),
         ):
             model, effort = backend.resolve_launch(tier, None)
             cmd = backend.build_command(
