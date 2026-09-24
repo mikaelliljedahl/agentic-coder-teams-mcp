@@ -231,7 +231,7 @@ async def test_spawn_agent_description_documents_tier_ladder() -> None:
         ("low", "gpt-6-luna", "xhigh"),
         ("medium", "gpt-6-luna", "max"),
         ("high", "gpt-6-sol", "high"),
-        ("xhigh", "gpt-6-sol", "xhigh"),
+        ("xhigh", "gpt-6-astra", "low"),
         ("max", "gpt-6-astra", "medium"),
     ):
         line = _tier_line(description, tier)

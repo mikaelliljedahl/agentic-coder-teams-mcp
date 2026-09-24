@@ -93,7 +93,7 @@ class TestCodexResolveModel:
         assert backend.resolve_model("low") == "gpt-6-luna"
         assert backend.resolve_model("medium") == "gpt-6-luna"
         assert backend.resolve_model("high") == "gpt-6-sol"
-        assert backend.resolve_model("xhigh") == "gpt-6-sol"
+        assert backend.resolve_model("xhigh") == "gpt-6-astra"
         assert backend.resolve_model("max") == "gpt-6-astra"
 
     def test_passes_through_direct_slug(self):
@@ -117,7 +117,7 @@ class TestCodexResolveLaunch:
         assert backend.resolve_launch("low", None) == ("gpt-6-luna", "xhigh")
         assert backend.resolve_launch("medium", None) == ("gpt-6-luna", "max")
         assert backend.resolve_launch("high", None) == ("gpt-6-sol", "high")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-6-sol", "xhigh")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
     def test_legacy_luna_env_has_no_effect(self, _stub_discovery, monkeypatch):
@@ -125,7 +125,7 @@ class TestCodexResolveLaunch:
         monkeypatch.setenv("WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS", "1")
         backend = CodexBackend()
         assert backend.resolve_launch("high", None) == ("gpt-6-sol", "high")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-6-sol", "xhigh")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
     def test_old_ultra_name_uses_raw_slug_passthrough(self, _stub_discovery):
@@ -139,7 +139,7 @@ class TestCodexResolveLaunch:
         # silently ignored and the bundled tier effort is used.
         assert backend.resolve_launch("low", "max") == ("gpt-6-luna", "xhigh")
         assert backend.resolve_launch("high", "xhigh") == ("gpt-6-sol", "high")
-        assert backend.resolve_launch("xhigh", "max") == ("gpt-6-sol", "xhigh")
+        assert backend.resolve_launch("xhigh", "max") == ("gpt-6-astra", "low")
 
     def test_blank_model_defers_to_codex_config(self):
         backend = CodexBackend()
@@ -155,12 +155,13 @@ class TestCodexResolveLaunch:
             "xhigh",
         )
 
-    @pytest.mark.parametrize("tier", ["high", "xhigh"])
-    def test_errors_when_sol_tier_unavailable(self, _stub_discovery, tier):
+    def test_errors_when_sol_tier_unavailable(self, _stub_discovery):
         _stub_discovery(["gpt-5.6-terra", "gpt-6-luna", "gpt-6-astra"])
         backend = CodexBackend()
         with pytest.raises(BackendModelUnavailableError, match=r"gpt-6-sol"):
-            backend.resolve_launch(tier, None)
+            backend.resolve_launch("high", None)
+        # xhigh needs only Astra, so it still resolves without GPT-6 Sol.
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
 
     def test_luna_and_sol_tiers_ok_without_astra(self, _stub_discovery):
         _stub_discovery(["gpt-6-luna", "gpt-6-sol"])
@@ -169,7 +170,6 @@ class TestCodexResolveLaunch:
         assert backend.resolve_launch("low", None) == ("gpt-6-luna", "xhigh")
         assert backend.resolve_launch("medium", None) == ("gpt-6-luna", "max")
         assert backend.resolve_launch("high", None) == ("gpt-6-sol", "high")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-6-sol", "xhigh")
 
     def test_errors_when_luna_tier_unavailable(self, _stub_discovery):
         _stub_discovery(["gpt-5.6-terra", "gpt-6-sol", "gpt-6-astra"])
@@ -177,14 +177,15 @@ class TestCodexResolveLaunch:
         with pytest.raises(BackendModelUnavailableError):
             backend.resolve_launch("medium", None)
 
-    def test_missing_astra_tier_includes_upgrade_hint(self, _stub_discovery):
+    @pytest.mark.parametrize("tier", ["xhigh", "max"])
+    def test_missing_astra_tier_includes_upgrade_hint(self, _stub_discovery, tier):
         _stub_discovery(["gpt-6-luna", "gpt-6-sol"])
         backend = CodexBackend()
         with pytest.raises(
             BackendModelUnavailableError,
             match=r"npm install -g @openai/codex@latest",
         ):
-            backend.resolve_launch("max", None)
+            backend.resolve_launch(tier, None)
 
     @pytest.mark.parametrize(
         ("tier", "slug"),
@@ -193,7 +194,6 @@ class TestCodexResolveLaunch:
             ("low", "gpt-6-luna"),
             ("medium", "gpt-6-luna"),
             ("high", "gpt-6-sol"),
-            ("xhigh", "gpt-6-sol"),
         ],
     )
     def test_gpt56_only_catalog_errors_for_gpt6_tiers(

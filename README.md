@@ -691,7 +691,7 @@ Astra = `gpt-6-astra`.
 | `medium` | Luna @ max | Luna @ max |
 | `medium-fast` | — | **Sol @ medium** |
 | `high` | Sol @ high | Sol @ high |
-| `xhigh` | Sol @ xhigh | Sol @ xhigh |
+| `xhigh` | Astra @ low | Astra @ low |
 | `max` | Astra @ medium | Astra @ medium |
 
 `medium-fast` is pi-only. Sol runs faster than Luna, so it is the low-latency
@@ -704,11 +704,18 @@ GPT-6 needs more reasoning effort than GPT-5.6 did at the same tier, so
 `cheapest` through `high` (and pi's `medium-fast`) each sit one effort step
 above the previous ladder on the same model family (DeepSWE v1.1: Sol @ medium
 56.6 % vs Sol @ high 65.3 %); pi's `high` also moves from Luna @ max to
-Sol @ high, since Luna has no step above `max`. `xhigh` changes model instead: it uses Sol @ xhigh rather
-than Astra: Astra costs 5x Sol per token, and Astra @ low only matches
-Sol @ xhigh on coding (67.0 % vs 66.6 %) at ~1.6x the cost per task. Sol @ max
-adds ~2 points for ~2.7x the cost, so it is not on the ladder. Astra @ medium
-(72.8 %) is the clear capability jump and stays at `max`. Luna has no
+Sol @ high, since Luna has no step above `max`.
+
+`xhigh` is meant for hard problems such as tricky code review and uses
+Astra @ low rather than Sol @ xhigh. Sol @ xhigh (66.6 % on DeepSWE) barely
+separates from Sol @ high (65.3 %), whereas Astra @ low (67.0 %) brings a
+stronger base model; on a harder cross-file review subset Astra found 57.1 %
+of actionable issues vs 47.6 % (measured against GPT-5.6 Sol, so directional
+only). On coding evaluations Astra used about one-third as many tokens as
+GPT-5.6 Sol, which keeps more of the reviewed code inside codex's 272k window, and its tendency to widen targeted
+fixes does not matter for read-only review. It costs 5x Sol per token (~1.6x
+per task), acceptable for an infrequent tier. Astra @ medium (72.8 %) stays at
+`max`. Luna has no
 published per-effort benchmarks; its step up is operator judgement.
 
 Codex runs with a 272k default context window; Luna @ max at `medium` is not
@@ -722,7 +729,7 @@ The error includes a backend-specific upgrade hint: `codex` suggests
 `npm install -g @openai/codex@latest`, while `pi` suggests
 `npm install -g @earendil-works/pi-coding-agent@latest` (or adding the model to
 provider config). GPT-6 Sol/Luna need pi >= 0.87.1; on pi 0.87.0 every tier
-except `max` fails until pi is upgraded. Empty discovery skips validation. Explicit raw slugs remain
+except `xhigh`/`max` (Astra) fails until pi is upgraded. Empty discovery skips validation. Explicit raw slugs remain
 an escape hatch; pi soft-falls to its configured default when such a slug is
 absent.
 
