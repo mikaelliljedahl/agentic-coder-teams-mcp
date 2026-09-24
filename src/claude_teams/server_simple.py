@@ -3187,7 +3187,7 @@ async def spawn_agent(
       - ``low``      -> Luna (``gpt-6-luna``) @ xhigh : quick, low-stakes tasks
       - ``medium``   -> Luna (``gpt-6-luna``) @ max : token-efficient default
       - ``high``     -> Sol (``gpt-6-sol``) @ high : backend dev, code review
-      - ``xhigh``    -> Sol (``gpt-6-sol``) @ xhigh : genuinely hard problems
+      - ``xhigh``    -> Astra (``gpt-6-astra``) @ low : hard problems, tricky review
       - ``max``      -> Astra (``gpt-6-astra``) @ medium : hardest (top tier)
     codex and pi use this identical ladder. pi only, one extra low-latency
     subtier sits beside ``medium``; Sol runs faster than Luna:

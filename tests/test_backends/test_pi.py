@@ -123,7 +123,7 @@ class TestPiModels:
         assert backend.resolve_model("medium") == "gpt-6-luna"
         assert backend.resolve_model("medium-fast") == "gpt-6-sol"
         assert backend.resolve_model("high") == "gpt-6-sol"
-        assert backend.resolve_model("xhigh") == "gpt-6-sol"
+        assert backend.resolve_model("xhigh") == "gpt-6-astra"
         assert backend.resolve_model("max") == "gpt-6-astra"
 
     def test_resolve_model_rejects_retired_high_fast(self):
@@ -147,14 +147,14 @@ class TestPiResolveLaunch:
         assert backend.resolve_launch("medium", None) == ("gpt-6-luna", "max")
         assert backend.resolve_launch("medium-fast", None) == ("gpt-6-sol", "medium")
         assert backend.resolve_launch("high", None) == ("gpt-6-sol", "high")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-6-sol", "xhigh")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
     def test_legacy_luna_env_has_no_effect(self, _models, monkeypatch):
         monkeypatch.setenv("WIN_AGENT_TEAMS_GPT_PREFER_LUNA_MODEL_TIERS", "1")
         backend = PiBackend()
         assert backend.resolve_launch("high", None) == ("gpt-6-sol", "high")
-        assert backend.resolve_launch("xhigh", None) == ("gpt-6-sol", "xhigh")
+        assert backend.resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
         assert backend.resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
     def test_shared_ladder_tiers_match_codex(self):
@@ -236,7 +236,6 @@ class TestPiResolveLaunch:
             ("medium", "gpt-6-luna"),
             ("medium-fast", "gpt-6-sol"),
             ("high", "gpt-6-sol"),
-            ("xhigh", "gpt-6-sol"),
         ],
     )
     def test_stale_pi_catalog_errors_with_minimum_version(self, _models, tier, slug):
@@ -255,6 +254,12 @@ class TestPiResolveLaunch:
         message = str(excinfo.value)
         assert slug in message
         assert "0.87.1" in message
+
+    def test_stale_pi_catalog_still_serves_astra_tiers(self, _models):
+        # pi 0.87.0 already lists Astra, so the Astra tiers keep working there.
+        _models(["openai-codex/gpt-5.6-sol", "openai-codex/gpt-6-astra"])
+        assert PiBackend().resolve_launch("xhigh", None) == ("gpt-6-astra", "low")
+        assert PiBackend().resolve_launch("max", None) == ("gpt-6-astra", "medium")
 
     def test_raw_gpt56_slug_still_passes_through(self, _models):
         assert PiBackend().resolve_launch("gpt-5.6-terra", "high") == (

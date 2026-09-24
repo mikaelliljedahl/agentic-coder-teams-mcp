@@ -182,11 +182,12 @@ class PiBackend(BaseBackend):
     #   medium      -> Luna  @ max     (token-efficient general default)
     #   medium-fast -> Sol   @ medium  (pi only; latency sibling of ``medium``)
     #   high        -> Sol   @ high
-    #   xhigh       -> Sol   @ xhigh
+    #   xhigh       -> Astra @ low
     #   max         -> Astra @ medium  (top)
     # The six shared tiers are identical to the Codex ladder; see there for why
-    # the Luna/Sol tiers moved up one effort step, ``xhigh`` left Astra for Sol
-    # and ``max`` stayed Astra @ medium. Luna and Sol need pi >= 0.87.1.
+    # the Luna/Sol tiers sit one effort step up for GPT-6 and why ``xhigh`` is
+    # Astra @ low. Luna and Sol need pi >= 0.87.1; the Astra tiers (``xhigh``,
+    # ``max``) also work on older pi.
     #
     # ``medium-fast`` exists only here. Sol runs faster than Luna, so it is the
     # low-latency pick when turnaround dominates — a different model, not
@@ -197,7 +198,7 @@ class PiBackend(BaseBackend):
         "medium": ("gpt-6-luna", "max"),
         "medium-fast": ("gpt-6-sol", "medium"),
         "high": ("gpt-6-sol", "high"),
-        "xhigh": ("gpt-6-sol", "xhigh"),
+        "xhigh": ("gpt-6-astra", "low"),
         "max": ("gpt-6-astra", "medium"),
     }
 
