@@ -17,6 +17,43 @@ from tests.test_backends._base_support import (
 )
 
 
+@pytest.mark.parametrize(
+    ("current", "pid_alive", "expected_alive", "reason"),
+    [
+        (None, True, True, "identity unverified"),
+        (None, False, False, "process not found"),
+        ("other", True, False, "pid reused"),
+        ("stored", True, True, "token match"),
+    ],
+)
+def test_token_health_without_registry(
+    monkeypatch, current, pid_alive, expected_alive, reason
+) -> None:
+    manager = process_manager_mod.process_manager
+    monkeypatch.setattr(manager, "_processes", {})
+    monkeypatch.setattr(manager, "_pid_alive", lambda handle: pid_alive)
+    monkeypatch.setattr(process_manager_mod, "creation_token", lambda handle: current)
+
+    alive, detail = manager._pid_health_with_token("777", "stored")
+
+    assert alive is expected_alive
+    assert reason in detail
+
+
+@pytest.mark.parametrize("pid_alive", [True, False])
+def test_token_health_without_stored_token_uses_pid_liveness(
+    monkeypatch, pid_alive
+) -> None:
+    manager = process_manager_mod.process_manager
+    monkeypatch.setattr(manager, "_processes", {})
+    monkeypatch.setattr(manager, "_pid_alive", lambda handle: pid_alive)
+    monkeypatch.setattr(process_manager_mod, "creation_token", lambda handle: "other")
+
+    alive, _ = manager._pid_health_with_token("777", None)
+
+    assert alive is pid_alive
+
+
 class _DangerousEnvBackend(_ProcessStubBackend):
     """Stub backend returning a shell-metacharacter env value."""
 
