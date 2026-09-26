@@ -16,6 +16,7 @@ each other, nothing more.
 
 from __future__ import annotations
 
+import errno
 import os
 import time
 from collections.abc import Iterator
@@ -58,6 +59,24 @@ def lock_handle(handle: Any, *, timeout_s: float = LOCK_TIMEOUT_SECONDS) -> None
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
 
 
+def try_lock_handle(handle: Any) -> bool:
+    """Try once; return False only for contention, preserving other OS errors."""
+    try:
+        if os.name == "nt":
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, LOCK_SIZE)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as err:
+        contention = {errno.EAGAIN, errno.EWOULDBLOCK}
+        if os.name == "nt":
+            contention.update({errno.EACCES, errno.EDEADLK})
+        if err.errno in contention:
+            return False
+        raise
+    return True
+
+
 def unlock_handle(handle: Any) -> None:
     """Release a lock taken by :func:`lock_handle`."""
     if os.name == "nt":
@@ -91,5 +110,6 @@ __all__ = [
     "FileLockTimeoutError",
     "file_lock",
     "lock_handle",
+    "try_lock_handle",
     "unlock_handle",
 ]

@@ -29,7 +29,7 @@ from typing import Any, Literal, cast
 
 from fastmcp import FastMCP
 
-from claude_teams import delivery, delivery_store, hooks, procinfo
+from claude_teams import delivery, delivery_store, hooks, native_wake, procinfo
 from claude_teams.agent_output import (
     BINDING_LEGACY,
     CORRELATION_FIELD,
@@ -358,10 +358,86 @@ mcp = FastMCP(
 )
 
 
+_NATIVE_PLATFORM_NOTE = (
+    "Claude session wake is Linux-only; on native Windows and macOS it is "
+    "unavailable and the watcher is the wake path. Codex queue wake works on "
+    "all platforms."
+)
+_NATIVE_RESTART_NOTE = (
+    "After a restart, call session_info or resume_session first. When the "
+    "Claude channel is available and unread messages are waiting, a backlog "
+    "notice follows immediately."
+)
+_NATIVE_TOOL_NOTES = {
+    "send_message": (
+        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, a registered Codex external "
+        "member also gets wake:{method:codex_queue,status:queued|coalesced|backoff|"
+        "failed|timeout|unavailable|unverified_thread|stale_registration|disabled,"
+        "detail?}. This best-effort doorbell never fails the send or confirms "
+        "delivery; keep arming the watcher. Cleared registrations omit wake."
+    ),
+    "read_messages": (
+        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, a [win-agent-teams wake #n] "
+        "best-effort notice may arrive. It has no content: call read_messages "
+        "to drain the inbox. Duplicates are harmless; keep arming the watcher. "
+        + _NATIVE_PLATFORM_NOTE
+    ),
+    "external_read": (
+        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, a [win-agent-teams wake #n] "
+        "or win-agent-teams: best-effort notice may arrive. It has no content: "
+        "call external_read with your saved member_token. Duplicates are "
+        "harmless; keep arming the watcher. After a Claude-hosted member MCP restart, "
+        "call external_read once to re-arm notices; no native notice arrives "
+        "until the next external_read, external_send, or external_set_wake call. "
+        "Saved Codex registration still supports lead-side queue notices. "
+        + _NATIVE_PLATFORM_NOTE
+    ),
+    "create_join_ticket": (
+        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, the join prompt includes "
+        "external_set_wake and Unix/PowerShell commands for Codex registration. "
+        "It is a best-effort doorbell; keep the watcher and read fallback."
+    ),
+    "session_info": (
+        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, native_wake reports "
+        "{claude_channel,owner_verified,notifier_owner}: channel availability, "
+        "never delivery. This best-effort doorbell never replaces the watcher. "
+        + _NATIVE_PLATFORM_NOTE
+        + " "
+        + _NATIVE_RESTART_NOTE
+    ),
+    "resume_session": (
+        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, the best-effort doorbell "
+        "observes explicit session activation; keep arming the watcher. "
+        + _NATIVE_PLATFORM_NOTE
+        + " "
+        + _NATIVE_RESTART_NOTE
+    ),
+}
+
+
+def _native_send_description(description: str) -> str:
+    """Use an explicit flag-on external paragraph, retaining the other paths."""
+    external = description.index("    * **An external member you registered**")
+    spawned = description.index("    * **A spawned agent you spawned**", external)
+    external_note = """\
+    * **An external member you registered** receives one inbox line and returns
+      ``delivery="inbox"``. This is pull-based and unconfirmed: it reads the
+      message on its next ``external_read`` call. No idempotency key, lease,
+      durable delivery row, or process resume is involved. There is no wake
+      unless WIN_AGENT_TEAMS_NATIVE_WAKE=1 and a Codex thread is registered.
+"""
+    return description[:external] + external_note + description[spawned:]
+
+
 def _register_tool(*, external: bool = False):
     """Register one tool unless the import-time external-only gate excludes it."""
 
     def _decorate(fn):
+        if native_wake.enabled() and fn.__name__ in _NATIVE_TOOL_NOTES:
+            description = fn.__doc__ or ""
+            if fn.__name__ == "send_message":
+                description = _native_send_description(description)
+            fn.__doc__ = description + "\n\n" + _NATIVE_TOOL_NOTES[fn.__name__]
         external_only = os.environ.get(
             "WIN_AGENT_TEAMS_EXTERNAL_ONLY", ""
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -758,7 +834,7 @@ def _build_join_prompt(
 ) -> str:
     """Build the deterministic paste-ready external-member join prompt."""
     fence = _markdown_fence(note)
-    return (
+    prompt = (
         f"You are joining {parent}'s win-agent-teams session as {name!r}.\n\n"
         f"Role note:\n{fence}\n{note}\n{fence}\n\n"
         "Join protocol:\n"
@@ -774,6 +850,23 @@ def _build_join_prompt(
         f"--reader {name}\n"
         "5. When finished permanently, call leave_team(member_token=...).\n"
     )
+
+    if native_wake.enabled():
+        prompt += (
+            "6. If you are a Codex session, run one shell command and pass both "
+            "values to external_set_wake(member_token=..., codex_thread_id=..., "
+            'codex_home=...). Unix: echo "$CODEX_THREAD_ID '
+            '${CODEX_HOME:-$HOME/.codex}"; PowerShell: "$env:CODEX_THREAD_ID '
+            "$(if ($env:CODEX_HOME) {$env:CODEX_HOME} else "
+            "{Join-Path $HOME '.codex'})\". Both MCP entries (lead and member) "
+            "need WIN_AGENT_TEAMS_NATIVE_WAKE=1. If the tool is absent, keep "
+            "polling external_read. This best-effort doorbell never replaces "
+            "the watcher; still check external_read before ending a long wait. "
+            "After a restart, the lead must call session_info or resume_session "
+            "first; when the Linux-only Claude channel is available and unread "
+            "messages are waiting, a backlog notice follows immediately.\n"
+        )
+    return prompt
 
 
 def _member_secret(ticket_id: object, token: object) -> str:
@@ -1266,6 +1359,7 @@ def _active_session_id(*, create: bool = False) -> str:
     recovered = _recover_session_id()
     if recovered:
         _session_id = recovered
+        native_wake.session_activated(_session_id)
         # A fallback auto-adoption must re-bind to the current parent key (so
         # the next call hits the fast path) and prune the stale binding.
         if _pending_recovery.get("adopted_session"):
@@ -1274,6 +1368,7 @@ def _active_session_id(*, create: bool = False) -> str:
     if create:
         _maybe_cleanup_old_sessions()
         _session_id = _create_session()
+        native_wake.session_activated(_session_id)
         return _session_id
     return ""
 
@@ -1640,6 +1735,20 @@ always get state-marker hooks, but get this lead-wake group only when spawned
 with `enable_spawned_lead_wake=true`. A top-level lead wires it with the
 `install_lead_wake` tool.
 """.strip()
+
+
+if native_wake.enabled():
+    _DISK_CONTRACT_NOTE += (
+        "\n\nOnly with WIN_AGENT_TEAMS_NATIVE_WAKE=1, native wake is a "
+        "best-effort doorbell, never delivery: keep arming watch. The notifier "
+        "holds native-wake-lead.<reader>.lock (native-wake-member.<name>.lock for "
+        "members) for the target lifetime. Kill switches "
+        "WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE=0 and "
+        "WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX=0 disable each half. "
+        + _NATIVE_PLATFORM_NOTE
+        + " "
+        + _NATIVE_RESTART_NOTE
+    )
 
 
 def _with_disk_note(fn):
@@ -3489,7 +3598,7 @@ async def send_message(
                         "a", encoding="utf-8"
                     ) as handle:
                         handle.write(line + "\n")
-                    return {
+                    inbox_result: dict = {
                         "success": True,
                         "to": recipient,
                         "delivery": "inbox",
@@ -3498,6 +3607,27 @@ async def send_message(
                             "this inbox on its next external_read call."
                         ),
                     }
+                    external_target = True
+                    registered_target = bool(
+                        (target.get("codex_wake") or {}).get("thread_id")
+                    )
+                else:
+                    external_target = False
+            if external_target:
+                if native_wake.enabled() and registered_target:
+                    try:
+                        wake = _codex_member_wake.wake(
+                            session_id,
+                            recipient,
+                            IDENTITY,
+                            lambda: _native_member_snapshot(session_id, recipient),
+                        )
+                    except Exception:
+                        # The inbox append succeeded; a doorbell cannot undo it.
+                        wake = {"method": "codex_queue", "status": "failed"}
+                    if wake is not None:
+                        inbox_result["wake"] = wake
+                return inbox_result
             # R5: the only accept-then-drop risk left is a child that is not
             # polling, so a downstream send is the guaranteed path, never an
             # inbox append. B4 stays intact — the audit row is the record, and
@@ -3769,7 +3899,8 @@ async def external_send(member_token: str, text: str) -> dict:
                 _write_state_marker(session_id, name, state="running", event="activity")
             except OSError:
                 result["heartbeat_warning"] = True
-            return result
+        native_wake.watch_member(session_id, name)
+        return result
 
     return await run_blocking(_send)
 
@@ -3839,9 +3970,88 @@ async def external_read(
                 _write_state_marker(session_id, name, state="running", event="activity")
             except OSError:
                 result["heartbeat_warning"] = True
-            return result
+        native_wake.watch_member(session_id, name)
+        return result
 
     return await run_blocking(_read)
+
+
+def _register_wake_tool(fn):
+    """Expose registration only under the import-time native opt-in gate."""
+    return _register_tool(external=True)(fn) if native_wake.enabled() else fn
+
+
+@_register_wake_tool
+async def external_set_wake(
+    member_token: str, codex_thread_id: str, codex_home: str = ""
+) -> dict:
+    """Register, replace, or clear a token-authenticated Codex member doorbell.
+
+    Available only with WIN_AGENT_TEAMS_NATIVE_WAKE=1 at server startup,
+    including external-only servers. Both member and lead MCP entries need
+    that flag; otherwise keep polling external_read. This best-effort doorbell
+    never confirms delivery and never replaces the watcher.
+
+    Pass CODEX_THREAD_ID from your shell as a canonical lowercase UUID and
+    your absolute CODEX_HOME (blank home defaults to ~/.codex). A blank thread
+    clears registration. Unix: echo "$CODEX_THREAD_ID ${CODEX_HOME:-$HOME/.codex}".
+    PowerShell: "$env:CODEX_THREAD_ID $(if ($env:CODEX_HOME) {$env:CODEX_HOME}
+    else {Join-Path $HOME '.codex'})". Save member_token from join_team; every
+    call revalidates it and requires a running member. Invalid input returns
+    success:false with invalid_codex_thread_id or invalid_codex_home, without
+    writing. Calls may be repeated at any time after joining, including after
+    restart; no ticket-retention limit applies. After a Claude-hosted member
+    MCP restart,
+    call external_read once to re-arm notices; no native notice arrives until
+    the next external_read, external_send, or external_set_wake call.
+    Saved Codex registration still supports lead-side queue notices.
+
+    codex_home is member-supplied input, validated as an existing directory
+    before queueing. For the subprocess it is used only as CODEX_HOME, never
+    as cwd; CODEX_HOME selects Codex's config.toml under the same-user trust
+    model. No lead configuration is changed.
+
+    Returns {success, name, codex_wake}; codex_wake contains thread_id,
+    codex_home, registered_at, and monotonically increasing generation. Clear
+    retains a generation tombstone with null thread_id and codex_home.
+    The lead verifies the thread in the reported home before codex queue;
+    archived, missing, or unverifiable threads are never queued. Queue wake
+    works on all platforms and has a real subprocess timeout. A loaded idle
+    Desktop thread woke in the Linux smoke; closed/unloaded Desktop persistence
+    and dispatch after a busy turn remain unverified (V1/V2). A queue insertion
+    is never a consumption receipt. Keep external_read and watcher fallback.
+    """
+    thread_id = codex_thread_id.strip()
+    if thread_id:
+        try:
+            if str(uuid.UUID(thread_id)) != thread_id:
+                return {"success": False, "reason": "invalid_codex_thread_id"}
+        except ValueError:
+            return {"success": False, "reason": "invalid_codex_thread_id"}
+    home = codex_home.strip() or str(Path.home() / ".codex")
+    if thread_id and not Path(home).is_absolute():
+        return {"success": False, "reason": "invalid_codex_home"}
+
+    def _set() -> dict:
+        with _member_operation(member_token) as (record, agents, session_id, refusal):
+            if refusal is not None:
+                return refusal
+            if record is None or agents is None:
+                return {"success": False, "reason": "membership_revoked"}
+            generation = (record.get("codex_wake") or {}).get("generation", 0) + 1
+            registration = {
+                "thread_id": thread_id or None,
+                "codex_home": home if thread_id else None,
+                "registered_at": datetime.now(UTC).isoformat(),
+                "generation": generation,
+            }
+            record["codex_wake"] = registration
+            _save_agents_unlocked(session_id, agents)
+            name = str(record["name"])
+        native_wake.watch_member(session_id, name)
+        return {"success": True, "name": name, "codex_wake": registration}
+
+    return await run_blocking(_set)
 
 
 @_register_tool(external=True)
@@ -5966,6 +6176,7 @@ async def resume_session(session_id: str) -> dict:
         ):
             return {"success": False, "session_id": sid, "reason": "session_not_found"}
         _session_id = sid
+        native_wake.session_activated(_session_id)
         _persist_session_binding(sid)  # re-bind current key + prune stale bindings
         try:
             agents = _load_agents(sid)
@@ -6025,7 +6236,21 @@ async def session_info() -> dict:
             "recoverable_sessions": recoverable,
         }
 
-    return await run_blocking(_do_info)
+    result = await run_blocking(_do_info)
+    if native_wake.enabled():
+        channel = (
+            _native_notifier.channel
+            if _native_notifier is not None
+            else native_wake.resolve_claude_channel(os.environ)
+        )
+        result["native_wake"] = {
+            "claude_channel": channel.reason,
+            "owner_verified": channel.owner_verified,
+            "notifier_owner": bool(
+                _native_notifier and _native_notifier.owns(_native_wake_target())
+            ),
+        }
+    return result
 
 
 def _marker_timestamp(marker: dict | None) -> float | None:
@@ -6881,9 +7106,58 @@ async def install_member_wake(
     return await run_blocking(_do_install)
 
 
+_codex_member_wake = native_wake.CodexMemberWake()
+
+
+def _native_member_snapshot(
+    session_id: str, name: str
+) -> tuple[dict | None, dict[str, dict[str, int]]]:
+    """Snapshot registration and cursors under a short agents lock."""
+    with _agents_file_lock(session_id):
+        record = _find_agent(_load_agents_unlocked(session_id), name)
+        scan = native_wake.scan_inbox(_session_dir(session_id), name)
+    return record, scan
+
+
+_native_notifier: native_wake.NativeWakeNotifier | None = None
+
+
+def _native_wake_target() -> tuple[str, str] | None:
+    """Read ambient state without triggering session recovery."""
+    external_only = os.environ.get(
+        "WIN_AGENT_TEAMS_EXTERNAL_ONLY", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not _session_id or _IDENTITY_UNRESOLVED or external_only:
+        return None
+    return _session_id, IDENTITY
+
+
+def _native_member_alive(session_id: str, name: str) -> bool:
+    """Read member status under a short registry lock."""
+    record = _find_agent(_load_agents(session_id), name)
+    return bool(
+        record
+        and record.get("backend") == "external"
+        and record.get("status") == "running"
+    )
+
+
 def main() -> None:
     """Run the MCP server."""
-    mcp.run()
+    global _native_notifier  # noqa: PLW0603 - one notifier per MCP server.
+    if native_wake.enabled("CLAUDE") and native_wake.claude_platform_supported():
+        _native_notifier = native_wake.NativeWakeNotifier(
+            get_target=_native_wake_target,
+            session_dir=_session_dir,
+            member_alive=_native_member_alive,
+        )
+        _native_notifier.start()
+    try:
+        mcp.run()
+    finally:
+        if _native_notifier is not None:
+            _native_notifier.close()
+            _native_notifier = None
 
 
 if __name__ == "__main__":

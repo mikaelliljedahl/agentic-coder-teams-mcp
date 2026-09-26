@@ -67,6 +67,12 @@ woken instead of polling:
 - **Send work:** `send_message(to="<member-name>", text="...")`. To an external
   member this returns `delivery:"inbox"` — pull-only, unconfirmed. Do **not**
   pass an `idempotency_key` (that is for guaranteed delivery to spawned agents).
+  With `WIN_AGENT_TEAMS_NATIVE_WAKE=1` and a Codex member registration, the
+  result also has `wake:{method:"codex_queue",status,detail?}`. Status is
+  `queued|coalesced|backoff|failed|timeout|unavailable|unverified_thread|
+  stale_registration|disabled`. Wake failure never fails the inbox append.
+  A cleared registration omits `wake`. A successful queue is a best-effort
+  doorbell, never delivery: keep the watcher and confirm the member's reply.
 - Confirm round-trips by content: include a distinctive marker in a probe and
   check the member echoes it back.
 
@@ -89,3 +95,17 @@ woken instead of polling:
   member-wake there would nag your own orchestrator session).
 - "Done" ≠ "correct": verify a member's deliverable independently, exactly as
   with a spawned worker.
+
+## Optional native notices and restart
+
+Set `WIN_AGENT_TEAMS_NATIVE_WAKE=1` in both lead and member MCP entries. The
+flag-on join prompt includes `external_set_wake` and shell commands for the
+Codex thread/home. Claude session wake is Linux-only; native
+Windows and macOS use the watcher. Codex queue wake works on all platforms. Inbound
+Claude policy can silently hold/refuse notices and Codex needs a loaded thread;
+keep the watcher steps above.
+
+After a lead MCP restart, call `session_info` or `resume_session` first. When
+the Claude channel is available and unread messages wait, a backlog notice
+follows immediately. `session_info.native_wake` reports availability and
+ownership, never delivery.

@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import pytest
 
+from claude_teams import native_wake as nw
 from claude_teams import server_simple as ss
 
 
@@ -1253,3 +1254,38 @@ def test_large_inbox_read_contention_bounded(
     assert elapsed < 30
     read_result = cast("dict[str, Any]", results["read"])
     assert len(read_result["messages"]) == 10_000
+
+
+def test_join_prompt_flag_on_both_shells_and_reader(join_session, monkeypatch):
+    monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", "1")
+    prompt = asyncio.run(ss.create_join_ticket("member"))["join_prompt"]
+    for literal in (
+        "external_set_wake",
+        "$CODEX_THREAD_ID",
+        "$env:CODEX_THREAD_ID",
+        "${CODEX_HOME:-$HOME/.codex}",
+        "Join-Path",
+        "--reader member",
+        "both",
+        "MCP",
+        "absent",
+        "external_read",
+    ):
+        assert literal in prompt
+
+
+def test_session_info_availability_only(join_session, monkeypatch):
+    monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", "1")
+    monkeypatch.setattr(
+        nw,
+        "resolve_claude_channel",
+        lambda env: nw.ClaudeChannel("available", "/fake", "secret", True),
+    )
+    monkeypatch.setattr(ss, "_native_notifier", None)
+    result = asyncio.run(ss.session_info())
+    assert result["native_wake"] == {
+        "claude_channel": "available",
+        "owner_verified": True,
+        "notifier_owner": False,
+    }
+    assert "secret" not in json.dumps(result)

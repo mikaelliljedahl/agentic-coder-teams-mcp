@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 
+from claude_teams import native_wake
 from claude_teams.backends.contracts import (
     _SAFE_ENV_KEY,
     AgentProfile,
@@ -99,6 +100,10 @@ class BaseBackend:
         for key in env_vars:
             if not _SAFE_ENV_KEY.match(key):
                 raise InvalidEnvVarNameError(key)
+
+        if native_wake.enabled():
+            env_vars["CLAUDE_CODE_MESSAGING_SOCKET"] = ""
+            env_vars["CLAUDE_CODE_MESSAGING_TOKEN"] = ""
 
         return process_manager.spawn_process(
             request, cmd_parts, env_vars, self._name, is_interactive=self.is_interactive
