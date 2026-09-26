@@ -70,29 +70,64 @@ def test_default_codex_home(monkeypatch):
     assert server_simple._effective_codex_home() == str(Path.home() / ".codex")
 
 
-def test_resume_bumps_dispatch_epoch(monkeypatch):
+def test_dispatch_epoch_is_monotonic_across_name_reuse(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", "1")
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path / "sessions")
+    server_simple._session_dir("s1").mkdir(parents=True)
+    assert server_simple._dispatch_extra("s1", "worker", {}) == {"dispatch_epoch": "1"}
+    assert server_simple._dispatch_extra("s1", "worker", {"dispatch_epoch": 1}) == {
+        "dispatch_epoch": "2"
+    }
+    # Record removed by kill; a same-name successor must not reuse 1 or 2.
+    assert server_simple._dispatch_extra("s1", "worker", {}) == {"dispatch_epoch": "3"}
+    # A record ahead of the file (e.g. restored) still wins.
+    assert server_simple._dispatch_extra("s1", "worker", {"dispatch_epoch": 9}) == {
+        "dispatch_epoch": "10"
+    }
+    assert server_simple._dispatch_extra("s1", "other", {}) == {"dispatch_epoch": "1"}
+
+
+def test_dispatch_extra_flag_off_is_empty(tmp_path, monkeypatch):
+    monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
+    assert server_simple._dispatch_extra("s1", "worker", {}) == {}
+
+
+def test_record_fields_take_the_minted_epoch(monkeypatch):
     monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", "1")
     monkeypatch.setattr(
         server_simple.process_manager, "provides_tty", lambda *a, **k: True
     )
-    backend = _InteractiveBackend()
     fields = server_simple._native_record_fields(
-        {"dispatch_epoch": 4}, "claude-code", backend
+        "claude-code", _InteractiveBackend(), {"dispatch_epoch": "5"}
     )
-    assert fields["dispatch_epoch"] == 5
-    assert (
-        server_simple._native_record_fields(
-            {"dispatch_epoch": "x"}, "claude-code", backend
-        )["dispatch_epoch"]
-        == 1
-    )
+    assert fields == {"interactive": True, "dispatch_epoch": 5}
+    assert server_simple._native_record_fields("claude-code", _FakeBackend(), {}) == {}
 
 
-def test_resume_flag_off_adds_nothing(monkeypatch):
-    monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
-    assert (
-        server_simple._native_record_fields(
-            {"dispatch_epoch": 4}, "codex", _FakeBackend()
-        )
-        == {}
+def test_epoch_is_exported_to_the_child_environment(monkeypatch):
+    from claude_teams.backends import process_base
+    from claude_teams.backends.claude_code import ClaudeCodeBackend
+    from claude_teams.backends.contracts import SpawnRequest
+
+    monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", "1")
+    observed = []
+    monkeypatch.setattr(
+        process_base.process_manager,
+        "spawn_process",
+        lambda request, argv, env_vars, *a, **k: observed.append(env_vars),
     )
+    backend = ClaudeCodeBackend()
+    request = SpawnRequest(
+        agent_id="id",
+        name="agent",
+        team_name="team",
+        prompt="task",
+        model="",
+        agent_type="",
+        color="",
+        cwd=".",
+        lead_session_id="team-lead",
+        extra={"dispatch_epoch": "7"},
+    )
+    backend._spawn_with_command(request, ["fake"], {})
+    assert observed[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] == "7"

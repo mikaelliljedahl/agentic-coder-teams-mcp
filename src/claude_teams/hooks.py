@@ -115,21 +115,44 @@ def emit(session_dir: Path, agent: str) -> None:
     )
 
 
-def _next_marker(prior: dict, event_name: str, session_id: str) -> dict:
-    """Derive the next marker from the prior one (counters are monotonic).
+def _dispatch_epoch() -> int:
+    """Return this host's dispatch epoch from the spawn/resume environment."""
+    try:
+        value = int(os.environ.get("WIN_AGENT_TEAMS_DISPATCH_EPOCH", "") or 0)
+    except ValueError:
+        return 0
+    return max(value, 0)
 
-    ``idle_seq`` counts ``waiting`` events and ``turn_seq`` counts submitted
-    prompts, so a whole turn that happens between two polls is still visible
-    as a larger ``idle_seq`` even though ``state`` looks unchanged.
+
+def _counter(marker: dict, name: str) -> int:
+    value = marker.get(name)
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _next_marker(prior: dict, event_name: str, session_id: str) -> dict | None:
+    """Derive the next marker from the prior one, or ``None`` to drop the write.
+
+    ``idle_seq`` counts *transitions* into ``waiting`` (a duplicate ``Stop``
+    within one idle period does not count) and ``turn_seq`` counts submitted
+    prompts, so a whole turn between two polls is still visible even though
+    ``state`` looks unchanged. Both restart in a new namespace: a new dispatch
+    epoch (a respawn) or a different host session. A late hook from an older
+    epoch is dropped so it cannot overwrite the new incarnation's marker.
     """
     state = _map_event_to_state(event_name)
-
-    def counter(name: str) -> int:
-        value = prior.get(name)
-        return value if isinstance(value, int) and value >= 0 else 0
-
-    idle_seq = counter("idle_seq") + (1 if state == "waiting" else 0)
-    turn_seq = counter("turn_seq") + (1 if event_name == "UserPromptSubmit" else 0)
+    epoch = _dispatch_epoch()
+    prior_epoch = _counter(prior, "dispatch_epoch")
+    if epoch < prior_epoch:
+        return None
+    prior_session = prior.get("backend_session_id")
+    fresh = epoch != prior_epoch or (
+        bool(session_id)
+        and isinstance(prior_session, str)
+        and bool(prior_session)
+        and prior_session != session_id
+    )
+    base = {} if fresh else prior
+    entered_idle = state == "waiting" and (fresh or prior.get("state") != "waiting")
     # ``gen`` identifies this exact write so a watcher can acknowledge one park
     # and still wake for the next one (equality, never timestamp ordering).
     return {
@@ -137,9 +160,11 @@ def _next_marker(prior: dict, event_name: str, session_id: str) -> dict:
         "event": event_name,
         "ts": time.time(),
         "gen": uuid.uuid4().hex,
-        "idle_seq": idle_seq,
-        "turn_seq": turn_seq,
+        "idle_seq": _counter(base, "idle_seq") + (1 if entered_idle else 0),
+        "turn_seq": _counter(base, "turn_seq")
+        + (1 if event_name == "UserPromptSubmit" else 0),
         "backend_session_id": session_id,
+        "dispatch_epoch": epoch,
     }
 
 
@@ -158,7 +183,9 @@ def _record_event(
             prior = {}
         if not isinstance(prior, dict):
             prior = {}
-        _write_marker_atomic(path, _next_marker(prior, event_name, session_id))
+        marker = _next_marker(prior, event_name, session_id)
+        if marker is not None:
+            _write_marker_atomic(path, marker)
 
 
 def _emit_command(session_dir: Path, agent: str) -> list[str]:

@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -95,7 +95,12 @@ from claude_teams.delivery_store import (
     settle,
     validate_idempotency_key,
 )
-from claude_teams.filelock import FileLockTimeoutError, lock_handle, unlock_handle
+from claude_teams.filelock import (
+    FileLockTimeoutError,
+    file_lock,
+    lock_handle,
+    unlock_handle,
+)
 from claude_teams.leases import (
     LEASES_FILE_NAME,
     LeaseStoreError,
@@ -2868,18 +2873,51 @@ def _effective_codex_home() -> str:
     return os.environ.get("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
 
 
-def _native_record_fields(prior: dict, backend_name: str, backend: Any) -> dict:
+def _next_dispatch_epoch(session_id: str, name: str, prior: dict) -> int:
+    """Mint the next dispatch epoch for ``name``, monotonic across name reuse.
+
+    The high-water mark lives in ``dispatch-epochs.json`` (not the agent
+    record), so a same-name successor spawned after a kill never reuses an
+    epoch that an old offer, poster or late hook could still carry.
+    """
+    path = _session_dir(session_id) / "dispatch-epochs.json"
+    with file_lock(path.with_suffix(".lock")):
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+        candidates = [stored.get(name), prior.get("dispatch_epoch")]
+        high = max(
+            (value for value in candidates if isinstance(value, int) and value >= 0),
+            default=0,
+        )
+        stored[name] = high + 1
+        _write_json_object_atomic(path, stored)
+    return high + 1
+
+
+def _dispatch_extra(session_id: str, name: str, prior: dict) -> dict[str, str]:
+    """Spawn/resume ``extra`` carrying the new epoch; empty with the flag off."""
+    if not native_wake.enabled():
+        return {}
+    return {"dispatch_epoch": str(_next_dispatch_epoch(session_id, name, prior))}
+
+
+def _native_record_fields(
+    backend_name: str, backend: Any, extra: Mapping[str, str] | None
+) -> dict:
     """Record native-delivery facts at spawn/resume; empty with the flag off.
 
     ``interactive`` says whether the child got a TTY (a live, wakeable
     session); ``codex_home`` pins where ``codex queue`` must look for the
-    thread; ``dispatch_epoch`` is the revocable fence a native offer must match
-    and is bumped by every spawn/resume (never by a native finalisation).
+    thread; ``dispatch_epoch`` is the revocable fence a native offer must match,
+    minted per spawn/resume (never by a native finalisation) and also exported
+    to the child so its hooks stamp their markers with it.
     """
-    if not native_wake.enabled():
+    if not native_wake.enabled() or not extra or "dispatch_epoch" not in extra:
         return {}
-    previous = prior.get("dispatch_epoch")
-    base = previous if isinstance(previous, int) and previous >= 0 else 0
     fields: dict = {
         "interactive": bool(
             process_manager.provides_tty(
@@ -2887,7 +2925,7 @@ def _native_record_fields(prior: dict, backend_name: str, backend: Any) -> dict:
                 is_interactive=bool(getattr(backend, "is_interactive", False)),
             )
         ),
-        "dispatch_epoch": base + 1,
+        "dispatch_epoch": int(extra["dispatch_epoch"]),
     }
     if backend_name == "codex":
         fields["codex_home"] = _effective_codex_home()
@@ -3468,6 +3506,7 @@ async def spawn_agent(
                     backend_name,
                     enable_spawned_lead_wake,
                 ),
+                **_dispatch_extra(session_id, agent_name, {}),
             }
 
             request = SpawnRequest(
@@ -3521,7 +3560,7 @@ async def spawn_agent(
                     # asserted. ``follow_up_agent`` refuses any other caller.
                     SPAWNED_BY_FIELD: IDENTITY,
                     SPAWNED_BY_SOURCE_FIELD: SPAWNED_BY_SOURCE_SPAWN,
-                    **_native_record_fields({}, backend_name, b),
+                    **_native_record_fields(backend_name, b, extra),
                 }
             )
             _save_agents_transaction(session_id, agents)
@@ -4254,6 +4293,7 @@ def _build_resume_request(
             backend_name,
             agent.get("enable_spawned_lead_wake") is True,
         ),
+        **_dispatch_extra(session_id, agent_name, agent),
     }
     request = SpawnRequest(
         agent_id=f"{agent_name}@{session_id}",
@@ -4374,7 +4414,9 @@ def _finalize_follow_up(
                 PROMPT_TRANSPORT_FIELD: plan.prompt_transport,
                 # A respawn is a new dispatch epoch: native offers made to the
                 # previous incarnation must no longer be takeable.
-                **_native_record_fields(agent, plan.backend_name, plan.backend),
+                **_native_record_fields(
+                    plan.backend_name, plan.backend, plan.request.extra
+                ),
             }
         )
         agent.pop(PENDING_DELIVERY_FIELD, None)
