@@ -157,9 +157,32 @@ def _build_posix_shell_command(cwd: str, cmd: list[str], env: dict[str, str]) ->
     return f"cd {shlex.quote(cwd)} && {export_prefix}exec {shlex.join(cmd)}"
 
 
+# Every character PowerShell's tokenizer treats as a single quote
+# (``CharTraits.IsSingleQuote``): ASCII ``'`` plus U+2018, U+2019, U+201A and
+# U+201B. Each one both delimits a verbatim literal and escapes itself when
+# doubled, so escaping only ASCII ``'`` lets e.g. ``x\u2019; calc`` break out.
+_POWERSHELL_SINGLE_QUOTES = frozenset("'\u2018\u2019\u201a\u201b")
+
+# A bare ``$env:<name>`` reference is only safe for a plain identifier.
+_POWERSHELL_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
 def _powershell_quote(value: str) -> str:
-    """Quote a value as a PowerShell single-quoted literal (``'`` -> ``''``)."""
-    return "'" + str(value).replace("'", "''") + "'"
+    """Quote a value as a PowerShell single-quoted (verbatim) literal.
+
+    Inside a single-quoted literal the tokenizer (``ScanStringLiteral``) ends
+    the string at any unpaired single-quote character, and reads a PAIR of
+    them as one literal quote -- keeping the second. Doubling each of the five
+    quote characters with itself therefore preserves the value exactly while
+    leaving no unpaired quote before the closing ``'``. Nothing else is special
+    in a verbatim literal: no ``$`` expansion, no backtick escapes, newlines
+    are content. This is parser-level safety only; it says nothing about how a
+    value survives a native command line, ``wt``'s ``;`` splitting, or CMD.
+    """
+    escaped = "".join(
+        ch * 2 if ch in _POWERSHELL_SINGLE_QUOTES else ch for ch in str(value)
+    )
+    return "'" + escaped + "'"
 
 
 def _force_kill_pid(handle: str) -> None:
@@ -1063,7 +1086,8 @@ class WindowsProcessManager(_PidOwnershipMixin):
             "powershell",
             "-NoExit",
             "-Command",
-            f"Get-Content -LiteralPath '{log_path}' -Wait -Tail 80",
+            f"Get-Content -LiteralPath {_powershell_quote(str(log_path))} "
+            "-Wait -Tail 80",
         ]
         subprocess.Popen(  # noqa: S603 - opens log tail in Windows Terminal only.
             command,
@@ -1251,6 +1275,12 @@ class WindowsProcessManager(_PidOwnershipMixin):
         baked in as PowerShell single-quoted literals, so the free-form prompt
         argument needs no fragile cross-shell quoting.
         """
+        for key in env:
+            if not _POWERSHELL_ENV_NAME.fullmatch(key):
+                raise ValueError(  # noqa: TRY003
+                    f"refusing to write {key!r} into the tab wrapper: not a "
+                    "plain environment variable name"
+                )
         lines = ["$ErrorActionPreference = 'Stop'"]
         lines.extend(
             f"$env:{key} = {_powershell_quote(value)}" for key, value in env.items()

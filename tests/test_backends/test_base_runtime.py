@@ -1048,7 +1048,8 @@ class TestWindowsTerminalTail:
             "--title",
             "worker@team",
         ]
-        assert f"Get-Content -LiteralPath '{log_path}' -Wait -Tail 80" in command
+        quoted = process_manager_mod._powershell_quote(str(log_path))
+        assert f"Get-Content -LiteralPath {quoted} -Wait -Tail 80" in command
         # The tail only displays a file; inheriting this server's stdin would
         # hand a long-lived child the JSON-RPC pipe. The stdin ratchet in
         # tests/test_subprocess_stdin.py covers subprocess.run only, so this
