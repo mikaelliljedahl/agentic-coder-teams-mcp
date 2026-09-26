@@ -188,3 +188,90 @@ def test_epoch_is_exported_with_the_flag_off(monkeypatch):
     ClaudeCodeBackend()._spawn_with_command(request, ["fake"], {})
     assert observed[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] == "7"
     assert "CLAUDE_CODE_MESSAGING_SOCKET" not in observed[0]
+
+
+def _pristine_request(**extra: str):
+    from claude_teams.backends.contracts import SpawnRequest
+
+    return SpawnRequest(
+        agent_id="id",
+        name="agent",
+        team_name="team",
+        prompt="task",
+        model="",
+        agent_type="",
+        color="",
+        cwd=".",
+        lead_session_id="team-lead",
+        extra=dict(extra),
+    )
+
+
+def _spawn_env(monkeypatch, request) -> dict[str, str]:
+    from claude_teams.backends import process_base
+    from claude_teams.backends.claude_code import ClaudeCodeBackend
+
+    observed = []
+    monkeypatch.setattr(
+        process_base.process_manager,
+        "spawn_process",
+        lambda request, argv, env_vars, *a, **k: observed.append(env_vars),
+    )
+    ClaudeCodeBackend()._spawn_with_command(request, ["fake"], {})
+    return observed[0]
+
+
+@pytest.mark.parametrize("flag", [None, "1"])
+def test_request_without_epoch_blanks_an_inherited_epoch(monkeypatch, flag):
+    """A child never inherits its parent's epoch (review round 2, finding 1).
+
+    Launchers merge the server's own environment into the child's, so a
+    request with no minted epoch must override the parent's value explicitly.
+    """
+    if flag is None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
+    else:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", flag)
+    monkeypatch.setenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", "6")
+    assert (
+        _spawn_env(monkeypatch, _pristine_request())["WIN_AGENT_TEAMS_DISPATCH_EPOCH"]
+        == ""
+    )
+
+
+def test_minted_epoch_wins_over_an_inherited_one(monkeypatch):
+    monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
+    monkeypatch.setenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", "6")
+    env = _spawn_env(monkeypatch, _pristine_request(dispatch_epoch="2"))
+    assert env["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] == "2"
+
+
+def test_pristine_flag_off_spawn_without_ambient_epoch_adds_no_key(monkeypatch):
+    monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
+    monkeypatch.delenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", raising=False)
+    assert "WIN_AGENT_TEAMS_DISPATCH_EPOCH" not in _spawn_env(
+        monkeypatch, _pristine_request()
+    )
+
+
+@pytest.mark.parametrize("flag", [None, "1"])
+def test_codex_mcp_override_never_carries_the_parents_epoch(monkeypatch, flag):
+    from claude_teams.backends.codex import CodexBackend
+
+    if flag is None:
+        monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
+    else:
+        monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", flag)
+    monkeypatch.setenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", "6")
+    args = CodexBackend()._mcp_identity_args(_pristine_request())
+    assert not any("WIN_AGENT_TEAMS_DISPATCH_EPOCH" in arg for arg in args)
+
+
+def test_posix_launchers_export_the_blank_override():
+    """tmux/terminal/herdr panes get the blank as an explicit shell export."""
+    from claude_teams.backends import process_manager as pm
+
+    command = pm._build_posix_shell_command(
+        "/work", ["claude"], {"WIN_AGENT_TEAMS_DISPATCH_EPOCH": ""}
+    )
+    assert "export WIN_AGENT_TEAMS_DISPATCH_EPOCH='';" in command

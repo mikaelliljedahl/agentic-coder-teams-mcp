@@ -25,6 +25,7 @@ from claude_teams import delivery_store as ds
 from claude_teams import hooks, leases, native_wake, server_simple
 from claude_teams.agent_output import BINDING_BOUND, AgentOutput, BindingResult
 from claude_teams.backends import process_base
+from claude_teams.backends import process_manager as process_manager_mod
 from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.delivery import DELIVERY_MARKER_PREFIX
@@ -1227,3 +1228,116 @@ async def test_flag_off_resume_of_pristine_record_adds_no_native_metadata(
     for field in ("interactive", "codex_home", "dispatch_epoch"):
         assert field not in record
     assert not (env.session_dir / "dispatch-epochs.json").exists()
+
+
+# ==========================================================================
+# A flag-off descendant never inherits its parent's epoch (review round 2)
+# ==========================================================================
+
+
+class _LaunchingBackend(_FakeResumeBackend):
+    """Launch through the real Claude backend and Windows process manager.
+
+    Only ``_popen`` and the window side effects are faked, so ``launches``
+    holds the environment the child process would actually get: the manager's
+    merge of this server's own environment with the backend's overrides.
+    """
+
+    def __init__(self, transcript: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        super().__init__(transcript)
+        self.launches: list[dict[str, str]] = []
+        manager = process_manager_mod.WindowsProcessManager()
+        log = transcript.parent / "agent.log"
+        monkeypatch.setattr(manager, "log_path", lambda *a: log)
+        monkeypatch.setattr(manager, "_open_windows_terminal_tail", lambda *a: None)
+        monkeypatch.setattr(
+            manager, "_should_use_interactive_console", lambda *a, **k: False
+        )
+
+        def _popen(cmd, creationflags, **kwargs):
+            self.launches.append(dict(kwargs["env"]))
+            return SimpleNamespace(pid=4321)
+
+        monkeypatch.setattr(manager, "_popen", _popen)
+        monkeypatch.setattr(process_base, "process_manager", manager)
+        self.real = ClaudeCodeBackend()
+
+    def launch(self, request: SpawnRequest) -> dict[str, str]:
+        self.real._spawn_with_command(request, ["fake"], {})
+        return self.launches[-1]
+
+    def resume(self, request: SpawnRequest, backend_session_id: str) -> SimpleNamespace:
+        self.launch(request)
+        return super().resume(request, backend_session_id)
+
+
+def _child_epoch(launch_env: dict[str, str]) -> str | None:
+    return launch_env.get("WIN_AGENT_TEAMS_DISPATCH_EPOCH")
+
+
+@pytest.mark.asyncio
+async def test_flag_off_nested_spawn_does_not_inherit_the_parents_epoch(
+    env,
+) -> None:
+    """Nested flag-off spawn → flag-on resume: the new host's hooks still count.
+
+    A nested lead resumed with the flag off exports its recovery epoch (6)
+    into its own environment. A pristine child it spawns gets no epoch of its
+    own, so the launch must not leak the parent's 6 into the child: otherwise
+    the child's markers sit at 6 while its record stays pristine, the first
+    flag-on resume mints 1, and every replacement-host hook is dropped.
+    """
+    backend = _LaunchingBackend(env.transcript, env.monkeypatch)
+    env.monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
+    env.monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: True
+    )
+    # This MCP server belongs to the nested lead, resumed at epoch 6.
+    env.monkeypatch.setenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", "6")
+
+    # The flag-off spawn of the pristine child: no epoch is minted ...
+    record = server_simple._load_agents(SESSION)[0]
+    extra = server_simple._dispatch_extra(SESSION, AGENT, record)
+    assert extra == {}
+    request = SpawnRequest(
+        agent_id=f"{AGENT}@{SESSION}",
+        name=AGENT,
+        team_name=SESSION,
+        prompt="task",
+        model="model",
+        agent_type="",
+        color="",
+        cwd=str(env.work),
+        lead_session_id=LEAD,
+        extra=extra,
+    )
+    spawned = backend.launch(request)
+    # ... and the merged launch environment carries no epoch either.
+    assert _child_epoch(spawned) in (None, "")
+
+    # The child parks, stamping its marker with what it was launched with.
+    _hook(env, "Stop", _child_epoch(spawned))
+    assert _state_marker()["state"] == "waiting"
+    assert _state_marker()["dispatch_epoch"] == 0
+    env.monkeypatch.setenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", "6")
+
+    # The master flag goes on; the first resume mints the child's epoch 1.
+    _all_on(env.monkeypatch)
+    first = await server_simple.follow_up_agent(AGENT, "first", KEY)
+
+    assert first["status"] == "delivered"
+    assert len(backend.resume_calls) == 1
+    assert (backend.resume_calls[0][0].extra or {}).get("dispatch_epoch") == "1"
+    assert _child_epoch(backend.launches[-1]) == "1"
+    assert server_simple._load_agents(SESSION)[0]["dispatch_epoch"] == 1
+
+    # The replacement host starts its turn at the epoch it was launched with.
+    _hook(env, "UserPromptSubmit", _child_epoch(backend.launches[-1]))
+    marker = _state_marker()
+    assert marker["state"] == "running"
+    assert marker["dispatch_epoch"] == 1
+
+    # ... so it is busy, and a follow-up must not shut it down and resume again.
+    busy = await server_simple.follow_up_agent(AGENT, "second", "k-2")
+    assert busy["status"] != "delivered"
+    assert len(backend.resume_calls) == 1

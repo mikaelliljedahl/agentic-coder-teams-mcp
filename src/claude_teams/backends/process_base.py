@@ -20,6 +20,9 @@ from claude_teams.backends.contracts import (
 )
 from claude_teams.backends.process_manager import process_manager
 
+#: The spawn/resume epoch a child's hooks stamp on their state markers.
+_DISPATCH_EPOCH_ENV = "WIN_AGENT_TEAMS_DISPATCH_EPOCH"
+
 
 class BaseBackend:
     """Convenience base class with shared Windows process lifecycle management."""
@@ -114,7 +117,16 @@ class BaseBackend:
         # predecessor's marker. A pristine flag-off request carries none.
         epoch = (request.extra or {}).get("dispatch_epoch")
         if epoch:
-            env_vars["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] = str(epoch)
+            env_vars[_DISPATCH_EPOCH_ENV] = str(epoch)
+        elif _DISPATCH_EPOCH_ENV in os.environ:
+            # Never let a child inherit this server's own epoch (its host's,
+            # e.g. a nested lead resumed at epoch 6): launchers merge our
+            # environment into the child's, so its hooks would stamp markers
+            # with the parent's epoch while its record stays pristine, and a
+            # later resume minting a lower epoch would have every hook
+            # dropped. Blank reads as "no epoch" (0) in the hooks; with no
+            # ambient epoch nothing is added, keeping pristine launches as-is.
+            env_vars[_DISPATCH_EPOCH_ENV] = ""
 
         return process_manager.spawn_process(
             request, cmd_parts, env_vars, self._name, is_interactive=self.is_interactive

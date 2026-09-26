@@ -143,3 +143,24 @@ def test_concurrent_prompts_never_lose_an_increment(tmp_path, workers, monkeypat
     for thread in threads:
         thread.join(10)
     assert _read(tmp_path)["turn_seq"] == workers
+
+
+def test_blank_epoch_is_no_epoch(tmp_path, monkeypatch):
+    """The launcher's blank override (no minted epoch) reads as epoch 0.
+
+    It must never raise, and a host launched with it behaves exactly like one
+    launched without the variable: its hooks are accepted at epoch 0.
+    """
+    monkeypatch.setenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", "")
+    assert hooks._dispatch_epoch() == 0
+    _emit(tmp_path, "Stop")
+    _emit(tmp_path, "UserPromptSubmit")
+    blank = _read(tmp_path)
+    assert (blank["dispatch_epoch"], blank["state"], blank["turn_seq"]) == (
+        0,
+        "running",
+        1,
+    )
+    monkeypatch.delenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH")
+    _emit(tmp_path, "Stop")
+    assert (_read(tmp_path)["dispatch_epoch"], _read(tmp_path)["idle_seq"]) == (0, 2)

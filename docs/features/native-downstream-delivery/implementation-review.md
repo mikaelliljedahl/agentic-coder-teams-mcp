@@ -116,3 +116,105 @@ provided records. Run and record the plan's N1/N3/N5/N6/N7/N8 gates before merge
 
 Gates after the fixes: ruff format/check clean; ty only the 2 pre-existing
 Windows diagnostics; pytest 2598 passed, 10 skipped.
+
+## Round 2
+
+VERDICT: CHANGES_REQUESTED
+
+Reviewed `git diff ffa3a44..57e4341` and the lead's dispositions at HEAD
+`57e4341`. Both original reproductions are fixed for the scenarios reviewed:
+
+- **Round-1 finding 1:** the direct flag-off resume now uses epoch 6 in the
+  request, exported environment and record. Re-running the hook/follow-up
+  reproduction with the actual exported epoch gives `marker_state=running`,
+  `second_status=queued`, and `resume_count=1`. Current launch facts are
+  refreshed, and pristine flag-off requests without an ambient epoch remain
+  unchanged. A remaining nested-spawn case is reported below.
+- **Round-1 finding 2:** verification is bound to the thread/home pair, and
+  the final active/generation/incarnation/pair check and queue share the
+  registration lock. The old fourth-read window no longer exists. Replacing
+  before the final check produces zero queues. With an actual concurrent
+  registration writer during the injected queue, the writer waits, the queue
+  uses the original verified active registration, and the writer completes
+  after return. It also completes after an injected queue exception: the
+  context manager releases the lock and the notifier backs off. No lock
+  inversion was found in this path; registration updates/corroboration use
+  the same lock without acquiring the notifier owner lock. The default queue
+  timeout is 15 seconds, with up to 5 seconds of bounded reap on failure;
+  holding the registration lock across that call delays updates deliberately.
+
+1. **MAJOR — A new flag-off descendant inherits its parent's epoch without recording it, so a later resume rejects its hooks.**
+   `src/claude_teams/backends/process_base.py:115`,
+   `src/claude_teams/server_simple.py:3069`,
+   `src/claude_teams/backends/process_manager.py:705`.
+
+   Resume a previously native nested lead with the master flag off. The fix
+   correctly exports its new epoch, for example 6. Its own MCP server then
+   spawns a new child while the flag is still off. This child's record has no
+   `dispatch_epoch`, so `_dispatch_extra` mints none; `process_base` supplies
+   no epoch override either. The process manager merges `os.environ` into
+   the child's environment, so the child inherits the **parent's** epoch 6.
+   Its hooks write epoch-6 markers while its record and per-name watermark
+   remain pristine. After the master flag is enabled, the first resume of
+   that child mints epoch 1. Every replacement-host hook is rejected behind
+   the epoch-6 marker. The old waiting marker again permits shutdown/resume
+   of a busy child. Thus the newly exported recovery epoch must also be
+   isolated from descendants that do not receive their own epoch.
+
+   **Reproduction:** pass a request with empty `extra` through the real
+   `ClaudeCodeBackend._spawn_with_command` and
+   `WindowsProcessManager.spawn_process`, with master off and ambient epoch
+   6, faking only `_popen` and ancillary window actions. The environment at
+   `_popen` contains epoch 6 although the request has none. Then, using the
+   real hook/store/follow-up path in `test_native_selection.env`, write that
+   pristine child's `Stop` at inherited epoch 6, enable flags, resume it, and
+   emit `UserPromptSubmit` at the newly minted epoch. Observed:
+   `first_resume_epoch=1`, `marker_state=waiting`,
+   `second_status=delivered`, `resume_count=2`. All artifacts were temporary;
+   no real agent process was launched.
+
+   **Suggested fix:** prevent a child from inheriting the parent's dispatch
+   epoch when its request has no minted epoch. An explicit blank override
+   when an ambient epoch exists makes the child hooks use epoch 0 despite
+   the process manager's environment merge; alternatively allocate and
+   persist a distinct child epoch in this recovery context. Keep genuinely
+   pristine flag-off environments unchanged. Add a nested flag-off spawn →
+   flag-on resume regression that observes the **merged launch environment**,
+   then real hooks, and verifies a busy replacement cannot be resumed again.
+   The new pristine-record test only inspects the backend's override dict,
+   and its fake `spawn_process` omits the inherited environment merge.
+
+Round-2 counts: **0 BLOCKER, 1 MAJOR, 0 MINOR, 0 NIT**.
+
+Validation at `57e4341`: all **11 new regression cases passed**; broader
+selection/record/lead-wake/propagation/runner/native-dispatch/poster/hooks/tool
+text suites returned **606 passed, 1 skipped**. Both original reproductions,
+concurrent registration success/exception checks, and the new nested-spawn
+reproduction ran separately with temporary artifacts and fake transports.
+Repository-wide ruff format/check passed. `ty check` still reports only the
+two previously documented Windows diagnostics. The full pytest suite was
+not rerun in this round; the lead's full-suite result above is unchanged and
+is not presented as an independent run. Required live merge gates remain
+unverified. Only this review file was edited; no source/tests or commits.
+
+## Disposition (lead, round 2)
+
+1. **Accepted, fixed.** `process_base._spawn_with_command` never lets a child
+   inherit the parent's `WIN_AGENT_TEAMS_DISPATCH_EPOCH`: a minted epoch is
+   exported as before; otherwise, when the server itself has an ambient epoch,
+   the child gets an explicit blank override (Popen env, Windows Terminal
+   wrapper, tmux/terminal/herdr shell `export ...=''`), which hooks read as
+   epoch 0. With no ambient epoch nothing is added, so pristine launches and
+   the flag-off goldens are unchanged. MCP configs and the Codex `-c` override
+   never carry the epoch. Regression:
+   `test_flag_off_nested_spawn_does_not_inherit_the_parents_epoch` (real
+   `_spawn_with_command` + `WindowsProcessManager.spawn_process` merged env,
+   real hooks, busy replacement not resumed), 7 cases in
+   `test_native_record_fields.py`, `test_blank_epoch_is_no_epoch`.
+   **Accepted residual:** a tmux pane inherits the tmux *server's* environment;
+   if that server was started by an agent with an epoch while this MCP server
+   has none, the pane can still see it. Closing it would add a key to every
+   pristine launch, which the flag-off baseline forbids.
+
+Gates: ruff format/check clean; ty only the 2 pre-existing Windows
+diagnostics; pytest 2607 passed, 10 skipped.
