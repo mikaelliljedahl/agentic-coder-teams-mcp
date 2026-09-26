@@ -3199,13 +3199,55 @@ def _delivery_owner_lock_held(session_id: str, name: str) -> bool:
     return False
 
 
+def _windows_tab_hosts_enabled() -> bool:
+    """Whether Windows Terminal tab host resolution applies (a test seam)."""
+    return os.name == "nt"
+
+
+def _windows_tab_claude_host(pid: int, token: str) -> tuple[int, str] | None:
+    """Return the ``claude.exe`` a verified Windows Terminal tab wrapper runs.
+
+    A claude tab's record PID is the in-tab PowerShell wrapper; the real
+    Claude host (the PID its poster binds to) is that wrapper's direct child.
+    Proven only when: the wrapper is still the recorded incarnation (its live
+    creation token equals the stored one) and is not itself a host; exactly
+    one direct child has the ``claude.exe`` image; and that child's creation
+    token is readable and not earlier than the wrapper's. Anything else is
+    ``None``: an unprovable host is never a match.
+    """
+    live = process_manager.creation_token(str(pid))
+    if live is None or live != token:
+        return None
+    table = procinfo.windows_process_table()
+    wrapper = table.get(pid)
+    if wrapper is None or procinfo.is_host(wrapper):
+        return None
+    children = [
+        row
+        for row in table.values()
+        if row.ppid == pid and row.pid != pid and procinfo.is_claude_host(row.name)
+    ]
+    if len(children) != 1:
+        return None
+    child = children[0].pid
+    child_token = process_manager.creation_token(str(child)) or ""
+    try:
+        # Windows tokens are creation FILETIMEs; an unreadable one is "".
+        created_after = int(child_token) >= int(token)
+    except ValueError:
+        created_after = False
+    return (child, child_token) if created_after else None
+
+
 def _record_hosts(agent: dict) -> set[tuple[int, str]]:
     """Return the host incarnations a child record stands for.
 
     The record's own ``(pid, create_token)``, plus, for launcher-style
     spawns (tmux, a terminal), the authoritative agent PID the launcher
-    resolves to with its creation token. A host whose token cannot be read is
-    left out: an unprovable incarnation is never a match.
+    resolves to with its creation token. On Windows a claude record launched
+    in a Windows Terminal tab also stands for the wrapper's ``claude.exe``
+    child (:func:`_windows_tab_claude_host`). A host whose token cannot be
+    read is left out: an unprovable incarnation is never a match.
     """
     hosts: set[tuple[int, str]] = set()
     try:
@@ -3215,6 +3257,14 @@ def _record_hosts(agent: dict) -> set[tuple[int, str]]:
     token = _agent_create_token(agent)
     if pid > 0 and token is not None:
         hosts.add((pid, token))
+        if agent.get("backend") == "claude-code" and _windows_tab_hosts_enabled():
+            try:
+                tab_host = _windows_tab_claude_host(pid, token)
+            except Exception:
+                logger.debug("Could not resolve the tab's claude host", exc_info=True)
+                tab_host = None
+            if tab_host is not None:
+                hosts.add(tab_host)
     try:
         resolved = int(
             process_manager.resolve_agent_pid(

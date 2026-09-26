@@ -35,6 +35,7 @@ from claude_teams import (
     filelock,
     leases,
     native_wake,
+    procinfo,
     server_simple,
 )
 from claude_teams import delivery_mailbox as mb
@@ -995,3 +996,167 @@ async def test_downstream_off_claude_follow_up_touches_no_mailbox(env) -> None:
 
     assert result["method"] == ds.METHOD_RESUME
     assert not mb.mailbox_path(env.session_dir, AGENT).exists()
+
+
+# ==========================================================================
+# E3 on Windows: a Windows Terminal tab record's host is the wrapper's
+# direct claude.exe child (live smoke N3)
+# ==========================================================================
+
+WRAPPER_PID = 123
+WRAPPER_TOKEN = "1000"
+CLAUDE_PID = 17208
+CLAUDE_TOKEN = "2000"
+
+
+def _wt_tab(
+    env,
+    *,
+    windows: bool = True,
+    live_wrapper_token: str | None = WRAPPER_TOKEN,
+    child_name: str = "claude.exe",
+    child_token: str | None = CLAUDE_TOKEN,
+    children: int = 1,
+) -> dict:
+    """A claude WT tab: record PID = the PowerShell wrapper, host = its child.
+
+    The marker names the claude.exe host, as the child's poster writes it.
+    """
+    case = _claude_target(env)
+    case["agent"]["create_token"] = WRAPPER_TOKEN
+    _set_agent(env, create_token=WRAPPER_TOKEN)
+    table = {
+        WRAPPER_PID: procinfo.ProcessInfo(WRAPPER_PID, 1236, "powershell.exe"),
+        555: procinfo.ProcessInfo(555, WRAPPER_PID, "conhost.exe"),
+    }
+    for index in range(children):
+        pid = CLAUDE_PID + index
+        table[pid] = procinfo.ProcessInfo(pid, WRAPPER_PID, child_name)
+    tokens = {str(WRAPPER_PID): live_wrapper_token}
+    tokens.update({str(CLAUDE_PID + i): child_token for i in range(children)})
+    env.monkeypatch.setattr(
+        server_simple, "_windows_tab_hosts_enabled", lambda: windows
+    )
+    env.monkeypatch.setattr(procinfo, "windows_process_table", lambda: table)
+    env.monkeypatch.setattr(
+        server_simple.process_manager,
+        "creation_token",
+        lambda handle: tokens.get(str(handle)),
+    )
+    _sel._marker(env, host_pid=CLAUDE_PID, host_create_token=CLAUDE_TOKEN)
+    return case
+
+
+def test_wt_tab_claude_child_of_a_verified_wrapper_satisfies_e3(env) -> None:
+    case = _wt_tab(env)
+    assert _candidate(case) == (ds.METHOD_CLAUDE_MAILBOX, "")
+    hosts = server_simple._record_hosts(case["agent"])
+    assert (CLAUDE_PID, CLAUDE_TOKEN) in hosts
+    assert (WRAPPER_PID, WRAPPER_TOKEN) in hosts
+
+
+def test_wt_tab_wrapper_with_a_different_live_token_is_no_match(env) -> None:
+    case = _wt_tab(env, live_wrapper_token="9999")
+    assert _candidate(case)[1].startswith("E3")
+    assert (CLAUDE_PID, CLAUDE_TOKEN) not in server_simple._record_hosts(case["agent"])
+
+
+def test_wt_tab_dead_wrapper_is_no_match(env) -> None:
+    case = _wt_tab(env, live_wrapper_token=None)
+    assert _candidate(case)[1].startswith("E3")
+
+
+def test_wt_tab_child_that_is_not_claude_is_no_match(env) -> None:
+    case = _wt_tab(env, child_name="node.exe")
+    assert _candidate(case)[1].startswith("E3")
+
+
+def test_wt_tab_child_created_before_the_wrapper_is_no_match(env) -> None:
+    case = _wt_tab(env, child_token="999")
+    _sel._marker(env, host_create_token="999")
+    assert _candidate(case)[1].startswith("E3")
+
+
+def test_wt_tab_child_with_an_unreadable_token_is_no_match(env) -> None:
+    case = _wt_tab(env, child_token=None)
+    assert _candidate(case)[1].startswith("E3")
+    assert server_simple._record_hosts(case["agent"]) == {(WRAPPER_PID, WRAPPER_TOKEN)}
+
+
+def test_wt_tab_ambiguous_claude_children_are_no_match(env) -> None:
+    case = _wt_tab(env, children=2)
+    assert _candidate(case)[1].startswith("E3")
+
+
+def test_wt_tab_resolution_is_windows_only(env) -> None:
+    case = _wt_tab(env, windows=False)
+    consulted: list[bool] = []
+    env.monkeypatch.setattr(
+        procinfo, "windows_process_table", lambda: consulted.append(True) or {}
+    )
+    assert _candidate(case)[1].startswith("E3")
+    assert consulted == [], "POSIX never consults the Windows process table"
+    assert server_simple._record_hosts(case["agent"]) == {(WRAPPER_PID, WRAPPER_TOKEN)}
+
+
+def test_wt_tab_resolution_only_for_claude_records(env) -> None:
+    case = _wt_tab(env)
+    case["agent"]["backend"] = "codex"
+    assert (CLAUDE_PID, CLAUDE_TOKEN) not in server_simple._record_hosts(case["agent"])
+
+
+def test_poster_binding_names_the_wt_tab_claude_host(env) -> None:
+    _wt_tab(env)
+    binding = server_simple._poster_current_binding(
+        SESSION, AGENT, (CLAUDE_PID, CLAUDE_TOKEN)
+    )
+    assert binding == mb.HostBinding(EPOCH, BACKEND_SESSION, CLAUDE_PID, CLAUDE_TOKEN)
+
+
+@pytest.mark.asyncio
+async def test_windows_wt_claude_child_gets_the_mailbox_not_resume(env) -> None:
+    """Through dispatch: the claude.exe host is E3 and passes take/begin."""
+    _wt_tab(env)
+    host = (CLAUDE_PID, CLAUDE_TOKEN)
+    binding = mb.HostBinding(EPOCH, BACKEND_SESSION, *host)
+    sleep = env.clock.sleep
+
+    def current() -> mb.HostBinding | None:
+        return server_simple._poster_current_binding(SESSION, AGENT, host)
+
+    def poll_sleep(seconds: float) -> None:
+        sleep(seconds)
+        sd = env.session_dir
+        doc = mb.read_mailbox(sd, AGENT) or {"entries": {}}
+        for nonce, entry in doc["entries"].items():
+            if entry["state"] != mb.STATE_OFFERED:
+                continue
+            assert mb.take(
+                sd,
+                AGENT,
+                nonce,
+                poster=POSTER,
+                binding=binding,
+                current_binding=current,
+            ).done
+            assert mb.begin(
+                sd,
+                AGENT,
+                nonce,
+                poster=POSTER,
+                binding=binding,
+                current_binding=current,
+                idle=mb.IdleProof(EPOCH, BACKEND_SESSION, 1),
+            ).done
+            _append(env.transcript, _user_record(entry["text"]))
+            assert mb.finish(
+                sd, AGENT, nonce, poster=POSTER, ok=True, write_started=True
+            ).done
+
+    env.monkeypatch.setattr(server_simple, "_delivery_sleep", poll_sleep)
+
+    result = await server_simple.follow_up_agent(AGENT, "next step", KEY)
+
+    assert result["status"] == ds.STATUS_DELIVERED, result
+    assert result["method"] == ds.METHOD_CLAUDE_MAILBOX
+    assert env.backend.resume_calls == []
