@@ -557,8 +557,13 @@ class NativeWakeNotifier(threading.Thread):
         clock: Callable[[], float] = time.monotonic,
         poll: float | None = None,
         codex_lead: CodexLeadWake | None = None,
+        delivery: Any | None = None,
     ) -> None:
-        """Inject state readers, never recovery or MCP tool calls."""
+        """Inject state readers, never recovery or MCP tool calls.
+
+        ``delivery`` is the child's ``DeliveryPoster`` (plan §2.3.4), a second
+        target kind ticked here under its own gate and owner lock.
+        """
         super().__init__(name="native-session-wake", daemon=True)
         self.get_target = get_target
         self.session_dir = session_dir
@@ -576,6 +581,7 @@ class NativeWakeNotifier(threading.Thread):
         # Keyed by (session, identity, generation, host pid, host token), so a
         # session switch, re-registration or new host never inherits state.
         self.codex_targets: dict[tuple[Any, ...], _Target] = {}
+        self.delivery = delivery
         self._stop_event = threading.Event()
 
     def run(self) -> None:
@@ -599,6 +605,15 @@ class NativeWakeNotifier(threading.Thread):
             winpipe.reap_parked()
         self._tick_claude(activated)
         self._tick_codex_lead(activated)
+        self._tick_delivery()
+
+    def _tick_delivery(self) -> None:
+        if self.delivery is None:
+            return
+        try:
+            self.delivery.tick()
+        except Exception as err:
+            _LOG.warning("Delivery poster failed: %s", type(err).__name__)
 
     def _tick_claude(self, activated: bool) -> None:
         if self.channel.reason != "available" or not enabled("CLAUDE"):
@@ -828,6 +843,8 @@ class NativeWakeNotifier(threading.Thread):
     def _release_targets(self) -> None:
         self._release_claude_targets()
         self._release_codex_targets()
+        if self.delivery is not None:
+            self.delivery.close()
 
     def close(self) -> None:
         """Stop the daemon and release its lifetime locks."""

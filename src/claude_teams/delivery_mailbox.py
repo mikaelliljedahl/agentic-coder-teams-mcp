@@ -551,9 +551,10 @@ def retract(
     ``done`` proves the nonce can never be presented and permits a new nonce.
 
     ``allow_taken`` also retracts ``taken``: ``begin`` is itself a CAS, so an
-    entry still ``taken`` provably has not started a write (§2.3.2). It is off
-    by default because the kill and recovery paths (§2.3.3, §2.3.5) leave
-    ``taken`` unresolved.
+    entry still ``taken`` provably has not started a write (§2.3.2). Only kill
+    and CLI force pass it, and only after bumping the dispatch epoch, which
+    makes every later ``begin`` fail its binding check. Ordinary recovery and
+    budget expiry keep the default and leave ``taken`` unresolved.
     """
     retractable = {STATE_OFFERED, STATE_TAKEN} if allow_taken else {STATE_OFFERED}
 
@@ -585,6 +586,24 @@ def cleanup(
                 del doc[part][nonce]
                 dirty = True
         return MailboxResult(OUTCOME_DONE), dirty
+
+    return _transact(session_dir, child, step)
+
+
+def prune_consumed(session_dir: Path, child: str, *, below: int) -> MailboxResult:
+    """Drop the idle-sequence consumption of every epoch older than ``below``.
+
+    For kill and force after the dispatch epoch was bumped to ``below``: no
+    poster can ``begin`` in an older epoch any more, so its consumption can
+    never be consulted again. A pre-write rollback of such an entry then
+    finds nothing to restore, which is harmless for the same reason.
+    """
+
+    def step(doc: dict[str, Any]) -> tuple[MailboxResult, bool]:
+        doomed = [epoch for epoch in doc["consumed"] if int(epoch) < below]
+        for epoch in doomed:
+            del doc["consumed"][epoch]
+        return MailboxResult(OUTCOME_DONE), bool(doomed)
 
     return _transact(session_dir, child, step)
 
@@ -775,6 +794,7 @@ __all__ = [
     "finish",
     "mailbox_lock_path",
     "mailbox_path",
+    "prune_consumed",
     "publish",
     "read_entry",
     "read_mailbox",

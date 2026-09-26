@@ -354,7 +354,11 @@ async def test_master_on_downstream_off_records_resume(env) -> None:
 
 @pytest.mark.asyncio
 async def test_eligible_target_without_an_implemented_carrier_resumes(env) -> None:
-    """Every flag on, every E true, but no carrier registered: plain resume."""
+    """Every flag on, every E true, but no carrier registered: plain resume.
+
+    Both carriers exist now, so the seam is exercised by unregistering one.
+    """
+    env.monkeypatch.delitem(server_simple._NATIVE_DISPATCH, ds.METHOD_CLAUDE_MAILBOX)
     _native_claude_target(env)
     _claude_channel_proven(env)
     _idle(env)
@@ -856,10 +860,11 @@ def test_half_switches_only_disable_their_own_half(
 async def test_no_channel_is_probed_while_no_carrier_is_implemented(env) -> None:
     """Without a carrier to hand to, stage 1 costs nothing and cannot fail.
 
-    Codex has its carrier since step 2 (``test_native_codex_dispatch``); the
-    Claude mailbox is still unimplemented, so it is the half pinned here.
+    Both carriers exist now (``test_native_codex_dispatch``,
+    ``test_native_claude_dispatch``), so the seam is exercised by
+    unregistering the Claude mailbox for this test.
     """
-    assert ds.METHOD_CLAUDE_MAILBOX not in server_simple._NATIVE_DISPATCH
+    env.monkeypatch.delitem(server_simple._NATIVE_DISPATCH, ds.METHOD_CLAUDE_MAILBOX)
     _native_claude_target(env)
     _idle(env)
     probes: list = []

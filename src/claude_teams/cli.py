@@ -218,10 +218,14 @@ def lease_clear(
             "Use `lease force` if it is hung.[/red]"
         )
         raise typer.Exit(code=3)
-    with server_simple._agents_file_lock(session_id):
+    with server_simple._agents_transaction(session_id) as agents:
         # Under the registry lock, which is what ``reserve_lease`` holds when it
         # grants. Clearing outside it can drop a lease that was granted in the
         # meantime, letting a third caller resume the same conversation.
+        #
+        # Plan §2.3.5: like force, bump the dispatch epoch and withdraw the
+        # child's unbegun mailbox offers before the lease is dropped.
+        server_simple._revoke_native_offers(session_id, agent, agents)
         _, persisted = leases.force_clear_lease(
             server_simple._leases_file(session_id),
             agent,
@@ -308,6 +312,10 @@ def lease_force(
             fenced_generation = server_simple._bump_generation(record)
             child_pid = record.get("pid")
             server_simple._save_agents_transaction(session_id, agents)
+        # Step 1b (plan §2.3.5) — bump the dispatch epoch so the child's
+        # delivery poster stops at take/begin, then withdraw offered and
+        # taken mailbox entries; posting and later stay unresolved.
+        server_simple._revoke_native_offers(session_id, agent, agents)
 
         # Step 2 — terminate the resumed child, only when ownership is provable.
         if record is not None and child_pid is not None:

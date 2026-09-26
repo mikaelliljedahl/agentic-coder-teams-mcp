@@ -29,7 +29,15 @@ from typing import Any, Literal, cast
 
 from fastmcp import FastMCP
 
-from claude_teams import delivery, delivery_store, hooks, native_wake, procinfo
+from claude_teams import (
+    delivery,
+    delivery_mailbox,
+    delivery_poster,
+    delivery_store,
+    hooks,
+    native_wake,
+    procinfo,
+)
 from claude_teams.agent_output import (
     BINDING_LEGACY,
     CORRELATION_FIELD,
@@ -107,6 +115,7 @@ from claude_teams.filelock import (
     FileLockTimeoutError,
     file_lock,
     lock_handle,
+    try_lock_handle,
     unlock_handle,
 )
 from claude_teams.leases import (
@@ -3081,13 +3090,95 @@ def _delivery_capability_file(session_id: str, name: str) -> Path:
     return _session_dir(session_id) / f"native-delivery-{name}.json"
 
 
-def _delivery_owner_lock_held(session_id: str, name: str) -> bool:  # noqa: ARG001 - the poster's lock is per session and name.
-    """Whether the child's delivery poster holds its owner lock.
+def _delivery_owner_lock_held(session_id: str, name: str) -> bool:
+    """Whether the child's delivery poster holds its lifetime owner lock.
 
-    Fails closed until the poster exists: without a live owner nothing would
-    ever take an offered entry, so no Claude channel counts as proven.
+    Probed by trying the lock once: contention means a poster owns it; an
+    acquired lock is released at once and means nobody does. A missing lock
+    file means no poster ever ran. Any other error fails closed (not held):
+    without a live owner nothing would ever take an offered entry.
     """
+    path = delivery_poster.owner_lock_file(_session_dir(session_id), name)
+    if not path.exists():
+        return False
+    try:
+        with path.open("a+b") as handle:
+            if not try_lock_handle(handle):
+                return True
+            unlock_handle(handle)
+    except OSError:
+        logger.debug("Could not probe the delivery owner lock", exc_info=True)
     return False
+
+
+def _record_hosts(agent: dict) -> set[tuple[int, str]]:
+    """Return the host incarnations a child record stands for.
+
+    The record's own ``(pid, create_token)``, plus, for launcher-style
+    spawns (tmux, a terminal), the authoritative agent PID the launcher
+    resolves to with its creation token. A host whose token cannot be read is
+    left out: an unprovable incarnation is never a match.
+    """
+    hosts: set[tuple[int, str]] = set()
+    try:
+        pid = int(agent.get("pid") or 0)
+    except (TypeError, ValueError):
+        return hosts
+    token = _agent_create_token(agent)
+    if pid > 0 and token is not None:
+        hosts.add((pid, token))
+    try:
+        resolved = int(
+            process_manager.resolve_agent_pid(
+                str(agent.get("pid")),
+                str(agent.get("session_id") or ""),
+                str(agent.get("name") or ""),
+            )
+        )
+    except Exception:
+        logger.debug("Could not resolve the agent host PID", exc_info=True)
+        return hosts
+    if resolved > 0 and resolved != pid:
+        resolved_token = process_manager.creation_token(str(resolved))
+        if resolved_token:
+            hosts.add((resolved, resolved_token))
+    return hosts
+
+
+def _record_epoch(agent: dict) -> int | None:
+    """Return the record's dispatch epoch, or ``None`` when it has none."""
+    epoch = agent.get("dispatch_epoch")
+    return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
+
+
+def _poster_current_binding(
+    session_id: str, name: str, host: tuple[int, str]
+) -> delivery_mailbox.HostBinding | None:
+    """Return the child's authoritative binding, as its poster validates it.
+
+    Runs under the mailbox lock, so ``agents.json`` is read without its lock
+    (never ``agents.lock`` inside the mailbox lock). A torn read raises, and
+    the mailbox turns a raising check into ``unknown``: it fails closed.
+    ``host`` is the poster's own host: it is the
+    binding's host only when the record stands for it, otherwise the record's
+    own host is returned and the mailbox reports ``host_mismatch``.
+    """
+    agent = _find_agent(_load_agents_unlocked(session_id), name)
+    if agent is None:
+        return None
+    epoch = _record_epoch(agent)
+    backend_session_id = _stored_backend_session_id(agent)
+    if epoch is None or not backend_session_id:
+        return None
+    hosts = _record_hosts(agent)
+    if tuple(host) in hosts:
+        chosen = tuple(host)
+    else:
+        token = _agent_create_token(agent) or ""
+        chosen = (int(agent.get("pid") or 0), token)
+    return delivery_mailbox.HostBinding(
+        epoch, backend_session_id, int(chosen[0]), str(chosen[1])
+    )
 
 
 def _claude_delivery_capability(
@@ -3112,17 +3203,21 @@ def _claude_delivery_capability(
         os.environ.get("WIN_AGENT_TEAMS_NATIVE_WAKE_POLL_SECONDS", ""), 1.0
     )
     age = time.time() - _safe_float(marker.get("heartbeat_ts"))
-    epoch = agent.get("dispatch_epoch")
-    token = _agent_create_token(agent)
+    epoch = _record_epoch(agent)
+    host_pid = marker.get("host_pid")
+    host = (
+        (host_pid, marker.get("host_create_token"))
+        if isinstance(host_pid, int) and not isinstance(host_pid, bool)
+        else None
+    )
     bound = (
         0 <= age <= 3 * poll
-        and str(marker.get("host_pid")) == str(agent.get("pid"))
-        and token is not None
-        and marker.get("host_create_token") == token
+        and bool(backend_session_id)
         and marker.get("backend_session_id") == backend_session_id
-        and isinstance(epoch, int)
-        and not isinstance(epoch, bool)
+        and epoch is not None
         and marker.get("dispatch_epoch") == epoch
+        and host is not None
+        and host in _record_hosts(agent)
     )
     if not bound or not _delivery_owner_lock_held(session_id, name):
         return None
@@ -5460,6 +5555,15 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             # It is also the stage-2 commit: N5 is re-checked in the same store
             # transaction that records the method, so a native attempt made
             # since phase 1 can never be followed by this one.
+            #
+            # The Claude mailbox exists before the first attempt to the child
+            # is ``sent`` (R3-3), so its absence can later only mean lost
+            # evidence. If it cannot be made, nothing is marked and the call
+            # continues resume-only, exactly like a pre-launch refusal.
+            if plan.method == METHOD_CLAUDE_MAILBOX and not _mailbox_ready(
+                session_id, plan.agent_name
+            ):
+                return None
             blocking = _mark_attempt_sent(session_id, record, plan)
             if blocking is not None:
                 remove_prompt_file(plan.prompt_file)
@@ -5753,29 +5857,11 @@ def _native_row_cas(
 ) -> bool:
     """Apply ``mutate`` to this attempt's row only if it is still this attempt.
 
-    The compare is ``(sender, key, nonce, operation_id)`` on a non-terminal
-    row in ``sent`` or ``unconfirmed``. So a write never reverts a settled row
-    (a receipt found by a concurrent reconcile, an operator release) and never
-    lands on a later attempt under the same key. ``record`` is refreshed from
-    the store either way, so the caller reports what is actually stored.
+    See :func:`_attempt_row_cas`: the compare is ``(sender, key, nonce,
+    operation_id)`` on a non-terminal ``sent``/``unconfirmed`` row, and
+    ``record`` is refreshed from the store either way.
     """
-    sender = str(record.get("sender") or "")
-    key = str(record.get("idempotency_key") or "")
-    with delivery_transaction(_deliveries_file(session_id)) as txn:
-        stored = txn.get(sender, key)
-        if stored is None:
-            return False
-        ours = (
-            not is_terminal(stored)
-            and stored.get("phase") in {PHASE_SENT, PHASE_UNCONFIRMED}
-            and str(stored.get("nonce") or "") == plan.nonce
-            and str(stored.get("operation_id") or "") == plan.operation_id
-        )
-        if ours:
-            mutate(stored)
-            txn.put(stored)
-        record.update(stored)
-        return ours
+    return _attempt_row_cas(session_id, record, plan.nonce, plan.operation_id, mutate)
 
 
 def _attach_carrier_ref(session_id: str, record: dict, plan: Any, ref: str) -> bool:
@@ -6091,6 +6177,506 @@ def _release_native_row(
             "session presents its queued turn later."
         ),
     }
+
+
+# ==========================================================================
+# B — Claude child via the delivery mailbox, lead side (plan §2.3.3, §2.3.5)
+# ==========================================================================
+
+#: An offer was withdrawn before any poster began it (retracted, or it failed
+#: before the write): provably never presented, so the row is ``pending``.
+REASON_NATIVE_RETRACTED = "native_offer_retracted"
+#: Recovery tombstoned an attempt that was never published: provably never
+#: offered, so the row is ``pending`` and a late publish aborts (R3-3).
+REASON_NATIVE_REVOKED = "native_offer_revoked"
+
+#: Entry states that prove the nonce was never written to the channel.
+_MAILBOX_UNSENT = frozenset(
+    {delivery_mailbox.STATE_FAILED_BEFORE_WRITE, delivery_mailbox.STATE_RETRACTED}
+)
+#: Entry states a poster reached: presentation is possible, so the row stays
+#: unresolved and N5 holds the target until a receipt or an operator release.
+_MAILBOX_UNRESOLVED = frozenset(
+    {
+        delivery_mailbox.STATE_TAKEN,
+        delivery_mailbox.STATE_POSTING,
+        delivery_mailbox.STATE_POSTED,
+        delivery_mailbox.STATE_UNCERTAIN,
+    }
+)
+
+
+def _attempt_row_cas(
+    session_id: str,
+    record: dict,
+    nonce: str,
+    operation_id: str,
+    mutate: Callable[[dict], None],
+) -> bool:
+    """Apply ``mutate`` to ``record``'s row only while it is still this attempt.
+
+    The compare is ``(sender, key, nonce, operation_id)`` on a non-terminal
+    row in ``sent`` or ``unconfirmed``, so a write never reverts a settled row
+    and never lands on a later attempt under the same key. ``record`` is
+    refreshed from the store either way.
+    """
+    sender = str(record.get("sender") or "")
+    key = str(record.get("idempotency_key") or "")
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        stored = txn.get(sender, key)
+        if stored is None:
+            return False
+        ours = (
+            not is_terminal(stored)
+            and stored.get("phase") in {PHASE_SENT, PHASE_UNCONFIRMED}
+            and str(stored.get("nonce") or "") == nonce
+            and str(stored.get("operation_id") or "") == operation_id
+        )
+        if ours:
+            mutate(stored)
+            txn.put(stored)
+        record.update(stored)
+        return ours
+
+
+def _row_is_attempt(
+    session_id: str,
+    record: dict,
+    nonce: str,
+    operation_id: str,
+    phases: frozenset[str] = frozenset({PHASE_SENT, PHASE_UNCONFIRMED}),
+) -> Callable[[], bool]:
+    """Return the mailbox's ``row_is_current`` check for one attempt.
+
+    It runs under the mailbox lock and takes only ``deliveries.lock``, the
+    next lock in the declared order; it never mutates ``record``.
+    """
+    sender = str(record.get("sender") or "")
+    key = str(record.get("idempotency_key") or "")
+
+    def check() -> bool:
+        with delivery_transaction(_deliveries_file(session_id)) as txn:
+            stored = txn.get(sender, key)
+            return (
+                stored is not None
+                and not is_terminal(stored)
+                and stored.get("phase") in phases
+                and str(stored.get("nonce") or "") == nonce
+                and str(stored.get("operation_id") or "") == operation_id
+            )
+
+    return check
+
+
+def _refresh_row(session_id: str, record: dict) -> None:
+    """Re-read ``record``'s row from the store into ``record``."""
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        stored = txn.get(
+            str(record.get("sender") or ""), str(record.get("idempotency_key") or "")
+        )
+        if stored is not None:
+            record.update(stored)
+
+
+def _mailbox_ready(session_id: str, child: str) -> bool:
+    """Initialise ``child``'s mailbox; must hold BEFORE an attempt is ``sent``.
+
+    From then on a missing mailbox file means evidence was lost (unknown),
+    never "nothing was offered" (R3-3).
+    """
+    return delivery_mailbox.ensure_initialised(_session_dir(session_id), child).done
+
+
+def _mailbox_pending_result(
+    session_id: str, record: dict, plan: _FollowUpPlan, why: str
+) -> dict:
+    """Put a provably unpresented mailbox attempt back at ``pending``.
+
+    Only for an attempt that can never reach the child (revoked before it was
+    offered, or withdrawn before any poster began it). A row that moved
+    meanwhile answers with what it now holds.
+    """
+    moved = not _attempt_row_cas(
+        session_id,
+        record,
+        plan.nonce,
+        plan.operation_id,
+        lambda row: mark_phase(row, PHASE_PENDING, reason=why),
+    )
+    if moved and is_terminal(record):
+        return _settled_result(session_id, plan.agent_name, record)
+    if moved and record.get("phase") != PHASE_PENDING:
+        return _unresolved_attempt_result(session_id, plan.agent_name, record)
+    return _pending_tail(session_id, plan.agent_name, record, why, 0)
+
+
+def _dispatch_claude_mailbox(  # noqa: PLR0911 - one return per outcome.
+    session_id: str, record: dict, plan: _FollowUpPlan, deadline: float
+) -> dict | None:
+    """Offer the attempt in the Claude child's delivery mailbox (B).
+
+    Runs after the mailbox was initialised and ``_mark_attempt_sent`` made the
+    row ``sent`` with its method and frozen carrier, under the lease and
+    outside every other lock (plan §2.3.3):
+
+    1. ``publish`` by CAS: the row must still be ``sent`` with this operation
+       and no tombstone may exist. A tombstone means recovery revoked it
+       first: nothing was ever offered, so the row is ``pending``.
+    2. Confirm against the frozen carrier for the rest of the budget; the
+       child's own poster presents the entry at its next idle edge.
+    3. On budget expiry, ``retract``. Only a withdrawal that provably never
+       reached the channel (``done``, or an entry already ``retracted`` or
+       ``failed_before_write``) puts the row back at ``pending``; anything a
+       poster took stays ``unconfirmed(native_unresolved)``, as does an
+       unknown publish outcome.
+    """
+    carrier = plan.carrier or {}
+    epoch = carrier.get("dispatch_epoch")
+    if not isinstance(epoch, int) or isinstance(epoch, bool):
+        return _revert_native_attempt(
+            session_id, record, plan, REASON_NATIVE_INELIGIBLE
+        )
+    directory = _session_dir(session_id)
+    child = plan.agent_name
+    published = delivery_mailbox.publish(
+        directory,
+        child,
+        plan.nonce,
+        operation_id=plan.operation_id,
+        sender=str(record.get("sender") or ""),
+        key=str(record.get("idempotency_key") or ""),
+        dispatch_epoch=epoch,
+        backend_session_id=plan.backend_session_id,
+        text=plan.native_text,
+        row_is_current=_row_is_attempt(
+            session_id, record, plan.nonce, plan.operation_id, frozenset({PHASE_SENT})
+        ),
+    )
+    if published.lost and published.state == delivery_mailbox.STATE_REVOKED:
+        return _mailbox_pending_result(session_id, record, plan, REASON_NATIVE_REVOKED)
+    if published.rejected:
+        # The row moved on under us (released, or recovered to pending).
+        _refresh_row(session_id, record)
+        if is_terminal(record):
+            return _settled_result(session_id, child, record)
+        if record.get("phase") == PHASE_PENDING:
+            return _pending_tail(session_id, child, record, REASON_NATIVE_REVOKED, 0)
+        return _unresolved_attempt_result(session_id, child, record)
+
+    delivered = False
+    if published.done:
+        confirmed = confirm_delivery(
+            plan.scanner,
+            plan.nonce,
+            child_alive=lambda: True,
+            bound_s=max(0.0, deadline - _delivery_clock()),
+            poll_interval_s=_DELIVERY_POLL_SECONDS,
+            clock=_delivery_clock,
+            sleep=_delivery_sleep,
+        )
+        delivered = confirmed.status == DELIVERY_DELIVERED
+    if not delivered:
+        # An unknown publish is withdrawn too: an entry may exist after all.
+        # Only a proven withdrawal is pending; an absent entry after an
+        # unknown publish is left to recovery, which tombstones it first.
+        withdrawn = delivery_mailbox.retract(directory, child, plan.nonce)
+        unsent = withdrawn.done or (
+            withdrawn.lost and withdrawn.state in _MAILBOX_UNSENT
+        )
+        if unsent:
+            return _mailbox_pending_result(
+                session_id, record, plan, REASON_NATIVE_RETRACTED
+            )
+        # A receipt already on disk is proof whatever the mailbox says.
+        delivered = plan.scanner.poll(plan.nonce) == SCAN_FOUND
+
+    def _outcome(row: dict) -> None:
+        if delivered:
+            settle(row, STATUS_DELIVERED, reason="", now=time.time())
+        else:
+            mark_phase(row, PHASE_UNCONFIRMED, reason=REASON_NATIVE_UNRESOLVED)
+
+    # Store first, registry second, as for the Codex carrier.
+    ours = _native_row_cas(session_id, record, plan, _outcome)
+    if is_terminal(record):
+        _mailbox_retention(session_id, child)
+    _finalize_native(
+        session_id, plan, unresolved=ours and not delivered, carrier_ref=""
+    )
+    return _native_result(session_id, record, plan)
+
+
+_NATIVE_DISPATCH[METHOD_CLAUDE_MAILBOX] = _dispatch_claude_mailbox
+
+
+def _live_claim_elsewhere(record: dict, own_claim: str) -> bool:
+    """Whether a live call in THIS process (other than ``own_claim``) holds it.
+
+    The only reason recovery ever skips a row (R3-3): correctness comes from
+    the mailbox CAS, and this only avoids disrupting a call still in flight.
+    Another process's claim, a finished call's stale claim and a missing
+    claim never stop recovery.
+    """
+    holder = record.get(ACTIVE_HOLDER_FIELD)
+    if not isinstance(holder, dict):
+        return False
+    mapping = cast("dict[str, Any]", holder)
+    claim_id = mapping.get(CLAIM_ID_FIELD)
+    if (
+        mapping.get("pid") != os.getpid()
+        or not isinstance(claim_id, str)
+        or not claim_id
+        or claim_id == own_claim
+    ):
+        return False
+    with _ACTIVE_CLAIM_LOCK:
+        return claim_id in _ACTIVE_CLAIM_IDS
+
+
+def _claim_id_of(record: dict) -> str:
+    """Return the claim id of ``record``'s active holder, or ``""``."""
+    holder = record.get(ACTIVE_HOLDER_FIELD)
+    if not isinstance(holder, dict):
+        return ""
+    claim_id = cast("dict[str, Any]", holder).get(CLAIM_ID_FIELD)
+    return claim_id if isinstance(claim_id, str) else ""
+
+
+def _mailbox_state_after_withdrawal(
+    session_id: str, row: dict, child: str, state: str | None, *, allow_taken: bool
+) -> str | None:
+    """Revoke an unpublished attempt or retract an unbegun offer.
+
+    Returns the state recovery must act on: ``revoked`` or ``retracted`` when
+    this call withdrew it, the state a lost CAS found, or ``None`` when the
+    mailbox could not answer.
+    """
+    directory = _session_dir(session_id)
+    nonce = str(row.get("nonce") or "")
+    operation_id = str(row.get("operation_id") or "")
+    if state in {delivery_mailbox.STATE_ABSENT, delivery_mailbox.STATE_REVOKED}:
+        revoked = delivery_mailbox.revoke(
+            directory,
+            child,
+            nonce,
+            operation_id=operation_id,
+            row_is_current=_row_is_attempt(session_id, row, nonce, operation_id),
+        )
+        if revoked.done:
+            return delivery_mailbox.STATE_REVOKED
+        if not revoked.lost or revoked.state == delivery_mailbox.STATE_REVOKED:
+            return None
+        state = revoked.state
+    retractable = {delivery_mailbox.STATE_OFFERED}
+    if allow_taken:
+        retractable.add(delivery_mailbox.STATE_TAKEN)
+    if state in retractable:
+        withdrawn = delivery_mailbox.retract(
+            directory, child, nonce, allow_taken=allow_taken
+        )
+        if withdrawn.done:
+            return delivery_mailbox.STATE_RETRACTED
+        return withdrawn.state if withdrawn.lost else None
+    return state
+
+
+def _recover_mailbox_row(
+    session_id: str, row: dict, *, own_claim: str = "", allow_taken: bool = False
+) -> None:
+    """Recover one ``claude_mailbox`` attempt from what the mailbox proves.
+
+    Receipts first: a found nonce is ``delivered``. Then, by the entry:
+
+    - none (or this attempt's own tombstone) ⇒ ``revoke`` CAS ⇒ ``pending``;
+      a late publish by the old holder then hits the tombstone;
+    - ``offered`` (and ``taken`` with ``allow_taken``, kill and force only,
+      after the epoch bump) ⇒ ``retract`` CAS ⇒ ``pending``;
+    - ``failed_before_write`` or ``retracted`` ⇒ ``pending``;
+    - ``taken``, ``posting``, ``posted``, ``uncertain`` ⇒ unresolved.
+
+    Any ``unknown`` leaves the row exactly as it is. Every row write is a CAS
+    on the attempt's identity. Lock order: the mailbox CAS takes its lock and
+    then ``deliveries.lock``; nothing here is called under ``deliveries.lock``.
+    """
+    nonce = str(row.get("nonce") or "")
+    operation_id = str(row.get("operation_id") or "")
+    child = str(row.get("to") or "")
+    if (
+        row.get(METHOD_FIELD) != METHOD_CLAUDE_MAILBOX
+        or is_terminal(row)
+        or row.get("phase") not in {PHASE_SENT, PHASE_UNCONFIRMED}
+        or not (nonce and operation_id and child)
+        or _live_claim_elsewhere(row, own_claim)
+    ):
+        return
+    was_sent = row.get("phase") == PHASE_SENT
+
+    def cas(mutate: Callable[[dict], None]) -> bool:
+        return _attempt_row_cas(session_id, row, nonce, operation_id, mutate)
+
+    def delivered(stored: dict) -> None:
+        settle(stored, STATUS_DELIVERED, reason="", now=time.time())
+
+    if _carrier_scan(session_id, row) == SCAN_FOUND:
+        cas(delivered)
+        return
+    try:
+        read = delivery_mailbox.read_entry(_session_dir(session_id), child, nonce)
+    except ValueError:  # an unsafe name never had a mailbox
+        return
+    if read.unknown:
+        return
+    state = _mailbox_state_after_withdrawal(
+        session_id, row, child, read.state, allow_taken=allow_taken
+    )
+    if state == delivery_mailbox.STATE_REVOKED:
+        cas(
+            lambda stored: mark_phase(
+                stored, PHASE_PENDING, reason=REASON_NATIVE_REVOKED
+            )
+        )
+    elif state in _MAILBOX_UNSENT:
+        cas(
+            lambda stored: mark_phase(
+                stored, PHASE_PENDING, reason=REASON_NATIVE_RETRACTED
+            )
+        )
+    elif state in _MAILBOX_UNRESOLVED and was_sent:
+        cas(
+            lambda stored: mark_phase(
+                stored, PHASE_UNCONFIRMED, reason=REASON_NATIVE_UNRESOLVED
+            )
+        )
+
+
+def _recover_mailbox_rows(
+    session_id: str,
+    rows: list[dict],
+    *,
+    own_claim: str = "",
+    allow_taken: bool = False,
+) -> None:
+    """Recover each mailbox row (:func:`_recover_mailbox_row`), then retain.
+
+    Never called under ``deliveries.lock``. Retention runs for every child
+    whose mailbox rows were looked at, so a row settled elsewhere (a receipt
+    found by a scan, an operator release) is cleaned up here too.
+    """
+    children: set[str] = set()
+    for row in rows:
+        if row.get(METHOD_FIELD) != METHOD_CLAUDE_MAILBOX:
+            continue
+        children.add(str(row.get("to") or ""))
+        _recover_mailbox_row(
+            session_id, row, own_claim=own_claim, allow_taken=allow_taken
+        )
+    for child in sorted(children):
+        _mailbox_retention(session_id, child)
+
+
+def _recover_mailbox_for(
+    session_id: str, sender: str, *, key: str = "", to: str | None = None
+) -> None:
+    """Recover ``sender``'s mailbox rows: one key, or every row to ``to``."""
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        rows = [
+            dict(row)
+            for row in txn.for_sender(sender, to)
+            if row.get(METHOD_FIELD) == METHOD_CLAUDE_MAILBOX
+            and (not key or row.get("idempotency_key") == key)
+        ]
+    if rows:
+        _recover_mailbox_rows(session_id, rows)
+
+
+def _mailbox_retention(session_id: str, child: str) -> None:
+    """Drop mailbox entries whose rows are terminal (plan §2.3.2, R2-2).
+
+    Order: the delivery store is read first, the mailbox written second.
+    Entries of rows that are not terminal are kept in every state, ``posted``
+    included: deleting one is never an acknowledgement. A tombstone is kept
+    while any unsettled row still carries its nonce, which is the only time a
+    late publish could pass its row check.
+    """
+    directory = _session_dir(session_id)
+    try:
+        if not delivery_mailbox.mailbox_path(directory, child).exists():
+            return
+    except ValueError:
+        return
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        rows = {
+            (str(row.get("sender") or ""), str(row.get("idempotency_key") or "")): (
+                is_terminal(row),
+                str(row.get("nonce") or ""),
+            )
+            for row in txn.data.values()
+            if row.get("to") == child
+        }
+    doc = delivery_mailbox.read_mailbox(directory, child)
+    if doc is None:
+        return
+    live_nonces = {nonce for terminal, nonce in rows.values() if not terminal}
+    doomed = [
+        nonce
+        for nonce, entry in doc["entries"].items()
+        if rows.get((entry["sender"], entry["key"]), (False, ""))[0]
+    ]
+    doomed += [nonce for nonce in doc["tombstones"] if nonce not in live_nonces]
+    if doomed:
+        delivery_mailbox.cleanup(directory, child, doomed)
+
+
+def _revoke_native_offers(session_id: str, name: str, agents: list[dict]) -> None:
+    """Kill and CLI force (plan §2.3.5): fence the child's posters, then withdraw.
+
+    Called under ``agents.lock`` (lock order ``agents.lock`` ⇒
+    ``delivery-mailbox-<child>.lock`` ⇒ ``deliveries.lock``):
+
+    1. Bump the record's ``dispatch_epoch`` and persist it, so every poster
+       now fails its binding check at ``take`` and ``begin``.
+    2. Only then withdraw ``offered`` AND ``taken`` entries: after the bump a
+       poster can no longer ``begin``, so a ``taken`` entry is provably
+       unsent. ``posting`` and later stay unresolved (N5); an ``unknown``
+       result keeps the row as it is.
+    3. Prune the consumed idle sequences of the older epochs.
+
+    A record without an epoch (made with the flags off) is not bumped, and a
+    child without a mailbox is left alone, so a flag-off kill writes nothing
+    new. Best effort: a store failure is logged and the kill or force goes on.
+    If the bump itself could not be persisted, ``taken`` entries are left
+    alone: without the fence a poster could still begin them.
+    """
+    agent = _find_agent(agents, name)
+    new_epoch: int | None = None
+    if agent is not None and _record_epoch(agent) is not None:
+        prior = agent.get("dispatch_epoch")
+        try:
+            agent["dispatch_epoch"] = _next_dispatch_epoch(session_id, name, agent)
+            _save_agents_transaction(session_id, agents)
+            new_epoch = agent["dispatch_epoch"]
+        except OSError:
+            agent["dispatch_epoch"] = prior
+            logger.warning("Could not bump the dispatch epoch of %s", name)
+    directory = _session_dir(session_id)
+    try:
+        if not delivery_mailbox.mailbox_path(directory, name).exists():
+            return
+    except ValueError:
+        return
+    try:
+        with delivery_transaction(_deliveries_file(session_id)) as txn:
+            rows = [
+                dict(row)
+                for row in txn.data.values()
+                if row.get("to") == name
+                and row.get(METHOD_FIELD) == METHOD_CLAUDE_MAILBOX
+            ]
+        _recover_mailbox_rows(session_id, rows, allow_taken=new_epoch is not None)
+    except DeliveryStoreError:
+        logger.warning("Delivery store failed while withdrawing offers to %s", name)
+    if new_epoch is not None:
+        delivery_mailbox.prune_consumed(directory, name, below=new_epoch)
 
 
 def _with_delivery_identity(result: dict, record: dict) -> dict:
@@ -6570,6 +7156,18 @@ def _reconcile_before_resend(session_id: str, name: str, record: dict) -> dict |
     """
     if record.get("phase") not in {PHASE_SENT, PHASE_UNCONFIRMED}:
         return None
+    if record.get(METHOD_FIELD) == METHOD_CLAUDE_MAILBOX:
+        # The mailbox answers first (plan §2.3.3), outside deliveries.lock.
+        # This call's own claim is not a live publisher of the old attempt.
+        _recover_mailbox_rows(
+            session_id, [dict(record)], own_claim=_claim_id_of(record)
+        )
+        _refresh_row(session_id, record)
+        if not is_terminal(record) and record.get("phase") not in {
+            PHASE_SENT,
+            PHASE_UNCONFIRMED,
+        }:
+            return None
     agents = _load_agents(session_id)
     with delivery_transaction(_deliveries_file(session_id)) as txn:
         stored = (
@@ -6980,6 +7578,7 @@ def _delivery_status(session_id: str, idempotency_key: str, to: str) -> dict:
             # call ``delivered`` publishes two different truths about one
             # message. Every unsettled row this sender has for ``to`` is
             # rescanned before the list is returned.
+            _recover_mailbox_for(session_id, IDENTITY, to=to)
             agents = _load_agents(session_id)
             with delivery_transaction(_deliveries_file(session_id)) as txn:
                 rows = txn.for_sender(IDENTITY, to)
@@ -7008,6 +7607,7 @@ def _delivery_status(session_id: str, idempotency_key: str, to: str) -> dict:
             "reason": delivery_store.KEY_REQUIRED,
             "detail": "Pass either an idempotency_key or a `to` agent name.",
         }
+    _recover_mailbox_for(session_id, IDENTITY, key=idempotency_key)
     agents = _load_agents(session_id)
     with delivery_transaction(_deliveries_file(session_id)) as txn:
         record = txn.get(IDENTITY, idempotency_key)
@@ -7066,6 +7666,7 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
         if not session_id:
             return {"success": False, "reason": "session_not_found"}
         store = _deliveries_file(session_id)
+        _recover_mailbox_for(session_id, IDENTITY, key=idempotency_key)
         agents = _load_agents(session_id)
         # Reconcile everything first, under one lock, so a message that
         # already landed is settled before anything considers resending it.
@@ -7333,6 +7934,10 @@ async def kill_agent(name: str) -> dict:
             # reintroduce exactly the false status this feature removes.
             # Records are settled here, never deleted: unlike the inbox lines
             # purged below, the sender's audit trail must outlive the target.
+            #
+            # Plan §2.3.5 first: bump the dispatch epoch so the child's poster
+            # stops at take/begin, then withdraw what it cannot have begun.
+            _revoke_native_offers(session_id, name, agents)
             native_unresolved = _reconcile_deliveries_for_target(
                 session_id, name, agent
             )
@@ -8383,6 +8988,64 @@ def _native_member_alive(session_id: str, name: str) -> bool:
     )
 
 
+def _own_dispatch_epoch() -> int:
+    """Return the dispatch epoch this child's host started with (plan R3-2)."""
+    return hooks._dispatch_epoch()
+
+
+def _channel_host(
+    channel: native_wake.ClaudeChannel,
+) -> Callable[[], tuple[int, str] | None]:
+    """Return this server's Claude host incarnation, read once and cached.
+
+    The host is the one the channel was resolved against (its nearest
+    ``claude`` ancestor, whose PID is checked again on every post). Without
+    an available channel, or a readable creation token, there is none.
+    """
+    cache: dict[str, tuple[int, str] | None] = {}
+
+    def host() -> tuple[int, str] | None:
+        if "value" not in cache:
+            token = (
+                process_manager.creation_token(str(channel.host_pid))
+                if channel.reason == "available" and channel.host_pid
+                else None
+            )
+            cache["value"] = (channel.host_pid, token) if token else None
+        return cache["value"]
+
+    return host
+
+
+def _delivery_poster(
+    channel: native_wake.ClaudeChannel,
+) -> delivery_poster.DeliveryPoster:
+    """Build this server's delivery poster (plan §2.3.4).
+
+    It is inert on every tick unless this process's own environment has the
+    master, downstream and ``_CLAUDE`` flags on; it posts only for its own
+    identity and only to its own host channel.
+    """
+    pid = os.getpid()
+    return delivery_poster.DeliveryPoster(
+        delivery_poster.PosterFacts(
+            host=_channel_host(channel),
+            current_binding=_poster_current_binding,
+            read_marker=_read_state_marker,
+            identity=delivery_mailbox.PosterIdentity(
+                pid, process_manager.creation_token(str(pid)) or ""
+            ),
+            epoch=_own_dispatch_epoch,
+        ),
+        get_target=_native_wake_target,
+        session_dir=_session_dir,
+        channel=channel,
+        poll=native_wake.positive_seconds(
+            os.environ.get("WIN_AGENT_TEAMS_NATIVE_WAKE_POLL_SECONDS", ""), 1.0
+        ),
+    )
+
+
 def main() -> None:
     """Run the MCP server."""
     global _native_notifier  # noqa: PLW0603 - one notifier per MCP server.
@@ -8391,13 +9054,16 @@ def main() -> None:
     if (
         native_wake.enabled("CLAUDE") and native_wake.claude_platform_supported()
     ) or native_wake.enabled("CODEX"):
+        channel = native_wake.resolve_claude_channel(os.environ)
         _native_notifier = native_wake.NativeWakeNotifier(
             get_target=_native_wake_target,
             session_dir=_session_dir,
             member_alive=_native_member_alive,
+            channel=channel,
             codex_lead=native_wake.CodexLeadWake(
                 host=_codex_lead_host, binding=_codex_lead_binding
             ),
+            delivery=_delivery_poster(channel),
         )
         _native_notifier.start()
     try:
