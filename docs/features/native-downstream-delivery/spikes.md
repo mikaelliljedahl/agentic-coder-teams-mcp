@@ -123,6 +123,8 @@ TUI `n1probe` (tier `cheapest`), spawned by the lead.
 - N8 needs server restarts with other flag values; golden tests cover it.
 - N3 and N4 need a logged-in `claude` CLI.
 
+| Smoke | Result | Evidence |
+|---|---|---|
 | N7: Codex lead woken by `codex queue` (spawned nested lead) | **pass** | `n7lead` (Codex, `enable_spawned_lead_wake=true`) ran the shell command and `set_lead_wake`: `status: provisional`, `reason: awaiting_parent_binding`. After the parent's `check_agent(full=True)` bound `backend_session_id` equal to the thread, the registration became `active`. Phase 2 reached `n7lead` via `codex_queue`. It spawned `n7child`, ended its turn without polling or a watcher, and was woken by `[win-agent-teams wake #1] 1 unread messages in your team inbox from n7child:1 ...`. `n7child` sent at 20:38:38.99 UTC; `n7lead` had read it and replied upstream by 20:38:58.22 (about 19 s, model turn included). The same reply woke this Claude lead again through the pipe (`wake #2`), a second N6 pass. |
 
 **Observation (NIT, follow-up).** With the flags on, the Claude delivery poster
