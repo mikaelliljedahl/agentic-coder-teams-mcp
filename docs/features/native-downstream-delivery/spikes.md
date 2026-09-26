@@ -157,3 +157,20 @@ with lead wake on both hosts it now shows. **Follow-up:** give each
 human-started lead its own identity or session, or refuse a second live lead
 registration for the same identity. **For a clean N7:** open the Codex lead
 in its own directory.
+
+### Codex Desktop, isolated workspace (2026-09-26, 20:46 to 20:50 UTC)
+
+Codex Desktop was reopened in its own folder, `C:\code\Ccoden7test`, so its
+server had its own session (`a51f94f9…`). Reported by the Desktop thread
+itself after joining this lead as external member `codexn7`.
+
+| Smoke | Result | Evidence |
+|---|---|---|
+| N7, human-started Codex lead (clean) | **pass** | `codex_lead: {status: active, generation: 1, thread_verified: true}` straight after `set_lead_wake`. Spawned `n7child` at 20:46:38. The child sent at 20:47:34.50. The lead, with its turn ended and no polling, watcher or sleep, got `[win-agent-teams wake #1] 1 unread messages in your team inbox from n7child:1. … call mcp__win_agent_teams__read_messages …` at 20:47:50 (about 16 s after the send). `read_messages` returned `N7-WAKE from n7child`. |
+| External Codex member, member → lead | **pass** | `codexn7` joined via a join ticket and `external_set_wake` (thread `01a0df77-…`, generation 1). Its `external_send` report woke this Claude lead through the pipe (`wake #6`). |
+| External Codex member, lead → member (clean) | **pass** | `send_message(to="codexn7")` returned `wake: {method: codex_queue, status: queued}`. The member was woken by the **member** notice: `win-agent-teams: wake 1 new message from team-lead in your member inbox - call mcp__win_agent_teams__external_read …` (seen 20:50:05). It replied `EXT-ACK codexn7` at 20:50:14, which woke this lead again (`wake #7`). |
+
+With separate workspaces, every direction works on Windows without a watcher:
+Claude lead ↔ Codex child, Codex lead ← Codex child, and Claude lead ↔
+external Codex member. The earlier ambiguity came only from the
+shared-identity collision described above.
