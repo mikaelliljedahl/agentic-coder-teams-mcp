@@ -80,12 +80,22 @@ fills with the spawner's `IDENTITY` (`src/claude_teams/server_simple.py:1261`).
 ### Parentage is a flat field, not a tree
 
 A spawned agent's record is
-`{name, pid, backend, session_id, status, spawned_at, cwd, model,
+`{name, pid, backend, session_id, status, spawned_at, launch_started_at,
+launch_interactive, hooks_wired, cwd, model,
 permission_mode, reasoning_effort, create_token, correlation_id,
 prompt_transport, spawned_by, spawned_by_source}` (`spawn_agent._do_spawn`),
 plus two fields written only by `follow_up_agent`: `generation` (int, the CAS
 counter — absent counts as 0) and `pending_delivery` (present only while an
 attempt is unconfirmed, see [section 4a](#4a-delivery-confirmation)).
+
+`launch_started_at` is captured immediately before each spawn or resume;
+`spawned_at` retains its existing later capture point. `launch_interactive`
+records whether the process manager provides a TTY for that backend launch.
+`hooks_wired` records whether the backend's actual state-hook argv was nonempty
+at launch, including hook kill switches. An adapter without the optional
+hook-argv capability records `false`. A follow-up that records a new PID
+(delivered or unconfirmed) refreshes all three fields; older records may lack
+them.
 
 `spawned_by` holds the spawning server's `IDENTITY` at the moment of the spawn,
 and `spawned_by_source` records how that parentage was established: `spawn`
@@ -503,6 +513,7 @@ persisting one would make every later read trust it.
 
 **Returns** `{name, state, alive, pid, backend, last_activity_at, unread_count,
 last_line, seq, truncated, full_len, heartbeat_age_s, stalled, binding,
+no_marker_since_launch, startup_hint,
 binding_retriable}`. `full=True` adds `last_message` and `backend_session_id`.
 
 `binding` is the binding outcome for this call and `binding_retriable` says
@@ -522,6 +533,23 @@ transcript-derived data at all.
 `stalled` is `True` only when alive, state is neither `waiting` nor `dead`, and
 heartbeat age exceeds `WIN_AGENT_TEAMS_STALL_SECONDS` (default 300 s)
 (`src/claude_teams/server_simple.py:118-148`).
+
+`no_marker_since_launch` is `true` exactly when the process is alive, hooks
+were wired for this launch, at least `WIN_AGENT_TEAMS_FIRST_MARKER_SECONDS`
+(default 45) have elapsed since `launch_started_at`, and the raw marker has no
+numeric `ts` at or after launch. It is `false` before the threshold, for a dead
+process, when hooks were not wired, or when a post-launch marker exists. It is
+`null` for legacy and external records. A marker without a numeric `ts`, or
+one older than launch, counts as absent for this field only. `startup_hint` is
+`null` unless that predicate is true. Then it gives a hedged, backend-aware
+heuristic: interactive Codex may be at its folder-trust prompt, Claude Code at
+its workspace-trust dialog, or Pi at its project-trust selector; a login prompt,
+slow start, or hook failure is also possible. A headless hint names a CLI
+startup problem or hook failure. The parent and child use a wall clock, so a
+backward clock step can make a genuine marker appear stale. This diagnosis
+does not alter public `state`, `stalled`, or `heartbeat_age_s` and does not
+resolve a transcript binding. The same two fields appear on both `check_agent`
+forms, both `list_agents` forms, and `agent_status`.
 
 **`unread_count` and `seq` count messages *from* this agent *to the caller***,
 read out of the caller's own inbox — not the agent's inbox
@@ -647,9 +675,10 @@ recoverable_sessions}` (`src/claude_teams/server_simple.py:1882-1889`).
 ### `list_agents(full=False)`
 
 Compact rows `{name, state, alive, pid, backend, last_activity_at,
-unread_count, binding}`. `full=True` returns the raw registry record plus
+unread_count, binding, no_marker_since_launch, startup_hint}`. `full=True`
+returns the raw registry record plus
 `last_line`, `truncated`, `full_len`, `binding`, and
-`backend_session_id_verified`.
+`backend_session_id_verified`, `no_marker_since_launch`, and `startup_hint`.
 
 `binding` is the binding outcome (see [section 3a](#3a-transcript-binding)),
 kept as its own field and never folded into lifecycle `state` — "this process is
@@ -666,8 +695,9 @@ from a session with no agents; call `session_info()` to tell them apart.
 
 ### `agent_status(names=None)`
 
-The cheap path. Rows are exactly `{name, state, last_activity_ts, unread_count,
-seq, heartbeat_age_s, stalled}`. Cost is one marker read + one cursor read + one
+The cheap path. Rows are exactly `{name, backend, state, last_activity_ts,
+unread_count, seq, heartbeat_age_s, stalled, binding,
+no_marker_since_launch, startup_hint}`. Cost is one marker read + one cursor read + one
 liveness check per agent; a rollout-log scan happens **only** as a fallback when
 no marker exists. Unknown names are silently skipped.
 

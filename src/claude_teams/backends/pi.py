@@ -509,13 +509,21 @@ class PiBackend(BaseBackend):
 
         Either is omitted when its path is absent from ``request.extra``.
         """
-        extra = request.extra or {}
-        args: list[str] = []
-        for key in ("pi_state_extension_path", "pi_wake_extension_path"):
-            ext = extra.get(key)
-            if ext:
-                args.extend(["-e", str(ext)])
+        args = PiBackend._state_extension_args(request)
+        wake = (request.extra or {}).get("pi_wake_extension_path")
+        if wake:
+            args.extend(["-e", str(wake)])
         return args
+
+    @staticmethod
+    def _state_extension_args(request: SpawnRequest) -> list[str]:
+        """Build argv for the state-reporting extension alone."""
+        path = (request.extra or {}).get("pi_state_extension_path")
+        return ["-e", str(path)] if path else []
+
+    def state_hook_args(self, request: SpawnRequest) -> list[str]:
+        """Return the state extension argv, excluding unrelated extensions."""
+        return self._state_extension_args(request)
 
     @staticmethod
     def _guard_leading_char(prompt: str) -> str:

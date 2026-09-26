@@ -80,6 +80,11 @@ class BaseBackend:
             return args
         return self.default_permission_args()
 
+    def state_hook_args(self, request: SpawnRequest) -> list[str]:
+        """Return state-hook argv for this launch; unsupported backends return none."""
+        _ = request
+        return []
+
     def spawn(self, request: SpawnRequest) -> SpawnResult:
         """Spawn the agent as a Windows-native process."""
         cmd_parts = self.build_command(request)
