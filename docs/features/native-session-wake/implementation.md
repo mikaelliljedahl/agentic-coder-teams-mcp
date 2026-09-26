@@ -188,3 +188,27 @@ Final review-fix validation, whole repository on Linux:
 | `uv run pytest` | PASS — 1832 passed, 4 skipped in 42.24s |
 
 `git diff --check` passes. No pre-existing failure was hidden or remains.
+
+## Live smoke results (2026-09-26, Linux, lead run by the Claude Opus reviewer)
+
+Setup: a Claude Code 2.1.282 lead and a Codex 0.156.1 TUI member, each in its
+own herdr tab, both running this worktree's server with
+`WIN_AGENT_TEAMS_NATIVE_WAKE=1` (lead via `--mcp-config --strict-mcp-config`,
+member via `-c mcp_servers.win-agent-teams.*` overrides). Neither side armed a
+watcher, polled or slept.
+
+| Smoke | Result | Evidence |
+|---|---|---|
+| S1 round trip, flag on | PASS | Three full PING→PONG cycles. Every lead `send_message` returned `wake: {method: codex_queue, status: queued}` and the idle Codex member started a new turn; every member `external_send` woke the idle lead with `[win-agent-teams wake #n] 1 unread message(s) ... from: smoke-codex`. `session_info.native_wake = {claude_channel: available, owner_verified: true, notifier_owner: true}`. |
+| S2 spawned Claude child has its own socket | PASS | Child server env `CLAUDE_CODE_MESSAGING_SOCKET=/run/user/1000/cc-socks/3949699.sock`, stem = its own `claude` host pid (not the lead's 3903430). |
+| S4 restart with backlog | PASS | Lead `claude` killed; member sent `BACKLOG-1`; new lead called only `resume_session` and received `[win-agent-teams wake #1]` immediately, then read `BACKLOG-1`. |
+| S5 bypass-mode lead | PASS | The lead ran with `--permission-mode bypassPermissions`; every notice was delivered without an approval prompt (own-child). |
+| S3, S6, S7 | Not run live | Covered by unit/flag-off tests; S7 is the default for every other session on this machine, which runs `main`. |
+| Codex **Desktop** member | Covered by the pre-implementation smoke run | Same `codex queue` path; see smoke-run-2026-09-25.md §3. |
+| W1–W3 (Windows) | **Pending** | Must run on the Windows machine before merge. |
+| V1 / V2 | Open | Not blockers (plan §5). |
+
+Observation: a Claude child spawned by a flag-on lead runs the same server
+command but does not inherit `WIN_AGENT_TEAMS_NATIVE_WAKE`; its own wake stays
+off unless its MCP entry sets the flag. This matches the per-installation
+opt-in.
