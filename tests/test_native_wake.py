@@ -103,6 +103,7 @@ def test_nearest_host_guard(kind):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX sockets")
 def test_socket_ownership(tmp_path):
+    assert sys.platform != "win32"  # narrows AF_UNIX for ty on Windows
     assert (
         nw.resolve_claude_channel(
             env(tmp_path / "999.sock"), resolve_host=host()
@@ -127,6 +128,7 @@ def test_socket_ownership(tmp_path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX sockets")
 def test_wire_two_lines_then_eof(tmp_path):
+    assert sys.platform != "win32"  # narrows AF_UNIX for ty on Windows
     with socket.socket(socket.AF_UNIX) as listener:
         listener.bind(str(tmp_path / "123.sock"))
         listener.listen()

@@ -102,7 +102,11 @@ def post_claude_notice(
     channel: ClaudeChannel, text: str, deadline: float = 5.0
 ) -> PostResult:
     """Write auth and user JSON lines with a real total POSIX operation deadline."""
-    if not claude_platform_supported() or channel.reason != "available":
+    if (
+        sys.platform == "win32"
+        or not claude_platform_supported()
+        or channel.reason != "available"
+    ):
         return PostResult(False, channel.reason)
     try:
         end = time.monotonic() + deadline
