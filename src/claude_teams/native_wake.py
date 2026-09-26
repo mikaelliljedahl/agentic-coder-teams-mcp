@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -571,42 +572,80 @@ def queue_environment(home: str) -> dict[str, str]:
     return environ
 
 
-def codex_queue(
+def _outcome_from(returncode: int, stdout: str, stderr: str) -> QueueOutcome:
+    match = _SUBMISSION_RE.search(stdout or "")
+    return QueueOutcome(
+        True,
+        returncode,
+        match[1] if match and returncode == 0 else "",
+        stderr_tail=(stderr or "")[-200:],
+    )
+
+
+def codex_queue(  # noqa: PLR0911 - one return per staged outcome.
     binary: str,
     thread_id: str,
     home: str,
     message: str,
     *,
-    runner: Callable[..., Any] = subprocess.run,
+    popen: Callable[..., Any] = subprocess.Popen,
+    runner: Callable[..., Any] | None = None,
     timeout: float | None = None,
 ) -> QueueOutcome:
-    """Run ``codex queue`` with a real timeout; ``cwd`` is home, not CODEX_HOME."""
-    try:
-        completed = runner(
-            [binary, "queue", "--thread", thread_id, "--message", message],
-            env=queue_environment(home),
-            cwd=Path.home(),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout or _seconds("CODEX_QUEUE_TIMEOUT_SECONDS", 15.0),
-            check=False,
+    """Run ``codex queue`` with a real timeout; ``cwd`` is home, not CODEX_HOME.
+
+    Process creation and communication are separate stages on purpose: only a
+    failure to *construct* the process proves nothing was queued. Once a
+    process object exists, every error (including an ``OSError`` from
+    ``communicate``) is uncertain, because the turn may already be queued.
+    ``runner`` is a legacy ``subprocess.run``-style seam; it cannot tell the
+    stages apart, so none of its failures are ever reported as unstarted.
+    """
+    argv = [binary, "queue", "--thread", thread_id, "--message", message]
+    limit = timeout or _seconds("CODEX_QUEUE_TIMEOUT_SECONDS", 15.0)
+    options: dict[str, Any] = {
+        "env": queue_environment(home),
+        "cwd": Path.home(),
+        "stdin": subprocess.DEVNULL,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if runner is not None:
+        try:
+            completed = runner(
+                argv, capture_output=True, timeout=limit, check=False, **options
+            )
+        except subprocess.TimeoutExpired:
+            return QueueOutcome(True, timed_out=True)
+        except (OSError, subprocess.SubprocessError):
+            return QueueOutcome(True)
+        return _outcome_from(
+            completed.returncode,
+            getattr(completed, "stdout", "") or "",
+            getattr(completed, "stderr", "") or "",
         )
-    except subprocess.TimeoutExpired:
-        return QueueOutcome(True, timed_out=True)
-    except OSError:
-        # Raised by process creation itself (missing/denied executable).
+    try:
+        process = popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
+    except (OSError, ValueError):
+        # Construction failed: no codex process ever ran.
         return QueueOutcome(False)
-    except subprocess.SubprocessError:
+    try:
+        stdout, stderr = process.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        _reap(process)
+        return QueueOutcome(True, timed_out=True)
+    except Exception:
+        _reap(process)
         return QueueOutcome(True)
-    match = _SUBMISSION_RE.search(getattr(completed, "stdout", "") or "")
-    return QueueOutcome(
-        True,
-        completed.returncode,
-        match[1] if match and completed.returncode == 0 else "",
-        stderr_tail=(getattr(completed, "stderr", "") or "")[-200:],
-    )
+    return _outcome_from(process.returncode, stdout, stderr)
+
+
+def _reap(process: Any) -> None:
+    """Kill and collect a queue process without letting cleanup raise."""
+    with contextlib.suppress(Exception):
+        process.kill()
+    with contextlib.suppress(Exception):
+        process.communicate(timeout=5)
 
 
 @dataclass
@@ -623,7 +662,7 @@ class CodexMemberWake:
     def __init__(
         self,
         *,
-        runner: Callable[..., Any] = subprocess.run,
+        runner: Callable[..., Any] | None = None,
         discover: Callable[[], str] = _discover_codex,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:

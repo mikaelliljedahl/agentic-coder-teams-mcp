@@ -226,14 +226,34 @@ def reap_parked() -> int:
         return len(still)
 
 
-def _admission(path: str) -> str:
-    """Refuse a write while this path has an undrained one, or at the cap."""
+# Paths with a write in flight (reserved before any I/O is initiated).
+_RESERVED: set[str] = set()
+
+
+def _key(path: str) -> str:
+    """Local pipe names are case-insensitive."""
+    return path.casefold()
+
+
+def _reserve(key: str) -> str:
+    """Atomically reserve ``key`` before I/O; refuse if busy or at the cap.
+
+    A reservation lives until the call returns; a write that gets parked is
+    covered by its parked entry from the moment it is appended, which happens
+    before the reservation is released, so there is never an unguarded gap.
+    """
     with _PARKED_LOCK:
-        if any(pending.path == path for pending in _PARKED):
+        if key in _RESERVED or any(pending.path == key for pending in _PARKED):
             return "channel_busy"
-        if len(_PARKED) >= MAX_PARKED:
+        if len(_RESERVED) + len(_PARKED) >= MAX_PARKED:
             return "parked_cap"
+        _RESERVED.add(key)
     return ""
+
+
+def _release(key: str) -> None:
+    with _PARKED_LOCK:
+        _RESERVED.discard(key)
 
 
 def _write(path: str, handle: Any, payload: bytes, end: float) -> tuple[str, bool]:
@@ -309,24 +329,29 @@ def post(  # noqa: PLR0911 - one return per refusal reason.
     if not math.isfinite(deadline) or deadline <= 0:
         return PipeResult(False, "invalid_deadline")
     end = time.monotonic() + deadline
+    key = _key(path)
     owns = True
     handle = None
+    reserved = False
     try:
         reap_parked()
-        refused = _admission(path)
+        refused = _reserve(key)
         if refused:
             return PipeResult(False, refused)
+        reserved = True
         handle, reason = _open(path, end)
         if handle is None:
             return PipeResult(False, reason)
         if expected_pid is not None and _server_pid(handle) != expected_pid:
             return PipeResult(False, "socket_not_owned")
-        reason, owns = _write(path, handle, payload, end)
+        reason, owns = _write(key, handle, payload, end)
     except Exception as err:  # Never let transport errors escape.
         return PipeResult(False, type(err).__name__, write_started=not owns)
     finally:
         if owns and handle is not None:
             _k().CloseHandle(handle)
+        if reserved:
+            _release(key)
     return PipeResult(
         not reason,
         reason,

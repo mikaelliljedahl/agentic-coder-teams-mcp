@@ -13,9 +13,12 @@ from claude_teams import server_simple
 from tests.test_spawn_agent_watch_contract import _FakeBackend, _FakeRegistry
 
 
+class _InteractiveBackend(_FakeBackend):
+    is_interactive = True
+
+
 async def _spawn(tmp_path, monkeypatch, backend_name="claude-code"):
-    backend = _FakeBackend()
-    backend.is_interactive = True
+    backend = _InteractiveBackend()
     monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path / "sessions")
     monkeypatch.setattr(server_simple, "_session_id", "")
     monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend, backend_name))
@@ -72,8 +75,7 @@ def test_resume_bumps_dispatch_epoch(monkeypatch):
     monkeypatch.setattr(
         server_simple.process_manager, "provides_tty", lambda *a, **k: True
     )
-    backend = _FakeBackend()
-    backend.is_interactive = True
+    backend = _InteractiveBackend()
     fields = server_simple._native_record_fields(
         {"dispatch_epoch": 4}, "claude-code", backend
     )

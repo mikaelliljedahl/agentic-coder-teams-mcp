@@ -82,6 +82,7 @@ def kernel(monkeypatch):
         monkeypatch.setattr(winpipe, "_KERNEL32", fake)
         monkeypatch.setattr(winpipe, "_last_error", lambda: fake.error)
         monkeypatch.setattr(winpipe, "_PARKED", [])
+        monkeypatch.setattr(winpipe, "_RESERVED", set())
         return fake
 
     return install
@@ -216,3 +217,52 @@ def test_reaper_runs_without_a_new_post(kernel):
     fake.waits = [winpipe.WAIT_OBJECT_0]
     assert winpipe.reap_parked() == 0
     assert sorted(fake.closed) == [10, 20]
+
+
+def test_concurrent_same_path_posts_are_serialised(kernel):
+    import threading
+
+    fake = kernel()
+    entered = threading.Event()
+    release = threading.Event()
+    original = fake.CreateFileW
+
+    def blocking_create(*args):
+        entered.set()
+        release.wait(5)
+        return original(*args)
+
+    fake.CreateFileW = blocking_create
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(winpipe.post(PIPE, b"abc", 2.0, expected_pid=77))
+    )
+    first.start()
+    assert entered.wait(5)
+    second = winpipe.post(PIPE.upper(), b"abc", 2.0, expected_pid=77)
+    release.set()
+    first.join(5)
+    assert (second.ok, second.reason, second.write_started) == (
+        False,
+        "channel_busy",
+        False,
+    )
+    assert results[0].ok
+    assert fake.calls.count("WriteFile") == 1
+
+
+def test_reservation_is_released_after_completion_and_refusal(kernel):
+    fake = kernel()
+    assert winpipe.post(PIPE, b"abc", 1.0, expected_pid=77).ok
+    assert winpipe.post(PIPE, b"abc", 1.0, expected_pid=78).reason == "socket_not_owned"
+    assert winpipe.post(PIPE, b"abc", 1.0, expected_pid=77).ok
+    assert set() == winpipe._RESERVED
+    assert fake.calls.count("WriteFile") == 2
+
+
+def test_cap_counts_in_flight_reservations(kernel, monkeypatch):
+    monkeypatch.setattr(winpipe, "MAX_PARKED", 1)
+    kernel()
+    winpipe._RESERVED.add("\\\\.\\pipe\\other")
+    result = winpipe.post(PIPE, b"abc", 1.0, expected_pid=77)
+    assert result.reason == "parked_cap"

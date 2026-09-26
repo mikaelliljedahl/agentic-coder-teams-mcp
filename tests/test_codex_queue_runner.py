@@ -77,7 +77,65 @@ def test_everything_after_spawn_without_an_id_is_uncertain(
 
 
 @pytest.mark.parametrize("error", [FileNotFoundError(), PermissionError()])
-def test_exec_failure_proves_nothing_was_enqueued(error):
+def test_legacy_runner_errors_are_never_proof_of_non_enqueue(error):
     outcome = nw.codex_queue("codex", THREAD, "/h", "m", runner=runner(raises=error))
+    assert outcome.started
+    assert not outcome.provably_not_enqueued
+
+
+class FakeProcess:
+    def __init__(self, *, returncode=0, stdout="", stderr="", raises=None):
+        self.returncode = returncode
+        self.stdout_text = stdout
+        self.stderr_text = stderr
+        self.raises = list(raises or [])
+        self.killed = False
+
+    def communicate(self, timeout=None):
+        if self.raises:
+            raise self.raises.pop(0)
+        return self.stdout_text, self.stderr_text
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError(), PermissionError()])
+def test_construction_failure_proves_nothing_was_enqueued(error):
+    def popen(*args, **kwargs):
+        raise error
+
+    outcome = nw.codex_queue("codex", THREAD, "/h", "m", popen=popen)
     assert not outcome.started
     assert outcome.provably_not_enqueued
+
+
+def test_communicate_oserror_after_launch_is_uncertain():
+    process = FakeProcess(raises=[OSError("pipe broke after enqueue")])
+    outcome = nw.codex_queue("codex", THREAD, "/h", "m", popen=lambda *a, **k: process)
+    assert outcome.started
+    assert not outcome.provably_not_enqueued
+    assert not outcome.enqueued
+    assert process.killed
+
+
+def test_timeout_after_launch_kills_and_is_uncertain():
+    process = FakeProcess(raises=[subprocess.TimeoutExpired("codex", 1)])
+    outcome = nw.codex_queue("codex", THREAD, "/h", "m", popen=lambda *a, **k: process)
+    assert (outcome.started, outcome.timed_out) == (True, True)
+    assert process.killed
+
+
+def test_popen_success_parses_submission(monkeypatch):
+    seen = {}
+
+    def popen(argv, **kwargs):
+        seen.update(kwargs)
+        return FakeProcess(stdout=f"Queued message {SUBMISSION} for thread {THREAD}.")
+
+    outcome = nw.codex_queue("codex", THREAD, "/h/.codex", "m", popen=popen)
+    assert outcome.enqueued
+    assert outcome.submission_id == SUBMISSION
+    assert seen["env"]["CODEX_HOME"] == "/h/.codex"
+    assert seen["cwd"] == Path.home()
+    assert seen["stdin"] == subprocess.DEVNULL
