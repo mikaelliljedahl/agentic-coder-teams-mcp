@@ -70,7 +70,10 @@ def test_trust_cwd_override_is_one_argv_token_before_prompt(
         if resume
         else backend.build_command(request)
     )
-    override = f"projects={{ '{cwd.resolve()}' = {{ trust_level = 'trusted' }} }}"
+    key = str(cwd.resolve())
+    if codex_module._windows_trust_key():
+        key = "".join(c.lower() if "A" <= c <= "Z" else c for c in key)
+    override = f"projects={{ '{key}' = {{ trust_level = 'trusted' }} }}"
     assert command.count(override) == 1
     assert command[command.index(override) - 1] == "-c"
     assert command.index(override) < len(command) - 1
@@ -114,7 +117,8 @@ def test_trust_cwd_windows_key_ascii_lowercase(_make_request, monkeypatch):
     )
     command = backend.build_command(request)
     override = next(part for part in command if part.startswith("projects="))
-    assert "mixed-case/abc" in override
+    # Windows resolves to backslashes; compare separator-neutrally.
+    assert "mixed-case/abc" in override.replace("\\", "/")
     assert "Mixed-Case" not in override
 
 
@@ -126,7 +130,7 @@ def test_trust_cwd_windows_key_preserves_non_ascii(_make_request, monkeypatch):
     override = next(
         part for part in backend.build_command(request) if part.startswith("projects=")
     )
-    assert "\u00c4bc/abc" in override
+    assert "\u00c4bc/abc" in override.replace("\\", "/")
 
 
 def test_trust_cwd_validates_the_same_resolved_key_it_emits(_make_request, monkeypatch):
@@ -146,7 +150,7 @@ def test_trust_cwd_validates_the_same_resolved_key_it_emits(_make_request, monke
     monkeypatch.setattr(Path, "resolve", changing_resolve)
     command = backend.build_command(request)
     assert calls == 1
-    assert "'/workspace/safe'" in next(
+    assert f"'{Path('/workspace/safe')}'" in next(
         part for part in command if part.startswith("projects=")
     )
 
@@ -195,7 +199,8 @@ def test_build_env_passes_isolated_codex_home_to_child(_make_request, monkeypatc
     monkeypatch.setenv("CODEX_HOME", "/isolated/codex-home")
     monkeypatch.setattr(codex_module.shutil, "which", lambda _: None)
     env = CodexBackend().build_env(_make_request())
-    assert env["CODEX_HOME"] == "/isolated/codex-home"
+    # Forwarded as an absolute path; on Windows that gains a drive letter.
+    assert env["CODEX_HOME"] == str(Path("/isolated/codex-home").resolve())
 
 
 def test_build_env_absolutizes_relative_codex_home(

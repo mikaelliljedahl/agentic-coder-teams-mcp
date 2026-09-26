@@ -115,3 +115,7 @@ uv run ruff check .            # pass: All checks passed
 uv run ty check                # pass: All checks passed
 uv run pytest                  # pass: 1933 passed, 6 skipped
 ```
+
+### CI fix (Windows), Part B
+
+The first CI run of PR #73 failed six `tests/test_backends/test_codex.py` Part B tests on `tests-windows`. All six were test portability bugs; the production behavior was correct. The tests expected POSIX separators and non-drive-rooted paths, and one expected mixed case where Windows builds the ASCII-lowercased key. On Windows the key is the resolved native path (backslashes, drive letter), lowercased to match Codex's lookup, and `CODEX_HOME` is forwarded as an absolute (drive-rooted) path. The tests now derive their expectations the same way, or compare separators neutrally. No production change. Linux gates were re-run: format, ruff and ty pass; pytest 1933 passed, 6 skipped.
