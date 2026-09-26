@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -34,6 +35,12 @@ _TMUX_PANE_ID = re.compile(r"%[0-9]+")
 #: is a plain positive decimal or it is not a pane PID.
 _TMUX_PANE_PID = re.compile(r"[1-9][0-9]*")
 _PROC_STAT_SPLIT_FIELD_COUNT = 2
+_DARWIN_START_TIME_PREFIX_BYTES = 12
+# sysctl MIB for ``kern.proc.pid.<pid>`` (sys/sysctl.h).
+_CTL_KERN = 1
+_KERN_PROC = 14
+_KERN_PROC_PID = 1
+_MICROSECONDS_PER_SECOND = 1_000_000
 _STILL_ACTIVE = 259
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _ERROR_ACCESS_DENIED = 5
@@ -262,6 +269,64 @@ def _read_linux_creation_token(pid: int) -> str | None:
     return starttime if starttime.isdigit() else None
 
 
+def _parse_darwin_kinfo_start_time(raw: bytes) -> tuple[int, int] | None:
+    """Decode the LP64 little-endian kinfo_proc start-time prefix."""
+    if len(raw) < _DARWIN_START_TIME_PREFIX_BYTES:
+        return None
+    sec, usec = struct.unpack_from("<qi", raw)
+    if sec <= 0 or not 0 <= usec < _MICROSECONDS_PER_SECOND:
+        return None
+    return sec, usec
+
+
+def _read_darwin_creation_token(pid: int) -> str | None:
+    """Read a Darwin PID's immutable start time through kern.proc.pid sysctl.
+
+    ``kp_proc.p_starttime`` never changes for a process's lifetime, so a reused
+    PID yields a different token. ``sysctl`` is used rather than libproc's
+    ``proc_pidinfo``, which returns nothing for PID 1 and for zombies. ``None``
+    means the PID is gone or could not be read; callers must fail closed.
+    """
+    try:
+        sysctl = ctypes.CDLL(None).sysctl
+    except (OSError, AttributeError):
+        return None
+    sysctl.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    sysctl.restype = ctypes.c_int
+    mib = (ctypes.c_int * 4)(_CTL_KERN, _KERN_PROC, _KERN_PROC_PID, pid)
+    size = ctypes.c_size_t()
+    if sysctl(mib, len(mib), None, ctypes.byref(size), None, 0) != 0 or size.value == 0:
+        return None
+    capacity = size.value
+    buffer = ctypes.create_string_buffer(capacity)
+    if sysctl(mib, len(mib), buffer, ctypes.byref(size), None, 0) != 0:
+        return None
+    if size.value > capacity:
+        return None
+    started = _parse_darwin_kinfo_start_time(buffer.raw[: size.value])
+    if started is None:
+        return None
+    sec, usec = started
+    return f"{sec}.{usec:06d}"
+
+
+def _creation_token_is_windows() -> bool:
+    """Return whether creation tokens use the Windows reader."""
+    return os.name == "nt"
+
+
+def _creation_token_is_darwin() -> bool:
+    """Return whether creation tokens use the Darwin reader."""
+    return sys.platform == "darwin"
+
+
 def _codex_creation_epoch_ms(value: object) -> int:
     """Return a monotonic sort key from a WMI CreationDate JSON value.
 
@@ -299,8 +364,10 @@ def creation_token(handle: str) -> str | None:
         return None
     if pid <= 0:
         return None
-    if os.name == "nt":
+    if _creation_token_is_windows():
         return _read_windows_creation_token(pid)
+    if _creation_token_is_darwin():
+        return _read_darwin_creation_token(pid)
     return _read_linux_creation_token(pid)
 
 
@@ -431,15 +498,17 @@ class _PidOwnershipMixin:
     ) -> tuple[bool, str]:
         """Token-aware liveness for the no-in-memory-registry case.
 
-        With ``expected_token`` set, a live PID whose token differs (reuse) or
-        is unreadable is reported dead. Without a token, falls back to bare PID
-        liveness (backward compatible for records predating tokens — display
-        only; destructive ops still gate on ``owns_process``).
+        With ``expected_token`` set, a differing token reports PID reuse. An
+        unreadable token falls back to PID liveness but leaves identity
+        unverified. Without a stored token, bare PID liveness is used for
+        backward compatibility; destructive ops still gate on ``owns_process``.
         """
         if expected_token:
             live = creation_token(handle)
             if live is None:
-                return False, "process not found or token unreadable"
+                if self._pid_alive(handle):
+                    return True, "process alive; token unreadable, identity unverified"
+                return False, "process not found"
             if live != expected_token:
                 return False, "pid reused (token mismatch)"
             return True, "process exists by pid (token match)"

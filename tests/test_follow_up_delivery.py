@@ -273,6 +273,35 @@ def _pin_liveness_to(monkeypatch: pytest.MonkeyPatch, child: SimpleNamespace) ->
     monkeypatch.setattr(server_simple.process_manager, "health_check", health_check)
 
 
+@pytest.mark.asyncio
+async def test_unreadable_token_on_live_bound_child_does_not_resume_or_clean_artifacts(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restarted manager must keep an unverified live child busy."""
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    manager = server_simple.process_manager
+    monkeypatch.setattr(manager, "_processes", {})
+    monkeypatch.setattr(
+        manager, "_pid_alive", lambda handle: handle == str(os.getpid())
+    )
+    monkeypatch.setattr(process_manager, "creation_token", lambda handle: None)
+    agent = _record()
+    agent["pid"] = os.getpid()
+    agent["create_token"] = "stored"
+    server_simple._save_agents(SESSION, [agent])
+    prompts = server_simple._prompts_dir(SESSION)
+    prompts.mkdir(parents=True, exist_ok=True)
+    artifact = prompts / f"{AGENT}.{'a' * 32}.prompt.txt"
+    artifact.write_text("live child", encoding="utf-8")
+
+    result = await server_simple.follow_up_agent(AGENT, "next prompt", "unreadable")
+
+    assert result["status"] == "queued"
+    assert backend.resume_calls == []
+    assert artifact.read_text(encoding="utf-8") == "live child"
+
+
 # ==========================================================================
 # A3 — child liveness as an early-failure signal only
 # ==========================================================================
@@ -363,6 +392,9 @@ async def test_nonce_in_the_correct_transcript_is_delivered(
 
     assert result["success"] is True
     assert result["status"] == "delivered"
+    assert len(backend.resume_calls) == 1
+    assert backend.resume_calls[0][0].prompt.startswith("next prompt")
+    assert backend.resume_calls[0][0].prompt.count(DELIVERY_MARKER_PREFIX) == 1
     assert _record()["pid"] == 789
 
 

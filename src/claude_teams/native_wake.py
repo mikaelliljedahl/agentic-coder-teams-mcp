@@ -739,6 +739,11 @@ class CodexMemberWake:
             return result
 
     def _queue(self, registration: dict, sender: str, seq: int) -> dict:
+        from claude_teams.backends.codex import (  # noqa: PLC0415 - backend import cycle.
+            CodexBackend,
+            codex_mcp_tool_name,
+        )
+
         result = {"method": "codex_queue", "status": "queued"}
         try:
             binary = self.discover()
@@ -746,9 +751,13 @@ class CodexMemberWake:
             return {**result, "status": "unavailable"}
         # No member-controlled free text or cmd.exe metacharacters reach the shim.
         safe_sender = re.sub(r"[^A-Za-z0-9_-]", "_", sender)
+        external_key = CodexBackend._MCP_SERVER_NAME + "-external"
         notice = (
             f"win-agent-teams: wake {seq} new message from {safe_sender} "
-            "in your member inbox - call external_read with your member_token"
+            "in your member inbox - call "
+            f"{codex_mcp_tool_name('external_read')} or "
+            f"{codex_mcp_tool_name('external_read', server=external_key)} "
+            "with your member_token using your configured MCP key"
         )
         outcome = codex_queue(
             binary,

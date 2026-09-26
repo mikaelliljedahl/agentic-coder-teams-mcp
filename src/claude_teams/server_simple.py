@@ -49,6 +49,7 @@ from claude_teams.agent_output import (
 )
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends import process_manager as process_manager_module
+from claude_teams.backends.codex import CodexBackend, codex_mcp_tool_name
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.pi import MAX_ARGV_PROMPT_CHARS
 from claude_teams.backends.process_manager import (
@@ -844,6 +845,7 @@ def _build_join_prompt(
         f"You are joining {parent}'s win-agent-teams session as {name!r}.\n\n"
         f"Role note:\n{fence}\n{note}\n{fence}\n\n"
         "Join protocol:\n"
+        f"{_join_tool_names_line()}\n"
         "1. Call this tool first, with these literal values:\n"
         f"   join_team(session_id={session_id!r}, token={token!r})\n"
         "2. You must save the returned member_token in this conversation. It is the "
@@ -858,9 +860,14 @@ def _build_join_prompt(
     )
 
     if native_wake.enabled():
+        external_key = CodexBackend._MCP_SERVER_NAME + "-external"
         prompt += (
             "6. If you are a Codex session, run one shell command and pass both "
-            "values to external_set_wake(member_token=..., codex_thread_id=..., "
+            "values to "
+            f"{codex_mcp_tool_name('external_set_wake')} or "
+            f"{codex_mcp_tool_name('external_set_wake', server=external_key)} "
+            "using "
+            "external_set_wake(member_token=..., codex_thread_id=..., "
             'codex_home=...). Unix: echo "$CODEX_THREAD_ID '
             '${CODEX_HOME:-$HOME/.codex}"; PowerShell: "$env:CODEX_THREAD_ID '
             "$(if ($env:CODEX_HOME) {$env:CODEX_HOME} else "
@@ -873,6 +880,23 @@ def _build_join_prompt(
             "messages are waiting, a backlog notice follows immediately.\n"
         )
     return prompt
+
+
+def _join_tool_names_line() -> str:
+    """Name member tools for Codex and Claude Code in a backend-neutral prompt."""
+    keys = (CodexBackend._MCP_SERVER_NAME, CodexBackend._MCP_SERVER_NAME + "-external")
+    tools = ("join_team", "external_read", "external_send", "leave_team")
+    names = [
+        ", ".join(codex_mcp_tool_name(tool, server=key) for tool in tools)
+        for key in keys
+    ]
+    return (
+        "Tool names: use this MCP server's key. Codex replaces non-[A-Za-z0-9_] "
+        f"key characters with _: for {keys[0]} call {names[0]}; for "
+        f"{keys[1]} call {names[1]}. Claude Code keeps the key: "
+        f"mcp__{keys[0]}__join_team or mcp__{keys[1]}__join_team "
+        "with the same tool suffixes. Use the MCP tools, not Codex collaboration tools."
+    )
 
 
 def _member_secret(ticket_id: object, token: object) -> str:
@@ -942,6 +966,7 @@ def _external_membership_result(session_id: str, ticket: dict, secret: str) -> d
         "state_marker_path": str(_state_marker_file(session_id, name)),
         "watch_argv": _watch_argv(session_dir, reader=name),
         "instructions": (
+            f"{_join_tool_names_line()} "
             "Save member_token. Poll external_read for work, answer with "
             "external_send, and call leave_team only when leaving permanently."
         ),
