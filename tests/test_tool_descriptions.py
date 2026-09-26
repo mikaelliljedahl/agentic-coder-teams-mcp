@@ -1,5 +1,10 @@
 """Tests for MCP tool descriptions exposed from docstrings."""
 
+import json
+import os
+import subprocess
+import sys
+
 import pytest
 
 from claude_teams import server_simple
@@ -286,3 +291,72 @@ async def test_wake_install_descriptions_document_local_project_file(
     assert "tracked" in description
     assert "~/.claude/settings.json" in description
     assert "settings_write_failed" in description
+
+
+def test_flag_on_tool_contract_and_watch_retained():
+    env = os.environ.copy()
+    env["WIN_AGENT_TEAMS_NATIVE_WAKE"] = "1"
+    code = (
+        "import asyncio,json; "
+        "from claude_teams import server_simple as s; "
+        'print(json.dumps({"tools":{t.name:t.description '
+        "for t in asyncio.run(s.mcp.list_tools())}, "
+        '"note":s._DISK_CONTRACT_NOTE}))'
+    )
+    result = subprocess.run(  # noqa: S603 - fresh interpreter, no external CLI.
+        [sys.executable, "-c", code],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    data = json.loads(result.stdout)
+    tools = data["tools"]
+    for name in (
+        "send_message",
+        "read_messages",
+        "external_read",
+        "create_join_ticket",
+        "session_info",
+        "resume_session",
+        "external_set_wake",
+    ):
+        assert "WIN_AGENT_TEAMS_NATIVE_WAKE=1" in tools[name]
+        assert "best-effort" in tools[name]
+        assert "watcher" in tools[name] or "watch" in tools[name]
+        assert "stop arming" not in tools[name]
+    for name in ("read_messages", "external_read", "session_info", "resume_session"):
+        assert "Linux-only" in tools[name]
+        assert "macOS" in tools[name]
+    for name in ("session_info", "resume_session"):
+        assert "backlog notice follows immediately" in tools[name]
+    for name in ("read_messages", "external_read"):
+        assert "no content" in tools[name]
+    for status in (
+        "queued",
+        "coalesced",
+        "backoff",
+        "failed",
+        "timeout",
+        "unavailable",
+        "unverified_thread",
+        "stale_registration",
+        "disabled",
+    ):
+        assert status in tools["send_message"]
+    assert "or wake is involved" not in tools["send_message"]
+    assert "or process resume is involved" in tools["send_message"]
+    for name in ("external_read", "external_set_wake"):
+        assert "call external_read once to re-arm notices" in tools[name]
+        assert "no native notice" in tools[name]
+    assert "member-supplied" in tools["external_set_wake"]
+    assert "existing directory" in tools["external_set_wake"]
+    assert "run the watch as a BACKGROUND command" in data["note"]
+    for literal in (
+        "Linux-only",
+        "native-wake-",
+        "WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE",
+        "WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX",
+        "keep arming",
+    ):
+        assert literal in data["note"]

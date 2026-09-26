@@ -1,0 +1,11 @@
+Captured failing run — diagnostic excerpts:
+
+E           assert 'WIN_AGENT_TEAMS_NATIVE_WAKE=1' in 'Send a message one hop along the spawn edge: to your spawner, or a child.\n\n``to`` defaults to ``"team-lead"``, whic...routed to your lead with a warning; it no longer is, because\nthat turned a typo into a real-looking upstream message.'
+E           assert 'external_set_wake' in "You are joining team-lead's win-agent-teams session as 'member'.\n\nRole note:\n```\n\n```\n\nJoin protocol:\n1. Call...aaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee --reader member\n5. When finished permanently, call leave_team(member_token=...).\n"
+E       KeyError: 'native_wake'
+
+=========================== short test summary info ============================
+FAILED tests/test_native_wake_contract.py::test_flag_on_tool_contract_and_watch_retained
+FAILED tests/test_native_wake_contract.py::test_join_prompt_flag_on_both_shells_and_reader
+FAILED tests/test_native_wake_contract.py::test_session_info_availability_only
+3 failed in 1.09s

@@ -1,0 +1,19 @@
+Captured failing run — diagnostic excerpts:
+
+E       AssertionError: assert {'first_new':... {}, 'seq': 0} == {'first_new':... {}, 'seq': 0}
+E         
+E         Omitting 3 identical items, use -vv to show
+E         Differing items:
+E         {'first_new': 0} != {'first_new': None}
+E         Use -v to get more diff
+E           assert 2 == 1
+E            +  where 2 = len([0.0, 5.0])
+E       AssertionError: assert 'timeout' == 'backoff'
+E         - backoff
+E         + timeout
+
+=========================== short test summary info ============================
+FAILED tests/test_native_wake.py::test_policy_is_pure - AssertionError: asser...
+FAILED tests/test_native_wake.py::test_slow_post_backoff_starts_after_completion
+FAILED tests/test_codex_member_wake.py::test_slow_queue_backoff_starts_after_completion
+3 failed in 0.57s

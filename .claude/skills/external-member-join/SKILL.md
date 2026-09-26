@@ -14,14 +14,14 @@ external member**: the lead can put work in your inbox, and you reply with
 Rules that hold in every mode:
 
 - Use **only** `join_team`, `external_read`, `external_send`, `leave_team`, and
-  (Mode B) `install_member_wake`. Do **not** use ambient team tools like
+  (Mode B) `install_member_wake`, plus flag-on `external_set_wake`. Do **not** use ambient team tools like
   `send_message`/`read_messages` from this external-member conversation.
 - **Save the `member_token`** returned by `join_team` in this conversation. It is
   your credential for every call below and survives an MCP server restart.
 - Downstream (lead → you) is **pull-only**: nothing is pushed into your
-  conversation. You are woken only because a background **watcher** you armed
-  fires when a message lands — then you drain it. That watcher is the actual
-  wake mechanism in both modes.
+  conversation by the inbox write. A background **watcher** you armed fires
+  when a message lands — then you drain it. Optional native doorbells below
+  are best effort; keep arming the watcher in both modes.
 
 ## Choose your mode
 
@@ -100,7 +100,41 @@ profile via `WIN_AGENT_TEAMS_EXTERNAL_ONLY=1` for a real remote member.
 
 ## After an MCP restart
 
-Your `member_token` still works — just resume calling `external_read`/
+Your `member_token` still works. Call `external_read` once to re-arm native
+notices after a Claude-hosted MCP restart: no native notice arrives until your next
+`external_read`, `external_send`, or `external_set_wake` call registers the
+Claude member target again. Saved Codex wake registration remains on the shared
+member record for the lead-side queue path. Resume calling `external_read`/
 `external_send` with it. If you lost it, replay the original `join_team(session_id,
 token)` during the ticket's retention window to recover the same membership and
 token.
+
+## Optional Codex native wake
+
+Both your MCP entry and the lead's need `WIN_AGENT_TEAMS_NATIVE_WAKE=1`.
+If `external_set_wake` is absent, keep polling `external_read` and arming your
+watcher. If you are a Codex session, read the thread and home in your shell:
+
+Unix:
+```sh
+echo "$CODEX_THREAD_ID ${CODEX_HOME:-$HOME/.codex}"
+```
+
+PowerShell:
+```powershell
+"$env:CODEX_THREAD_ID $(if ($env:CODEX_HOME) {$env:CODEX_HOME} else {Join-Path $HOME '.codex'})"
+```
+
+Pass both to `external_set_wake(member_token=..., codex_thread_id=...,
+codex_home=...)`. Repeat to change threads; blank thread clears the registration.
+The home must be an absolute path on the lead's machine. This **best-effort
+doorbell** never confirms delivery: on a `win-agent-teams:` notice call
+`external_read` with your saved token. Keep the watcher and check the inbox
+before ending a long wait. Closed/unloaded Desktop queue persistence and dispatch
+after a busy turn remain unverified.
+
+Claude session wake is Linux-only; on native Windows and macOS the watcher
+is the wake path. Codex queue wake works on all platforms. After a lead MCP
+restart, call `session_info` or `resume_session` first; when the Claude channel
+is available and unread messages wait, a backlog notice follows immediately.
+Member calls still use the saved token without ambient session adoption.

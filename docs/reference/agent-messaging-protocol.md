@@ -244,8 +244,10 @@ had an accept-then-drop path. Both are gone: the refusal names the class and
 says plainly that nothing was sent.
 
 **For the upstream class, `success: true` still proves only that a line was
-appended to a file.** There is no push and no wake from `send_message` itself;
-the guarantee comes from the recipient's watcher (§5), which is why R3 makes the
+appended to a file.** With native wake off there is no push or wake; with it
+on, the recipient's own Claude notifier may supply a best-effort doorbell. In
+either case, the guarantee comes from the recipient's watcher (§5), which is why
+R3 makes the
 watcher a protocol component rather than a convenience.
 
 **Guaranteed-path messages never enter the actionable inbox.** A message
@@ -386,6 +388,99 @@ the hook re-resolves the active session at runtime before using that fallback.
 entry alone in a separate Desktop profile/client instance for client-surface
 isolation. Running it beside the ordinary server in one profile leaves the
 ambient root tools selectable and is only a degraded compatibility setup.
+
+### Native session wake: opt-in doorbells
+
+`native_wake.enabled()` requires `WIN_AGENT_TEAMS_NATIVE_WAKE=1`; every other
+value is off. Off preserves the exact tool surface, descriptions, prompt, tool
+results, and spawn/resume environment, with no new files, threads, or queue
+subprocesses. `lead_wake`, `member_wake`, and `watch` are unchanged.
+
+With the flag on, each server observes its own explicit active session and
+reader identity. Its daemon never invokes recovery. On Linux it resolves the
+nearest host once and refuses Codex/Pi hosts, absent socket/token exports,
+mismatched numeric socket PID, or a non-socket path. Native Windows and macOS
+short-circuit
+before environment/host resolution with `unsupported_platform`; no pipe I/O
+is implemented. A resolved Claude channel posts auth then user JSON lines
+with a bounded AF_UNIX deadline. No message body or credential is in a notice.
+The lifetime OS owner lock prevents competing notice streams; successful posts
+alone advance notification totals and sequence. Claude bursts coalesce for two
+seconds; outstanding notices repeat after 300 seconds. Every failure backs off
+2, 4, 8, ... seconds, capped at 300 seconds, resetting after success.
+
+`external_set_wake(member_token, codex_thread_id, codex_home="")` is registered
+only at flag-on import, also under `WIN_AGENT_TEAMS_EXTERNAL_ONLY`. Both MCP
+entries must opt in. It revalidates a running member under the agents lock,
+accepts a canonical lowercase UUID and absolute home (blank home defaults to
+`~/.codex`), and returns `{success,name,codex_wake}`. Invalid input writes
+nothing and returns `invalid_codex_thread_id` or `invalid_codex_home`. A blank
+thread stores a tombstone with null thread/home. Every set/clear increments
+`generation`, which is monotonic for the record's lifetime. A registration is
+eligible only when `thread_id` is non-null, including after a clear (R4-A).
+
+After a lead appends to a registered member inbox and releases the agents lock,
+its per-member lock serializes snapshot/decide/revalidate/queue/update. Notice
+state, verification cache, and failure backoff belong to the registration
+generation; a replacement starts from current cursors. The agents lock is never
+held across the subprocess. Status/generation revalidation immediately before
+queue prevents stale decisions; one harmless queue row can still land in the
+small window after revalidation and before a concurrent leave/change.
+
+Verification uses the reported home: existing `state_5.sqlite` is opened via
+`mode=ro`, 0.5-second busy timeout, with WAL visibility, and closed before queue.
+Archived rows/paths are refused. Missing rows/db or schema/lock errors fall
+back to rollout filenames under `sessions/*/*/*`. Missing/unverifiable threads
+are not queued. Queue uses the discovered Codex binary, that home's `CODEX_HOME`,
+`cwd=Path.home()`, DEVNULL stdin, UTF-8 capture, and a real 15-second subprocess
+timeout. Notice text contains no cmd.exe metacharacters or free member text. The queue
+subprocess environment drops inherited `CLAUDE_CODE_MESSAGING_SOCKET`,
+`CLAUDE_CODE_MESSAGING_TOKEN`, all `AGENT_*` variables, and
+`WIN_AGENT_TEAMS_SESSION_DIR`; the parent environment is unchanged.
+`codex_home` is member-supplied input, validated as an existing directory
+before queueing. For the subprocess it is used only as `CODEX_HOME`, never
+as cwd. `CODEX_HOME` selects the member-supplied home's Codex `config.toml`
+under the same-user trust model; no lead configuration is changed.
+
+`send_message` keeps `success:true,delivery:"inbox"` and adds
+`wake:{method:"codex_queue",status,detail?}` only for flag-on registrations.
+Statuses: `queued|coalesced|backoff|failed|timeout|unavailable|unverified_thread|
+stale_registration|disabled`. The first send queues within that call; there is
+no deferred Codex timer. Cleared registrations omit `wake` and invoke neither
+verification nor queue. Wake failure never turns the successful append into a
+failed send. `external_read`/`external_send`/`external_set_wake` register Claude
+member targets only after releasing the agents lock; their target registry is
+a leaf lock. Targets disappear when members stop running. An unavailable Claude
+channel drains member registrations without taking the agents lock or reading
+`agents.json` on each tick. Lock names distinguish lead and member readers with
+a dot separator that cannot occur in a reader name.
+
+Native wake is additive: **keep arming watch**. A notice is never delivery;
+Claude can silently refuse/hold it and Codex must load the target thread.
+Closed/unloaded Desktop persistence and busy-turn dispatch are unverified
+manual smokes V1/V2. `session_info.native_wake` reports `claude_channel`,
+`owner_verified`, and `notifier_owner`, never delivery. After a restart, call
+`session_info` or `resume_session` first: when the Claude channel is available
+and unread messages wait, a backlog notice follows immediately. After a Claude-hosted member
+MCP restart, call `external_read` once to re-arm notices: no native notice arrives
+until the member's next `external_read`, `external_send`, or `external_set_wake`
+call. This re-establishes the Claude member target; a Codex registration remains
+in the shared record and its lead-side queue path does not require member-server
+re-arming. Activation is
+transition-only; repeated same-session resume preserves notice/backoff/lock
+state, and rapid switches process the latest session without late old notices.
+
+Spawn/resume empty inherited `CLAUDE_CODE_MESSAGING_SOCKET` and
+`CLAUDE_CODE_MESSAGING_TOKEN` only with the master flag on. A spawned Claude
+host must export its own fresh socket; nearest-host/PID checks remain the
+primary guard. `WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE=0` and
+`WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX=0` disable each half. Poll/coalesce/re-notice
+seconds are controlled by `WIN_AGENT_TEAMS_NATIVE_WAKE_POLL_SECONDS` (1),
+`WIN_AGENT_TEAMS_NATIVE_WAKE_COALESCE_SECONDS` (2), and
+`WIN_AGENT_TEAMS_NATIVE_WAKE_RENOTIFY_SECONDS` (300); queue timeout by
+`WIN_AGENT_TEAMS_CODEX_QUEUE_TIMEOUT_SECONDS` (15). Invalid/non-finite/non-positive
+seconds fall back to defaults.
+
 
 ### `check_agent(name, full=False, max_chars=200)`
 
@@ -608,6 +703,7 @@ Everything lives under `~/.claude/agent-sessions/<session-uuid>/`
 | `inbox-{name}.jsonl` | an agent's upstream `send_message` (append); since C3 only the owner's own children can write it (`src/claude_teams/server_simple.py:1332-1333`) | the owner's `read_messages`; watcher (`src/claude_teams/cli.py:223`) |
 | `inbox-{name}.pos.json` | the owner's `read_messages` (`src/claude_teams/server_simple.py:1475`) | owner; watcher (read-only) |
 | `state-{name}.json` | the **worker's own** lifecycle hook process (`src/claude_teams/hooks.py:88-89`) | server status tools; watcher |
+| `native-wake-lead.<reader>.lock` / `native-wake-member.<name>.lock` | flag-on Claude notifier; lifetime OS lock, never truncated | competing notifiers; no credentials or heartbeat |
 | `.watch/ack-{reader}.json` (+ `.lock`) | the watcher, after delivering a `reason="waiting"` wake | that reader's later watches (suppresses re-delivery of an acknowledged park) |
 | `prompts/{name}.<nonce>.prompt.txt` | server, before a claude-code spawn/resume (`_materialize_prompt`) | the worker itself, as a file read |
 | `operation-leases.json` | server, temp-file + atomic replace (`src/claude_teams/leases.py:save_leases`) | server |
@@ -1453,8 +1549,10 @@ parent instead of waiting for a human. Both are emitted on spawn and on resume.
 
 ### The R3 delivery contract
 
-Upstream messaging has no push: `send_message` appends a line and returns. The
-recipient learns about it because its watcher wakes it. That makes the watcher a
+Upstream `send_message` appends a line and returns. With native wake off there
+is no push; with it on, the recipient's own Linux-only Claude notifier may post
+a best-effort doorbell (see the native wake note above). The watcher remains
+the wake guarantee, including when inbound policy silently refuses notices. That makes the watcher a
 **protocol component with obligations**, not a convenience — and the three
 obligations below are load-bearing for every upstream message in the system.
 

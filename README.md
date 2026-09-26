@@ -224,12 +224,57 @@ member-token digest, and public status/list tools redact it.
 For the external session, run a separate Desktop profile or separate client
 instance whose MCP configuration contains only a
 `win-agent-teams-external` entry with
-`WIN_AGENT_TEAMS_EXTERNAL_ONLY=1`. That server exposes only `join_team`,
+`WIN_AGENT_TEAMS_EXTERNAL_ONLY=1`. Without native wake, that server exposes only `join_team`,
 `external_send`, `external_read`, `leave_team`, and `list_backends`. A dual
 registration in the same profile is a degraded mode: the normal ambient root
 tools remain selectable, so it does not provide client-surface isolation. If
 your client cannot scope MCP configuration to a separate profile or instance,
 ambient-tool isolation is unavailable on that client.
+
+### Native session wake (opt-in)
+
+With `WIN_AGENT_TEAMS_NATIVE_WAKE=1`, each Claude-hosted MCP server can post a
+body-free notice to its own host's session inbox socket. Claude wake is
+**Linux-only**; native Windows and macOS report `unsupported_platform` and
+keep the watcher wake path. A nearest-host check and socket PID check refuse
+stale inherited channels. Spawn and resume explicitly empty the inherited
+socket/token variables; a spawned Claude host must export its own fresh socket.
+
+A Codex external member may register its shell's `CODEX_THREAD_ID` and absolute
+`CODEX_HOME` with `external_set_wake(member_token, codex_thread_id, codex_home)`.
+Both lead and member MCP entries need the flag; the tool exists only when it is
+on at server startup, including under external-only mode. Blank thread clears
+registration; blank home defaults to `~/.codex`. The lead verifies the live
+thread in that home, then calls bounded `codex queue` after releasing the agents
+lock. The queue environment drops inherited Claude messaging variables,
+`AGENT_*`, and `WIN_AGENT_TEAMS_SESSION_DIR`. `send_message` retains
+`success:true, delivery:"inbox"` and adds
+`wake:{method:"codex_queue",status,...}` for registered members. Status is one
+of `queued`, `coalesced`, `backoff`, `failed`, `timeout`, `unavailable`,
+`unverified_thread`, `stale_registration`, or `disabled`. A clear omits `wake`.
+
+These are **best-effort doorbells**, never delivery receipts. The inbox and
+`read_messages`/`external_read` remain authoritative; **keep arming `watch`**.
+Claude inbound policy may silently hold/refuse notices, and a Codex thread must
+be loaded for a queued row to dispatch. Closed/unloaded Desktop persistence and
+busy-turn dispatch are still manual verifications. After a lead server restart,
+call `session_info` or `resume_session` first; with an available Claude channel,
+a backlog notice follows immediately. `session_info.native_wake` reports
+channel availability and notifier ownership, never delivery.
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `WIN_AGENT_TEAMS_NATIVE_WAKE` | off | Exactly `1` enables the feature |
+| `WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE` | `1` | `0` disables Claude notices |
+| `WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX` | `1` | `0` disables Codex queue notices |
+| `WIN_AGENT_TEAMS_NATIVE_WAKE_POLL_SECONDS` | `1` | Notifier tick |
+| `WIN_AGENT_TEAMS_NATIVE_WAKE_COALESCE_SECONDS` | `2` | Claude burst coalesce; activation catch-up is immediate |
+| `WIN_AGENT_TEAMS_NATIVE_WAKE_RENOTIFY_SECONDS` | `300` | Outstanding notice repeat floor |
+| `WIN_AGENT_TEAMS_CODEX_QUEUE_TIMEOUT_SECONDS` | `15` | Real subprocess timeout |
+
+Seconds accept only finite positive values; invalid settings use the defaults.
+Flag off preserves the tool list, descriptions, prompts, results, and spawn
+behavior and creates no notifier thread, lock file, or queue subprocess.
 
 ### Registry backend labels
 
@@ -750,7 +795,8 @@ polling* above.
 
 Still open, but constrained by the host harnesses rather than by this server:
 
-- **True push over poll.** A model-facing event that wakes an *idle* coordinator on an external
+- **Broader push over poll.** Native session wake now supplies opt-in best-effort
+  doorbells for Claude hosts and Codex external members (see above). A model-facing event that wakes an *idle* coordinator on an external
   MCP event. Currently impossible: no harness surfaces MCP notifications (or a `FileChanged`
   hook) as a mid-idle wake — only a background command's completion wakes the coordinator, which
   is exactly what the marker + `watch` loop rides. A real push needs a harness change.

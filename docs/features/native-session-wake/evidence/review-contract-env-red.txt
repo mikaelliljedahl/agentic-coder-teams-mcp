@@ -1,0 +1,20 @@
+Captured red diagnostic excerpts:
+
+E       AssertionError: assert not {'AGENT_CAPABILITY', 'AGENT_NAME', 'AGENT_PARENT_NAME', 'AGENT_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', ...}
+E        +  where {'AGENT_CAPABILITY', 'AGENT_NAME', 'AGENT_PARENT_NAME', 'AGENT_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', ...} = <built-in method intersection of set object at 0x7d92ada7ba00>({'AGENT_CAPABILITY': 'capability', 'AGENT_NAME': 'lead', 'AGENT_PARENT_NAME': 'parent', 'AGENT_SESSION_ID': 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', ...})
+E        +    where <built-in method intersection of set object at 0x7d92ada7ba00> = {'AGENT_CAPABILITY', 'AGENT_NAME', 'AGENT_PARENT_NAME', 'AGENT_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', ...}.intersection
+E        +      where {'AGENT_CAPABILITY', 'AGENT_NAME', 'AGENT_PARENT_NAME', 'AGENT_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', ...} = set({'AGENT_CAPABILITY': 'capability', 'AGENT_NAME': 'lead', 'AGENT_PARENT_NAME': 'parent', 'AGENT_SESSION_ID': 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', ...})
+E           AssertionError: assert 'Linux-only' in 'Read unread messages from own inbox, delta-by-default with a watermark.\n\n    Returns ``{messages, cursors, seq, unr...macOS); on native Windows it is unavailable and the watcher is the wake path. Codex queue wake works on all platforms.'
+
+            assert "best-effort" in tools[name]
+            assert "watcher" in tools[name] or "watch" in tools[name]
+            assert "stop arming" not in tools[name]
+        for name in ("read_messages", "external_read", "session_info", "resume_session"):
+>           assert "Linux-only" in tools[name]
+E           AssertionError: assert 'Linux-only' in 'Read unread messages from own inbox, delta-by-default with a watermark.\n\n    Returns ``{messages, cursors, seq, unr...macOS); on native Windows it is unavailable and the watcher is the wake path. Codex queue wake works on all platforms.'
+
+tests/test_tool_descriptions.py:329: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_codex_member_wake.py::test_queue_environment_drops_lead_channel_and_identity
+FAILED tests/test_tool_descriptions.py::test_flag_on_tool_contract_and_watch_retained
+2 failed in 1.07s
