@@ -469,6 +469,13 @@ class TestWindowsTerminalTabSpawn:
             monkeypatch.delenv(
                 process_manager_mod._CODEX_DIRECT_LAUNCH_ENV, raising=False
             )
+        # This class simulates Windows on Linux CI; the real accessor now
+        # ignores the flag outside Windows.
+        monkeypatch.setattr(
+            process_manager_mod,
+            "codex_direct_launch_enabled",
+            lambda: codex_direct,
+        )
         # Force the interactive decision on so the branch runs on Linux CI too.
         monkeypatch.setattr(
             manager,

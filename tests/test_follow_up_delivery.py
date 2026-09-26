@@ -82,6 +82,26 @@ class _FakeResumeBackend:
             self._in_flight.clear()
 
 
+class _TrustResumeBackend(_FakeResumeBackend):
+    is_interactive = True
+
+    def __init__(self, on_resume=None) -> None:
+        super().__init__(on_resume)
+        self.binaries = iter(["/usr/bin/codex", "/usr/bin/codex"])
+        self.built: list[SpawnRequest] = []
+
+    def discover_binary(self) -> str:
+        return next(self.binaries)
+
+    def build_resume_command(self, request: SpawnRequest, backend_session_id: str):
+        self.built.append(request)
+        return [
+            (request.extra or {})["codex_trust_binary"],
+            "resume",
+            backend_session_id,
+        ]
+
+
 class _FakeRegistry:
     def __init__(self, backend: object) -> None:
         self.backend = backend
@@ -242,6 +262,172 @@ def _record() -> dict:
     return server_simple._load_agents(SESSION)[0]
 
 
+def _trusted_record() -> None:
+    agent = _record()
+    agent.update(backend="codex", trust_cwd=True, launch_interactive=True)
+    server_simple._save_agents(SESSION, [agent])
+
+
+@pytest.mark.asyncio
+async def test_trust_follow_up_refuses_changed_mode_before_stopping_old(
+    env, monkeypatch
+):
+    _trusted_record()
+    backend = _TrustResumeBackend()
+    _install(monkeypatch, backend)
+    monkeypatch.setattr(
+        server_simple,
+        "_resolve_agent_binding",
+        lambda agent, **_: BindingResult(
+            BINDING_BOUND,
+            AgentOutput(
+                last_activity_at=900.0,
+                last_message="done",
+                rollout_path=str(env.transcript),
+                backend_session_id="newly-bound-session",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: False
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager, "health_check", lambda *a, **k: (True, "ok")
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "graceful_shutdown",
+        lambda *a, **k: pytest.fail("old stopped"),
+    )
+    result = await server_simple.follow_up_agent(AGENT, "next", "trust-mode")
+    assert result["reason"] == "trust_cwd_launch_mode_changed"
+    assert result["status"] == "queued"
+    assert result["idempotency_key"] == "trust-mode"
+    assert backend.resume_calls == []
+    assert _record()["backend_session_id"] == "newly-bound-session"
+    assert leases.active_lease(server_simple._leases_file(SESSION), AGENT) is None
+
+
+@pytest.mark.asyncio
+async def test_trust_follow_up_refuses_resolution_change_before_stop(env, monkeypatch):
+    _trusted_record()
+    _write_waiting_marker(env)
+    backend = _TrustResumeBackend()
+    backend.binaries = iter(["/usr/bin/codex", "codex.cmd"])
+    _install(monkeypatch, backend)
+    monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager, "health_check", lambda *a, **k: (True, "alive")
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "graceful_shutdown",
+        lambda *a, **k: pytest.fail("old stopped"),
+    )
+    result = await server_simple.follow_up_agent(AGENT, "next", "trust-binary")
+    assert result["reason"] == "trust_cwd_unsafe_transport"
+    assert result["status"] == "queued"
+    assert result["phase"] == "pending"
+    assert _record()["pid"] == 123
+    assert backend.resume_calls == []
+    assert leases.active_lease(server_simple._leases_file(SESSION), AGENT) is None
+
+
+@pytest.mark.asyncio
+async def test_trust_follow_up_reports_changed_safe_binary(env, monkeypatch):
+    _trusted_record()
+    _write_waiting_marker(env)
+    backend = _TrustResumeBackend()
+    backend.binaries = iter(["/usr/bin/codex", "/opt/new/codex"])
+    _install(monkeypatch, backend)
+    monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager, "health_check", lambda *a, **k: (True, "alive")
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "graceful_shutdown",
+        lambda *a, **k: pytest.fail("old stopped"),
+    )
+    result = await server_simple.follow_up_agent(AGENT, "next", "trust-new-binary")
+    assert result["reason"] == "trust_cwd_binary_changed"
+    assert "retry" in result["detail"].lower()
+    assert _record()["pid"] == 123
+    assert backend.resume_calls == []
+    assert leases.active_lease(server_simple._leases_file(SESSION), AGENT) is None
+
+
+@pytest.mark.asyncio
+async def test_trust_follow_up_preserves_override(env, monkeypatch):
+    _trusted_record()
+    backend = _TrustResumeBackend(
+        lambda nonce: _append(
+            env.transcript,
+            _claude_user_record(f"next {DELIVERY_MARKER_PREFIX}{nonce}"),
+        )
+    )
+    _install(monkeypatch, backend)
+    monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: True
+    )
+    _child_alive(monkeypatch, True)
+    result = await server_simple.follow_up_agent(AGENT, "next", "trust-success")
+    assert result["status"] == "queued", result
+    assert result["phase"] == "unconfirmed"
+    assert (backend.resume_calls[0][0].extra or {})["codex_trust_cwd"] == "1"
+    assert (backend.resume_calls[0][0].extra or {})[
+        "codex_trust_binary"
+    ] == "/usr/bin/codex"
+
+
+@pytest.mark.asyncio
+async def test_reconciled_receipt_wins_before_new_unsafe_mode(env, monkeypatch):
+    backend = _FakeResumeBackend()
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+    await _unconfirmed_attempt(backend, env, "trust-prior", "next")
+    agent = _record()
+    agent.update(trust_cwd=True, launch_interactive=True)
+    server_simple._save_agents(SESSION, [agent])
+    monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: False
+    )
+    result = await server_simple.follow_up_agent(AGENT, "next", "trust-reconcile")
+    assert result["status"] == "delivered", result
+    assert result["reconciled"] is True
+    assert len(backend.resume_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_request_failure_retries_lease_release(env, monkeypatch):
+    _install(monkeypatch, _FakeResumeBackend())
+    _dead_agent(monkeypatch)
+    original_release = server_simple.release_lease
+    calls = 0
+
+    def release(path, agent_name, operation_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return False
+        return original_release(path, agent_name, operation_id)
+
+    monkeypatch.setattr(server_simple, "release_lease", release)
+
+    def fail_build(*args):
+        raise RuntimeError("build failed")  # noqa: TRY003
+
+    monkeypatch.setattr(server_simple, "_build_resume_request", fail_build)
+    with pytest.raises(RuntimeError, match="build failed"):
+        await server_simple.follow_up_agent(AGENT, "next", "lease-build")
+    assert calls == 2
+    assert leases.active_lease(server_simple._leases_file(SESSION), AGENT) is None
+
+
 def _repoint_record_at(child: SimpleNamespace) -> None:
     """Make the stored record describe ``child`` -- PID *and* creation token.
 
@@ -394,6 +580,7 @@ async def test_nonce_in_the_correct_transcript_is_delivered(
     assert result["success"] is True
     assert result["status"] == "delivered"
     assert len(backend.resume_calls) == 1
+    assert "codex_trust_cwd" not in (backend.resume_calls[0][0].extra or {})
     assert backend.resume_calls[0][0].prompt.startswith("next prompt")
     assert backend.resume_calls[0][0].prompt.count(DELIVERY_MARKER_PREFIX) == 1
     assert _record()["pid"] == 789

@@ -56,6 +56,165 @@ class TestCodexProperties:
         assert backend.is_interactive is True
 
 
+@pytest.mark.parametrize("resume", [False, True])
+def test_trust_cwd_override_is_one_argv_token_before_prompt(
+    _make_request, monkeypatch, tmp_path, resume
+):
+    backend = CodexBackend()
+    monkeypatch.setattr(backend, "discover_binary", lambda: "/usr/bin/codex")
+    cwd = tmp_path / "a b.;%!&^"
+    cwd.mkdir()
+    request = _make_request(cwd=str(cwd), extra={"codex_trust_cwd": "1"})
+    command = (
+        backend.build_resume_command(request, "native-id")
+        if resume
+        else backend.build_command(request)
+    )
+    override = f"projects={{ '{cwd.resolve()}' = {{ trust_level = 'trusted' }} }}"
+    assert command.count(override) == 1
+    assert command[command.index(override) - 1] == "-c"
+    assert command.index(override) < len(command) - 1
+    default = _make_request(cwd=str(cwd))
+    assert not any("projects=" in part for part in backend.build_command(default))
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "'",
+        '"',
+        "\n",
+        "\r",
+        "\t",
+        "\x00",
+        "\x1f",
+        "\x7f",
+        "\u2018",
+        "\u2019",
+        "\u201a",
+        "\u201b",
+    ],
+)
+def test_trust_cwd_builder_rejects_unsafe_path(_make_request, monkeypatch, bad):
+    backend = CodexBackend()
+    monkeypatch.setattr(backend, "discover_binary", lambda: "/usr/bin/codex")
+    request = _make_request(
+        cwd=f"/workspace/bad{bad}path", extra={"codex_trust_cwd": "1"}
+    )
+    with pytest.raises(ValueError, match="trust_cwd"):
+        backend.build_command(request)
+
+
+def test_trust_cwd_windows_key_ascii_lowercase(_make_request, monkeypatch):
+    backend = CodexBackend()
+    monkeypatch.setattr(backend, "discover_binary", lambda: "C:/Codex/codex.exe")
+    monkeypatch.setattr(codex_module, "_windows_trust_key", lambda: True)
+    request = _make_request(
+        cwd="C:/Work/Mixed-Case/ABC", extra={"codex_trust_cwd": "1"}
+    )
+    command = backend.build_command(request)
+    override = next(part for part in command if part.startswith("projects="))
+    assert "mixed-case/abc" in override
+    assert "Mixed-Case" not in override
+
+
+def test_trust_cwd_windows_key_preserves_non_ascii(_make_request, monkeypatch):
+    backend = CodexBackend()
+    monkeypatch.setattr(backend, "discover_binary", lambda: "C:/Codex/codex.exe")
+    monkeypatch.setattr(codex_module, "_windows_trust_key", lambda: True)
+    request = _make_request(cwd="C:/Work/\u00c4BC/ABC", extra={"codex_trust_cwd": "1"})
+    override = next(
+        part for part in backend.build_command(request) if part.startswith("projects=")
+    )
+    assert "\u00c4bc/abc" in override
+
+
+def test_trust_cwd_validates_the_same_resolved_key_it_emits(_make_request, monkeypatch):
+    backend = CodexBackend()
+    monkeypatch.setattr(backend, "discover_binary", lambda: "/usr/bin/codex")
+    request = _make_request(cwd="/workspace/link", extra={"codex_trust_cwd": "1"})
+    original_resolve = Path.resolve
+    calls = 0
+
+    def changing_resolve(path, *args, **kwargs):
+        nonlocal calls
+        if str(path) == request.cwd:
+            calls += 1
+            return Path("/workspace/safe" if calls == 1 else "/workspace/bad'key")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", changing_resolve)
+    command = backend.build_command(request)
+    assert calls == 1
+    assert "'/workspace/safe'" in next(
+        part for part in command if part.startswith("projects=")
+    )
+
+
+@pytest.mark.parametrize("binary", ["codex.cmd", "codex.bat"])
+def test_trust_cwd_builder_refuses_shim(_make_request, monkeypatch, binary):
+    backend = CodexBackend()
+    monkeypatch.setattr(backend, "discover_binary", lambda: binary)
+    with pytest.raises(ValueError, match="trust_cwd"):
+        backend.build_command(_make_request(extra={"codex_trust_cwd": "1"}))
+
+
+def test_trust_cwd_builder_refuses_direct_launch(_make_request, monkeypatch):
+    backend = CodexBackend()
+    monkeypatch.setattr(backend, "discover_binary", lambda: "/usr/bin/codex")
+    monkeypatch.setattr(codex_module, "codex_direct_launch_enabled", lambda: True)
+    with pytest.raises(ValueError, match="trust_cwd"):
+        backend.build_command(_make_request(extra={"codex_trust_cwd": "1"}))
+
+
+def test_trust_cwd_resume_uses_pinned_binary_and_mode(_make_request, monkeypatch):
+    backend = CodexBackend()
+    monkeypatch.setattr(
+        backend,
+        "discover_binary",
+        lambda: pytest.fail("resolution changed after preflight"),
+    )
+    monkeypatch.setattr(
+        codex_module.process_manager,
+        "provides_tty",
+        lambda *a, **k: pytest.fail("mode changed after preflight"),
+    )
+    request = _make_request(
+        extra={
+            "codex_trust_cwd": "1",
+            "codex_trust_binary": "/approved/codex",
+            "codex_trust_interactive": "1",
+        }
+    )
+    command = backend.build_resume_command(request, "native-id")
+    assert command[0] == "/approved/codex"
+    assert command[1] != "exec"
+
+
+def test_build_env_passes_isolated_codex_home_to_child(_make_request, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", "/isolated/codex-home")
+    monkeypatch.setattr(codex_module.shutil, "which", lambda _: None)
+    env = CodexBackend().build_env(_make_request())
+    assert env["CODEX_HOME"] == "/isolated/codex-home"
+
+
+def test_build_env_absolutizes_relative_codex_home(
+    _make_request, monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", "isolated")
+    monkeypatch.setattr(codex_module.shutil, "which", lambda _: None)
+    assert CodexBackend().build_env(_make_request())["CODEX_HOME"] == str(
+        tmp_path / "isolated"
+    )
+
+
+def test_build_env_omits_unset_codex_home(_make_request, monkeypatch):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(codex_module.shutil, "which", lambda _: None)
+    assert "CODEX_HOME" not in CodexBackend().build_env(_make_request())
+
+
 @pytest.fixture
 def _stub_discovery(monkeypatch: pytest.MonkeyPatch):
     """Return a helper that stubs live model discovery with a fixed slug list."""

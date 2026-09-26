@@ -23,9 +23,11 @@ from claude_teams.backends.contracts import (
     BackendModelUnavailableError,
 )
 from claude_teams.backends.process_manager import (
+    codex_direct_launch_enabled,
     nested_linux_launcher_env,
     process_manager,
 )
+from claude_teams.codex_home import codex_home
 
 _LOCAL_PATH_CLS = type(Path.cwd())
 
@@ -46,6 +48,24 @@ _MODEL_DISCOVERY_TIMEOUT_S = 20.0
 # a spawn pays at most one ``codex debug models`` subprocess per process.
 _MODEL_SLUG_CACHE: dict[str, list[str]] = {}
 _CODEX_UPGRADE_HINT = "Upgrade codex: npm install -g @openai/codex@latest"
+
+
+def _unsafe_trust_chars(path: str) -> bool:
+    """Reject TOML literal delimiters, PowerShell quotes, and controls."""
+    return any(
+        char in "'\"\u2018\u2019\u201a\u201b" or char <= "\x1f" or char == "\x7f"
+        for char in path
+    )
+
+
+def unsafe_trust_path(cwd: str) -> bool:
+    """Reject unsafe characters in the raw and resolved trust path."""
+    return _unsafe_trust_chars(cwd) or _unsafe_trust_chars(str(Path(cwd).resolve()))
+
+
+def _windows_trust_key() -> bool:
+    """Report the platform whose Codex project lookup lowercases ASCII."""
+    return os.name == "nt"
 
 
 def _discover_codex_model_slugs(binary: str) -> list[str]:
@@ -374,11 +394,11 @@ class CodexBackend(BaseBackend):
             Command parts list.
 
         """
-        binary = self.discover_binary()
+        binary, headless = self._launch_binary_and_mode(request)
         via_cmd_shim = self._launches_via_cmd_shim(binary)
         cmd = [
             binary,
-            *(["exec"] if self._headless() else []),
+            *(["exec"] if headless else []),
             *self.permission_args(request),
             "-C",
             request.cwd,
@@ -391,6 +411,7 @@ class CodexBackend(BaseBackend):
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
 
         cmd.extend(self._agent_args(request))
+        cmd.extend(self._trust_args(request, binary, headless))
 
         cmd.append(
             self._prompt_arg(
@@ -411,9 +432,8 @@ class CodexBackend(BaseBackend):
         ``codex exec resume <session-id> [OPTIONS] <prompt>`` entrypoint
         otherwise — see :meth:`_headless`.
         """
-        binary = self.discover_binary()
+        binary, headless = self._launch_binary_and_mode(request)
         via_cmd_shim = self._launches_via_cmd_shim(binary)
-        headless = self._headless()
         cmd = [
             binary,
             *(["exec", "resume", backend_session_id] if headless else []),
@@ -429,6 +449,7 @@ class CodexBackend(BaseBackend):
             cmd.extend(self._REASONING_EFFORT_SPEC.build_args(request.reasoning_effort))
 
         cmd.extend(self._agent_args(request))
+        cmd.extend(self._trust_args(request, binary, headless))
         if not headless:
             cmd.extend(["resume", backend_session_id])
         cmd.append(
@@ -439,6 +460,35 @@ class CodexBackend(BaseBackend):
             )
         )
         return cmd
+
+    def _launch_binary_and_mode(self, request: SpawnRequest) -> tuple[str, bool]:
+        """Use the executable and mode pinned by a trusted launch preflight."""
+        extra = request.extra or {}
+        if extra.get("codex_trust_cwd") == "1" and extra.get("codex_trust_binary"):
+            return extra["codex_trust_binary"], extra.get(
+                "codex_trust_interactive"
+            ) != "1"
+        return self.discover_binary(), self._headless()
+
+    @staticmethod
+    def _trust_args(request: SpawnRequest, binary: str, headless: bool) -> list[str]:
+        """Build the process-only project trust override, refusing unsafe transports."""
+        if (request.extra or {}).get("codex_trust_cwd") != "1":
+            return []
+        if (
+            headless
+            or CodexBackend._launches_via_cmd_shim(binary)
+            or codex_direct_launch_enabled()
+        ):
+            raise ValueError("unsafe trust_cwd transport")  # noqa: TRY003
+        if _unsafe_trust_chars(request.cwd):
+            raise ValueError("unsafe trust_cwd path")  # noqa: TRY003
+        key = str(Path(request.cwd).resolve())
+        if _unsafe_trust_chars(key):
+            raise ValueError("unsafe trust_cwd path")  # noqa: TRY003
+        if _windows_trust_key():
+            key = "".join(char.lower() if "A" <= char <= "Z" else char for char in key)
+        return ["-c", f"projects={{ '{key}' = {{ trust_level = 'trusted' }} }}"]
 
     @staticmethod
     def _with_team_tool_hint(prompt: str) -> str:
@@ -641,6 +691,10 @@ class CodexBackend(BaseBackend):
             "AGENT_SESSION_ID": request.team_name,
             "AGENT_PARENT_NAME": request.lead_session_id,
         }
+        if os.environ.get("CODEX_HOME"):
+            # WT's existing tab does not inherit the server process environment;
+            # the wrapper exports only build_env entries to its child.
+            env["CODEX_HOME"] = str(codex_home())
         shim = shutil.which(self._binary_name)
         native = self._resolve_native_codex(shim) if shim else None
         if native:

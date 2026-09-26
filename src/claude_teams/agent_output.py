@@ -15,6 +15,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+from claude_teams.codex_home import codex_home
+
 _MTIME_SLACK_SECONDS = 2.0
 _REVERSE_READ_CHUNK_SIZE = 64 * 1024
 _CODEX_CORRELATION_PREFIX = "wat-corr:"
@@ -492,7 +494,7 @@ def _codex_candidate_dirs(
     days = {
         (dt + timedelta(days=offset)).date() for dt in roots for offset in (-1, 0, 1)
     }
-    base = Path.home() / ".codex" / "sessions"
+    base = codex_home() / "sessions"
     directories = [
         base / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
         for day in sorted(days)
