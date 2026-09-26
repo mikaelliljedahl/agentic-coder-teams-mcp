@@ -97,3 +97,28 @@ queried the server PID, and closed the handle **without writing**.
   a live proof.
 - The host walk must keep stopping at the nearest match.
 - A standalone CLI (not under Desktop) still needs the same check (smoke N6).
+
+## Windows live smokes (2026-09-26)
+
+Windows 11 Pro 26200 test VM. The MCP server ran from branch
+`feat/native-downstream-delivery` at 147efa6, with
+`WIN_AGENT_TEAMS_NATIVE_WAKE=1` and `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1` in
+both the Claude and the Codex MCP config. codex-cli 0.157.1; the lead was
+Claude Code CLI 2.1.281 hosted by Claude Desktop. Child: an interactive Codex
+TUI `n1probe` (tier `cheapest`), spawned by the lead.
+
+| Smoke | Result | Evidence |
+|---|---|---|
+| N1: idle Codex child | **pass** | Two follow-ups (`n1-first`, `n1-second`): `status: delivered`, `method: codex_queue`, `replaced_existing: false`, pid 3820 both times; the child answered `ACK-N1`. Settled 2.5 to 7.6 s after creation. The marker carried `idle_seq`, `turn_seq`, `backend_session_id` and `dispatch_epoch: 1`. |
+| §2.7 propagation to a Codex child | **pass** | The child's command line had `WIN_AGENT_TEAMS_NATIVE_WAKE = "1"` and `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM = "1"` inside `-c mcp_servers.win-agent-teams.env={...}`. |
+| N5 (dead child resumes) | **pass** | After `Stop-Process` on pid 3820, follow-up `n5-dead-resume` returned `method: resume`, new pid 15216, same backend session. Epoch 2 in the marker, the record and `dispatch-epochs.json`. The next follow-up (`n5-native-after-resume`) went native again: `codex_queue`, pid 15216. |
+| N6: Claude lead woken on Windows (CLI under Desktop) | **pass** | The child ran `send_message` to `team-lead` after a 20 s sleep while the lead's turn had ended and no watcher was armed. The lead session received `[win-agent-teams wake #1] 1 unread message(s) ... from: n1probe (1)` and `read_messages` returned `N6-WAKE from n1probe`. `session_info.native_wake.claude_channel` was `available`. |
+
+**Not run on this VM.**
+
+- The N5 barrier with a live unresolved queue item was not run; unit tests
+  cover it.
+- N6 with a standalone CLI (not under Desktop) was not run.
+- N7 needs a Codex lead (TUI or Desktop).
+- N8 needs server restarts with other flag values; golden tests cover it.
+- N3 and N4 need a logged-in `claude` CLI.
