@@ -854,25 +854,24 @@ def test_half_switches_only_disable_their_own_half(
 
 @pytest.mark.asyncio
 async def test_no_channel_is_probed_while_no_carrier_is_implemented(env) -> None:
-    """Without a carrier to hand to, stage 1 costs nothing and cannot fail."""
-    case = _eligibility_case(env, "codex")
-    _set_agent(env, **case["agent"])
+    """Without a carrier to hand to, stage 1 costs nothing and cannot fail.
+
+    Codex has its carrier since step 2 (``test_native_codex_dispatch``); the
+    Claude mailbox is still unimplemented, so it is the half pinned here.
+    """
+    assert ds.METHOD_CLAUDE_MAILBOX not in server_simple._NATIVE_DISPATCH
+    _native_claude_target(env)
+    _idle(env)
     probes: list = []
     env.monkeypatch.setattr(
-        native_wake,
-        "verify_codex_thread",
-        lambda home, thread: probes.append("thread") or (True, ""),
-    )
-    env.monkeypatch.setattr(
         server_simple,
-        "_codex_queue_binary",
-        lambda: probes.append("binary") or "C:/codex/codex.exe",
+        "_claude_delivery_capability",
+        lambda *a, **k: probes.append("capability") or {"channel": "available"},
     )
 
     result = await server_simple.follow_up_agent(AGENT, "next", KEY)
 
-    # The stand-in transcript is Claude-shaped, so the Codex receipt scan does
-    # not settle it; what matters is the carrier that was used.
+    assert result["status"] == "delivered"
     assert result["method"] == ds.METHOD_RESUME
     assert len(env.backend.resume_calls) == 1
     assert probes == []

@@ -339,6 +339,45 @@ def lease_force(
         raise typer.Exit(code=4)
 
 
+deliveries_app = typer.Typer(
+    name="deliveries",
+    help="Operator tools for durable delivery rows.",
+    no_args_is_help=True,
+)
+app.add_typer(deliveries_app, name="deliveries")
+
+#: Exit code per refusal of ``deliveries release-native``.
+_RELEASE_EXIT = {"not_found": 1, "not_unresolved_native": 3, "ambiguous": 4}
+
+
+@deliveries_app.command("release-native")
+def deliveries_release_native(
+    session_id: str = typer.Argument(..., help="Session id holding the row."),
+    key: str = typer.Argument(..., help="The row's idempotency key."),
+    token: str = typer.Option(..., "--token", help="Session recovery token."),
+    sender: str = typer.Option(
+        "", "--sender", help="The sending agent, when several share the key."
+    ),
+) -> None:
+    """Give up on an unresolved native delivery: it settles failed(operator_released).
+
+    THE MESSAGE MAY STILL EXECUTE. A native attempt was handed to the target
+    session's own durable queue, which can still present it after a kill or a
+    reboot. Releasing only stops that row from holding the target, so later
+    messages can be sent to it again. Refuses any row that is not an
+    unresolved native attempt.
+    """
+    _authorize(session_id, token)
+    try:
+        result = server_simple._release_native_row(session_id, key, sender)
+    except server_simple.DeliveryStoreError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=5) from exc
+    console.print_json(json.dumps(result))
+    if not result.get("released"):
+        raise typer.Exit(code=_RELEASE_EXIT.get(str(result.get("reason")), 1))
+
+
 @app.command("adopt")
 def adopt(
     session_id: str = typer.Argument(..., help="Session id holding the agent."),

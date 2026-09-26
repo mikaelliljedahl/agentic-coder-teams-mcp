@@ -82,6 +82,7 @@ from claude_teams.delivery_store import (
     METHOD_CODEX_QUEUE,
     METHOD_FIELD,
     METHOD_RESUME,
+    NATIVE_METHODS,
     PHASE_PENDING,
     PHASE_SENT,
     PHASE_UNCONFIRMED,
@@ -94,6 +95,7 @@ from claude_teams.delivery_store import (
     DeliveryTransaction,
     delivery_transaction,
     is_terminal,
+    is_unresolved_native,
     mark_phase,
     public_view,
     record_key,
@@ -2188,6 +2190,9 @@ class _FollowUpPlan:
     method: str = METHOD_RESUME
     #: Frozen carrier of a native attempt; ``None`` for resume.
     carrier: dict | None = None
+    #: The inline text a native carrier presents: the prompt and this
+    #: attempt's multi-line nonce marker (plan §2.2.1). Empty for resume.
+    native_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -2626,7 +2631,7 @@ def _scan_target(record: dict, agent: dict | None) -> dict | None:
     return cast("dict[str, Any]", snapshot) if isinstance(snapshot, dict) else None
 
 
-def _reconcile_delivery_record(
+def _reconcile_delivery_record(  # noqa: PLR0911 - one return per settlement verdict.
     session_id: str, record: dict, agent: dict | None, *, now: float | None = None
 ) -> bool:
     """Actively reconcile one ``unconfirmed`` attempt. Returns whether it moved.
@@ -2641,12 +2646,19 @@ def _reconcile_delivery_record(
     from the no-dispatcher non-goal and is honest rather than silently
     expired. Only once the child is proven dead, and one flush grace has
     passed, does a still-absent nonce become terminal.
+
+    Native rows (``codex_queue``, ``claude_mailbox``) are the exception: they
+    are scanned in their frozen carrier and never become terminal on absence
+    (:func:`_reconcile_native_record`).
     """
     if is_terminal(record) or record.get("phase") not in {
         PHASE_SENT,
         PHASE_UNCONFIRMED,
     }:
         return False
+    if record.get(METHOD_FIELD) in NATIVE_METHODS:
+        # A durable carrier: frozen-carrier scan, never terminal on absence.
+        return _reconcile_native_record(session_id, record, now=now)
     nonce = str(record.get("nonce") or "")
     outcome = _scan_for_nonce(session_id, _scan_target(record, agent), nonce)
     if outcome == SCAN_FOUND:
@@ -2679,7 +2691,7 @@ def _reconcile_delivery_record(
 
 def _reconcile_deliveries_for_target(
     session_id: str, agent_name: str, agent: dict | None
-) -> None:
+) -> list[str] | None:
     """Settle every in-flight attempt against ``agent_name``, receipt first.
 
     Called from ``kill_agent`` while the registry lock is held. Order is the
@@ -2694,20 +2706,31 @@ def _reconcile_deliveries_for_target(
     only here**: kill is a lifecycle operation that must still terminate the
     process. The rows simply stay where they were, which is honest — nothing
     was settled — and a later ``delivery_status`` reconciles them.
+
+    Returns the keys of native rows to ``agent_name`` that are still
+    unresolved afterwards (plan §2.2.4), or ``None`` when the store could not
+    be used. Kill never settles those on absence: their message can still be
+    presented, and N5 keeps holding the name until each one resolves.
     """
     try:
-        _reconcile_deliveries_unchecked(session_id, agent_name, agent)
+        return _reconcile_deliveries_unchecked(session_id, agent_name, agent)
     except DeliveryStoreError:
         logger.debug("Delivery store write failed during kill", exc_info=True)
+        return None
 
 
 def _reconcile_deliveries_unchecked(
     session_id: str, agent_name: str, agent: dict | None
-) -> None:
+) -> list[str]:
     """Body of :func:`_reconcile_deliveries_for_target`."""
     with delivery_transaction(_deliveries_file(session_id)) as txn:
         for record in list(txn.data.values()):
             if record.get("to") != agent_name or is_terminal(record):
+                continue
+            if record.get(METHOD_FIELD) in NATIVE_METHODS:
+                # Frozen carrier; a receipt settles it, absence never does.
+                if _reconcile_native_record(session_id, record):
+                    txn.touch()
                 continue
             outcome = _scan_for_nonce(
                 session_id,
@@ -2731,6 +2754,10 @@ def _reconcile_deliveries_unchecked(
                 # arrived; that is the false status this feature removes.
                 mark_phase(record, PHASE_UNCONFIRMED)
             txn.touch()
+        return [
+            str(row.get("idempotency_key") or "")
+            for row in txn.unresolved_native(agent_name)
+        ]
 
 
 def _create_session() -> str:
@@ -2983,8 +3010,12 @@ _NATIVE_BACKENDS = {
 #: Implemented native carriers: ``(session_id, record, plan, deadline) ->
 #: result``, run under the lease after the method is durably committed. An
 #: eligible candidate whose method is not listed here is not selected, so the
-#: attempt resumes exactly as it would with the flags off.
-_NATIVE_DISPATCH: dict[str, Callable[[str, dict, _FollowUpPlan, float], dict]] = {}
+#: attempt resumes exactly as it would with the flags off. A carrier returns
+#: ``None`` only when it proved nothing was handed over and put the row back
+#: at ``pending``; the call then continues resume-only (plan §2.2.3).
+_NATIVE_DISPATCH: dict[
+    str, Callable[[str, dict, _FollowUpPlan, float], dict | None]
+] = {}
 
 
 def _native_delivered_text(prompt: str, nonce: str) -> str:
@@ -3171,12 +3202,18 @@ def _native_plan_fields(
 
 
 def _native_carrier(
-    agent: dict, backend_name: str, backend_session_id: str, binding: BindingResult
+    agent: dict,
+    backend_name: str,
+    backend_session_id: str,
+    binding: BindingResult,
+    scanned: Path | None = None,
 ) -> dict:
     """Freeze what a native attempt was handed to (plan §2.1, R2-9).
 
     Settlement scans this carrier, never a same-name successor's transcript,
-    and judges liveness only for a matching dispatch epoch.
+    and judges liveness only for a matching dispatch epoch. ``scanned`` is the
+    transcript the attempt's own scanner resolved, used when the binding did
+    not name one, so the frozen path is the one confirmation watched.
     """
     carrier: dict = {
         "backend": backend_name,
@@ -3186,7 +3223,9 @@ def _native_carrier(
         carrier["codex_home"] = str(agent.get("codex_home") or "")
     path_field = "rollout_path" if backend_name == "codex" else "transcript_path"
     output = binding.output
-    carrier[path_field] = str(output.rollout_path or "") if output else ""
+    carrier[path_field] = str(
+        (output.rollout_path if output else "") or (scanned or "") or ""
+    )
     carrier["dispatch_epoch"] = agent.get("dispatch_epoch")
     carrier["host_pid"] = agent.get("pid")
     carrier["host_create_token"] = _agent_create_token(agent)
@@ -5121,10 +5160,17 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                     method=native_method or METHOD_RESUME,
                     carrier=(
                         _native_carrier(
-                            agent, backend_name, str(backend_session_id), binding
+                            agent,
+                            backend_name,
+                            str(backend_session_id),
+                            binding,
+                            scanner.path,
                         )
                         if native_method
                         else None
+                    ),
+                    native_text=(
+                        _native_delivered_text(prompt, nonce) if native_method else ""
                     ),
                 ),
                 ticket=reservation.ticket,
@@ -5148,31 +5194,44 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             if prep.refusal is not None:
                 return prep.refusal
             if prep.plan is not None:
-                if prep.plan.method == METHOD_RESUME:
-                    break
-                # Stage 2 (plan §2.1): under the granted lease, N5 first, then
-                # E0-E6. The commit in ``_mark_attempt_sent`` re-checks N5
-                # atomically with the write; this one keeps a barrier from
-                # ever being reported as lost eligibility.
-                try:
-                    blocking = _n5_blocking_row(session_id, name, record)
-                    kept = blocking is None and _native_still_eligible(
-                        session_id, prep.plan, prompt
-                    )
-                except Exception:
-                    _release_lease_or_warn(session_id, prep.plan)
-                    raise
-                if blocking is not None:
-                    _release_lease_or_warn(session_id, prep.plan)
-                    return _native_barrier(session_id, name, record, blocking)
-                if kept:
-                    break
-                # Stage 2 lost eligibility (plan §2.1). Give up the lease AND
-                # its FIFO place — releasing drops this call's waiter, so the
-                # retry re-enters at the tail — and meet today's idle/replace
-                # gate for the rest of the call. A native branch never
-                # resumes directly, and the budget is the original one.
-                _release_lease_or_warn(session_id, prep.plan)
+                if prep.plan.method != METHOD_RESUME:
+                    # Stage 2 (plan §2.1): under the granted lease, N5 first,
+                    # then E0-E6. The commit in ``_mark_attempt_sent``
+                    # re-checks N5 atomically with the write; this one keeps a
+                    # barrier from ever being reported as lost eligibility.
+                    try:
+                        blocking = _n5_blocking_row(session_id, name, record)
+                        kept = blocking is None and _native_still_eligible(
+                            session_id, prep.plan, prompt
+                        )
+                    except Exception:
+                        _release_lease_or_warn(session_id, prep.plan)
+                        raise
+                    if blocking is not None:
+                        _release_lease_or_warn(session_id, prep.plan)
+                        return _native_barrier(session_id, name, record, blocking)
+                    if not kept:
+                        # Stage 2 lost eligibility (plan §2.1). Give up the
+                        # lease AND its FIFO place — releasing drops this
+                        # call's waiter, so the retry re-enters at the tail —
+                        # and meet today's idle/replace gate for the rest of
+                        # the call. A native branch never resumes directly,
+                        # and the budget is the original one.
+                        _release_lease_or_warn(session_id, prep.plan)
+                        native_allowed = False
+                        if _delivery_clock() >= deadline:
+                            return _pending_tail(
+                                session_id, name, record, waited_for, position
+                            )
+                        continue
+                result = _commit_attempt(prep.plan)
+                if result is not None:
+                    return result
+                # The native carrier proved nothing was handed over (plan
+                # §2.2.3, §2.9 R3-5): the row is back at ``pending`` and the
+                # lease was released with its FIFO place. The rest of the call
+                # is resume-only through today's idle/replace gate, so it can
+                # never loop back into the carrier that just declined.
                 native_allowed = False
                 if _delivery_clock() >= deadline:
                     return _pending_tail(session_id, name, record, waited_for, position)
@@ -5194,10 +5253,17 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                 return _pending_tail(session_id, name, record, waited_for, position)
             _delivery_sleep(_DELIVERY_POLL_SECONDS)
 
-        plan = prep.plan
-        # Phase 2 — the registry lock is NOT held here. Shutdown, resume and
-        # confirmation all take real time, and holding a cross-process lock
-        # across them would block every registry reader on the machine.
+    def _commit_attempt(plan: _FollowUpPlan) -> dict | None:
+        """Phase 2 — commit the leased attempt, then carry it.
+
+        Returns the call's answer, or ``None`` when a native carrier proved
+        that nothing was handed over: the row is then back at ``pending`` and
+        the caller retries resume-only.
+
+        The registry lock is NOT held here. Shutdown, resume and confirmation
+        all take real time, and holding a cross-process lock across them would
+        block every registry reader on the machine.
+        """
         try:
             # Crash-recovery window "after spawn, before sent": the nonce is
             # durable BEFORE the resume, so a crash here still leaves a
@@ -5214,6 +5280,15 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                 return _native_barrier(session_id, name, record, blocking)
             if plan.method != METHOD_RESUME:
                 return _NATIVE_DISPATCH[plan.method](session_id, record, plan, deadline)
+
+            # R3-5: Codex resume carries the prompt in argv. A command this
+            # platform cannot launch is refused before the live child is
+            # touched, rather than surfacing later as an unexplained resume
+            # failure. Downstream-flag-gated: with it off this is ``main``.
+            if not _resume_command_fits(plan):
+                return _record_outcome(
+                    session_id, record, _message_too_large(plan.agent_name), plan
+                )
 
             # Fail closed: only signal a PID we can prove is still ours.
             if (
@@ -5425,6 +5500,411 @@ def _record_outcome(
         txn.put(target)
         record.update(target)
     return _with_public_status(result, record)
+
+
+#: A native attempt was handed to a durable carrier and its receipt has not
+#: been seen. It may still be presented, even after a kill or a reboot, so it
+#: is never followed by another carrier until it resolves (plan §2.2.3).
+REASON_NATIVE_UNRESOLVED = "native_unresolved"
+#: Pre-launch: the carrier could not be used for this call (discovery, thread
+#: proof or command budget failed). Nothing ran; the call continues by resume.
+REASON_NATIVE_INELIGIBLE = "native_ineligible_this_call"
+#: The queue process could not even be constructed. Nothing ran.
+REASON_NATIVE_NOT_ENQUEUED = "native_not_enqueued"
+#: The operator released an unresolved native row (``deliveries
+#: release-native``). Terminal, but the message may still execute.
+REASON_OPERATOR_RELEASED = "operator_released"
+#: A resumed prompt no command line on this platform can carry.
+REASON_MESSAGE_TOO_LARGE = "message_too_large"
+#: The queued submission id ``codex queue`` printed, on the delivery row.
+CARRIER_REF_FIELD = "carrier_ref"
+
+
+def _message_too_large(name: str) -> dict:
+    """Refuse, before any launch, a prompt the command line cannot carry."""
+    return _follow_up_failure(
+        REASON_MESSAGE_TOO_LARGE,
+        name,
+        retriable=False,
+        detail=(
+            "The message is too large for this platform's command line, which "
+            "is how this agent receives a resumed prompt. Nothing was sent and "
+            "the running agent was not touched. Send a shorter message, for "
+            "example by writing the details to a file and sending its path."
+        ),
+    )
+
+
+def _resume_command_fits(plan: _FollowUpPlan) -> bool:
+    """R3-5: whether a Codex resume's real command can be launched here.
+
+    Codex resume passes the prompt in argv, so the command, not just the text,
+    is measured (:func:`native_wake.command_fits`). Only with the downstream
+    flags on: flag-off resumes stay byte-identical to ``main``. A command that
+    cannot be built is let through, so the resume reports its own failure.
+    """
+    if (
+        plan.backend_name != "codex"
+        or plan.request is None
+        or not native_wake.downstream_enabled("")
+    ):
+        return True
+    build = getattr(plan.backend, "build_resume_command", None)
+    if build is None:
+        return True
+    try:
+        argv = list(build(plan.request, plan.backend_session_id))
+        build_env = getattr(plan.backend, "build_env", None)
+        env = {**os.environ, **(build_env(plan.request) if build_env else {})}
+    except Exception:
+        logger.debug("Could not build the resume command to measure", exc_info=True)
+        return True
+    return native_wake.command_fits(argv, env)
+
+
+def _native_row_cas(
+    session_id: str, record: dict, plan: Any, mutate: Callable[[dict], None]
+) -> bool:
+    """Apply ``mutate`` to this attempt's row only if it is still this attempt.
+
+    The compare is ``(sender, key, nonce, operation_id)`` on a non-terminal
+    row in ``sent`` or ``unconfirmed``. So a write never reverts a settled row
+    (a receipt found by a concurrent reconcile, an operator release) and never
+    lands on a later attempt under the same key. ``record`` is refreshed from
+    the store either way, so the caller reports what is actually stored.
+    """
+    sender = str(record.get("sender") or "")
+    key = str(record.get("idempotency_key") or "")
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        stored = txn.get(sender, key)
+        if stored is None:
+            return False
+        ours = (
+            not is_terminal(stored)
+            and stored.get("phase") in {PHASE_SENT, PHASE_UNCONFIRMED}
+            and str(stored.get("nonce") or "") == plan.nonce
+            and str(stored.get("operation_id") or "") == plan.operation_id
+        )
+        if ours:
+            mutate(stored)
+            txn.put(stored)
+        record.update(stored)
+        return ours
+
+
+def _attach_carrier_ref(session_id: str, record: dict, plan: Any, ref: str) -> bool:
+    """Record the queued submission id on this attempt's row, by CAS.
+
+    Without it a row stays unresolved exactly as with it; the ref only makes
+    an authoritative removal possible later (S-5).
+    """
+    return _native_row_cas(
+        session_id, record, plan, lambda row: row.__setitem__(CARRIER_REF_FIELD, ref)
+    )
+
+
+def _revert_native_attempt(
+    session_id: str, record: dict, plan: _FollowUpPlan, why: str
+) -> dict | None:
+    """Return a provably unsent native attempt to ``pending``.
+
+    Only for failures before any process ran (plan §2.2.3), so no carrier can
+    still present the message and a resume cannot duplicate it. Returns
+    ``None`` to let the call continue resume-only. If the row moved meanwhile
+    (an operator released it), that stored outcome is the answer instead.
+    """
+    if _native_row_cas(
+        session_id, record, plan, lambda row: mark_phase(row, PHASE_PENDING, reason=why)
+    ):
+        return None
+    if is_terminal(record):
+        return _settled_result(session_id, plan.agent_name, record)
+    return _unresolved_attempt_result(session_id, plan.agent_name, record)
+
+
+def _finalize_native(
+    session_id: str, plan: _FollowUpPlan, *, unresolved: bool, carrier_ref: str
+) -> bool:
+    """Phase 3 for a native method: fence, then describe the attempt.
+
+    Unlike :func:`_finalize_follow_up` the child was never replaced, so
+    ``pid``, ``create_token``, ``spawned_at`` and ``prompt_transport`` are left
+    exactly as they are (plan §2.2.5). The generation is bumped as for every
+    finalised attempt, and an unresolved one leaves the pending marker with
+    its method and carrier ref. Returns whether the record was written; a
+    fenced or replaced record is left alone, and the store row, which N5
+    reads, still carries the outcome.
+    """
+    with _agents_transaction(session_id) as agents:
+        agent = _find_agent(agents, plan.agent_name)
+        fenced = agent is None or _record_generation(agent) != plan.generation
+        won = not fenced and finalize_lease(
+            _leases_file(session_id),
+            plan.agent_name,
+            plan.operation_id,
+            plan.generation,
+        )
+        if agent is None or not won:
+            return False
+        agent.pop(PENDING_DELIVERY_FIELD, None)
+        if unresolved:
+            agent[PENDING_DELIVERY_FIELD] = {
+                "nonce": plan.nonce,
+                "operation_id": plan.operation_id,
+                "attempted_at": time.time(),
+                "prompt_file": "",
+                "method": plan.method,
+                "carrier_ref": carrier_ref,
+            }
+        _bump_generation(agent)
+        _save_agents_transaction(session_id, agents)
+        return True
+
+
+def _native_result(session_id: str, record: dict, plan: _FollowUpPlan) -> dict:
+    """Answer a native attempt from what the store now holds for it."""
+    pid = plan.agent_snapshot.get("pid")
+    if record.get("status") == STATUS_DELIVERED:
+        return _with_public_status(
+            {
+                "success": True,
+                "name": plan.agent_name,
+                "status": STATUS_DELIVERED,
+                "pid": pid,
+                "backend": plan.backend_name,
+                "backend_session_id": plan.backend_session_id,
+                "replaced_existing": False,
+                "session_id": session_id,
+            },
+            record,
+        )
+    if is_terminal(record):
+        # Settled by someone else first (an operator release): report that.
+        return _settled_result(session_id, plan.agent_name, record)
+    return _with_public_status(
+        {
+            "success": False,
+            "name": plan.agent_name,
+            "reason": REASON_NATIVE_UNRESOLVED,
+            "retriable": True,
+            "pid": pid,
+            "backend_session_id": plan.backend_session_id,
+            "session_id": session_id,
+            "sender_obligation": _TAIL_OBLIGATION,
+            "detail": (
+                "The message was put into the running agent's own queue but "
+                "has not been observed in its context yet. It may still be "
+                "acted on at any time, even after this call, a kill or a "
+                "restart, so do NOT resend it under a new key or by another "
+                "route. Retry this same call, or delivery_status("
+                "idempotency_key), to reconcile it; other messages to this "
+                "agent wait until it resolves. An operator can give up on it "
+                "with `win-agent-teams deliveries release-native`."
+            ),
+        },
+        record,
+    )
+
+
+def _dispatch_codex_queue(
+    session_id: str, record: dict, plan: _FollowUpPlan, deadline: float
+) -> dict | None:
+    """Put the attempt into the live Codex thread with ``codex queue`` (A).
+
+    Runs after ``_mark_attempt_sent`` made the row ``sent`` with its method
+    and frozen carrier (plan §2.2.2), under the lease, outside every lock.
+
+    - Everything before the queue process exists (discovery, the ``.cmd``
+      shim, thread proof, the R3-5 command budget) and a process that could
+      not be constructed are proof that nothing was queued: the row goes back
+      to ``pending`` and the call continues resume-only (``None``).
+    - ``enqueued``: the submission id is attached by CAS, then the receipt is
+      awaited in the frozen carrier's rollout for the rest of the budget.
+    - Anything else (exit 0 without an id, a non-zero exit, a timeout, an
+      error after spawn) may still have queued the turn durably: it is
+      ``unconfirmed(native_unresolved)`` unless its receipt is already there.
+
+    Child death never makes the attempt fail: a queued turn outlives the
+    process, so only a receipt settles it.
+    """
+    carrier = plan.carrier or {}
+    home = str(carrier.get("codex_home") or "")
+    thread = plan.backend_session_id
+    binary = _codex_queue_binary()
+    if not binary or Path(binary).suffix.lower() in {".cmd", ".bat"}:
+        return _revert_native_attempt(
+            session_id, record, plan, REASON_NATIVE_INELIGIBLE
+        )
+    if not home or not native_wake.verify_codex_thread(home, thread)[0]:
+        return _revert_native_attempt(
+            session_id, record, plan, REASON_NATIVE_INELIGIBLE
+        )
+    argv = native_wake.codex_queue_argv(binary, thread, plan.native_text)
+    if not native_wake.command_fits(argv, native_wake.queue_environment(home)):
+        return _revert_native_attempt(
+            session_id, record, plan, REASON_NATIVE_INELIGIBLE
+        )
+
+    outcome = native_wake.codex_queue(binary, thread, home, plan.native_text)
+    if outcome.provably_not_enqueued:
+        return _revert_native_attempt(
+            session_id, record, plan, REASON_NATIVE_NOT_ENQUEUED
+        )
+
+    carrier_ref = ""
+    if outcome.enqueued:
+        carrier_ref = outcome.submission_id
+        try:
+            _attach_carrier_ref(session_id, record, plan, carrier_ref)
+        except DeliveryStoreError:
+            # The row stays unresolved exactly as it is; only a later
+            # authoritative removal would have needed the ref.
+            logger.warning(
+                "Could not record carrier_ref %s on %s", carrier_ref, plan.agent_name
+            )
+        confirmed = confirm_delivery(
+            plan.scanner,
+            plan.nonce,
+            child_alive=lambda: True,
+            bound_s=max(0.0, deadline - _delivery_clock()),
+            poll_interval_s=_DELIVERY_POLL_SECONDS,
+            clock=_delivery_clock,
+            sleep=_delivery_sleep,
+        )
+        delivered = confirmed.status == DELIVERY_DELIVERED
+    else:
+        # One look, not the budget: the run most likely queued nothing, but a
+        # receipt already on disk is proof whatever the CLI said.
+        delivered = plan.scanner.poll(plan.nonce) == SCAN_FOUND
+
+    def _outcome(row: dict) -> None:
+        if delivered:
+            settle(row, STATUS_DELIVERED, reason="", now=time.time())
+        else:
+            mark_phase(row, PHASE_UNCONFIRMED, reason=REASON_NATIVE_UNRESOLVED)
+
+    # Store first, registry second: N5 and settlement read the store, so a
+    # crash in between leaves an unresolved row without a marker, never a
+    # marker over a row that says nothing is in flight.
+    ours = _native_row_cas(session_id, record, plan, _outcome)
+    _finalize_native(
+        session_id,
+        plan,
+        unresolved=ours and not delivered,
+        carrier_ref=carrier_ref,
+    )
+    return _native_result(session_id, record, plan)
+
+
+_NATIVE_DISPATCH[METHOD_CODEX_QUEUE] = _dispatch_codex_queue
+
+
+def _carrier_scan(session_id: str, record: dict) -> str:
+    """Scan a native row's nonce in its FROZEN carrier's transcript (R2-9).
+
+    Never the current record's: after a kill and a same-name respawn that is a
+    different conversation, and a match there says nothing about this row.
+    Returns a ``SCAN_*`` outcome; only :data:`SCAN_FOUND` is ever acted on.
+    """
+    carrier = record.get(CARRIER_FIELD)
+    nonce = str(record.get("nonce") or "")
+    if not isinstance(carrier, dict) or not nonce:
+        return SCAN_INDETERMINATE
+    backend_name = str(carrier.get("backend") or "")
+    backend_session_id = str(carrier.get("backend_session_id") or "")
+    raw = carrier.get("rollout_path") or carrier.get("transcript_path")
+    path = Path(str(raw)) if raw else None
+    snapshot = record.get(TARGET_SNAPSHOT_FIELD)
+    if path is None and backend_session_id and isinstance(snapshot, dict):
+        # The attempt-time snapshot is this carrier's own incarnation.
+        binder = _make_binder(
+            backend_name,
+            _safe_float(snapshot.get("spawned_at")),
+            str(snapshot.get("cwd") or ""),
+            snapshot,
+        )
+        if binder is not None:
+            path = binder.resolve_by_session_id(backend_session_id)
+    _ = session_id
+    scanner = ReceiptScanner(
+        path, backend=backend_name, backend_session_id=backend_session_id
+    )
+    scanner.rewind()
+    return scanner.full_scan(nonce)
+
+
+def _reconcile_native_record(
+    session_id: str, record: dict, *, now: float | None = None
+) -> bool:
+    """Settle a native row only on its receipt (plan §2.2.4).
+
+    Absence is never terminal here: not a dead child, a kill, a removed record
+    or a reboot. A durably queued turn can still be presented after all of
+    them, so the row stays unresolved (and N5 keeps holding the target) until
+    its nonce is found or an operator releases it.
+    """
+    if _carrier_scan(session_id, record) != SCAN_FOUND:
+        return False
+    settle(record, STATUS_DELIVERED, reason="", now=now if now else time.time())
+    return True
+
+
+def _release_native_row(
+    session_id: str, idempotency_key: str, sender: str = ""
+) -> dict:
+    """Operator escape: settle an unresolved native row ``failed``.
+
+    Behind the CLI's session recovery token, never MCP. The message may still
+    execute; releasing only stops it from holding the target (N5). The pending
+    marker it left on the agent is dropped with it, so a later receipt cannot
+    wedge unrelated messages behind a row the operator already gave up on.
+    """
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        rows = [
+            row
+            for row in txn.data.values()
+            if row.get("idempotency_key") == idempotency_key
+            and (not sender or row.get("sender") == sender)
+        ]
+        if not rows:
+            return {"released": False, "reason": "not_found"}
+        if len(rows) > 1:
+            return {
+                "released": False,
+                "reason": "ambiguous",
+                "senders": sorted(str(row.get("sender") or "") for row in rows),
+            }
+        row = rows[0]
+        if not is_unresolved_native(row):
+            return {
+                "released": False,
+                "reason": "not_unresolved_native",
+                "status": row.get("status"),
+                "phase": row.get("phase"),
+                "method": row.get(METHOD_FIELD, ""),
+            }
+        settle(row, STATUS_FAILED, reason=REASON_OPERATOR_RELEASED, now=time.time())
+        txn.touch()
+        released = dict(row)
+    _clear_reconciled_marker(
+        session_id, str(released.get("to") or ""), str(released.get("nonce") or "")
+    )
+    return {
+        "released": True,
+        "sender": released.get("sender", ""),
+        "idempotency_key": idempotency_key,
+        "to": released.get("to", ""),
+        "method": released.get(METHOD_FIELD, ""),
+        "nonce": released.get("nonce", ""),
+        "carrier_ref": released.get(CARRIER_REF_FIELD, ""),
+        "status": released.get("status"),
+        "reason": released.get("reason"),
+        "warning": (
+            "Released: the row is failed(operator_released) and no longer "
+            "holds the target. The message may still execute if the target's "
+            "session presents its queued turn later."
+        ),
+    }
 
 
 def _with_delivery_identity(result: dict, record: dict) -> dict:
@@ -6667,7 +7147,9 @@ async def kill_agent(name: str) -> dict:
             # reintroduce exactly the false status this feature removes.
             # Records are settled here, never deleted: unlike the inbox lines
             # purged below, the sender's audit trail must outlive the target.
-            _reconcile_deliveries_for_target(session_id, name, agent)
+            native_unresolved = _reconcile_deliveries_for_target(
+                session_id, name, agent
+            )
 
             owned = process_manager.owns_process(
                 str(agent.get("pid")), _agent_create_token(agent)
@@ -6688,7 +7170,15 @@ async def kill_agent(name: str) -> dict:
             _cleanup_agent_artifacts(
                 session_id, name, child_exited=owned or not _agent_alive(agent)
             )
-            return {"success": True, "name": name}
+            result: dict = {"success": True, "name": name}
+            # Native attempts the kill could not settle stay unresolved and
+            # keep holding the name (N5). Reported with the master flag on, or
+            # whenever there are some; otherwise the payload is ``main``'s.
+            if native_unresolved or (
+                native_unresolved is not None and native_wake.enabled()
+            ):
+                result["native_unresolved"] = native_unresolved
+            return result
 
     return await run_blocking(_do_kill)
 

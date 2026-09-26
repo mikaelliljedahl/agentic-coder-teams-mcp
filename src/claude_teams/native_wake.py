@@ -11,6 +11,7 @@ import re
 import socket
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -569,6 +570,74 @@ class QueueOutcome:
         return not self.started
 
 
+#: Largest command line handed to ``CreateProcess``, in UTF-16 code units and
+#: including the terminating null. The API limit is 32 767; the margin covers
+#: whatever a launcher adds (plan §2.9 R3-5).
+WINDOWS_COMMAND_BUDGET = 32_000
+#: Linux ``MAX_ARG_STRLEN``: one argument or environment string, null included.
+POSIX_ARG_STRLEN_MAX = 128 * 1024
+#: Assumed ``ARG_MAX`` when ``sysconf`` cannot say.
+POSIX_ARG_MAX_FALLBACK = 128 * 1024
+#: Kept free of ``ARG_MAX`` for the loader's own use (auxv, the exec path).
+POSIX_ARG_MARGIN = 4 * 1024
+_WINDOWS = os.name == "nt"
+
+
+def _posix_arg_max() -> int:
+    """Return ``sysconf(SC_ARG_MAX)``, or the fallback when it cannot say."""
+    sysconf = getattr(os, "sysconf", None)  # absent on Windows
+    if sysconf is None:
+        return POSIX_ARG_MAX_FALLBACK
+    try:
+        value = int(sysconf("SC_ARG_MAX"))
+    except (ValueError, OSError):
+        return POSIX_ARG_MAX_FALLBACK
+    return value if value > 0 else POSIX_ARG_MAX_FALLBACK
+
+
+def command_fits(
+    argv: list[str],
+    env: Mapping[str, str] | None = None,
+    *,
+    windows: bool | None = None,
+    arg_max: int | None = None,
+) -> bool:
+    """Return whether ``argv`` (and ``env``) can be launched on this platform.
+
+    Checked before a launch whose failure would otherwise be ambiguous, so the
+    caller can choose another route while nothing has run yet.
+
+    - **Windows:** the quoted command line, as ``subprocess`` builds it,
+      measured in UTF-16 code units (a non-BMP character is two) plus the
+      terminating null, must be at most :data:`WINDOWS_COMMAND_BUDGET`.
+    - **POSIX:** every argument and ``KEY=value`` string, encoded and
+      null-terminated, must fit ``MAX_ARG_STRLEN``; all of them plus one
+      pointer each (and the two terminating null pointers) must fit
+      ``sysconf(SC_ARG_MAX)`` less :data:`POSIX_ARG_MARGIN`.
+    """
+    on_windows = _WINDOWS if windows is None else windows
+    if on_windows:
+        line = subprocess.list2cmdline(argv)
+        units = len(line.encode("utf-16-le", "surrogatepass")) // 2
+        return units + 1 <= WINDOWS_COMMAND_BUDGET
+    values = os.environ if env is None else env
+    strings = [*argv, *(f"{key}={value}" for key, value in values.items())]
+    pointer = struct.calcsize("P")
+    total = 2 * pointer
+    for text in strings:
+        size = len(os.fsencode(text)) + 1
+        if size > POSIX_ARG_STRLEN_MAX:
+            return False
+        total += size + pointer
+    limit = _posix_arg_max() if arg_max is None else arg_max
+    return total <= limit - POSIX_ARG_MARGIN
+
+
+def codex_queue_argv(binary: str, thread_id: str, message: str) -> list[str]:
+    """Return the exact ``codex queue`` command :func:`codex_queue` launches."""
+    return [binary, "queue", "--thread", thread_id, "--message", message]
+
+
 def queue_environment(home: str) -> dict[str, str]:
     """Scrub identity/channel variables and pin ``CODEX_HOME`` for a queue run."""
     environ = {
@@ -615,7 +684,7 @@ def codex_queue(  # noqa: PLR0911 - one return per staged outcome.
     ``runner`` is a legacy ``subprocess.run``-style seam; it cannot tell the
     stages apart, so none of its failures are ever reported as unstarted.
     """
-    argv = [binary, "queue", "--thread", thread_id, "--message", message]
+    argv = codex_queue_argv(binary, thread_id, message)
     limit = timeout or _seconds("CODEX_QUEUE_TIMEOUT_SECONDS", 15.0)
     options: dict[str, Any] = {
         "env": queue_environment(home),
