@@ -326,8 +326,10 @@ def test_flag_on_tool_contract_and_watch_retained():
         assert "watcher" in tools[name] or "watch" in tools[name]
         assert "stop arming" not in tools[name]
     for name in ("read_messages", "external_read", "session_info", "resume_session"):
-        assert "Linux-only" in tools[name]
+        assert "native Windows" in tools[name]
+        assert "named pipe" in tools[name]
         assert "macOS" in tools[name]
+        assert "Linux-only" not in tools[name]
     for name in ("session_info", "resume_session"):
         assert "backlog notice follows immediately" in tools[name]
     for name in ("read_messages", "external_read"):
@@ -353,7 +355,7 @@ def test_flag_on_tool_contract_and_watch_retained():
     assert "existing directory" in tools["external_set_wake"]
     assert "run the watch as a BACKGROUND command" in data["note"]
     for literal in (
-        "Linux-only",
+        "macOS",
         "native-wake-",
         "WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE",
         "WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX",

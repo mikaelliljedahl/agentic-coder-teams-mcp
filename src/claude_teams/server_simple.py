@@ -359,7 +359,8 @@ mcp = FastMCP(
 
 
 _NATIVE_PLATFORM_NOTE = (
-    "Claude session wake is Linux-only; on native Windows and macOS it is "
+    "Claude session wake works on Linux (inbox socket) and native Windows "
+    "(named pipe, server PID verified on every post); on macOS it is "
     "unavailable and the watcher is the wake path. Codex queue wake works on "
     "all platforms."
 )
@@ -863,7 +864,7 @@ def _build_join_prompt(
             "polling external_read. This best-effort doorbell never replaces "
             "the watcher; still check external_read before ending a long wait. "
             "After a restart, the lead must call session_info or resume_session "
-            "first; when the Linux-only Claude channel is available and unread "
+            "first; when the Claude channel (Linux or Windows) is available and unread "
             "messages are waiting, a backlog notice follows immediately.\n"
         )
     return prompt

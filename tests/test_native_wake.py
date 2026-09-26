@@ -148,23 +148,89 @@ def test_wire_two_lines_then_eof(tmp_path):
     ]
 
 
-@pytest.mark.parametrize("with_env", [False, True])
-def test_windows_short_circuit(with_env, monkeypatch):
+PIPE = "\\\\.\\pipe\\LOCAL\\cc-msg-test"
+
+
+@pytest.fixture
+def on_windows(monkeypatch):
+    monkeypatch.setattr(nw, "os", SimpleNamespace(name="nt", environ=ss.os.environ))
+    monkeypatch.setattr(nw, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(nw.socket, "socket", Mock(side_effect=AssertionError()))
+
+
+def test_windows_no_socket_skips_host_lookup(on_windows):
     resolver = Mock(side_effect=AssertionError())
-    with monkeypatch.context() as patch:
-        patch.setattr(nw, "os", SimpleNamespace(name="nt", environ=ss.os.environ))
-        patch.setattr(nw.socket, "socket", Mock(side_effect=AssertionError()))
-        values = env("/123.sock") if with_env else {"WIN_AGENT_TEAMS_NATIVE_WAKE": "1"}
-        assert (
-            nw.resolve_claude_channel(values, resolve_host=resolver).reason
-            == "unsupported_platform"
-        )
-        patch.setattr(type(ss.mcp), "run", lambda self: None)
-        patch.setattr(
-            nw.NativeWakeNotifier, "start", Mock(side_effect=AssertionError())
-        )
-        ss.main()
+    assert (
+        nw.resolve_claude_channel(
+            {"WIN_AGENT_TEAMS_NATIVE_WAKE": "1"}, resolve_host=resolver
+        ).reason
+        == "no_socket"
+    )
     resolver.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("path", "exists", "kind", "expected"),
+    [
+        ("/123.sock", True, "claude", "socket_missing"),
+        (PIPE, False, "claude", "socket_missing"),
+        (PIPE, True, "codex", "host_not_claude"),
+        (PIPE, True, "claude", "available"),
+    ],
+)
+def test_windows_pipe_rows(on_windows, monkeypatch, path, exists, kind, expected):
+    monkeypatch.setattr(nw.winpipe, "pipe_exists", lambda value: exists)
+    channel = nw.resolve_claude_channel(env(path), resolve_host=host(kind, 4242))
+    assert channel.reason == expected
+    if expected == "available":
+        assert channel.host_pid == 4242
+        assert channel.path == PIPE
+
+
+def test_windows_post_goes_through_verified_pipe(on_windows, monkeypatch):
+    calls = []
+
+    def fake_post(path, payload, deadline, *, expected_pid):
+        calls.append((path, payload, deadline, expected_pid))
+        return nw.winpipe.PipeResult(True)
+
+    monkeypatch.setattr(nw.winpipe, "post", fake_post)
+    channel = nw.ClaudeChannel("available", PIPE, "secret", host_pid=4242)
+    assert nw.post_claude_notice(channel, "notice", deadline=3.0).ok
+    ((path, payload, deadline, expected_pid),) = calls
+    assert (path, deadline, expected_pid) == (PIPE, 3.0, 4242)
+    assert [json.loads(line) for line in payload.decode().splitlines()] == [
+        {"type": "auth", "token": "secret"},
+        {"type": "user", "message": {"role": "user", "content": "notice"}},
+    ]
+
+
+def test_windows_post_without_host_pid_writes_nothing(on_windows, monkeypatch):
+    monkeypatch.setattr(nw.winpipe, "post", Mock(side_effect=AssertionError()))
+    result = nw.post_claude_notice(
+        nw.ClaudeChannel("available", PIPE, "secret"), "notice"
+    )
+    assert not result.ok
+    assert result.reason == "socket_not_owned"
+
+
+def test_windows_pipe_failure_reason_is_reported(on_windows, monkeypatch):
+    monkeypatch.setattr(
+        nw.winpipe, "post", lambda *a, **k: nw.winpipe.PipeResult(False, "timeout")
+    )
+    result = nw.post_claude_notice(
+        nw.ClaudeChannel("available", PIPE, "secret", host_pid=1), "notice"
+    )
+    assert (result.ok, result.reason) == (False, "timeout")
+
+
+def test_windows_main_starts_notifier(on_windows, monkeypatch):
+    started = Mock()
+    monkeypatch.setattr(type(ss.mcp), "run", lambda self: None)
+    monkeypatch.setattr(nw.NativeWakeNotifier, "start", started)
+    monkeypatch.setattr(nw.NativeWakeNotifier, "close", Mock())
+    ss.main()
+    started.assert_called_once()
 
 
 @pytest.mark.parametrize(

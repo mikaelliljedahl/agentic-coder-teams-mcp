@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from claude_teams import filelock, messaging, procinfo
+from claude_teams import filelock, messaging, procinfo, winpipe
 
 _LOG = logging.getLogger(__name__)
 _activation = threading.Event()
@@ -36,8 +36,13 @@ def enabled(half: str = "", environ: Mapping[str, str] | None = None) -> bool:
 
 
 def claude_platform_supported() -> bool:
-    """Require Linux: nearest-host discovery currently depends on /proc."""
-    return os.name != "nt" and sys.platform == "linux"
+    """Linux (/proc host walk, AF_UNIX) and Windows (toolhelp walk, named pipe).
+
+    macOS stays unsupported: nearest-host discovery cannot resolve ``claude``.
+    """
+    if os.name == "nt":
+        return sys.platform == "win32"
+    return sys.platform == "linux"
 
 
 def positive_seconds(raw: str, default: float) -> float:
@@ -61,6 +66,8 @@ class ClaudeChannel:
     path: str = ""
     token: str = field(default="", repr=False)
     owner_verified: bool = False
+    # Windows: every post requires the pipe's server process to be this PID.
+    host_pid: int = 0
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,12 @@ def resolve_claude_channel(  # noqa: PLR0911 - H-row decision table.
         host = resolve_host().host
         if host is None or not procinfo.is_claude_host(host):
             return ClaudeChannel("host_not_claude")
+        if sys.platform == "win32":
+            # H3-W/H4-W: a local pipe that exists. Ownership is proved per post
+            # (server PID == host PID) because a pipe name carries no PID.
+            if not winpipe.is_pipe_path(path) or not winpipe.pipe_exists(path):
+                return ClaudeChannel("socket_missing")
+            return ClaudeChannel("available", path, token, False, host.pid)
         match = re.fullmatch(r"(\d+)\.sock", Path(path).name)
         if match and int(match[1]) != host.pid:
             return ClaudeChannel("socket_not_owned")
@@ -95,32 +108,36 @@ def resolve_claude_channel(  # noqa: PLR0911 - H-row decision table.
             return ClaudeChannel("socket_missing")
     except (OSError, ValueError):
         return ClaudeChannel("socket_missing")
-    return ClaudeChannel("available", path, token, bool(match))
+    return ClaudeChannel("available", path, token, bool(match), host.pid)
 
 
 def post_claude_notice(
     channel: ClaudeChannel, text: str, deadline: float = 5.0
 ) -> PostResult:
-    """Write auth and user JSON lines with a real total POSIX operation deadline."""
-    if (
-        sys.platform == "win32"
-        or not claude_platform_supported()
-        or channel.reason != "available"
-    ):
+    """Write auth and user JSON lines with a real total operation deadline."""
+    if not claude_platform_supported() or channel.reason != "available":
         return PostResult(False, channel.reason)
+    wire = json.dumps({"type": "auth", "token": channel.token}) + "\n"
+    wire += (
+        json.dumps({"type": "user", "message": {"role": "user", "content": text}})
+        + "\n"
+    )
+    if sys.platform == "win32":
+        if not channel.host_pid:
+            return PostResult(False, "socket_not_owned")
+        piped = winpipe.post(
+            channel.path,
+            wire.encode("utf-8"),
+            deadline,
+            expected_pid=channel.host_pid,
+        )
+        return PostResult(piped.ok, piped.reason)
     try:
         end = time.monotonic() + deadline
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(deadline)
             connection.connect(channel.path)
             connection.settimeout(max(0.001, end - time.monotonic()))
-            wire = json.dumps({"type": "auth", "token": channel.token}) + "\n"
-            wire += (
-                json.dumps(
-                    {"type": "user", "message": {"role": "user", "content": text}}
-                )
-                + "\n"
-            )
             connection.sendall(wire.encode("utf-8"))
             connection.shutdown(socket.SHUT_WR)
     except Exception as err:
