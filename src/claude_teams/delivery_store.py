@@ -69,6 +69,20 @@ REASON_NOT_DELIVERED = "not_delivered"
 #: evidence. Absent on every ordinary row.
 RECONCILED_FROM_FIELD = "reconciled_from_key"
 
+#: How an attempt was carried (plan §2.1). Written on the row only with the
+#: master native flag on, so a flag-off session's rows stay byte-identical.
+METHOD_FIELD = "method"
+#: The frozen description of a native attempt's carrier. Settlement scans it,
+#: never a same-name successor's transcript. Internal: never in the view.
+CARRIER_FIELD = "carrier"
+METHOD_RESUME = "resume"
+METHOD_CODEX_QUEUE = "codex_queue"
+METHOD_CLAUDE_MAILBOX = "claude_mailbox"
+#: Durable carriers: an attempt through one may still be presented after its
+#: call returned, a crash, a kill or a reboot, so it is never followed by
+#: another carrier until it resolves (the N5 barrier).
+NATIVE_METHODS = frozenset({METHOD_CODEX_QUEUE, METHOD_CLAUDE_MAILBOX})
+
 #: Refusal when a key is reused with any differing request field.
 IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 
@@ -229,7 +243,9 @@ def mark_phase(record: dict[str, Any], phase: str, *, reason: str = "") -> None:
     record["reason"] = reason
 
 
-def public_view(record: dict[str, Any]) -> dict[str, Any]:
+def public_view(
+    record: dict[str, Any], *, include_method: bool = False
+) -> dict[str, Any]:
     """Project a record onto exactly the documented query contract.
 
     ``fingerprint``, ``sender``, ``operation_id`` and ``prompt_file`` are
@@ -241,6 +257,10 @@ def public_view(record: dict[str, Any]) -> dict[str, Any]:
     same request under a new key — and names the key whose nonce is the
     evidence. Without it such a row would read as ``delivered`` with an empty
     nonce and no way to see why.
+
+    ``method`` is added only with ``include_method`` (the master native flag),
+    so a flag-off view stays exactly the contract ``main`` ships. The frozen
+    ``carrier`` is internal bookkeeping and never part of the view.
     """
     view = {
         "message_id": record.get("message_id", ""),
@@ -257,7 +277,23 @@ def public_view(record: dict[str, Any]) -> dict[str, Any]:
     provenance = record.get(RECONCILED_FROM_FIELD)
     if provenance:
         view[RECONCILED_FROM_FIELD] = provenance
+    method = record.get(METHOD_FIELD)
+    if include_method and method:
+        view[METHOD_FIELD] = method
     return view
+
+
+def is_unresolved_native(record: dict[str, Any]) -> bool:
+    """Whether ``record`` is a native attempt whose presentation is still open.
+
+    ``sent`` counts: a queue call, ref write or finalisation still in flight
+    has already written it, and the message may be presented at any moment.
+    """
+    return (
+        record.get(METHOD_FIELD) in NATIVE_METHODS
+        and record.get("status") == STATUS_QUEUED
+        and record.get("phase") in {PHASE_SENT, PHASE_UNCONFIRMED}
+    )
 
 
 def load_records(path: Path) -> dict[str, dict[str, Any]]:
@@ -365,6 +401,29 @@ class DeliveryTransaction:
         )
         return rows
 
+    def unresolved_native(self, to: str, *, exclude: str = "") -> list[dict[str, Any]]:
+        """Return every sender's unresolved native rows for ``to``, oldest first.
+
+        This is the N5 query. It spans senders on purpose: whoever sent it, a
+        message that may still be presented to ``to`` must not be followed by
+        another carrier. ``exclude`` is the caller's own record key, whose
+        attempt is reconciled rather than treated as a barrier.
+        """
+        rows = [
+            record
+            for key, record in self.data.items()
+            if key != exclude
+            and record.get("to") == to
+            and is_unresolved_native(record)
+        ]
+        rows.sort(
+            key=lambda record: (
+                _as_float(record.get("created_at")),
+                str(record.get("message_id")),
+            )
+        )
+        return rows
+
 
 def _as_float(value: object) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
@@ -393,7 +452,7 @@ def delivery_transaction(path: Path) -> Iterator[DeliveryTransaction]:
 
 
 def list_for_sender(
-    path: Path, sender: str, to: str | None = None
+    path: Path, sender: str, to: str | None = None, *, include_method: bool = False
 ) -> list[dict[str, Any]]:
     """Return a sender's records as public views, oldest first.
 
@@ -403,10 +462,14 @@ def list_for_sender(
     key is for.
     """
     with delivery_transaction(path) as txn:
-        return [public_view(record) for record in txn.for_sender(sender, to)]
+        return [
+            public_view(record, include_method=include_method)
+            for record in txn.for_sender(sender, to)
+        ]
 
 
 __all__ = [
+    "CARRIER_FIELD",
     "DELIVERIES_FILE_NAME",
     "DELIVERIES_LOCK_NAME",
     "IDEMPOTENCY_CONFLICT",
@@ -414,6 +477,11 @@ __all__ = [
     "KEY_REQUIRED",
     "KEY_TOO_LONG",
     "MAX_IDEMPOTENCY_KEY_LENGTH",
+    "METHOD_CLAUDE_MAILBOX",
+    "METHOD_CODEX_QUEUE",
+    "METHOD_FIELD",
+    "METHOD_RESUME",
+    "NATIVE_METHODS",
     "PHASE_PENDING",
     "PHASE_SENT",
     "PHASE_SETTLED",
@@ -428,6 +496,7 @@ __all__ = [
     "DeliveryTransaction",
     "delivery_transaction",
     "is_terminal",
+    "is_unresolved_native",
     "list_for_sender",
     "load_records",
     "mark_phase",

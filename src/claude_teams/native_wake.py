@@ -36,6 +36,20 @@ def enabled(half: str = "", environ: Mapping[str, str] | None = None) -> bool:
     )
 
 
+def downstream_enabled(half: str, environ: Mapping[str, str] | None = None) -> bool:
+    """Return whether new downstream deliveries may use ``half``'s native carrier.
+
+    Needs the master flag, ``WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1`` and a half
+    switch that is not ``0``. It gates new attempts only: it never lifts the
+    barrier on native attempts that are already unresolved.
+    """
+    values = os.environ if environ is None else environ
+    return (
+        enabled(half, values)
+        and values.get("WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM", "").strip() == "1"
+    )
+
+
 def claude_platform_supported() -> bool:
     """Linux (/proc host walk, AF_UNIX) and Windows (toolhelp walk, named pipe).
 

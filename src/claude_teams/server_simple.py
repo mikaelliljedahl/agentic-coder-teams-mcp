@@ -75,8 +75,13 @@ from claude_teams.delivery import (
     stale_prompt_files,
 )
 from claude_teams.delivery_store import (
+    CARRIER_FIELD,
     DELIVERIES_FILE_NAME,
     IDEMPOTENCY_CONFLICT,
+    METHOD_CLAUDE_MAILBOX,
+    METHOD_CODEX_QUEUE,
+    METHOD_FIELD,
+    METHOD_RESUME,
     PHASE_PENDING,
     PHASE_SENT,
     PHASE_UNCONFIRMED,
@@ -2156,7 +2161,9 @@ class _FollowUpPlan:
     backend: Any
     backend_name: str
     backend_session_id: str
-    request: SpawnRequest
+    #: The resume request; ``None`` for a native method, which neither
+    #: respawns the child nor mints a dispatch epoch.
+    request: SpawnRequest | None
     old_pid: str
     old_create_token: str | None
     alive: bool
@@ -2177,6 +2184,10 @@ class _FollowUpPlan:
     #: durable row so a rescan survives the record's removal (see
     #: :func:`_scan_target`).
     agent_snapshot: dict
+    #: The carrier committed under the lease (plan §2.1 stage 2).
+    method: str = METHOD_RESUME
+    #: Frozen carrier of a native attempt; ``None`` for resume.
+    carrier: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -2955,6 +2966,263 @@ def _native_record_fields(
     if backend_name == "codex":
         fields["codex_home"] = _effective_codex_home()
     return fields
+
+
+#: Largest delivered text a native carrier takes inline, marker included, in
+#: UTF-8 bytes (plan §2.4). Native carriers have no sidecar: a larger message
+#: fails E5 and resumes, whose sidecar lifecycle is unchanged.
+NATIVE_INLINE_MAX = 16 * 1024
+
+#: The native method for each backend, and the half switch that gates it (E0).
+#: Any other backend (pi) always resumes.
+_NATIVE_BACKENDS = {
+    "codex": (METHOD_CODEX_QUEUE, "CODEX"),
+    "claude-code": (METHOD_CLAUDE_MAILBOX, "CLAUDE"),
+}
+
+#: Implemented native carriers: ``(session_id, record, plan, deadline) ->
+#: result``, run under the lease after the method is durably committed. An
+#: eligible candidate whose method is not listed here is not selected, so the
+#: attempt resumes exactly as it would with the flags off.
+_NATIVE_DISPATCH: dict[str, Callable[[str, dict, _FollowUpPlan, float], dict]] = {}
+
+
+def _native_delivered_text(prompt: str, nonce: str) -> str:
+    """Return the text a native carrier presents: the prompt and its marker."""
+    return delivered_prompt(prompt, nonce, single_line=False)
+
+
+def _codex_queue_binary() -> str:
+    """Return the binary ``codex queue`` would run, or ``""`` when unknown."""
+    try:
+        # The runner's own discovery, so E4 judges the binary it would launch.
+        return native_wake._discover_codex()
+    except Exception:
+        logger.debug("Could not discover the codex binary", exc_info=True)
+        return ""
+
+
+def _delivery_capability_file(session_id: str, name: str) -> Path:
+    """Return the child poster's capability marker (plan §2.3.4)."""
+    return _session_dir(session_id) / f"native-delivery-{name}.json"
+
+
+def _delivery_owner_lock_held(session_id: str, name: str) -> bool:  # noqa: ARG001 - the poster's lock is per session and name.
+    """Whether the child's delivery poster holds its owner lock.
+
+    Fails closed until the poster exists: without a live owner nothing would
+    ever take an offered entry, so no Claude channel counts as proven.
+    """
+    return False
+
+
+def _claude_delivery_capability(
+    session_id: str, name: str, agent: dict, backend_session_id: str
+) -> dict | None:
+    """E3 for Claude: return the child's capability marker, or ``None``.
+
+    The marker must be fresh (a heartbeat within three poll intervals), owned
+    (the owner lock is held), and bound to exactly this incarnation: the
+    record's host PID and creation token, backend session and dispatch epoch.
+    A marker left by a predecessor under the same name matches none of them.
+    """
+    try:
+        marker = json.loads(
+            _delivery_capability_file(session_id, name).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(marker, dict):
+        return None
+    poll = native_wake.positive_seconds(
+        os.environ.get("WIN_AGENT_TEAMS_NATIVE_WAKE_POLL_SECONDS", ""), 1.0
+    )
+    age = time.time() - _safe_float(marker.get("heartbeat_ts"))
+    epoch = agent.get("dispatch_epoch")
+    token = _agent_create_token(agent)
+    bound = (
+        0 <= age <= 3 * poll
+        and str(marker.get("host_pid")) == str(agent.get("pid"))
+        and token is not None
+        and marker.get("host_create_token") == token
+        and marker.get("backend_session_id") == backend_session_id
+        and isinstance(epoch, int)
+        and not isinstance(epoch, bool)
+        and marker.get("dispatch_epoch") == epoch
+    )
+    if not bound or not _delivery_owner_lock_held(session_id, name):
+        return None
+    return marker
+
+
+def _native_candidate(  # noqa: PLR0911 - one return per eligibility condition.
+    session_id: str,
+    name: str,
+    *,
+    agent: dict,
+    backend_name: str,
+    alive: bool,
+    binding: BindingResult,
+    backend_session_id: str,
+    prompt: str,
+) -> tuple[str | None, str]:
+    """Evaluate E0-E6 (plan §2.1): which native carrier may take this attempt.
+
+    Returns ``(method, "")`` when every condition holds, else ``(None, why)``
+    naming the first one that failed. It decides only between carriers; the
+    N5 barrier is separate and runs first, whatever the flags say.
+
+    E6 (idle by marker) applies to Codex only. A busy Claude target remains a
+    candidate because its poster waits for the next idle edge itself.
+    """
+    native = _NATIVE_BACKENDS.get(backend_name)
+    if native is None:
+        return None, "no_native_carrier"
+    method, half = native
+    if not native_wake.downstream_enabled(half):
+        return None, "E0_disabled"
+    if not (alive and binding.bound and backend_session_id):
+        return None, "E1_not_live"
+    if agent.get("interactive") is not True:
+        return None, "E2_not_interactive"
+    text = _native_delivered_text(prompt, new_delivery_nonce())
+    if len(text.encode("utf-8")) > NATIVE_INLINE_MAX:
+        return None, "E5_too_large"
+    if method == METHOD_CODEX_QUEUE:
+        idle = (
+            _resolve_agent_state(
+                alive=True,
+                marker=_read_state_marker(session_id, name),
+                last_activity_at=None,
+            )
+            == "waiting"
+        )
+        if not idle:
+            return None, "E6_busy"
+        binary = _codex_queue_binary()
+        if not binary or Path(binary).suffix.lower() in {".cmd", ".bat"}:
+            return None, "E4_transport_unsafe"
+        home = str(agent.get("codex_home") or "")
+        if not home or not native_wake.verify_codex_thread(home, backend_session_id)[0]:
+            return None, "E3_channel_unproven"
+        return method, ""
+    capability = _claude_delivery_capability(
+        session_id, name, agent, backend_session_id
+    )
+    if capability is None:
+        return None, "E3_channel_unproven"
+    if capability.get("channel") != "available":
+        return None, "E4_transport_unsafe"
+    return method, ""
+
+
+def _selectable_native_method(
+    session_id: str,
+    name: str,
+    *,
+    agent: dict,
+    backend_name: str,
+    alive: bool,
+    binding: BindingResult,
+    backend_session_id: str,
+    prompt: str,
+) -> str | None:
+    """Stage 1 of plan §2.1: the native method this attempt will try, if any.
+
+    A backend whose carrier is not implemented yet is never evaluated, so the
+    attempt resumes exactly as it would with the flags off and no channel is
+    probed for a choice that could not be acted on.
+    """
+    native = _NATIVE_BACKENDS.get(backend_name)
+    if native is None or native[0] not in _NATIVE_DISPATCH:
+        return None
+    method, _ = _native_candidate(
+        session_id,
+        name,
+        agent=agent,
+        backend_name=backend_name,
+        alive=alive,
+        binding=binding,
+        backend_session_id=backend_session_id,
+        prompt=prompt,
+    )
+    return method
+
+
+def _native_plan_fields(
+    agent: dict,
+) -> tuple[object, str, str | None, str | None, None, dict[str, str]]:
+    """Return the plan fields ``_build_resume_request`` would, for a native method.
+
+    A native carrier neither respawns the child nor mints a dispatch epoch,
+    and it carries the text inline: no request and no sidecar. The remaining
+    fields only describe the record.
+    """
+    effort = agent.get("reasoning_effort")
+    _, correlation_id = classify_correlation(agent)
+    return (
+        agent.get("model"),
+        str(agent.get("permission_mode") or "bypass"),
+        effort if isinstance(effort, str) else None,
+        correlation_id,
+        None,
+        {},
+    )
+
+
+def _native_carrier(
+    agent: dict, backend_name: str, backend_session_id: str, binding: BindingResult
+) -> dict:
+    """Freeze what a native attempt was handed to (plan §2.1, R2-9).
+
+    Settlement scans this carrier, never a same-name successor's transcript,
+    and judges liveness only for a matching dispatch epoch.
+    """
+    carrier: dict = {
+        "backend": backend_name,
+        "backend_session_id": backend_session_id,
+    }
+    if backend_name == "codex":
+        carrier["codex_home"] = str(agent.get("codex_home") or "")
+    path_field = "rollout_path" if backend_name == "codex" else "transcript_path"
+    output = binding.output
+    carrier[path_field] = str(output.rollout_path or "") if output else ""
+    carrier["dispatch_epoch"] = agent.get("dispatch_epoch")
+    carrier["host_pid"] = agent.get("pid")
+    carrier["host_create_token"] = _agent_create_token(agent)
+    return carrier
+
+
+def _native_still_eligible(session_id: str, plan: _FollowUpPlan, prompt: str) -> bool:
+    """Stage 2 of plan §2.1: re-evaluate E0-E6 under the granted lease.
+
+    Read from a fresh registry load, because the record may have changed
+    since phase 1 released the registry lock. Any change of generation or
+    backend session also counts as lost eligibility.
+    """
+    agent = _find_agent(_load_agents(session_id), plan.agent_name)
+    if agent is None or _record_generation(agent) != plan.generation:
+        return False
+    binding = _resolve_agent_binding(agent)
+    output = binding.output
+    backend_session_id = str(
+        _stored_backend_session_id(agent)
+        or (output.backend_session_id if output else "")
+        or ""
+    )
+    if backend_session_id != plan.backend_session_id:
+        return False
+    method, _ = _native_candidate(
+        session_id,
+        plan.agent_name,
+        agent=agent,
+        backend_name=plan.backend_name,
+        alive=_agent_alive(agent),
+        binding=binding,
+        backend_session_id=backend_session_id,
+        prompt=prompt,
+    )
+    return method == plan.method
 
 
 def _pi_binding_extra(
@@ -4440,7 +4708,9 @@ def _finalize_follow_up(
                 # A respawn is a new dispatch epoch: native offers made to the
                 # previous incarnation must no longer be takeable.
                 **_native_record_fields(
-                    plan.backend_name, plan.backend, plan.request.extra
+                    plan.backend_name,
+                    plan.backend,
+                    plan.request.extra if plan.request else None,
                 ),
             }
         )
@@ -4513,8 +4783,11 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
     happen before any waiting for response loss to be recoverable.
     """
 
-    def _prepare(ticket: str | None) -> _FollowUpPrep:  # noqa: PLR0911
+    def _prepare(ticket: str | None, native_allowed: bool) -> _FollowUpPrep:  # noqa: PLR0911
         """Phase 1 — validate, reserve the lease, and build the request.
+
+        ``native_allowed`` is cleared for the rest of a call once a native
+        choice was lost under the lease, so the retry meets today's gate.
 
         Runs entirely inside ``_agents_transaction``. Reserving the lease while
         the registry lock is held is what makes the reservation atomic against
@@ -4580,6 +4853,18 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                             "nothing was changed. Re-read the agent and retry."
                         ),
                     )
+                )
+
+            # N5 — the unresolved-native barrier (plan §2.1). Not an
+            # eligibility condition and deliberately flag-independent: a
+            # native attempt may still be presented after a crash, a kill or
+            # a reboot, so while one is open for this target, from any
+            # sender, nothing else is sent to it. The same key is not a
+            # barrier; ``_reconcile_before_resend`` already reconciled it.
+            blocking = _n5_blocking_row(session_id, name, record)
+            if blocking is not None:
+                return _FollowUpPrep(
+                    refusal=_native_barrier(session_id, name, record, blocking)
                 )
 
             backend_name = str(agent.get("backend") or "")
@@ -4667,7 +4952,27 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                 if answer is not None:
                     return _FollowUpPrep(refusal=answer)
 
-            if alive:
+            # Stage 1 (plan §2.1): provisional native eligibility, ahead of the
+            # idle/replace gate. A candidate skips that gate: a native carrier
+            # never replaces the process, and a Claude poster waits for idle
+            # itself (a busy Codex target already failed E6). A candidate with
+            # no implemented carrier is dropped here, so it resumes unchanged.
+            native_method = (
+                _selectable_native_method(
+                    session_id,
+                    name,
+                    agent=agent,
+                    backend_name=backend_name,
+                    alive=alive,
+                    binding=binding,
+                    backend_session_id=str(backend_session_id),
+                    prompt=prompt,
+                )
+                if native_allowed
+                else None
+            )
+
+            if alive and native_method is None:
                 last_activity_at = status.get("last_activity_at")
                 # A hook-written "waiting" marker is an authoritative idle
                 # signal: the agent has reached a wait/stop hook and is parked
@@ -4764,15 +5069,19 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                 correlation_id,
                 request,
                 prompt_extra,
-            ) = _build_resume_request(
-                session_id,
-                agent,
-                agent_name,
-                agent_cwd,
-                backend,
-                backend_name,
-                prompt,
-                nonce,
+            ) = (
+                _build_resume_request(
+                    session_id,
+                    agent,
+                    agent_name,
+                    agent_cwd,
+                    backend,
+                    backend_name,
+                    prompt,
+                    nonce,
+                )
+                if native_method is None
+                else _native_plan_fields(agent)
             )
 
             # Anchored BEFORE the resume, on the last COMPLETE record: that is
@@ -4809,11 +5118,19 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                         agent.get(SPAWNED_BY_SOURCE_FIELD) or SPAWNED_BY_SOURCE_SPAWN
                     ),
                     agent_snapshot=dict(agent),
+                    method=native_method or METHOD_RESUME,
+                    carrier=(
+                        _native_carrier(
+                            agent, backend_name, str(backend_session_id), binding
+                        )
+                        if native_method
+                        else None
+                    ),
                 ),
                 ticket=reservation.ticket,
             )
 
-    def _do_follow_up() -> dict:
+    def _do_follow_up() -> dict:  # noqa: PLR0911 - one return per phase-2 outcome.
         if not session_id:
             return _follow_up_failure("session_not_found", name)
         # A4b — the FIFO ticket is DERIVED from the durable delivery record, so
@@ -4825,12 +5142,41 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
         ticket: str | None = _queue_ticket(record)
         waited_for = ""
         position = 0
+        native_allowed = True
         while True:
-            prep = _prepare(ticket)
+            prep = _prepare(ticket, native_allowed)
             if prep.refusal is not None:
                 return prep.refusal
             if prep.plan is not None:
-                break
+                if prep.plan.method == METHOD_RESUME:
+                    break
+                # Stage 2 (plan §2.1): under the granted lease, N5 first, then
+                # E0-E6. The commit in ``_mark_attempt_sent`` re-checks N5
+                # atomically with the write; this one keeps a barrier from
+                # ever being reported as lost eligibility.
+                try:
+                    blocking = _n5_blocking_row(session_id, name, record)
+                    kept = blocking is None and _native_still_eligible(
+                        session_id, prep.plan, prompt
+                    )
+                except Exception:
+                    _release_lease_or_warn(session_id, prep.plan)
+                    raise
+                if blocking is not None:
+                    _release_lease_or_warn(session_id, prep.plan)
+                    return _native_barrier(session_id, name, record, blocking)
+                if kept:
+                    break
+                # Stage 2 lost eligibility (plan §2.1). Give up the lease AND
+                # its FIFO place — releasing drops this call's waiter, so the
+                # retry re-enters at the tail — and meet today's idle/replace
+                # gate for the rest of the call. A native branch never
+                # resumes directly, and the budget is the original one.
+                _release_lease_or_warn(session_id, prep.plan)
+                native_allowed = False
+                if _delivery_clock() >= deadline:
+                    return _pending_tail(session_id, name, record, waited_for, position)
+                continue
             # Two reasons to be here, and neither is a refusal (R1): the target
             # is busy (B2), or another valid caller holds the per-target FIFO
             # (A4b). Both wait; the honest cooperative tail appears only once
@@ -4858,7 +5204,16 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             # searchable receipt marker rather than an attempt nobody can
             # attribute. Inside the ``try`` so a lost write releases the lease
             # on its way out instead of stranding the target behind it.
-            _mark_attempt_sent(session_id, record, plan)
+            #
+            # It is also the stage-2 commit: N5 is re-checked in the same store
+            # transaction that records the method, so a native attempt made
+            # since phase 1 can never be followed by this one.
+            blocking = _mark_attempt_sent(session_id, record, plan)
+            if blocking is not None:
+                remove_prompt_file(plan.prompt_file)
+                return _native_barrier(session_id, name, record, blocking)
+            if plan.method != METHOD_RESUME:
+                return _NATIVE_DISPATCH[plan.method](session_id, record, plan, deadline)
 
             # Fail closed: only signal a PID we can prove is still ours.
             if (
@@ -4959,7 +5314,9 @@ def _release_lease_or_warn(session_id: str, plan: _FollowUpPlan) -> bool:
     return False
 
 
-def _mark_attempt_sent(session_id: str, record: dict, plan: _FollowUpPlan) -> None:
+def _mark_attempt_sent(
+    session_id: str, record: dict, plan: _FollowUpPlan
+) -> dict | None:
     """Move the store row to ``queued(phase=sent)`` BEFORE the resume runs.
 
     Ordering is the crash-recovery contract. If this process dies between the
@@ -4967,16 +5324,38 @@ def _mark_attempt_sent(session_id: str, record: dict, plan: _FollowUpPlan) -> No
     can reconcile the attempt by searching for it. Writing the nonce *after*
     the resume would leave a delivered prompt no one could attribute.
 
+    This is also where the method is committed (plan §2.1 stage 2), so N5 is
+    re-checked in the same transaction: when another row's native attempt to
+    this target is unresolved, nothing is written and that row is returned.
+    With the master flag on the row records ``method``, and a native attempt
+    also its frozen ``carrier`` and generation; with it off neither is left
+    on the row, so a flag-off resume is never mistaken for a native attempt.
+
     Raises :class:`DeliveryStoreError` when that write is lost, and the caller
     must abandon the attempt: a resume whose nonce never reached disk is a
     prompt nobody can attribute afterwards — exactly the case this ordering
     exists to prevent.
     """
     with delivery_transaction(_deliveries_file(session_id)) as txn:
-        stored = txn.get(
-            str(record.get("sender") or ""), str(record["idempotency_key"])
+        sender = str(record.get("sender") or "")
+        stored = txn.get(sender, str(record["idempotency_key"]))
+        blocking = txn.unresolved_native(
+            plan.agent_name,
+            exclude=record_key(sender, str(record["idempotency_key"])),
         )
+        if blocking:
+            return dict(blocking[0])
         target = stored if stored is not None else record
+        if native_wake.enabled():
+            target[METHOD_FIELD] = plan.method
+        else:
+            target.pop(METHOD_FIELD, None)
+        if plan.carrier is not None:
+            target[CARRIER_FIELD] = plan.carrier
+            target["generation"] = plan.generation
+        else:
+            target.pop(CARRIER_FIELD, None)
+            target.pop("generation", None)
         target["nonce"] = plan.nonce
         target["operation_id"] = plan.operation_id
         target["attempts"] = int(target.get("attempts") or 0) + 1
@@ -4989,6 +5368,13 @@ def _mark_attempt_sent(session_id: str, record: dict, plan: _FollowUpPlan) -> No
         mark_phase(target, PHASE_SENT)
         txn.put(target)
         record.update(target)
+        if plan.carrier is None:
+            # ``update`` never removes a key; mirror the pops above.
+            for field in (CARRIER_FIELD, "generation"):
+                record.pop(field, None)
+        if METHOD_FIELD not in target:
+            record.pop(METHOD_FIELD, None)
+    return None
 
 
 def _record_outcome(
@@ -5046,6 +5432,10 @@ def _with_delivery_identity(result: dict, record: dict) -> dict:
     result["message_id"] = record.get("message_id", "")
     result["idempotency_key"] = record.get("idempotency_key", "")
     result["call_budget_s"] = _DELIVERY_CALL_BUDGET_SECONDS
+    # The carrier, only with the master flag on (plan §2.1), so flag-off
+    # results stay exactly what ``main`` returns.
+    if native_wake.enabled() and record.get(METHOD_FIELD):
+        result["method"] = record[METHOD_FIELD]
     return result
 
 
@@ -5444,6 +5834,59 @@ def _unresolved_attempt_result(session_id: str, name: str, record: dict) -> dict
                 "key: once the receipt lands this reports delivered, and once "
                 "the child is provably gone with a complete negative scan it "
                 "reports failed."
+            ),
+        },
+        record,
+    )
+
+
+#: Another row's native attempt to this target is unresolved (the N5 barrier).
+REASON_PRIOR_NATIVE_UNRESOLVED = "prior_native_attempt_unresolved"
+
+
+def _n5_blocking_row(session_id: str, name: str, record: dict) -> dict | None:
+    """Return the oldest other row whose native attempt to ``name`` is open.
+
+    Reads the delivery store rather than the agent record's single
+    ``pending_delivery`` field, so the barrier survives record removal and a
+    same-name successor. Every sender's rows count; the caller's own row does
+    not, because a same-key retry reconciles its own attempt instead.
+    """
+    sender = str(record.get("sender") or "")
+    key = str(record.get("idempotency_key") or "")
+    with delivery_transaction(_deliveries_file(session_id)) as txn:
+        rows = txn.unresolved_native(name, exclude=record_key(sender, key))
+        return dict(rows[0]) if rows else None
+
+
+def _native_barrier(session_id: str, name: str, record: dict, blocking: dict) -> dict:
+    """Hold this message back while an earlier one may still be presented.
+
+    ``queued(pending)``, never a fall-through to another carrier: the earlier
+    message can still reach the target, and presenting this one by a second
+    route could reorder or duplicate what the target sees. The wording is the
+    same with every flag off, and does not presume the caller knows why.
+    """
+    blocking_key = str(blocking.get("idempotency_key") or "")
+    return _with_public_status(
+        {
+            "success": False,
+            "name": name,
+            "reason": REASON_PRIOR_NATIVE_UNRESOLVED,
+            "retriable": True,
+            "retry_after_s": _DELIVERY_RETRY_AFTER_SECONDS,
+            "session_id": session_id,
+            "blocking_key": blocking_key,
+            "blocking_sender": str(blocking.get("sender") or ""),
+            "sender_obligation": _TAIL_OBLIGATION,
+            "detail": (
+                f"An earlier message to {name!r} (idempotency_key "
+                f"{blocking_key!r}) was handed to its running session and its "
+                "outcome is still unresolved; it may still be acted on. This "
+                "message was NOT sent and stays queued, so the target never "
+                "receives the two out of order or twice. It can be sent once "
+                "the earlier message settles: check "
+                "delivery_status(idempotency_key) and retry later."
             ),
         },
         record,
@@ -5881,7 +6324,10 @@ def _delivery_status(session_id: str, idempotency_key: str, to: str) -> dict:
                         _find_agent(agents, str(row.get("to") or "")),
                     ):
                         txn.touch()
-                deliveries = [public_view(row) for row in rows]
+                deliveries = [
+                    public_view(row, include_method=native_wake.enabled())
+                    for row in rows
+                ]
             return {
                 "success": True,
                 "to": to,
@@ -5915,7 +6361,10 @@ def _delivery_status(session_id: str, idempotency_key: str, to: str) -> dict:
             session_id, record, _find_agent(agents, str(record.get("to") or ""))
         ):
             txn.touch()
-        return {"success": True, **public_view(record)}
+        return {
+            "success": True,
+            **public_view(record, include_method=native_wake.enabled()),
+        }
 
 
 @_register_tool()
@@ -6018,7 +6467,9 @@ async def deliver_pending(idempotency_key: str = "") -> dict:
         return {
             "success": True,
             "attempted": len(results) + len(refusals),
-            "deliveries": delivery_store.list_for_sender(store, IDENTITY),
+            "deliveries": delivery_store.list_for_sender(
+                store, IDENTITY, include_method=native_wake.enabled()
+            ),
             "refusals": refusals,
         }
 
