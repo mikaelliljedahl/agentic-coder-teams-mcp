@@ -35,3 +35,12 @@ uv run ruff check .            # pass: All checks passed
 uv run ty check                # pass: All checks passed
 uv run pytest                  # pass: 1885 passed, 6 skipped
 ```
+
+### CI fix (Windows)
+
+The first CI run of PR #72 failed on `tests-windows`:
+`tests/test_agent_output.py::test_spawn_agent_persists_output_lookup_metadata` expected
+`launch_interactive: True`, but the Windows runner has no interactive console, so
+`provides_tty` returns False. The test now pins `process_manager.provides_tty`
+to True, as `test_follow_up_delivery.py` already does. No production change.
+Linux gates re-run: format, ruff and ty all pass; pytest 1885 passed, 6 skipped.

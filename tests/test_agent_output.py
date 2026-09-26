@@ -894,6 +894,10 @@ async def test_spawn_agent_persists_output_lookup_metadata(
     monkeypatch.setattr(server_simple, "_SESSION_BASE", session_base)
     monkeypatch.setattr(server_simple, "_session_id", "")
     monkeypatch.setattr(server_simple, "registry", FakeRegistry())
+    # Pin the launch mode: CI's Windows runner has no interactive console.
+    monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: True
+    )
     before = 1_762_969_000.0
     monkeypatch.setattr(server_simple.time, "time", lambda: before)
 
