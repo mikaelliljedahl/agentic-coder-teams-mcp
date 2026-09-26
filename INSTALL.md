@@ -13,6 +13,10 @@ Setup is always **two parts**:
    lead — one `install_lead_wake()` tool call. For a spawned nested lead, pass
    `enable_spawned_lead_wake=true` to `spawn_agent` instead.
 
+Optionally, **native session wake** (section 6a) lets messages wake idle
+sessions directly, including Codex Desktop members. It is off unless every
+participating MCP entry sets `WIN_AGENT_TEAMS_NATIVE_WAKE=1`.
+
 ---
 
 ## 1. Prerequisites
@@ -139,7 +143,7 @@ JSON escapes and make the whole file unparseable):
 3. Ask the model to call `list_backends` — it should return the installed
    backend CLIs (claude-code / codex / pi).
 
-If any of these fail, jump to [Troubleshooting](#7-troubleshooting).
+If any of these fail, jump to [Troubleshooting](#8-troubleshooting).
 
 ## 4. Register with Codex
 
@@ -292,6 +296,93 @@ server-spawned agents.
 The hook is fail-open by design: it never blocks indefinitely and can never
 make a lead unstoppable (a no-progress guard caps repeated blocks, default 3).
 
+## 6a. Native session wake (optional, opt-in)
+
+Native session wake is an **opt-in doorbell**. It lets a message wake an idle
+session directly, without a watcher or a human nudge:
+
+| Direction | Mechanism | Platforms |
+|---|---|---|
+| Lead → Codex member (Codex TUI or **Codex Desktop**) | `codex queue` on the member's registered thread | Linux, Windows |
+| Member/child → Claude Code lead | Body-free notice on Claude Code's own session inbox socket | **Linux only** (Windows and macOS report `unsupported_platform`) |
+
+It is **off by default**. Without the flag the server behaves exactly as before:
+the same tool list, the same join prompt and the same results. The feature is
+additive. Keep the `Stop` hook (section 6) and the `watch` recipe, because the
+doorbell is best-effort and never a delivery receipt. For semantics and
+tunables, see the README "Native session wake (opt-in)" section.
+
+### 6a.1 Enable
+
+Set `WIN_AGENT_TEAMS_NATIVE_WAKE=1` in the `env` of **every** win-agent-teams
+MCP entry that takes part: the lead's **and** the member's. Setting it on one
+side is not enough. `external_set_wake` only exists on a member's server that
+started with the flag, and only a flag-on lead sends the doorbell.
+
+Claude Code (user scope). Remove and re-add an existing registration:
+
+```bash
+claude mcp remove --scope user win-agent-teams
+claude mcp add --scope user win-agent-teams -e WIN_AGENT_TEAMS_NATIVE_WAKE=1 -- \
+  /abs/path/to/agentic-coder-teams-mcp/.venv/bin/python -m claude_teams.server_simple
+```
+
+Claude Desktop, or any JSON MCP config (Windows paths need doubled
+backslashes):
+
+```json
+"win-agent-teams": {
+  "command": "C:\\abs\\path\\to\\agentic-coder-teams-mcp\\.venv\\Scripts\\python.exe",
+  "args": ["-m", "claude_teams.server_simple"],
+  "env": {"WIN_AGENT_TEAMS_NATIVE_WAKE": "1"}
+}
+```
+
+Codex (`~/.codex/config.toml`; add the key to the existing `env` table):
+
+```toml
+[mcp_servers.win-agent-teams]
+command = "C:\\abs\\path\\to\\agentic-coder-teams-mcp\\.venv\\Scripts\\python.exe"
+args = ["-m", "claude_teams.server_simple"]
+env = { "CLAUDE_TEAMS_PERMISSION_MODE" = "bypass", "WIN_AGENT_TEAMS_NATIVE_WAKE" = "1" }
+enabled = true
+```
+
+An external-only member entry (section 4a) needs the flag too, next to
+`WIN_AGENT_TEAMS_EXTERNAL_ONLY`. Restart the clients afterwards (Codex Desktop:
+quit it fully and start it again), because the flag is read at server
+startup.
+
+A Claude child spawned by a flag-on lead does **not** inherit the flag. Its own
+wake is controlled by its own MCP entry.
+
+### 6a.2 Codex members register their thread
+
+No extra install step is needed. With the flag on, the `join_prompt` from
+`create_join_ticket` tells a Codex member to run one shell command, which
+prints `CODEX_THREAD_ID` and `CODEX_HOME`, and to pass both to
+`external_set_wake(member_token, codex_thread_id, codex_home)`. The member then
+ends its turn. The next lead `send_message` queues a wake on that thread.
+
+### 6a.3 Verify
+
+1. `session_info` on the lead returns a `native_wake` object. On Linux under
+   Claude Code, `claude_channel` should be `available`. On Windows it is
+   `unsupported_platform`, which is expected.
+2. The member's tool list contains `external_set_wake`. If it is missing,
+   the member's entry lacks the flag or the client was not restarted.
+3. `list_agents(full=true)` on the lead shows a `codex_wake` block on the
+   member after registration.
+4. `send_message` to the member returns
+   `wake: {method: "codex_queue", status: "queued"}`, and the idle Codex thread
+   starts a new turn by itself.
+
+### 6a.4 Disable
+
+Remove the variable, or set it to anything other than `1`, and restart the
+clients. `WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE=0` or
+`WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX=0` turns off one half only.
+
 ## 7. Upgrading an existing install
 
 ```bash
@@ -367,6 +458,31 @@ a per-project approval gate. Use the user-scope `claude mcp add` command
    the registration.
 4. Check the tool output's `reader` field matches the lead's identity
    (`team-lead` for a human-started lead).
+
+### "No Python at '…\AppData\Roaming\uv\python\…'" (Windows, Codex Desktop shows no tools)
+
+Claude Desktop on Windows is an MSIX-packaged app. When it runs `uv sync` or
+`uv python install` (for example, when you ask Claude Desktop to install this
+server), the writes to `AppData\Roaming` are redirected into the package's
+private `AppData\Local\Packages\Claude_…` store. Claude sees the interpreter
+there, but other programs do not. Codex Desktop then fails to start the venv:
+its MCP handshake closes immediately, and the conversation has no
+win-agent-teams tools. Running the section 2 sanity check from a **regular**
+PowerShell window, outside Claude, shows the same `No Python at` error.
+
+Fix: install the interpreter outside `AppData`, then rebuild the venv.
+
+```powershell
+$env:UV_PYTHON_INSTALL_DIR = "$HOME\.local\share\uv\python"
+uv python install 3.12
+cd C:\abs\path\to\agentic-coder-teams-mcp
+Remove-Item -Recurse -Force .venv
+uv sync
+```
+
+The simplest fix is to run `uv sync` from a regular terminal, not from inside
+Claude Desktop. To avoid the problem for good, set `UV_PYTHON_INSTALL_DIR` as a
+user environment variable.
 
 ### Spawned agents open no visible window (Linux)
 
