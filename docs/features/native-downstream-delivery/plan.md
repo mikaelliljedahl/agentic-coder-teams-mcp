@@ -1,343 +1,539 @@
 # Native downstream delivery — plan
 
-Status: draft for independent review (opposite model family).
-Branch: `feat/native-downstream-delivery` (from `origin/main` at 471a175, after #70).
-Predecessor: `docs/features/native-session-wake/` (PR #70), §9.1 and follow-ups F3/F5.
+Status: **v2**. It revises v1 (07eaf67) after `plan-review.md` round 1 and the
+Windows spikes in `spikes.md`. Every finding is dispositioned in
+`plan-review.md` § Disposition.
+Branch: `feat/native-downstream-delivery`, from `origin/main` 471a175 (after #70).
+Predecessor: `docs/features/native-session-wake/` (PR #70): §9.1, F3, F5.
 
 ## 0. Summary
 
-Make the native session channels the normal way messages reach live agents:
+The goal is to make the native session channels the normal way messages reach
+live agents.
 
-- **A. Downstream, Codex child** — `follow_up_agent` and `send_message` to an own
-  child deliver *into the live Codex thread* with `codex queue`, instead of
-  kill-and-respawn via `backend.resume`.
-- **B. Downstream, Claude child** — the same, for a live Claude Code child: the
-  lead writes an exactly-once **delivery mailbox** entry, and the **child's own**
-  MCP server posts it to its own Claude inbox socket (own-child trust).
-- **C. F5 — Windows Claude channel** — overlapped, cancellable named-pipe I/O
-  so Claude hosts on Windows get the same channel Linux has (lead wake *and* B).
-- **D. F3 — Codex lead wake** — a Codex lead (human-started or spawned) is woken
-  by `codex queue` on its own thread when a child replies with `send_message`.
+- **A. Codex child, downstream.** `follow_up_agent`, and `send_message` to an
+  own child, put the message into the **live** Codex thread with
+  `codex queue`. They no longer kill the child and respawn it through
+  `backend.resume`.
+- **B. Claude child, downstream.** Same idea for a live Claude Code child. The
+  lead first persists the attempt, then publishes a **delivery mailbox**
+  entry. The **child's own** MCP server posts that entry to its own host
+  channel, which is the own-child trust path.
+- **C. F5: Windows Claude channel.** Overlapped, cancellable named-pipe I/O,
+  owner-verified on every post. This is **implemented** (71b5e7a, 11addf5).
+- **D. F3: Codex lead wake.** A Codex lead is woken by `codex queue` on its
+  own thread when a child replies.
 
-Resume (kill-and-respawn) stays as the fallback, and is still the path for a
-dead child (e.g. after a reboot), a headless child, a child whose native
-channel cannot be proven, and Pi.
+Resume (kill and respawn) stays as the fallback. It is still the path for a
+dead child, including after a reboot, and for a headless child, a child whose
+native channel cannot be proven, and Pi.
 
-Everything new is **opt-in**. A and B sit behind a new sibling flag
-`WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1`, which requires the master flag
-`WIN_AGENT_TEAMS_NATIVE_WAKE=1`. C and D are wake channels and follow the
-master flag and its existing half switches (`_CLAUDE`, `_CODEX`). With the
-flags off, behaviour is byte-identical to `main`.
+**Flags and baselines** (review #14):
+
+| Setting | Behaviour |
+|---|---|
+| master `WIN_AGENT_TEAMS_NATIVE_WAKE` off | Byte-identical to `main`: tools, results, env, and no `method` field, even on rows persisted earlier |
+| master on, `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM` off | #70 behaviour plus C and D. Downstream delivery is always `resume` |
+| master on, downstream on | A and B where eligible |
+| `…_CLAUDE=0` / `…_CODEX=0` | Disables that half everywhere: wake, B or A, and D |
+
+Exactly-once is defined narrowly. A nonce receipt proves the message was
+*presented* to the child. It does not prove that every requested action ran
+exactly once. The invariant this feature keeps is that **one message is never
+presented twice through two carriers**.
 
 ## 1. Current behaviour (facts, cited to 471a175)
 
 - `follow_up_agent` (`server_simple.py:5655`) and `send_message` to an own
-  child (`:3635-3642`) both call `_guaranteed_send` (`:5542`) →
-  `_guaranteed_delivery` → `_prepare` (`:4413-4711`, under
-  `_agents_transaction`) + `_do_follow_up` (`:4713-4822`).
-- `_prepare` enforces the gates (record, direction 2a/2b, backend
-  `supports_resume`, binding 3a, `backend_session_id`), reconciles prior
-  attempts, and for a **live** target waits until the state marker says
-  `waiting` (`:4567-4624`); a busy target yields `wait_reason="agent_busy"`
-  until the 45 s call budget (`_DELIVERY_CALL_BUDGET_SECONDS`, `:223`) runs out.
-  It mints `generation`, `operation_id`, `nonce` (`:4628-4630`), reserves the
-  operation lease (`:4636-4649`), builds the resume request with the nonce
-  marker (`_build_resume_request`, `:4162-4241`) and snapshots the receipt
-  scanner.
-- `_do_follow_up` marks the row `sent` (`_mark_attempt_sent`, `:4859-4888`),
-  **kills the live child** (`:4761-4766`), calls `backend.resume` (`:4769`),
-  which spawns a **new process**, then `confirm_delivery` waits for the nonce in
-  a **user** transcript record of the bound session (`delivery.py:162-195`,
-  strict regex `:58-61`), probing the new PID for liveness. `_finalize_follow_up`
-  (`:4244-4388`) writes the new PID / create token / `pending_delivery`.
-- Guaranteed-path messages **never** enter `inbox-<child>.jsonl`
-  (protocol doc §2 `send_message`), because of double execution and the
-  per-sender count-cursor hazard.
-- Delivery rows (`delivery_store.py`) are free-form dicts; `public_view`
-  whitelists fields; the fingerprint covers `to`, `prompt`, `options`
-  (`options` = `replace_if_idle` only).
-- Children are interactive TUIs on Linux (tmux/terminal/herdr) and on Windows
-  unless `WIN_AGENT_TEAMS_INTERACTIVE_CONSOLE` is false (`process_manager.py:
-  939-962`); headless Codex uses `codex exec` and exits after the turn. **Nothing
-  in `agents.json` records whether a child is interactive.**
-- Spawned Codex children get no per-agent `CODEX_HOME` (`codex.py:612-637`);
-  rollout discovery assumes `~/.codex` (`agent_output.py:495`).
-- Native wake (#70): `native_wake.py` — Claude channel is Linux-only
-  (`claude_platform_supported`, H1b); the notifier watches the lead's own inbox
-  and external members; `CodexMemberWake` runs
-  `codex queue --thread <id> --message <fixed notice>` for external Codex
-  members only. The socket wire is `{"type":"auth",...}` +
-  `{"type":"user","message":{"role":"user","content":text}}`. A post only counts
-  as own-child when it comes from the host's direct child (the MCP server);
-  a lead→child post is a peer message and can be held for approval.
-- Live observation (#70 Linux smoke): a Claude child spawned by a flag-on lead
-  did **not** end up with the flag in its own MCP server.
+  child (`:3635-3642`) both call `_guaranteed_send` (`:5542`). That calls
+  `_guaranteed_delivery`, which runs `_prepare` (`:4413-4711`, under
+  `_agents_transaction`) and then `_do_follow_up` (`:4713-4822`).
+- **`_prepare`:**
+  - Enforces the gates: record, direction (2a/2b), backend `supports_resume`,
+    binding (3a), and `backend_session_id`.
+  - Reconciles prior attempts.
+  - For a live target, returns `wait_reason` **before** reserving a lease
+    unless the marker says `waiting`. The same applies to
+    `replace_if_idle=False` (`:4567-4624`).
+  - Mints `generation`, `operation_id` and `nonce` (`:4628-4630`), reserves
+    the lease (`:4636-4649`), builds the request (`:4162-4241`) and snapshots
+    the scanner.
+- **`_do_follow_up`:**
+  1. Persists the row as `sent` (`:4859-4888`) **before** the transport.
+  2. Shuts the child down, gracefully first and forcibly only if needed
+     (`:4761-4766`).
+  3. Calls `backend.resume`, which spawns a new process (`:4769`).
+  4. Calls `confirm_delivery` (`delivery.py:572-616`), which scans for the
+     nonce in a **user** record (extractors `:162-195`) and probes the new PID.
+  5. `_finalize_follow_up` (`:4244-4388`) fences on generation and lease,
+     writes the new PID and `pending_delivery`, and deletes the prompt file on
+     receipt (`:4361-4362`).
+- **Settlement.** Reconciliation (`:2587-2635`) and kill (`:2638-2691`,
+  `:6116-6123`) settle `absent` as `failed` once the child is dead and the
+  grace has passed. That is sound only because resume is **not** a durable
+  carrier (review #1).
+- **Guaranteed messages never enter `inbox-<child>.jsonl`** (protocol §2).
+- **Delivery rows** are free-form dicts. `public_view` whitelists the fields;
+  the fingerprint covers `to`, `prompt` and `options`.
+- **Children are interactive TUIs by default** (`process_manager.py:939-962`),
+  but `agents.json` does not record that. Headless Codex uses `codex exec`.
+- **Spawned Codex children** do not get a per-agent `CODEX_HOME`
+  (`codex.py:612-637`).
+- **Native wake (#70):**
+  - The notifier starts only under the Claude half and platform gate
+    (`server_simple.py:7149-7155`).
+  - `CodexMemberWake` queues a fixed notice for external members, with
+    `CODEX_HOME=<home>` and `cwd=Path.home()` (`native_wake.py:589-638`).
+  - A Claude child spawned by a flag-on lead did **not** get the flag in its
+    own MCP server, even though the process environment is inherited. The
+    explicit MCP config carries only identity variables (`:2704-2723`).
+- **Spikes.** S-1 shows that `codex queue` into a live TUI child is detected
+  by the **unchanged** scanner and that the queue returns a queued submission
+  id. S-4 shows that the pipe server PID equals the nearest `claude.exe`.
 
 ## 2. Design
 
-### 2.1 Per-attempt method selection (A + B)
+### 2.1 Method selection in two stages (A, B; review #8)
 
-Selection happens at the end of `_prepare`, **after the lease is granted**,
-while the registry lock is held and `alive`, marker state, binding and
-`backend_session_id` are known. The chosen method is a new `_FollowUpPlan`
-field and is written to the delivery row in `_mark_attempt_sent` as
-`method ∈ {"codex_queue", "claude_mailbox", "resume"}` (added to `public_view`
-and to the result as `method`). It is **not** part of `options`, so it never
-affects the idempotency fingerprint.
-
-`native` is chosen only when **all** hold; otherwise `resume` exactly as today:
+**Stage 1: provisional eligibility.** This runs in `_prepare`, **before** the
+idle/replace gate. It computes `native_candidate ∈ {codex_queue,
+claude_mailbox, None}` from the following conditions. Evaluating eligibility
+this early also avoids a lease or kill.
 
 | # | Condition | Codex (A) | Claude (B) |
 |---|---|---|---|
-| N0 | `NATIVE_DOWNSTREAM=1`, master on, half switch not `0` | `_CODEX` | `_CLAUDE` |
-| N1 | target alive (`_agent_alive`) and binding bound, `backend_session_id` set | ✓ | ✓ |
-| N2 | child spawned **interactive** — new record field `interactive: true` written at spawn/resume from `provides_tty(...)`; absent (old records) ⇒ resume | ✓ | ✓ |
-| N3 | channel proof | `verify_codex_thread(codex_home, backend_session_id)` passes; `codex_home` recorded at spawn (server's effective `CODEX_HOME` or `~/.codex`) | fresh **poster capability** marker from the child's own server + its owner lock is held (§2.3) |
-| N4 | transport safety | native `codex.exe`/POSIX binary (never the `.cmd` shim, `_launches_via_cmd_shim`) | channel `available` in the child (reported by the capability marker) |
+| N0 | downstream on, master on, half not `0` | `_CODEX` | `_CLAUDE` |
+| N1 | alive, binding bound, `backend_session_id` set | ✓ | ✓ |
+| N2 | record `interactive: true`, written at spawn and resume from `provides_tty(...)`. A missing field means ineligible. | ✓ | ✓ |
+| N3 | channel proof | `verify_codex_thread(record.codex_home, backend_session_id)`. `codex_home` is recorded at spawn. | a fresh capability marker **bound to this incarnation** (§2.3), with its owner lock held |
+| N4 | transport safety | native binary, never the `.cmd` shim | the child's channel is `available` |
+| N5 | no unresolved native attempt to this target from **another** row (§2.2.4) | ✓ | ✓ |
 
-Busy targets: with a native method the lead **does not wait for idle**. Codex
-queues the turn and dispatches it after the current turn (V2, must be verified,
-§5 N3); Claude's poster holds the mailbox entry until its own marker says
-`waiting` (§2.3). If V2 fails live, Codex native is restricted to
-`idle_by_marker` and busy Codex targets keep today's wait-then-decide loop.
+With a candidate, the busy and `replace_if_idle=False` branches **do not
+return `wait_reason`**. The call goes on to reserve the lease.
 
-`replace_if_idle` is irrelevant to a native attempt (nothing is replaced); it
-keeps its meaning for the resume fallback.
+**Stage 2: commit under the lease.** Once the lease is granted, the
+conditions are re-evaluated. If they still hold, the method is committed on
+the `_FollowUpPlan`.
 
-### 2.2 A — Codex child via `codex queue`
+If they no longer hold, the method becomes `resume`. The call then **re-enters
+the existing idle/replace checks** within the same call budget: it releases
+the lease and keeps its FIFO ticket. It never calls `backend.resume` from a
+native error branch.
 
-- Carrier: Codex's own persistent queue. The **message is the follow-up
-  itself** (user decision), with the nonce marker appended exactly as the resume
-  path does (`delivered_prompt`, multi-line form).
-- Size/charset: argv goes to the native binary verbatim (no shell). If the
-  delivered text exceeds a conservative argv budget (`_NATIVE_QUEUE_MAX_CHARS`,
-  e.g. 24 000 chars on Windows, 100 000 on POSIX), use a **prompt file**:
-  the queued message is the single line
-  `Read your complete follow-up from UTF-8 file <path>, then follow it exactly. [win-agent-teams delivery id: wat-deliver:<nonce> — internal marker, ignore this line]`
-  — the marker lives in the queued user message itself, so the receipt does not
-  depend on the child reading the file. The file uses the existing prompt-file
-  lifecycle (§4c of the protocol doc).
-- Runner: extract the subprocess part of `CodexMemberWake._queue` into a
-  shared `codex_queue(binary, thread_id, home, message, timeout)` helper (same
-  env scrub, `cwd=home`, `stdin=DEVNULL`, real timeout).
-- Outcome mapping — the key exactly-once rule is **"only a provable
-  non-enqueue may fall back to resume in the same call"**:
+The method is written to the row in `_mark_attempt_sent` as
+`method ∈ {codex_queue, claude_mailbox, resume}`, together with
+`carrier_ref` (§2.2, §2.3). It is exposed in `public_view` and in results
+**only** when the master flag is on. It is never part of `options`.
 
-  | `codex queue` outcome | Row | Next |
-  |---|---|---|
-  | exit 0 | `sent` | `confirm_delivery` on the bound rollout; `child_alive` probes the **existing** PID |
-  | discovery failure, `unverified_thread`, non-zero exit **with** a recognised pre-enqueue error | back to `pending` | same call falls back to `resume` (fresh attempt, fresh nonce) |
-  | timeout, non-zero exit with unrecognised stderr, `OSError` after spawn | `unconfirmed` | never resend; reconcile by nonce later (existing rescan-before-resend) |
+### 2.2 A: Codex child via `codex queue`
 
-  A queued-but-undispatched row that later dispatches (e.g. after the child is
-  resumed for a *different* message) carries the original nonce, so it settles
-  that row as `delivered` late — never a duplicate of a *different* row.
-- Finalisation: a native `_finalize_follow_up` branch that keeps `pid`,
-  `create_token`, `spawned_at`, `prompt_transport` untouched; on `unconfirmed`
-  it writes `pending_delivery` with `method` so kill/reconcile know no new
-  process exists. `kill_agent` reconciliation is unchanged (rescan first).
+**2.2.1 Carrier and text.** The message is the follow-up itself, with the
+nonce marker appended (`delivered_prompt(single_line=False)`). S-1 shows this
+arrives intact through the native binary, including multiple lines and
+metacharacters.
 
-### 2.3 B — Claude child via delivery mailbox + own socket
+The size budget is computed on the **encoded full command** (review #13):
 
-Constraint (§9.1): only the child's own server may post to its host socket, and
-guaranteed messages may not use the actionable inbox. New carrier:
+- POSIX: the UTF-8 bytes of argv, capped at `ARG_MAX/4`.
+- Windows: the UTF-16 units of the quoted command line, capped at 30 000.
 
-- **Mailbox** `<session>/delivery-mailbox-<child>.json` (single JSON document,
-  atomic write, guarded by `delivery-mailbox-<child>.lock`), a map
-  `nonce → {operation_id, sender, text | prompt_file, state, ts}`.
-  `state` transitions are **CAS under the lock**:
-  `offered → taken(poster pid, create token) → posted | post_failed`, and
-  `offered → retracted` (lead only). No counters, no cursors, so none of the
-  inbox hazards apply.
-- **Lead side** (`_do_follow_up`, method `claude_mailbox`): write `offered`,
-  mark the row `sent`, then `confirm_delivery` on the bound transcript
-  (existing PID for liveness). On budget expiry: if still `offered`, **retract**
-  it (CAS) and return `queued(pending)` — nothing was presented, so a later
-  retry may resend (new nonce). If `taken`/`posted`, return
-  `queued(unconfirmed)` and leave reconciliation to the nonce scan.
-- **Child side**: the child's MCP server runs a `DeliveryPoster` alongside
-  (or inside) `NativeWakeNotifier`:
-  - Owner lock `native-delivery-<IDENTITY>.lock` (same pattern as the notifier).
-  - Capability marker `native-delivery-<IDENTITY>.json`
-    `{pid, create_token, channel, heartbeat_ts}` refreshed every poll while the
-    channel is `available`; deleted on shutdown. N3 requires a heartbeat within
-    `3 × poll` **and** the owner lock currently held (`try_lock_handle` probe
-    fails).
-  - Loop: when its own state marker is `waiting` (or no marker yet after
-    SessionStart), take the oldest `offered` entry (CAS → `taken`), post the
-    delivered text (nonce marker included; long text via the prompt-file line,
-    as Claude's resume sidecar already does) as the `user` line, then CAS →
-    `posted`. A failed post → `post_failed`; the lead's reconcile treats
-    `post_failed` + absent nonce as a provable non-delivery (back to `pending`).
-  - It never posts while the marker says `running`; one entry per idle edge
-    (the next waits for the next `waiting`), so a follow-up never lands between
-    tool calls.
-- **Flag propagation to the child** (fixes the #70 observation): the lead's
-  `build_env` passes `WIN_AGENT_TEAMS_NATIVE_WAKE=1` and
-  `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1` to Claude children when on. Whether
-  Claude Code forwards those to the child's MCP server must be verified
-  (spike S-2); if not, the capability marker simply never appears and N3 falls
-  back to resume — safe by construction.
-- Receipt: the socket content becomes a `type:"user"` transcript record
-  (spike S-3 must confirm the persisted shape; the scanner already accepts
-  string and text-list content and `tool_result` for the file variant).
+Above the budget, the message is a **sidecar wrapper line**, as for Claude,
+with the marker in the wrapper.
 
-### 2.4 C — F5: Windows Claude channel
+**2.2.2 Order.** The attempt is persisted before anything is queued:
 
-- `claude_platform_supported()` becomes `linux or win32`; macOS stays
-  `unsupported_platform` (H2 cannot resolve `claude` there).
-- Windows H-rows: H1 unchanged; H2 via the existing toolhelp host walk; **H3-W**:
-  the socket value must start with `\\.\pipe\`; after `CreateFileW`,
-  `GetNamedPipeServerProcessId(handle)` must equal the nearest `claude` host
-  PID (real owner verification, better than the POSIX filename check) —
-  mismatch ⇒ close without writing, `socket_not_owned`. H4: open failure ⇒
-  `socket_missing`.
-- Transport (`_post_pipe`, ctypes via `WinDLL("kernel32", use_last_error=True)`
-  as `process_manager.py`/`procinfo.py` already do; no new dependency):
-  `CreateFileW(GENERIC_WRITE, 0, OPEN_EXISTING, FILE_FLAG_OVERLAPPED)`;
-  `ERROR_PIPE_BUSY` ⇒ `WaitNamedPipeW` bounded by the remaining deadline;
-  one `WriteFile` with an `OVERLAPPED` + manual-reset event;
-  `WaitForSingleObject(remaining_ms)`; on timeout `CancelIoEx` then
-  `GetOverlappedResult(wait=True)` so the buffer is never freed under a pending
-  write; `FlushFileBuffers` is **not** used (it blocks). Always `CloseHandle`.
-  Same two JSON lines, auth line mandatory.
-- The existing `sys.platform` narrowing for `ty` stays; ctypes access is behind
-  `getattr(ctypes, "WinDLL")` as elsewhere.
+1. `_mark_attempt_sent` durably writes `method`, `nonce`, `operation_id`,
+   `generation`, the lease identity and `target_snapshot`.
+2. The queue call runs.
+3. `carrier_ref = <queued submission id>`, parsed from `Queued message <id>`,
+   is written with a second store write.
 
-### 2.5 D — F3: Codex lead wake
+If step 3's write fails, the row stays at `sent` without a `carrier_ref`.
+That is still conservative, because it stays unresolved (§2.2.4).
 
-- Registration: new tool `set_lead_wake(codex_thread_id, codex_home="")`
-  (registered only with the master flag), storing
-  `<session>/lead-wake-<IDENTITY>.json {thread_id, codex_home, generation}`
-  after `verify_codex_thread`. Blank thread clears. Its docstring gives the
-  same one-line shell command the join prompt uses
-  (`echo "$CODEX_THREAD_ID ${CODEX_HOME:-$HOME/.codex}"` / PowerShell form).
-- **Automatic for spawned Codex leads**: a spawned Codex agent's own server
-  knows `AGENT_NAME`; when its record in `agents.json` has a bound
-  `backend_session_id` and recorded `codex_home`, it self-registers, so nested
-  Codex leads need no tool call.
-- Delivery: `NativeWakeNotifier` gains a second channel kind. For the lead
-  target, when the host is Codex (nearest host `codex`) and a registration
-  exists, it runs the shared `codex_queue` helper with the **body-free** notice
-  (`plan_notice` text, same coalesce/renotify/backoff/owner lock). This is a
-  doorbell; the inbox remains authoritative and `watch` stays valid.
-- `session_info.native_wake` gains `codex_lead: {registered, thread_verified}`.
+**2.2.3 Outcome of the queue call** (review #1, #13, §8 Q1):
 
-### 2.6 Tool text
+| Outcome | Classification | Row |
+|---|---|---|
+| discovery fails, or `unverified_thread`, before any subprocess starts | provably not enqueued | back to `pending`; stage 2 falls back (§2.1) |
+| `OSError`/`FileNotFoundError` raised by `Popen` itself, so no process started | provably not enqueued | back to `pending` |
+| exit 0 with a parsed submission id | enqueued | `sent`, then confirm |
+| exit 0 without a parsable id, **any** non-zero exit, a timeout, or an error after spawn | **uncertain** | `unconfirmed` with `native_unresolved`; never fall back |
 
-The consuming agent only reads docstrings. With the flags on, decorate
-`follow_up_agent`, `send_message`, `delivery_status`, `spawn_agent` (new record
-fields), `session_info`, and the new `set_lead_wake`; flag-off descriptions
-stay golden-identical (`test_registered_tools_golden`).
+**2.2.4 Settlement of a durable carrier** (review #1). A queued Codex turn can
+outlive the process, a kill, a record removal and a reboot. For
+`method == codex_queue` rows:
+
+- `confirm_delivery` probes the **existing** PID for liveness, but child death
+  does **not** make an absent nonce terminal.
+- `_reconcile_delivery_record`, `kill_agent` settlement and `delivery_status`
+  keep the row `queued(unconfirmed, reason="native_unresolved")` until one of
+  two things happens:
+  - (a) the nonce is found, and the row becomes `delivered`; or
+  - (b) **authoritative removal**: `thread/queue/delete` with
+    `{threadId, queuedSubmissionId}` returns `deleted:true`, and a rescan
+    after the delete is `absent`. The row becomes `failed(not_delivered)`.
+    This needs spike **S-5**. Until S-5 passes, (b) is not implemented and
+    rows stay unresolved. The limitation is documented in the tool text.
+- **Barrier (N5).** While a target has an unresolved native row, no **other**
+  guaranteed delivery to that target is sent. The call returns
+  `queued(pending, reason="prior_native_attempt_unresolved")` with
+  `sender_obligation`, which reuses the existing agent-level
+  `pending_delivery` barrier.
+  - The same key reconciles as today.
+  - This blocks a "same instruction, new key" duplicate. It also blocks the
+    reload-dispatch race: a resume for a different message cannot load the
+    thread, and so run a stale queued turn, while the sender believes it
+    failed.
+  - An operator escape exists: CLI `deliveries release-native <key>` marks
+    the row `failed(operator_released)`. It is documented as **"may still
+    execute"**.
+- `kill_agent` still succeeds. It keeps unresolved native rows
+  **unresolved** (not failed), keeps their `target_snapshot`, and reports
+  them in its result as `native_unresolved: [keys]`.
+  - A same-name successor inherits the N5 barrier: the barrier is keyed on
+    `(session, name)` and is **not** cleared by removal.
+  - Removal is refused only for the lease reasons that already exist.
+
+**2.2.5 Finalisation.** A native branch of `_finalize_follow_up` leaves `pid`,
+`create_token`, `spawned_at` and `prompt_transport` untouched. On
+`unconfirmed` it writes `pending_delivery {…, method, carrier_ref}`.
+
+**2.2.6 Runner.** The subprocess part of `CodexMemberWake._queue` is
+extracted into `codex_queue(binary, thread_id, home, message, timeout) ->
+QueueOutcome{started, exit, submission_id, timed_out}`. It keeps `CODEX_HOME`
+set to the home, `cwd=Path.home()`, the same environment scrub and a real
+timeout. `CodexMemberWake` keeps its own notice text (review #9).
+
+### 2.3 B: Claude child via delivery mailbox and own channel
+
+**2.3.1 Mailbox.** The mailbox is `<session>/delivery-mailbox-<child>.json`:
+one JSON document, validated strictly, written atomically under
+`delivery-mailbox-<child>.lock` (§8 Q2). Reads and writes **fail closed**, in
+the style of `delivery_store`: an unreadable or non-object file means
+"unknown", never "empty".
+
+Each entry, keyed by nonce, carries:
+
+- `operation_id`, `generation`, `sender`
+- `target {name, backend_session_id, host_pid, host_create_token}` (host
+  incarnation, review #6)
+- `text`, or `prompt_file`
+- `state`, `ts`
+
+State transitions, each **one locked compare-and-swap (CAS) that returns an
+authoritative result** (review #5):
+
+```text
+offered --take(host incarnation matches)--> taken
+taken   --begin-->                          posting
+posting --PostResult ok-->                  posted
+posting --write_started=False failure-->    failed_before_write   (provably unsent)
+posting --write_started=True failure-->     uncertain             (never retried)
+offered --retract(lead)-->                  retracted             (provably unsent)
+```
+
+`retract` returns exactly one of `retracted`, `lost_to_take` (the current
+state), or `unknown` (lock, IO or corruption). Only a durably written
+`retracted` or `failed_before_write` permits `pending` and a new nonce.
+
+**2.3.2 Lead order** (review #3):
+
+1. `_mark_attempt_sent`, durably: method, nonce, operation, generation,
+   lease, snapshot.
+2. Publish `offered` with an atomic replace, then read it back.
+3. Confirm on the bound transcript, probing the existing PID.
+
+**Crash recovery:** a `sent` row with no entry for its nonce is **provably
+unsent**, because the poster only posts published entries. So an `absent`
+entry means the row goes back to `pending`. A mailbox that cannot be read
+means "unknown", and the row stays `sent`. On budget expiry, the lead calls
+`retract`, and the table above applies.
+
+**2.3.3 Child poster.** The child's MCP server runs a `DeliveryPoster`, which
+is a second target kind in `NativeWakeNotifier` that shares its owner-lock
+pattern.
+
+- **Capability marker.** `native-delivery-<IDENTITY>.json` records `{pid,
+  create_token, host_pid, host_create_token, backend_session_id, channel,
+  heartbeat_ts}`. It is refreshed every poll and removed on shutdown.
+  Eligibility (N3) requires all of the following:
+  - The heartbeat is at most `3 × poll` old.
+  - The owner lock is held.
+  - `host_pid` and `host_create_token` equal the **child record's**
+    `pid`/`create_token`, or its resolved host PID on the tmux/terminal
+    launchers.
+  - `backend_session_id` equals the record's.
+- **Take, and again immediately before the post.** The poster checks:
+  - Its own host PID and create token equal `entry.target`.
+  - The record's current generation is at least `entry.generation`.
+  - The session is active.
+
+  If any check fails, it leaves the entry alone (review #6).
+- **Idle rule** (review #7, §8 Q3):
+  - The poster requires an **affirmative** `waiting` marker for this
+    incarnation. A missing or stale marker means no post.
+  - It posts at most **one** entry per `running→waiting` edge. After a post,
+    it re-arms only when it sees a `running` marker newer than the post and
+    then a later `waiting` marker.
+  - If no `running` marker appears within `RENOTIFY` (300 s), the entry stays
+    `uncertain` (accepted but no turn started). It is never reposted, and the
+    next entry waits.
+  - **Residual race, documented:** a manual keystroke or an ordinary wake
+    notice can start a turn between the marker read and the post. The host
+    offers no atomic idle-only enqueue, so the plan does not promise that a
+    post can never land mid-turn. It promises only that one is never
+    *knowingly* posted mid-turn.
+- **Text.** Up to 32 KiB inline. Longer text goes through the sidecar wrapper
+  line with the marker (§2.4).
+- **Receipt.** S-3 (Linux) must confirm that the persisted record is
+  `type:"user"` with string or text content.
+
+**2.3.4 Kill and force** (review #6):
+
+- **Lock order:** `agents.lock`, then `delivery-mailbox-<child>.lock`, then
+  `deliveries.lock`.
+- `kill_agent` first retracts every `offered` entry for the target (CAS). It
+  then runs the existing rescan. `taken`, `posting` and `uncertain` entries
+  make their rows `native_unresolved`, as in §2.2.4.
+- CLI `force_clear_lease` also retracts `offered` entries for that target.
+- Cleanup removes the mailbox only when it holds no `taken`, `posting` or
+  `uncertain` entries.
+
+### 2.4 Prompt sidecars for native wrappers (review #4)
+
+A native wrapper's marker proves that the wrapper was presented, not that the
+file was read. So native sidecars are **pinned**:
+
+- They are not deleted on receipt, by finalisation or by reconciliation.
+- They are excluded from age GC.
+- They are released only by `kill_agent` cleanup of the target or by session
+  cleanup.
+
+For wrappers, `delivered` means "presented, body available at `prompt_file`",
+and the tool text says so. Inline delivery (under the budget) is preferred,
+which avoids most sidecars.
+
+### 2.5 C: F5, Windows Claude channel (implemented)
+
+- `claude_platform_supported()` is true on Linux and Windows. macOS stays
+  `unsupported_platform`.
+- **H3-W.** The path must be `\\.\pipe\…` and exist. On **every** post,
+  `GetNamedPipeServerProcessId` is called on the **same handle** that will be
+  written, before any byte is written. It must equal the nearest `claude`
+  host PID. A query failure or a mismatch means nothing is written
+  (review #12). S-4 confirmed that the pipe server is the CLI `claude.exe`
+  under Claude Desktop.
+- **Transport:**
+  - Overlapped `WriteFile` with an event.
+  - The wait is bounded by the deadline. On expiry, `CancelIoEx` is followed
+    by a **bounded** drain (`CANCEL_GRACE_MS`).
+  - If cancellation lost to a completed write, the result is read from the
+    completion.
+  - An undrained operation is **parked**: its handle, event, OVERLAPPED
+    structure and buffer are kept alive and reaped later (review #11).
+  - `WaitNamedPipeW` is never called with 0 remaining.
+- **Outcome.** `PipeResult` and `PostResult` carry `write_started`. Every
+  failure after `WriteFile` is uncertain.
+- **Tests** (done): a real pipe server (happy path, stalled reader, busy pipe,
+  PID mismatch, missing pipe) plus a scripted kernel32 (immediate completion,
+  cancel lost to completion, cancelled write, undrained cancel parked and
+  reaped, synchronous refusal, owner-query failure, short write).
+
+### 2.6 D: F3, Codex lead wake (review #9, §8 Q4)
+
+- **Notifier start.** `main()` starts the notifier when **either** the Claude
+  channel is eligible (`_CLAUDE` on and platform supported) **or** a Codex
+  lead registration is possible (`_CODEX` on). Each channel is gated
+  independently inside `tick()`. An unavailable Claude channel no longer
+  drains everything; it only disables the Claude targets.
+- **Registration.** `set_lead_wake(codex_thread_id, codex_home="")` is
+  registered with the master flag and writes
+  `<session>/lead-wake-<IDENTITY>.json` under a lock. It carries forward the
+  predecessor's rules:
+  - **R2-B:** clearing keeps a tombstone and bumps a monotonic `generation`.
+  - **R3-A:** notice, backoff and verification caches are keyed by
+    `(identity, generation)`.
+  - **R3-C:** the target and generation are revalidated immediately before
+    each queue call. Catch-up happens only on transitions.
+- **Proof of the thread (Q4).** The tool is called by the Codex lead with the
+  output of the same one-line shell command that the join prompt uses, which
+  prints its host-provided `CODEX_THREAD_ID` and `CODEX_HOME`. For a
+  **spawned** Codex lead (`enable_spawned_lead_wake=true`, an existing
+  parameter), the spawn prompt instructs exactly this call. The server then
+  also requires the supplied thread to equal the parent-bound
+  `backend_session_id` once binding exists. Before binding, it accepts and
+  re-checks at every tick; a later mismatch clears the registration with a
+  reason.
+- **Incarnation.** A registration is bound to the registering MCP server's
+  host PID and create token. A different host incarnation, for example after
+  a resume, ignores it until the new host registers again.
+- **Delivery.** The lead notice goes through `codex_queue(...)` with the lead
+  text ("call read_messages"). It is body-free and shares the coalesce,
+  renotify, backoff and owner-lock machinery. The inbox stays authoritative,
+  and `watch` stays valid.
+- `session_info.native_wake` gains `codex_lead: {registered, generation,
+  thread_verified}`.
+
+### 2.7 Flag propagation (review #10)
+
+After S-2, propagate the effective master flag, the downstream flag and
+**both half switches** as values. They are never turned on implicitly.
+
+- **Claude children:** through the generated `--mcp-config` env
+  (`server_simple.py:2704-2723`) and the process env.
+- **Codex children and nested leads:** through the `-c
+  mcp_servers.win-agent-teams.env.*` overrides the Codex backend already
+  builds.
+
+The socket and token scrub (`process_base.py:104-108`) is unchanged.
+
+### 2.8 Tool text
+
+The consuming agent reads only docstrings. With the master flag on, these get
+decorated:
+
+- `follow_up_agent`, `send_message`, `delivery_status`: `method`,
+  `native_unresolved`, the barrier, the wrapper meaning of `delivered`, and
+  "do not resend an unresolved native message".
+- `kill_agent`: `native_unresolved`.
+- `spawn_agent`: the `interactive` and `codex_home` record fields.
+- `session_info`: `codex_lead`.
+- `set_lead_wake`: new.
+
+Flag-off descriptions stay identical to the golden files.
 
 ## 3. Files affected
 
-- `src/claude_teams/native_wake.py` — Windows pipe transport + H3-W,
-  `codex_queue` helper, `DeliveryPoster`, notifier Codex-lead channel.
-- `src/claude_teams/delivery_mailbox.py` (new) — mailbox store + CAS.
-- `src/claude_teams/server_simple.py` — method selection in `_prepare`, native
-  dispatch in `_do_follow_up`, native `_finalize_follow_up` branch,
-  reconcile/kill awareness of `method`, record fields `interactive` +
-  `codex_home` at spawn/resume, `set_lead_wake`, `session_info`, docstrings.
-- `src/claude_teams/delivery_store.py` — `method` in `public_view`.
-- `src/claude_teams/backends/process_base.py`, `claude_code.py` — flag
-  propagation to Claude children.
-- `docs/reference/agent-messaging-protocol.md`, `README.md`, `INSTALL.md` §6a,
-  skills (`agent-orchestration`, `external-member-*`).
-- Tests: see §4.
+- `src/claude_teams/winpipe.py`: done (C).
+- `src/claude_teams/native_wake.py`: done for C. New: `codex_queue` runner,
+  `DeliveryPoster`, the Codex lead channel, and independent channel gating.
+- `src/claude_teams/delivery_mailbox.py`: new. Store, CAS and validation.
+- `src/claude_teams/server_simple.py`:
+  - two-stage selection in `_prepare`
+  - native dispatch and finalisation
+  - carrier-aware reconcile, kill and status
+  - the N5 barrier
+  - record fields at spawn and resume
+  - flag propagation, `set_lead_wake`, `session_info` and docstrings
+- `src/claude_teams/delivery.py`: confirmation without new-PID assumptions
+  for native methods.
+- `src/claude_teams/delivery_store.py`: `method`, `carrier_ref`,
+  `public_view` gating.
+- `src/claude_teams/leases.py`, `cli.py`: retract offers in
+  `force_clear_lease`, and `deliveries release-native`.
+- `src/claude_teams/backends/claude_code.py`, `codex.py`: MCP env propagation.
+- Docs: the protocol reference, `README.md`, `INSTALL.md` §6a, and the skills.
 
 ## 4. Tests (red first)
 
-Unit / integration (fakes for subprocess, sockets, pipes, clock):
+1. **Baselines:**
+   - master off: golden-identical, with no `method` even for persisted native
+     rows.
+   - master on and downstream off: always `resume`.
+   - each `_CLAUDE=0` / `_CODEX=0` combination.
+2. **Two-stage selection:**
+   - each of N0–N5 false means `resume`.
+   - busy, native succeeds without waiting.
+   - busy, native fails before enqueue, target still busy: waits, no kill.
+   - eligibility lost while waiting for the lease.
+   - `replace_if_idle=False` with native success and with native failure.
+   - original budget exhausted.
+3. **A:**
+   - same PID, no `backend.resume`, receipt, `carrier_ref` stored.
+   - each outcome in the §2.2.3 table.
+   - enqueue, then non-zero exit, stays unresolved.
+   - encoded-budget cases: quote-heavy, non-BMP, long path, multibyte.
+   - shim means resume.
+4. **Durable carrier:**
+   - enqueue, timeout, child death, negative scan: stays unresolved, never
+     `failed`.
+   - new-key retry: barrier.
+   - kill, then same-name successor: barrier inherited.
+   - thread reload dispatches the old item: `delivered`.
+   - operator release.
+5. **Mailbox CAS** (deterministic barriers):
+   - retract wins, take wins.
+   - retract persistence failure means unknown.
+   - corrupt or non-object file fails closed.
+   - `posting → uncertain` is never retaken after a poster crash.
+6. **Lead order:** a crash or failed write at every boundary, including
+   "publish succeeded, row write failed" and "sent without entry means
+   pending".
+7. **Poster:**
+   - affirmative idle only; a missing or stale marker means no post.
+   - one post per edge, with re-arm.
+   - `waiting → running` between take and post.
+   - accepted but no turn started means `uncertain`.
+   - incarnation mismatch at take and at post.
+   - lead death while the child poster survives.
+   - force-clear racing take or post.
+   - MCP restart while waiting.
+   - two consecutive offers.
+8. **Transport uncertainty:**
+   - POSIX: full send then shutdown failure; connect failure.
+   - Windows: the `winpipe` suite (done).
+9. **Sidecars:** wrapper receipt, then immediate reconcile, then delayed file
+   read. The file survives reconcile, GC and process death, and is released
+   on kill cleanup.
+10. **D:**
+    - `_CLAUDE=0/_CODEX=1`, Windows Codex lead.
+    - clear then set, backoff then replacement.
+    - undrained A→B.
+    - delayed binding, then a mismatch clears.
+    - restart backlog.
+    - session switch during a queue call.
+    - the external-member notice text is unchanged.
+11. **Flag propagation:** spawn and resume env for Claude and Codex, every
+    combination.
+12. **Guaranteed messages never appear in `inbox-<child>.jsonl`.**
 
-1. Flag-off golden: tools, join prompt, spawn/resume env, delivery results
-   byte-identical; `method` absent from results.
-2. Method matrix: each of N0–N4 false ⇒ `resume`; all true ⇒ native, per backend.
-3. Old record without `interactive` ⇒ resume.
-4. Codex native idle: no kill, no `backend.resume`, same PID, nonce in a queued
-   user record ⇒ `delivered`; row `method=codex_queue`.
-5. Codex outcome table: pre-enqueue failure falls back to resume in the same
-   call with a fresh nonce; timeout ⇒ `unconfirmed`, never resent; later nonce
-   ⇒ `delivered`.
-6. Codex long prompt ⇒ prompt-file line carries the marker; shim binary ⇒
-   resume.
-7. Busy Codex target ⇒ queued immediately (flagged by V2 switch) / waits when
-   the V2 switch is off.
-8. Mailbox CAS: offered→taken→posted; retract only from offered; concurrent
-   lead retract vs poster take (stress); crash between take and post ⇒
-   reconcile by nonce.
-9. Poster: posts only on `waiting`, one entry per idle edge, never on
-   `running`; owner lock exclusivity; capability heartbeat freshness gate.
-10. Claude native: lead budget expiry with `offered` ⇒ retract + `pending`;
-    with `taken` ⇒ `unconfirmed`; `post_failed` + absent ⇒ `pending`.
-11. Guaranteed messages still never appear in `inbox-<child>.jsonl`.
-12. `kill_agent` with an outstanding native attempt: rescan first; retract
-    `offered` mailbox entries; no stranded rows.
-13. Windows pipe (real named pipe server in-test via ctypes, Windows-only):
-    happy path; `ERROR_PIPE_BUSY` bounded wait; **stalled server** (never reads,
-    tiny buffer) ⇒ `CancelIoEx` within deadline, no thread left behind;
-    server-PID mismatch ⇒ no write.
-14. H-table on Windows: pipe prefix, H3-W, macOS still unsupported.
-15. Codex lead wake: registration validation/clear; notifier posts body-free
-    notice via `codex_queue` on child reply; coalesce/backoff; spawned Codex
-    lead self-registers from its bound record.
-16. `ty` narrowing: no new platform-only diagnostics on Windows or Linux.
+## 5. Live verification
 
-## 5. Live verification (before merge)
+**Spikes:**
 
-Spikes (first, they can change the design):
+| Spike | Question | Status |
+|---|---|---|
+| S-1 | Queued-turn shape and receipt | **done** (`spikes.md`) |
+| S-2 | Claude child MCP env | blocked on Windows (CLI not logged in); run on Linux |
+| S-3 | Socket-posted record shape | Linux |
+| S-4 | Pipe owner | **done** |
+| S-5 | `codex app-server` `thread/queue/delete` against a TUI's queue | new: can the app-server reach that queue, and does `deleted:true` guarantee no later dispatch? Decides §2.2.4(b) |
+| S-6 | Does a Codex-hosted MCP server see `CODEX_THREAD_ID`? | decides whether D can self-register without a tool call |
 
-- **S-1** `codex queue` on a TUI child: what the rollout records for a queued
-  turn (must be `response_item`, `role:user`, `input_text` containing the
-  marker); is there a `codex queue` list/remove?
-- **S-2** Does a Claude child's MCP server see env vars set on the `claude`
-  process? (decides flag propagation).
-- **S-3** Persisted transcript shape of a socket-posted user line; size limit
-  of `content`.
-- **S-4** `GetNamedPipeServerProcessId` on Claude Code's pipe equals the
-  `claude.exe` host PID (CLI and Claude Desktop).
+**Smokes (Linux and Windows unless noted):**
 
-Smokes (Linux and Windows unless noted):
-
-- **N1** Codex child idle follow-up delivered in place (same PID).
-- **N2** Codex child busy follow-up dispatched after the turn (closes V2).
-- **N3** Claude child (Linux, then Windows after C) idle follow-up in place,
-  bypass mode, no approval prompt.
-- **N4** Claude child busy: held until `waiting`, then delivered.
-- **N5** Dead child (kill the process / reboot) ⇒ resume fallback, delivered.
-- **N6** Windows Claude lead woken by a child's `send_message` (closes F5);
-  stalled-pipe test harness.
-- **N7** Codex lead (TUI and Desktop) woken by a child's reply (closes F3).
-- **N8** All flags off: identical to `main`.
+| Smoke | What it shows |
+|---|---|
+| N1 | Codex child, idle, delivered in place with the same PID |
+| N2 | Codex child, busy: dispatched after the turn (closes V2) |
+| N3 | Claude child, idle, in place, bypass mode, no approval prompt (Linux; Windows after S-2) |
+| N4 | Claude child, busy: held until `waiting` |
+| N5 | Dead child: resume fallback. Dead child with an unresolved queued item: barrier, then a resume dispatches the old item |
+| N6 | Windows Claude lead woken by a child's `send_message`, CLI and Desktop |
+| N7 | Codex lead woken by a child's reply, TUI and Desktop |
+| N8 | Baselines from §0 |
 
 ## 6. Risks
 
 | Risk | Mitigation |
 |---|---|
-| Double execution (queued native row + resume) | Only provable pre-enqueue failures fall back in-call; everything else is `unconfirmed` and reconciled by nonce; mailbox CAS retract-or-taken |
-| Queued Codex turn never dispatches (thread unloaded, V1) | Row stays `unconfirmed` with live child (honest); a later resume loads the thread and dispatches it with its original nonce |
-| Wrong-session post | H2/H3(-W) + capability marker + owner lock; scrub on spawn/resume unchanged |
-| Pipe write hang | Overlapped I/O + `CancelIoEx`, tested with a stalled server |
-| Claude holds/drops socket posts (`crossSessionInbound`, rate limits) | Post is never a receipt; budget expiry with `offered` retracts; `taken` stays `unconfirmed`; nonce decides |
-| Poster missing in child (flag not propagated) | Capability marker absent ⇒ resume (safe default) |
-| Behaviour change surprises | Sibling opt-in flag; flag-off golden tests |
+| Duplicate presentation through the durable queue plus a resume | Carrier-aware settlement: unresolved, never failed. N5 barrier. Authoritative removal only via S-5 |
+| Duplicate post after an uncertain write | `write_started`; `uncertain` is never retried |
+| Crash between persist and publish | Persist first; "sent without entry" means provably unsent |
+| Stale poster posting into a new incarnation | Incarnation-bound entries and capability, checked at take and at post |
+| Mid-turn post | Affirmative idle, edge rule, documented residual race |
+| Pipe write hang | Overlapped I/O, bounded drain, parking |
+| Sidecar deleted too early | Pinned until kill or session cleanup |
+| An unresolved row blocks a target for a long time | Visible reason, `kill_agent` report, operator release (documented "may still execute") |
 
 ## 7. Non-goals
 
 - Pi native delivery.
-- Making native delivery the default (separate PR once smokes are green on
-  both platforms).
-- Removing the `watch` recipe or the `Stop` hook.
-- Message bodies in *wake* notices (D stays body-free; A/B carry bodies because
-  they are deliveries with nonce receipts, not doorbells).
-
-## 8. Open questions for review
-
-1. Is "provable pre-enqueue failure" for `codex queue` decidable from exit
-   code/stderr, or should every non-zero exit be `unconfirmed`?
-2. Mailbox as one JSON document vs one file per entry (contention vs atomic
-   CAS simplicity)?
-3. Should the Claude poster also deliver mid-turn (between tool calls) when the
-   sender opts in, or is idle-edge-only the right invariant?
-4. F3 auto-registration for spawned Codex leads: trust the parent-bound
-   `backend_session_id`, or require the child to confirm via `CODEX_THREAD_ID`?
+- Making native delivery the default. That is a separate PR once N1–N8 are
+  green on both platforms.
+- Removing `watch` or the `Stop` hook.
+- Bodies in *wake* notices. D stays body-free; A and B carry bodies because
+  they are deliveries with nonce receipts.
+- A mid-turn delivery option (§8 Q3).
