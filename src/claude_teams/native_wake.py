@@ -518,6 +518,94 @@ def _discover_codex() -> str:
     return CodexBackend().discover_binary()
 
 
+_SUBMISSION_RE = re.compile(
+    r"Queued message ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+@dataclass(frozen=True)
+class QueueOutcome:
+    """One ``codex queue`` run. Only an exec failure proves nothing was queued.
+
+    ``started`` means a codex process may have run. From then on, anything but
+    exit 0 with a parsed submission id is uncertain: the turn may be queued
+    durably (it survives the process and a reboot) even when the CLI reports a
+    failure, so callers must never treat it as proof of non-delivery.
+    """
+
+    started: bool
+    exit: int | None = None
+    submission_id: str = ""
+    timed_out: bool = False
+    stderr_tail: str = field(default="", repr=False)
+
+    @property
+    def enqueued(self) -> bool:
+        """Return whether the CLI confirmed a queued submission."""
+        return self.exit == 0 and bool(self.submission_id)
+
+    @property
+    def provably_not_enqueued(self) -> bool:
+        """Return whether no codex process ever started."""
+        return not self.started
+
+
+def queue_environment(home: str) -> dict[str, str]:
+    """Scrub identity/channel variables and pin ``CODEX_HOME`` for a queue run."""
+    environ = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("AGENT_")
+        and key
+        not in {
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "WIN_AGENT_TEAMS_SESSION_DIR",
+        }
+    }
+    environ["CODEX_HOME"] = home
+    return environ
+
+
+def codex_queue(
+    binary: str,
+    thread_id: str,
+    home: str,
+    message: str,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+    timeout: float | None = None,
+) -> QueueOutcome:
+    """Run ``codex queue`` with a real timeout; ``cwd`` is home, not CODEX_HOME."""
+    try:
+        completed = runner(
+            [binary, "queue", "--thread", thread_id, "--message", message],
+            env=queue_environment(home),
+            cwd=Path.home(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout or _seconds("CODEX_QUEUE_TIMEOUT_SECONDS", 15.0),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return QueueOutcome(True, timed_out=True)
+    except OSError:
+        # Raised by process creation itself (missing/denied executable).
+        return QueueOutcome(False)
+    except subprocess.SubprocessError:
+        return QueueOutcome(True)
+    match = _SUBMISSION_RE.search(getattr(completed, "stdout", "") or "")
+    return QueueOutcome(
+        True,
+        completed.returncode,
+        match[1] if match and completed.returncode == 0 else "",
+        stderr_tail=(getattr(completed, "stderr", "") or "")[-200:],
+    )
+
+
 @dataclass
 class _CodexState:
     generation: int
@@ -620,41 +708,17 @@ class CodexMemberWake:
             f"win-agent-teams: wake {seq} new message from {safe_sender} "
             "in your member inbox - call external_read with your member_token"
         )
-        environ = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith("AGENT_")
-            and key
-            not in {
-                "CLAUDE_CODE_MESSAGING_SOCKET",
-                "CLAUDE_CODE_MESSAGING_TOKEN",
-                "WIN_AGENT_TEAMS_SESSION_DIR",
-            }
-        }
-        environ["CODEX_HOME"] = registration["codex_home"]
-        try:
-            completed = self.runner(
-                [
-                    binary,
-                    "queue",
-                    "--thread",
-                    registration["thread_id"],
-                    "--message",
-                    notice,
-                ],
-                env=environ,
-                cwd=Path.home(),
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=_seconds("CODEX_QUEUE_TIMEOUT_SECONDS", 15.0),
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
+        outcome = codex_queue(
+            binary,
+            registration["thread_id"],
+            registration["codex_home"],
+            notice,
+            runner=self.runner,
+        )
+        if outcome.timed_out:
             return {**result, "status": "timeout"}
-        except (OSError, subprocess.SubprocessError):
+        if outcome.exit is None:
             return {**result, "status": "failed"}
-        if completed.returncode != 0:
-            return {**result, "status": "failed", "detail": completed.stderr[-200:]}
+        if outcome.exit != 0:
+            return {**result, "status": "failed", "detail": outcome.stderr_tail}
         return result
