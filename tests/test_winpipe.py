@@ -15,6 +15,7 @@ PIPE_ACCESS_INBOUND = 0x00000001
 PIPE_TYPE_BYTE = 0x00000000
 ERROR_BROKEN_PIPE = 109
 ERROR_PIPE_CONNECTED = 535
+ERROR_NO_DATA = 232
 
 
 def _kernel32():
@@ -63,7 +64,12 @@ class PipeServer:
 
     def _serve(self) -> None:
         ok = self.k.ConnectNamedPipe(self.handle, None)
-        if not ok and ctypes.get_last_error() != ERROR_PIPE_CONNECTED:
+        # A client that connected (or even wrote and closed) before this call
+        # yields PIPE_CONNECTED / NO_DATA; its bytes are still buffered.
+        if not ok and ctypes.get_last_error() not in (
+            ERROR_PIPE_CONNECTED,
+            ERROR_NO_DATA,
+        ):
             return
         if not self.read:
             self.release.wait(10)

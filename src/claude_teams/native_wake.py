@@ -76,6 +76,9 @@ class PostResult:
 
     ok: bool
     reason: str = ""
+    # True once the user line may have reached the host: a failure after this
+    # point is uncertain and never proves non-delivery.
+    write_started: bool = False
 
 
 def resolve_claude_channel(  # noqa: PLR0911 - H-row decision table.
@@ -131,19 +134,21 @@ def post_claude_notice(
             deadline,
             expected_pid=channel.host_pid,
         )
-        return PostResult(piped.ok, piped.reason)
+        return PostResult(piped.ok, piped.reason, piped.write_started)
+    started = False
     try:
         end = time.monotonic() + deadline
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(deadline)
             connection.connect(channel.path)
             connection.settimeout(max(0.001, end - time.monotonic()))
+            started = True
             connection.sendall(wire.encode("utf-8"))
             connection.shutdown(socket.SHUT_WR)
     except Exception as err:
         # Never include transport text: an exception may echo a credential.
-        return PostResult(False, type(err).__name__)
-    return PostResult(True)
+        return PostResult(False, type(err).__name__, started)
+    return PostResult(True, "", True)
 
 
 @dataclass(frozen=True)

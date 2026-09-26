@@ -216,12 +216,64 @@ def test_windows_post_without_host_pid_writes_nothing(on_windows, monkeypatch):
 
 def test_windows_pipe_failure_reason_is_reported(on_windows, monkeypatch):
     monkeypatch.setattr(
-        nw.winpipe, "post", lambda *a, **k: nw.winpipe.PipeResult(False, "timeout")
+        nw.winpipe,
+        "post",
+        lambda *a, **k: nw.winpipe.PipeResult(False, "timeout", write_started=True),
     )
     result = nw.post_claude_notice(
         nw.ClaudeChannel("available", PIPE, "secret", host_pid=1), "notice"
     )
-    assert (result.ok, result.reason) == (False, "timeout")
+    assert (result.ok, result.reason, result.write_started) == (False, "timeout", True)
+
+
+def test_posix_failure_after_send_is_uncertain(monkeypatch):
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def settimeout(self, value):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, data):
+            pass
+
+        def shutdown(self, how):
+            raise ConnectionResetError
+
+    monkeypatch.setattr(nw.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(nw.socket, "socket", lambda *a, **k: Conn())
+    result = nw.post_claude_notice(
+        nw.ClaudeChannel("available", "/fake", "secret"), "notice"
+    )
+    assert (result.ok, result.write_started) == (False, True)
+
+
+def test_posix_connect_failure_is_before_write(monkeypatch):
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def settimeout(self, value):
+            pass
+
+        def connect(self, path):
+            raise ConnectionRefusedError()
+
+    monkeypatch.setattr(nw.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(nw.socket, "socket", lambda *a, **k: Conn())
+    result = nw.post_claude_notice(
+        nw.ClaudeChannel("available", "/fake", "secret"), "notice"
+    )
+    assert (result.ok, result.write_started) == (False, False)
 
 
 def test_windows_main_starts_notifier(on_windows, monkeypatch):
