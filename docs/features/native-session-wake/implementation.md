@@ -205,10 +205,29 @@ watcher, polled or slept.
 | S5 bypass-mode lead | PASS | The lead ran with `--permission-mode bypassPermissions`; every notice was delivered without an approval prompt (own-child). |
 | S3, S6, S7 | Not run live | Covered by unit/flag-off tests; S7 is the default for every other session on this machine, which runs `main`. |
 | Codex **Desktop** member | Covered by the pre-implementation smoke run | Same `codex queue` path; see smoke-run-2026-09-25.md §3. |
-| W1–W3 (Windows) | **Pending** | Must run on the Windows machine before merge. |
+| W1–W3 (Windows) | PASS | See the Windows section below. |
 | V1 / V2 | Open | Not blockers (plan §5). |
 
 Observation: a Claude child spawned by a flag-on lead runs the same server
 command but does not inherit `WIN_AGENT_TEAMS_NATIVE_WAKE`; its own wake stays
 off unless its MCP entry sets the flag. This matches the per-installation
 opt-in.
+
+## Live smoke results (2026-09-26, Windows 11, lead run by Claude Opus)
+
+Setup: Windows 11 Pro 26200, Python 3.12.14, codex-cli 0.157.1 (Codex Desktop
+26.924.22138). The leads were scripted FastMCP stdio clients that ran this
+branch's server with `WIN_AGENT_TEAMS_NATIVE_WAKE=1`.
+
+| Smoke | Result | Evidence |
+|---|---|---|
+| W1 flag-off identity and suite | PASS | `pytest`: 1829 passed, 7 skipped. `ruff format --check` and `ruff check` pass. With the flag unset, the dumped tool list (21 tools with names, descriptions and input schemas) and `_build_join_prompt` output are byte-identical to `origin/main`. With the flag on, the only change is `external_set_wake` plus the gated wording. `ty check` first showed three branch-introduced `socket.AF_UNIX` diagnostics on Windows. Commit a889cbe fixed them with `sys.platform` narrowing. The two remaining diagnostics (`scripts/herdr_nested_check.py:152`, `tests/test_join_team.py`) also appear on `main` under Windows. |
+| W2 Codex Desktop wake | PASS | A Codex Desktop thread joined as `w2desk` and registered `codex_wake` (generation 1). The lead's `send_message` returned `wake: {method: codex_queue, status: queued}`. The idle Desktop thread started a new turn by itself and replied `PONG-W2` 17 s later, with no watcher or nudge. `codex` resolved to the native `codex.exe` from the Codex Desktop install. No npm `.cmd` shim is installed on this machine, so the `.cmd` fallback is covered only by the argv unit test. |
+| W3 `unsupported_platform` and scrub | PASS | The server inherited Claude Desktop's real `CLAUDE_CODE_MESSAGING_SOCKET` (a `\\.\pipe\LOCAL\cc-msg-…` named pipe) and token. `session_info.native_wake` reported `{claude_channel: unsupported_platform, owner_verified: false, notifier_owner: false}`. A `sys.addaudithook` probe saw no open of the pipe path and no `socket.connect` except asyncio's `127.0.0.1` self-pipe. The spawned Claude child's `subprocess.Popen` env had both `CLAUDE_CODE_MESSAGING_*` variables set to `''`. |
+
+Setup pitfall, not a code issue: Claude Desktop is an MSIX-packaged app, so
+`uv python install` run from a Claude Desktop session writes the interpreter to
+the package's virtualized `AppData\Roaming`. Codex Desktop then cannot launch
+the venv (`No Python at '…\AppData\Roaming\uv\python\…'`), and the MCP
+handshake fails. Install the interpreter with `UV_PYTHON_INSTALL_DIR` set to a
+path outside `AppData`, or from a regular terminal.
