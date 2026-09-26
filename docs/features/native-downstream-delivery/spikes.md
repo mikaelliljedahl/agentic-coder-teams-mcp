@@ -200,3 +200,35 @@ read this set.
 Socket-posted messages appear in the child as a user turn prefixed "Another
 Claude session sent a message:", with the delivery marker intact. The receipt
 scanner found them, and both deliveries settled `delivered`.
+
+### N8: flag baselines on Windows (2026-09-26)
+
+Each step changed only the Claude lead's MCP `env` in `~/.claude.json` and
+restarted Claude Desktop.
+
+| Step | Lead flags | Result | Evidence |
+|---|---|---|---|
+| a | master on, downstream absent | **pass** | The Codex child `n8a` got only `WIN_AGENT_TEAMS_NATIVE_WAKE = "1"` in its `-c mcp_servers…env`. Follow-ups went `method: resume` with a new pid each time (13528, 4560). A child `send_message` still woke the Claude lead through the pipe (`wake #1`, `N8A-WAKE`). |
+| b | both absent | **pass** | The server exposed 21 tools, without `set_lead_wake` or `external_set_wake`. `session_info` had no `native_wake` key. The follow-up result had no `method` field and resumed with a new pid (16844). The agent record had no `interactive`, `codex_home` or `dispatch_epoch`. `kill_agent` returned `{success, name}` with no `native_unresolved`. |
+
+Notes on step b:
+
+- **The Codex child still had the flags.** A Codex child's MCP server also
+  reads the user's `~/.codex/config.toml`, which still set both flags, so its
+  poster wrote a `native-delivery-n8b.json` capability marker
+  (`channel: no_socket`). That is the Codex host's own configuration, not
+  propagation, and the marker can never pass E3.
+- **The hook marker is always extended.** `hooks.py` writes `idle_seq`,
+  `turn_seq`, `backend_session_id` and `dispatch_epoch` (0 when unset)
+  regardless of flags. This adds fields to the on-disk marker but changes no
+  tool, result or environment. It is recorded as a deviation from a strict
+  reading of "byte-identical to main" for the disk contract.
+
+### Linux: L-1 to L-4 (user's machine, codex 0.157.1, claude 2.1.283)
+
+| Id | Result | Consequence |
+|---|---|---|
+| L-1 (N2) | **pass.** A message queued while a 90 s sleep turn was running did not abort the turn (`SLEEP-DONE`, `TURN-1-DONE`). The queued text was presented exactly once, as a new turn afterwards. A 20 000-character message queued and was stored in full. | **E6 can be dropped** (plan §2.1: "If it passes, E6 is lifted in this PR"). |
+| L-2 (S-6) | **fail.** The Codex TUI does not host MCP servers itself: they run under the shared `codex app-server --managed-daemon`, one per thread, whose environment has neither `CODEX_THREAD_ID` nor `CODEX_HOME`. | As designed: D keeps explicit registration (the shell command plus `set_lead_wake`). Self-registration stays out. |
+| L-3 (S-2) | **socket: pass. Flag: missing on `main`.** The child's MCP server had `CLAUDE_CODE_MESSAGING_SOCKET` named after the child's own `claude` PID (no leak of the lead's socket) and the token present. `WIN_AGENT_TEAMS_NATIVE_WAKE` was absent in the child's MCP env although the lead had it. | Expected: the Linux MCP install ran `main`, where children never inherit the flag. The branch's §2.7 propagation fixes it and was verified live on Windows (N1, N8a). Re-run L-3 with the branch installed to close it on Linux. |
+| L-4 (S-3) | **pass** at 100, 16 000 and 60 000 characters. Each time the child took a turn and replied `S3-ACK`, the text arrived intact, and `receipt_nonces(record, "claude-code")` found the nonce. | The 16 KiB inline limit (§2.4) is conservative; the socket accepted 60 KB. |
