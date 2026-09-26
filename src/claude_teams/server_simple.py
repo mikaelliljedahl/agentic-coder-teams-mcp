@@ -2863,6 +2863,37 @@ def _write_prompt_file(
     return path
 
 
+def _effective_codex_home() -> str:
+    """Return the ``CODEX_HOME`` a spawned Codex child inherits from this server."""
+    return os.environ.get("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
+
+
+def _native_record_fields(prior: dict, backend_name: str, backend: Any) -> dict:
+    """Record native-delivery facts at spawn/resume; empty with the flag off.
+
+    ``interactive`` says whether the child got a TTY (a live, wakeable
+    session); ``codex_home`` pins where ``codex queue`` must look for the
+    thread; ``dispatch_epoch`` is the revocable fence a native offer must match
+    and is bumped by every spawn/resume (never by a native finalisation).
+    """
+    if not native_wake.enabled():
+        return {}
+    previous = prior.get("dispatch_epoch")
+    base = previous if isinstance(previous, int) and previous >= 0 else 0
+    fields: dict = {
+        "interactive": bool(
+            process_manager.provides_tty(
+                backend_name,
+                is_interactive=bool(getattr(backend, "is_interactive", False)),
+            )
+        ),
+        "dispatch_epoch": base + 1,
+    }
+    if backend_name == "codex":
+        fields["codex_home"] = _effective_codex_home()
+    return fields
+
+
 def _pi_binding_extra(
     backend_name: str, session_id: str, agent_name: str
 ) -> dict[str, str]:
@@ -3490,6 +3521,7 @@ async def spawn_agent(
                     # asserted. ``follow_up_agent`` refuses any other caller.
                     SPAWNED_BY_FIELD: IDENTITY,
                     SPAWNED_BY_SOURCE_FIELD: SPAWNED_BY_SOURCE_SPAWN,
+                    **_native_record_fields({}, backend_name, b),
                 }
             )
             _save_agents_transaction(session_id, agents)
@@ -4340,6 +4372,9 @@ def _finalize_follow_up(
                 # spawn prompt did, and gate 0's grace period restarts from
                 # this attempt.
                 PROMPT_TRANSPORT_FIELD: plan.prompt_transport,
+                # A respawn is a new dispatch epoch: native offers made to the
+                # previous incarnation must no longer be takeable.
+                **_native_record_fields(agent, plan.backend_name, plan.backend),
             }
         )
         agent.pop(PENDING_DELIVERY_FIELD, None)
