@@ -805,7 +805,7 @@ def test_codex_resume_command_preserves_permissions_and_prompt(
     # /usr/bin/codex is the native binary (not the cmd.exe shim), so the
     # multi-line prompt passes verbatim; the JSON-wrap fallback only applies
     # when launching through the npm codex.cmd shim.
-    assert cmd[-1] == "first line\nsecond line"
+    assert cmd[-1] == f"first line\nsecond line\n\n{codex_module._TEAM_TOOL_HINT}"
 
 
 def test_codex_resume_command_uses_exec_resume_without_tty(
@@ -828,7 +828,7 @@ def test_codex_resume_command_uses_exec_resume_without_tty(
     assert cmd[1] == "exec"
     assert cmd[2] == "resume"
     assert cmd[3] == "codex-session-id"
-    assert cmd[-1] == "follow up"
+    assert cmd[-1] == f"follow up\n\n{codex_module._TEAM_TOOL_HINT}"
 
 
 def test_claude_resume_command_preserves_permissions_and_mcp_config(

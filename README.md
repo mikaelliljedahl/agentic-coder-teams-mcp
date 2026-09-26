@@ -127,6 +127,20 @@ This is required in two scenarios:
 
 The server auto-injects `AGENT_NAME` and `AGENT_SESSION_ID` into the Codex config env before each spawn so the MCP server knows agent identity.
 
+Keep the MCP server key `win-agent-teams`: Codex identity injection and the
+spawned-worker tool-name hint both assume it. Under Codex's standard MCP naming,
+the team `send_message` tool appears as `mcp__win_agent_teams__send_message`
+(`tools.mcp__win_agent_teams__send_message` in code mode). Spawned Codex workers
+receive a hint with this name on spawn and resume, including guidance to avoid
+Codex's built-in `collaboration.send_message`. A Codex lead started by a human
+does not receive that hint. Codex options that remove MCP prefixes or rename
+tools, or tool-name collisions, can make the hint's spelling inexact even while
+identity injection works.
+
+This key requirement applies to **spawned Codex workers**. External members
+join by token and may use the isolated `win-agent-teams-external` key described
+below; their join and wake instructions give names for both keys.
+
 ### Setup — Pi (as Lead or Spawned Agent)
 
 [Pi](https://github.com/earendil-works/pi) (`pi`) has, by design, no built-in MCP
@@ -230,6 +244,12 @@ registration in the same profile is a degraded mode: the normal ambient root
 tools remain selectable, so it does not provide client-surface isolation. If
 your client cannot scope MCP configuration to a separate profile or instance,
 ambient-tool isolation is unavailable on that client.
+
+In this isolated profile, Codex sees names such as
+`mcp__win_agent_teams_external__join_team` and
+`mcp__win_agent_teams_external__external_read`; Claude Code keeps the hyphens,
+for example `mcp__win-agent-teams-external__join_team`. Use the names matching
+the member session's configured key.
 
 ### Native session wake (opt-in)
 
@@ -678,9 +698,9 @@ The server detects its role from environment variables:
 ### Example Flow
 
 ```
-1. Lead calls spawn_agent(prompt="Review auth.py and send_message results to lead", backend="codex", name="reviewer")
+1. Lead calls spawn_agent(prompt="Review auth.py and send results to lead with mcp__win_agent_teams__send_message", backend="codex", name="reviewer")
 2. Codex opens in a console window and starts working
-3. Codex calls send_message(to="lead", text="Found 3 issues in auth.py")
+3. Codex calls mcp__win_agent_teams__send_message(to="team-lead", text="Found 3 issues in auth.py") (in code mode: tools.mcp__win_agent_teams__send_message(...))
 4. Lead calls read_messages() → sees the message
 5. Lead calls kill_agent(name="reviewer") when done
 ```

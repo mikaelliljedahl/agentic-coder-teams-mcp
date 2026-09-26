@@ -363,6 +363,9 @@ async def test_nonce_in_the_correct_transcript_is_delivered(
 
     assert result["success"] is True
     assert result["status"] == "delivered"
+    assert len(backend.resume_calls) == 1
+    assert backend.resume_calls[0][0].prompt.startswith("next prompt")
+    assert backend.resume_calls[0][0].prompt.count(DELIVERY_MARKER_PREFIX) == 1
     assert _record()["pid"] == 789
 
 

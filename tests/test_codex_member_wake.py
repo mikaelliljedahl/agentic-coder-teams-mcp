@@ -137,7 +137,8 @@ def test_single_send_immediate_safe_shim_no_timer(member, monkeypatch):
     assert not re.search(r"""[()<>|&^%!"'\n]""", notice)
     assert "PRIVATE BODY" not in notice
     assert member.token not in notice
-    assert "external_read" in notice
+    assert "mcp__win_agent_teams__external_read" in notice
+    assert "mcp__win_agent_teams_external__external_read" in notice
     assert kwargs["env"]["CODEX_HOME"] == str(member.home)
     assert kwargs["cwd"] == Path.home()
     assert kwargs["stdin"] == subprocess.DEVNULL

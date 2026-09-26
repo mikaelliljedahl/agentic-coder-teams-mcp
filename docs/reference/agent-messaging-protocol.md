@@ -314,7 +314,13 @@ Both durations have strict finite-positive environment overrides:
 `WIN_AGENT_TEAMS_JOIN_TICKET_RETENTION_SECONDS`.
 
 The paste-ready prompt tells the interactive session to call
-`join_team(session_id, token)`. The join credential is replayable during
+`join_team(session_id, token)`. It gives the Codex naming rule and full names
+for `join_team`, `external_read`, `external_send`, and `leave_team` under both
+`win-agent-teams` and the isolated `win-agent-teams-external` key. It also gives
+the Claude Code rule, which preserves the configured key. The lead cannot know
+which client or key will receive the prompt. When native wake is enabled, its
+Codex step names both forms of `external_set_wake`. The successful `join_team`
+response repeats the same guidance. The join credential is replayable during
 retention: reconciliation replays return the same membership after any of the
 registry/ticket/marker crash windows. `join_team` returns a bearer token with
 the exact grammar
@@ -433,7 +439,10 @@ Archived rows/paths are refused. Missing rows/db or schema/lock errors fall
 back to rollout filenames under `sessions/*/*/*`. Missing/unverifiable threads
 are not queued. Queue uses the discovered Codex binary, that home's `CODEX_HOME`,
 `cwd=Path.home()`, DEVNULL stdin, UTF-8 capture, and a real 15-second subprocess
-timeout. Notice text contains no cmd.exe metacharacters or free member text. The queue
+timeout. The Codex queue notice names both `external_read` forms,
+`mcp__win_agent_teams__external_read` and
+`mcp__win_agent_teams_external__external_read`, and tells the member to use
+its configured MCP key. It contains no cmd.exe metacharacters or free member text. The queue
 subprocess environment drops inherited `CLAUDE_CODE_MESSAGING_SOCKET`,
 `CLAUDE_CODE_MESSAGING_TOKEN`, all `AGENT_*` variables, and
 `WIN_AGENT_TEAMS_SESSION_DIR`; the parent environment is unchanged.
@@ -1512,15 +1521,22 @@ a follow-up cannot overwrite the spawn prompt file and two concurrent calls to
 one agent cannot collide on a single path. Cleanup is by age or on confirmed
 child exit, never "delete the others because a new call started".
 
-Codex has no prompt-file path: `_materialize_prompt` returns the prompt
-unmarked for every non-`claude-code` backend. Codex relies on passing the prompt
+Codex has no prompt-file path: `_materialize_prompt` leaves its spawn
+correlation marker to the backend and appends the delivery marker on follow-up.
+Codex relies on passing the prompt
 as a verbatim argv token via the native `.exe`, falling back to a JSON-encoded
 single-line form only when it is forced through the `codex.cmd` npm shim
 (`src/claude_teams/backends/codex.py`, `_prompt_arg`). Its marker is appended by
 `CodexBackend._correlated_prompt`, which **consumes** the server-issued id from
 `extra["correlation_id"]` rather than deriving one — so a Codex prompt carries
 exactly one marker, never two. With no id in `extra` the prompt goes out
-unmarked; no id is ever invented.
+unmarked; no id is ever invented. The backend appends one Codex-specific final
+paragraph after the caller text and any correlation or delivery marker on both
+spawn and resume. It names `mcp__win_agent_teams__send_message` and
+`mcp__win_agent_teams__read_messages`, gives the code-mode form
+`tools.mcp__win_agent_teams__send_message`, and directs workers away from
+Codex's built-in `collaboration` tools. The added paragraph separator makes a
+one-line resume prompt use the JSON shim transport too.
 
 Pi is marked by its backend too (`PiBackend._correlated_prompt`), but it *does*
 get a sidecar — as a **fallback transport, not a second correlation site**. The
@@ -1777,18 +1793,20 @@ it never does within the budget, completing the message is the sender's job.
 ### Codex workers do not poll `read_messages`
 
 Nothing in the codex spawn path arranges for polling. The prompt is the caller's
-text plus the server-issued correlation marker
-(`CodexBackend._correlated_prompt`); the environment is
-`AGENT_NAME` / `AGENT_SESSION_ID` / `AGENT_PARENT_NAME` only
-(`src/claude_teams/backends/codex.py:566-570`). There is no Codex equivalent of
+text plus the server-issued correlation marker and the Codex team-tool hint
+(`CodexBackend._correlated_prompt`, `CodexBackend._with_team_tool_hint`); the
+environment carries `AGENT_NAME` / `AGENT_SESSION_ID` /
+`AGENT_PARENT_NAME`. There is no Codex equivalent of
 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, which the claude-code backend sets to
 put its workers in Claude Code's native team-messaging mode
 (`src/claude_teams/backends/claude_code.py:284-285`). Messages sent to a Codex
 worker's inbox therefore accumulate unread unless the caller's own prompt text
-instructs the agent to poll. Since C3 this is much less likely to be reached by
-accident: a spawner addressing its own Codex child gets the guaranteed path, not
-an inbox append. It still applies to anything that writes upstream into a Codex
-lead's inbox.
+instructs the agent to poll. The hint explains that work from the lead arrives
+as a new prompt through resume; `mcp__win_agent_teams__read_messages` reads
+inbox messages sent by agents that worker spawned itself. Since C3 this is much
+less likely to be reached by accident: a spawner addressing its own Codex child
+gets the guaranteed path, not an inbox append. It still applies to anything
+that writes upstream into a Codex lead's inbox.
 
 ### `kill_agent` still has no caller-identity check
 

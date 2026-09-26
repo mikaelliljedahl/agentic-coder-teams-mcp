@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -8,8 +9,11 @@ from claude_teams.agent_output import CORRELATION_FIELD, correlation_marker_toke
 from claude_teams.backends import codex as codex_module
 from claude_teams.backends import process_manager as process_manager_module
 from claude_teams.backends.base import SpawnRequest
+from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.backends.codex import CodexBackend
 from claude_teams.backends.contracts import BackendModelUnavailableError
+from claude_teams.backends.pi import PiBackend
+from claude_teams.delivery import DELIVERY_MARKER_PREFIX
 
 
 @pytest.fixture
@@ -828,10 +832,11 @@ class TestCodexPromptCmdShimFallback:
 
         assert cmd[-1] == (
             "Decode this JSON string as your complete task prompt, then follow "
-            'the decoded text exactly: "first line\\nsecond line"'
+            "the decoded text exactly: "
+            + json.dumps(f"first line\nsecond line\n\n{codex_module._TEAM_TOOL_HINT}")
         )
 
-    def test_single_line_prompt_not_wrapped_via_cmd_shim(
+    def test_single_line_prompt_wrapped_via_cmd_shim_after_hint(
         self, _make_request, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ):
         shim, _, _ = _make_codex_npm_tree(tmp_path, exe_subdir=None)
@@ -840,7 +845,11 @@ class TestCodexPromptCmdShimFallback:
 
         cmd = CodexBackend().build_resume_command(request, "sess-id")
 
-        assert cmd[-1] == "single line"
+        assert cmd[-1] == (
+            "Decode this JSON string as your complete task prompt, then follow "
+            "the decoded text exactly: "
+            + json.dumps(f"single line\n\n{codex_module._TEAM_TOOL_HINT}")
+        )
 
     def test_native_exe_keeps_multiline_verbatim(
         self, _make_request, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -851,4 +860,83 @@ class TestCodexPromptCmdShimFallback:
 
         cmd = CodexBackend().build_resume_command(request, "sess-id")
 
-        assert cmd[-1] == "first line\nsecond line"
+        assert cmd[-1] == f"first line\nsecond line\n\n{codex_module._TEAM_TOOL_HINT}"
+
+
+def test_codex_mcp_tool_name_mirrors_codex_sanitizer():
+    assert codex_module.codex_mcp_tool_name("send_message") == (
+        "mcp__win_agent_teams__send_message"
+    )
+    assert codex_module.codex_mcp_tool_name("x", server="a.b-c") == "mcp__a_b_c__x"
+
+
+def test_spawn_prompt_names_full_team_tools(_make_request, _stub_discovery):
+    _stub_discovery([])
+    request = _make_request(prompt="Call send_message to your lead")
+    prompt = CodexBackend().build_command(request)[-1]
+
+    assert prompt.startswith(request.prompt)
+    assert prompt.count(correlation_marker_token("corr-test")) == 1
+    assert prompt.count(codex_module._TEAM_TOOL_HINT) == 1
+    assert prompt.endswith(codex_module._TEAM_TOOL_HINT)
+    assert "your lead and any agents you spawn" in prompt
+    for name in (
+        "mcp__win_agent_teams__send_message",
+        "mcp__win_agent_teams__read_messages",
+        "collaboration.send_message",
+    ):
+        assert name in prompt
+
+
+def test_resume_prompt_names_full_team_tools(_make_request, _stub_discovery):
+    _stub_discovery([])
+    marker = f"{DELIVERY_MARKER_PREFIX}delivery-test]"
+    request = _make_request(prompt=f"Continue work\n\n{marker}")
+    prompt = CodexBackend().build_resume_command(request, "sess-id")[-1]
+
+    assert prompt.startswith(request.prompt)
+    assert prompt.count(marker) == 1
+    assert prompt.count(codex_module._TEAM_TOOL_HINT) == 1
+    assert prompt.endswith(codex_module._TEAM_TOOL_HINT)
+    assert "mcp__win_agent_teams__send_message" in prompt
+    assert "mcp__win_agent_teams__read_messages" in prompt
+    assert "Work from your lead arrives as a new prompt" in prompt
+    assert (
+        "read_messages reads only messages sent to you by agents you spawned" in prompt
+    )
+    assert "or external members you invited yourself" in prompt
+
+
+def test_team_tool_hint_is_shim_safe(_make_request, monkeypatch, tmp_path):
+    shim, _, _ = _make_codex_npm_tree(tmp_path, exe_subdir=None)
+    _patch_windows(monkeypatch, shim)
+    marker = f"{DELIVERY_MARKER_PREFIX}delivery-test]"
+    request = _make_request(prompt=f"Continue work\n\n{marker}")
+    argument = CodexBackend().build_resume_command(request, "sess-id")[-1]
+    prefix = (
+        "Decode this JSON string as your complete task prompt, then follow "
+        "the decoded text exactly: "
+    )
+    assert argument.startswith(prefix)
+    complete_prompt = json.loads(argument.removeprefix(prefix))
+
+    assert complete_prompt.startswith(request.prompt)
+    assert complete_prompt.count(marker) == 1
+    hint = codex_module._TEAM_TOOL_HINT
+    assert complete_prompt.endswith(hint)
+    assert "mcp__win_agent_teams__send_message" in hint
+    assert not any(char in hint for char in '\n\r<>|&^!()%"')
+
+
+def test_hint_is_codex_only(_make_request, monkeypatch):
+    monkeypatch.setattr(ClaudeCodeBackend, "discover_binary", lambda self: "claude")
+    monkeypatch.setattr(PiBackend, "_launcher", lambda self: ["pi"])
+    request = _make_request(model="opus")
+
+    for backend in (ClaudeCodeBackend(), PiBackend()):
+        assert "mcp__win_agent_teams__send_message" not in " ".join(
+            backend.build_command(request)
+        )
+        assert "mcp__win_agent_teams__send_message" not in " ".join(
+            backend.build_resume_command(request, "sess-id")
+        )

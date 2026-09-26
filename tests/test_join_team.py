@@ -72,6 +72,22 @@ def test_create_ticket_token_prompt_exact(
     assert prompt.count(note) == 1
 
 
+def test_join_prompt_names_both_client_tool_forms_flag_off(
+    join_session: tuple[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
+    prompt = _run(ss.create_join_ticket("member"))["join_prompt"]
+
+    for key in ("win_agent_teams", "win_agent_teams_external"):
+        for tool in ("join_team", "external_read", "external_send", "leave_team"):
+            assert f"mcp__{key}__{tool}" in prompt
+    for key in ("win-agent-teams", "win-agent-teams-external"):
+        assert f"mcp__{key}__join_team" in prompt
+    assert "non-" in prompt
+    assert "key" in prompt
+    assert "collaboration" in prompt
+
+
 def test_ticket_name_safe_and_dedup(
     join_session: tuple[str, Path],
 ) -> None:
@@ -167,6 +183,9 @@ def test_join_happy_path(join_session: tuple[str, Path]) -> None:
         f"wam-member:{issued['ticket_id']}:{issued['token']}".encode()
     ).hexdigest()
     assert result["member_token"] == f"wam1:{sid}:{secret}"
+    assert "mcp__win_agent_teams__external_read" in result["instructions"]
+    assert "mcp__win_agent_teams_external__external_read" in result["instructions"]
+    assert "mcp__win-agent-teams-external__join_team" in result["instructions"]
     assert re.fullmatch(
         r"wam1:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
         r"[89ab][0-9a-f]{3}-[0-9a-f]{12}:[0-9a-f]{64}",
@@ -1259,6 +1278,8 @@ def test_large_inbox_read_contention_bounded(
 def test_join_prompt_flag_on_both_shells_and_reader(join_session, monkeypatch):
     monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", "1")
     prompt = asyncio.run(ss.create_join_ticket("member"))["join_prompt"]
+    assert "mcp__win_agent_teams__external_set_wake" in prompt
+    assert "mcp__win_agent_teams_external__external_set_wake" in prompt
     for literal in (
         "external_set_wake",
         "$CODEX_THREAD_ID",

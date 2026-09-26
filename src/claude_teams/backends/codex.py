@@ -3,6 +3,7 @@
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -393,7 +394,9 @@ class CodexBackend(BaseBackend):
 
         cmd.append(
             self._prompt_arg(
-                request, self._correlated_prompt(request), via_cmd_shim=via_cmd_shim
+                request,
+                self._with_team_tool_hint(self._correlated_prompt(request)),
+                via_cmd_shim=via_cmd_shim,
             )
         )
         return cmd
@@ -428,8 +431,19 @@ class CodexBackend(BaseBackend):
         cmd.extend(self._agent_args(request))
         if not headless:
             cmd.extend(["resume", backend_session_id])
-        cmd.append(self._prompt_arg(request, via_cmd_shim=via_cmd_shim))
+        cmd.append(
+            self._prompt_arg(
+                request,
+                self._with_team_tool_hint(request.prompt),
+                via_cmd_shim=via_cmd_shim,
+            )
+        )
         return cmd
+
+    @staticmethod
+    def _with_team_tool_hint(prompt: str) -> str:
+        """Append the Codex-specific tool routing guidance as the last paragraph."""
+        return f"{prompt}\n\n{_TEAM_TOOL_HINT}"
 
     @staticmethod
     def _hook_override_args(request: SpawnRequest) -> list[str]:
@@ -576,9 +590,10 @@ class CodexBackend(BaseBackend):
 
         When the native exe can't be resolved and we fall back to the npm
         ``codex.cmd`` shim (``via_cmd_shim``), ``cmd.exe`` would truncate a
-        multi-line prompt at the first newline. As a fallback the prompt is
-        then carried as a single-line JSON string and decoded by the agent
-        from the leading instruction — no real newlines reach ``cmd.exe``.
+        multi-line prompt at the first newline. The team-tool hint makes every
+        built spawn and resume prompt multi-line, so each is carried as a
+        single-line JSON string and decoded by the agent from the leading
+        instruction — no real newlines reach ``cmd.exe``.
         """
         text = request.prompt if prompt is None else prompt
         if via_cmd_shim and ("\n" in text or "\r" in text):
@@ -636,3 +651,25 @@ class CodexBackend(BaseBackend):
                     env["PATH"] = f"{path_dir}{os.pathsep}{current}"
                     break
         return env
+
+
+def codex_mcp_tool_name(tool: str, server: str = CodexBackend._MCP_SERVER_NAME) -> str:
+    """Mirror Codex's standard MCP server-key sanitizer and tool prefix."""
+    return f"mcp__{re.sub(r'[^A-Za-z0-9_]', '_', server)}__{tool}"
+
+
+_TEAM_TOOL_HINT = (
+    "win-agent-teams: your lead and any agents you spawn are reachable only "
+    "through the "
+    "win-agent-teams MCP tools. Message your lead with "
+    f"{codex_mcp_tool_name('send_message')}. Work from your lead arrives as a "
+    "new prompt, not in an inbox; "
+    f"{codex_mcp_tool_name('read_messages')} reads only messages sent to you "
+    "by agents you spawned or external members you invited yourself. "
+    "spawn_agent, list_agents and "
+    f"follow_up_agent use the same {codex_mcp_tool_name('')} prefix. In code mode "
+    f"call them as tools.{codex_mcp_tool_name('send_message')}. Do not use "
+    "Codex's built-in collaboration tools such as collaboration.send_message "
+    "or collaboration.list_agents for this: they only reach Codex-internal "
+    "subagents, and your lead is not one."
+)
