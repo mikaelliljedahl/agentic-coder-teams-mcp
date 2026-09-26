@@ -15,6 +15,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from claude_teams import filelock
 from claude_teams import native_wake as nw
 from claude_teams import server_simple as ss
 from tests import test_join_team
@@ -76,6 +77,7 @@ class Fakes:
         self.verified = []
         self.outcome = nw.QueueOutcome(True, 0, "01a0ddd0-2200-4000-8000-000000000000")
         self.before_verify = None
+        self.on_queue = None
 
     def lead(self):
         def verify(home, thread):
@@ -84,12 +86,16 @@ class Fakes:
                 self.before_verify()
             return True, ""
 
+        def queue(thread, home, text):
+            if self.on_queue is not None:
+                self.on_queue()
+            self.queued.append((thread, home, text))
+            return self.outcome
+
         return nw.CodexLeadWake(
             host=lambda: self.host,
             binding=lambda sid, identity: self.bound,
-            queue=lambda thread, home, text: (
-                self.queued.append((thread, home, text)) or self.outcome
-            ),
+            queue=queue,
             verify=verify,
         )
 
@@ -290,6 +296,89 @@ def test_revalidates_target_immediately_before_queue(tmp_path):
         assert fakes.queued == []
     finally:
         wake.close()
+
+
+def _lock_free(path: Path) -> bool:
+    with path.open("a+b") as handle:
+        if not filelock.try_lock_handle(handle):
+            return False
+        filelock.unlock_handle(handle)
+        return True
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {"spawned": False, "bound": None},
+        {"spawned": True, "bound": None},
+    ],
+    ids=["same-thread-other-home", "provisional"],
+)
+@pytest.mark.parametrize("at_read", [2, 3, 4])
+def test_replacement_after_the_key_check_never_queues_it(
+    tmp_path, monkeypatch, replacement, at_read
+):
+    """A registration replaced late in a tick is never queued under the old state.
+
+    The barrier replaces the registration (same thread, another home) just
+    before the ``at_read``-th registration read of the first tick, i.e. after
+    the tick's key check (read 4 was the unguarded final read the review
+    reproduced; read 3 is now the final read, under the lock). A concurrent
+    ``set_lead_wake`` blocks while the registration lock is held, so a
+    replacement that would contend is deferred to the end of the tick, exactly
+    as the real writer would wait.
+    """
+    directory = inbox(tmp_path)
+    register(directory)
+    lock_path = nw.lead_wake_file(directory, "team-lead").with_suffix(".lock")
+    original_read = nw.read_lead_wake
+    reads = [0]
+    fired: list[str] = []
+
+    def replace():
+        nw.register_lead_wake(
+            directory,
+            "team-lead",
+            thread_id=THREAD_A,
+            codex_home="/other-home",
+            host=HOST,
+            **replacement,
+        )
+
+    def read(path, identity):
+        reads[0] += 1
+        if reads[0] == at_read and not fired:
+            if _lock_free(lock_path):
+                replace()
+                fired.append("replaced")
+            else:
+                fired.append("deferred")
+        return original_read(path, identity)
+
+    monkeypatch.setattr(nw, "read_lead_wake", read)
+    fakes = Fakes()
+    at_queue: list[dict | None] = []
+    fakes.on_queue = lambda: at_queue.append(original_read(directory, "team-lead"))
+    wake = notifier(tmp_path, [("s1", "team-lead")], fakes)
+    try:
+        wake.tick()
+    finally:
+        wake.close()
+    if fired == ["deferred"]:
+        replace()
+
+    # Reads 2..4 span every read after the key check up to the last one before
+    # the queue; an index past the tick's final read is simply not reached.
+    assert fired or reads[0] < at_read
+    if fired == ["replaced"]:
+        assert fakes.queued == []
+    for (thread, home, _), current in zip(fakes.queued, at_queue, strict=True):
+        # Whatever was queued is the verified, still-current registration A.
+        assert (home, thread) in fakes.verified
+        assert (thread, home) == (THREAD_A, "/codex-home")
+        assert current is not None
+        assert (current["status"], current["generation"]) == ("active", 1)
+        assert (current["thread_id"], current["codex_home"]) == (thread, home)
 
 
 def test_uncertain_queue_backs_off_and_retries(tmp_path):

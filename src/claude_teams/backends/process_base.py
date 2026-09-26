@@ -107,11 +107,14 @@ class BaseBackend:
             env_vars.update(native_wake.propagated_env())
             env_vars["CLAUDE_CODE_MESSAGING_SOCKET"] = ""
             env_vars["CLAUDE_CODE_MESSAGING_TOKEN"] = ""
-            # The child's hooks stamp their state markers with this epoch, so a
-            # late hook from a previous incarnation can be told apart.
-            epoch = (request.extra or {}).get("dispatch_epoch")
-            if epoch:
-                env_vars["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] = str(epoch)
+        # The child's hooks stamp their state markers with this epoch, so a
+        # late hook from a previous incarnation can be told apart. Exported
+        # whenever one was minted, flag or not: a flag-off resume of a
+        # previously native child still needs its hooks to outrank the
+        # predecessor's marker. A pristine flag-off request carries none.
+        epoch = (request.extra or {}).get("dispatch_epoch")
+        if epoch:
+            env_vars["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] = str(epoch)
 
         return process_manager.spawn_process(
             request, cmd_parts, env_vars, self._name, is_interactive=self.is_interactive

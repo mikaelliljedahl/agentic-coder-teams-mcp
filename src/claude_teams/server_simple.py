@@ -3058,8 +3058,15 @@ def _next_dispatch_epoch(session_id: str, name: str, prior: dict) -> int:
 
 
 def _dispatch_extra(session_id: str, name: str, prior: dict) -> dict[str, str]:
-    """Spawn/resume ``extra`` carrying the new epoch; empty with the flag off."""
-    if not native_wake.enabled():
+    """Spawn/resume ``extra`` carrying the new epoch.
+
+    Minted with the master flag on, and also with it off for a record that
+    already carries native recovery metadata (a ``dispatch_epoch``): its marker
+    namespace is epoch-fenced, so a new host running with epoch 0 would have
+    every hook dropped behind the predecessor's marker. A pristine record with
+    the flag off gets nothing, keeping its request, env and record unchanged.
+    """
+    if not native_wake.enabled() and _record_epoch(prior) is None:
         return {}
     return {"dispatch_epoch": str(_next_dispatch_epoch(session_id, name, prior))}
 
@@ -3067,15 +3074,20 @@ def _dispatch_extra(session_id: str, name: str, prior: dict) -> dict[str, str]:
 def _native_record_fields(
     backend_name: str, backend: Any, extra: Mapping[str, str] | None
 ) -> dict:
-    """Record native-delivery facts at spawn/resume; empty with the flag off.
+    """Record native-delivery facts at spawn/resume; empty without a minted epoch.
 
     ``interactive`` says whether the child got a TTY (a live, wakeable
     session); ``codex_home`` pins where ``codex queue`` must look for the
     thread; ``dispatch_epoch`` is the revocable fence a native offer must match,
     minted per spawn/resume (never by a native finalisation) and also exported
     to the child so its hooks stamp their markers with it.
+
+    Keyed on the minted epoch rather than the flag: :func:`_dispatch_extra`
+    mints one with the flag off only for a record that already has native
+    recovery metadata, whose epoch and launch facts must then describe the
+    new host (a pristine flag-off record still gets nothing).
     """
-    if not native_wake.enabled() or not extra or "dispatch_epoch" not in extra:
+    if not extra or "dispatch_epoch" not in extra:
         return {}
     fields: dict = {
         "interactive": bool(

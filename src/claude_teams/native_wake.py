@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, TypeGuard
 
 from claude_teams import filelock, messaging, procinfo, winpipe
 
@@ -341,8 +341,8 @@ class _Target:
     signature: tuple[Any, ...] | None = None
     snapshot: dict[str, dict[str, int]] = field(default_factory=dict)
     catchup: bool = True
-    # Codex lead only: the registered thread was verified in its home.
-    verified: bool = False
+    # Codex lead only: the ``(thread_id, codex_home)`` verified for this key.
+    verified: tuple[str, str] | None = None
 
     def close(self) -> None:
         if self.handle is not None:
@@ -398,12 +398,36 @@ def read_lead_wake(directory: Path, identity: str) -> dict | None:
     return value if _valid_lead_wake(value) else None
 
 
+def _lead_wake_lock(directory: Path, identity: str) -> Path:
+    """Return ``lead-wake-<identity>.lock``, serializing every registration write."""
+    return lead_wake_file(directory, identity).with_suffix(".lock")
+
+
+def _registration_is(
+    registration: dict | None, key: tuple[Any, ...]
+) -> TypeGuard[dict]:
+    """Return whether ``registration`` is the active one the state ``key`` names.
+
+    ``key`` is ``(session, identity, generation, host_pid, host_create_token)``.
+    Every registration write bumps ``generation`` except corroboration, which
+    only settles ``provisional``; so an ``active`` registration at the key's
+    generation and host is exactly the one the key was minted for.
+    """
+    return (
+        registration is not None
+        and registration["status"] == "active"
+        and registration["generation"] == key[2]
+        and (registration["host_pid"], registration["host_create_token"])
+        == tuple(key[3:])
+    )
+
+
 def _update_lead_wake(
     directory: Path, identity: str, change: Callable[[dict | None], dict | None]
 ) -> dict | None:
     """Apply ``change`` under ``lead-wake-<identity>.lock``; ``None`` writes nothing."""
     path = lead_wake_file(directory, identity)
-    with filelock.file_lock(path.with_suffix(".lock")):
+    with filelock.file_lock(_lead_wake_lock(directory, identity)):
         prior = read_lead_wake(directory, identity)
         value = change(prior)
         if value is None:
@@ -814,31 +838,38 @@ class NativeWakeNotifier(threading.Thread):
         if notice is None:
             return
         registration = read_lead_wake(directory, identity)
-        if registration is None:
+        if not _registration_is(registration, key):
             return
-        if not target.verified:
+        snapshot = (registration["thread_id"], registration["codex_home"])
+        if target.verified != snapshot:
             verify = self.codex_lead.verify or verify_codex_thread
-            target.verified, _ = verify(
-                registration["codex_home"], registration["thread_id"]
-            )
-            if not target.verified:
+            ok, _ = verify(snapshot[1], snapshot[0])
+            if not ok:
                 target.backoff.failed(self.clock())
                 return
-        # Revalidate target, generation and incarnation right before queueing.
-        if (
-            target.handle is None
-            or target.handle.closed
-            or self._codex_lead_key(self.get_target()) != key
-        ):
+            target.verified = snapshot
+        if target.handle is None or target.handle.closed:
             return
-        current = read_lead_wake(directory, identity)
-        if current is None or current["thread_id"] != registration["thread_id"]:
-            return
-        outcome = self.codex_lead.queue(
-            current["thread_id"],
-            current["codex_home"],
-            codex_lead_notice(notice.counts, target.state.seq + 1),
-        )
+        # The dispatch decision and the queue run under the registration lock,
+        # so a replacement or clear either lands first (and is seen here) or
+        # waits until this notice is queued: it can never slip in between the
+        # check and the queue. Held across ``codex queue`` on purpose; that
+        # call only enqueues (bounded by its timeout) and the only contenders
+        # are this identity's own set_lead_wake/corroboration writes.
+        with filelock.file_lock(_lead_wake_lock(directory, identity)):
+            current = read_lead_wake(directory, identity)
+            if (
+                self.get_target() != (session, identity)
+                or self.codex_lead.host() != tuple(key[3:])
+                or not _registration_is(current, key)
+                or (current["thread_id"], current["codex_home"]) != snapshot
+            ):
+                return
+            outcome = self.codex_lead.queue(
+                snapshot[0],
+                snapshot[1],
+                codex_lead_notice(notice.counts, target.state.seq + 1),
+            )
         if outcome.enqueued:
             target.state.succeeded(target.snapshot, self.clock())
             target.backoff.reset()

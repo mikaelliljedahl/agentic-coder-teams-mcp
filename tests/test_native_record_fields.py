@@ -131,3 +131,60 @@ def test_epoch_is_exported_to_the_child_environment(monkeypatch):
     )
     backend._spawn_with_command(request, ["fake"], {})
     assert observed[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] == "7"
+
+
+def test_recovery_metadata_is_recorded_with_the_flag_off(monkeypatch):
+    """A minted epoch (native recovery metadata) carries current launch facts."""
+    monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
+    monkeypatch.setenv("CODEX_HOME", "/new-home")
+    monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: False
+    )
+    fields = server_simple._native_record_fields(
+        "codex", _FakeBackend(), {"dispatch_epoch": "6"}
+    )
+    assert fields == {
+        "interactive": False,
+        "dispatch_epoch": 6,
+        "codex_home": "/new-home",
+    }
+
+
+def test_dispatch_extra_flag_off_mints_for_a_record_with_native_metadata(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
+    monkeypatch.setattr(server_simple, "_SESSION_BASE", tmp_path / "sessions")
+    server_simple._session_dir("s1").mkdir(parents=True)
+    assert server_simple._dispatch_extra("s1", "worker", {"dispatch_epoch": 5}) == {
+        "dispatch_epoch": "6"
+    }
+
+
+def test_epoch_is_exported_with_the_flag_off(monkeypatch):
+    from claude_teams.backends import process_base
+    from claude_teams.backends.claude_code import ClaudeCodeBackend
+    from claude_teams.backends.contracts import SpawnRequest
+
+    monkeypatch.delenv("WIN_AGENT_TEAMS_NATIVE_WAKE", raising=False)
+    observed = []
+    monkeypatch.setattr(
+        process_base.process_manager,
+        "spawn_process",
+        lambda request, argv, env_vars, *a, **k: observed.append(env_vars),
+    )
+    request = SpawnRequest(
+        agent_id="id",
+        name="agent",
+        team_name="team",
+        prompt="task",
+        model="",
+        agent_type="",
+        color="",
+        cwd=".",
+        lead_session_id="team-lead",
+        extra={"dispatch_epoch": "7"},
+    )
+    ClaudeCodeBackend()._spawn_with_command(request, ["fake"], {})
+    assert observed[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] == "7"
+    assert "CLAUDE_CODE_MESSAGING_SOCKET" not in observed[0]

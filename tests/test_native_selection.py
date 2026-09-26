@@ -22,8 +22,10 @@ from types import SimpleNamespace
 import pytest
 
 from claude_teams import delivery_store as ds
-from claude_teams import leases, native_wake, server_simple
+from claude_teams import hooks, leases, native_wake, server_simple
 from claude_teams.agent_output import BINDING_BOUND, AgentOutput, BindingResult
+from claude_teams.backends import process_base
+from claude_teams.backends.claude_code import ClaudeCodeBackend
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.delivery import DELIVERY_MARKER_PREFIX
 
@@ -1107,3 +1109,121 @@ def test_unresolved_native_query_excludes_the_callers_own_row() -> None:
         txn.put(record)
     rows = txn.unresolved_native(AGENT, exclude=ds.record_key(LEAD, "a"))
     assert [row["idempotency_key"] for row in rows] == ["b"]
+
+
+# ==========================================================================
+# Recovery metadata across a flag-off resume (plan §2.9 R3-2, review R4-2)
+# ==========================================================================
+
+
+class _EnvCapturingBackend(_FakeResumeBackend):
+    """Resume through the real env export, recording what the child would get."""
+
+    def __init__(self, transcript: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        super().__init__(transcript)
+        self.envs: list[dict[str, str]] = []
+        monkeypatch.setattr(
+            process_base.process_manager,
+            "spawn_process",
+            lambda request, argv, env_vars, *a, **k: self.envs.append(env_vars),
+        )
+        self._real = ClaudeCodeBackend()
+
+    def resume(self, request: SpawnRequest, backend_session_id: str) -> SimpleNamespace:
+        self._real._spawn_with_command(request, ["fake"], {})
+        return super().resume(request, backend_session_id)
+
+
+def _hook(env: SimpleNamespace, event: str, epoch: str | None) -> None:
+    """Run the real hook write as the host with ``epoch`` in its environment."""
+    if epoch is None:
+        env.monkeypatch.delenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", raising=False)
+    else:
+        env.monkeypatch.setenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", epoch)
+    hooks._record_event(env.session_dir, AGENT, event, BACKEND_SESSION)
+    env.monkeypatch.delenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", raising=False)
+
+
+def _state_marker() -> dict:
+    marker = server_simple._read_state_marker(SESSION, AGENT)
+    assert marker is not None
+    return marker
+
+
+@pytest.mark.asyncio
+async def test_flag_off_resume_of_native_record_refreshes_recovery_metadata(
+    env,
+) -> None:
+    """on → off resume → on: the new host's hooks count, and its facts are current."""
+    backend = _EnvCapturingBackend(env.transcript, env.monkeypatch)
+    env.monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
+    tty = SimpleNamespace(value=True)
+    env.monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: tty.value
+    )
+    # A child spawned with native wake on, now parked at epoch 5.
+    _set_agent(env, dispatch_epoch=5, interactive=True)
+    _hook(env, "Stop", "5")
+    assert _state_marker()["state"] == "waiting"
+
+    # The parent restarts with the master flag off; the host changes TTY-ness.
+    _flags(env.monkeypatch)
+    tty.value = False
+    first = await server_simple.follow_up_agent(AGENT, "first", KEY)
+
+    assert first["status"] == "delivered"
+    assert len(backend.resume_calls) == 1
+    request = backend.resume_calls[0][0]
+    record = server_simple._load_agents(SESSION)[0]
+    assert (request.extra or {}).get("dispatch_epoch") == "6"
+    assert backend.envs[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] == "6"
+    assert record["dispatch_epoch"] == 6
+    assert record["interactive"] is False
+    # The epoch is recovery metadata, not native delivery: nothing else native.
+    assert "WIN_AGENT_TEAMS_NATIVE_WAKE" not in backend.envs[0]
+    assert "CLAUDE_CODE_MESSAGING_SOCKET" not in backend.envs[0]
+
+    # The replacement host starts its turn: its hook must not be dropped.
+    _hook(env, "UserPromptSubmit", backend.envs[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"])
+    marker = _state_marker()
+    assert marker["state"] == "running"
+    assert marker["dispatch_epoch"] == 6
+
+    # ... so a follow-up while it is busy must not replace it.
+    busy = await server_simple.follow_up_agent(AGENT, "second", "k-2")
+    assert busy["status"] != "delivered"
+    assert len(backend.resume_calls) == 1
+
+    # Flags back on: record and marker agree on the epoch, and the next resume
+    # mints past it.
+    _hook(env, "Stop", "6")
+    _all_on(env.monkeypatch)
+    tty.value = True
+    third = await server_simple.follow_up_agent(AGENT, "third", "k-3")
+
+    assert third["status"] == "delivered"
+    assert len(backend.resume_calls) == 2
+    record = server_simple._load_agents(SESSION)[0]
+    assert (backend.resume_calls[1][0].extra or {}).get("dispatch_epoch") == "7"
+    assert backend.envs[1]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] == "7"
+    assert record["dispatch_epoch"] == 7
+    assert record["interactive"] is True
+
+
+@pytest.mark.asyncio
+async def test_flag_off_resume_of_pristine_record_adds_no_native_metadata(
+    env,
+) -> None:
+    backend = _EnvCapturingBackend(env.transcript, env.monkeypatch)
+    env.monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
+    _idle(env)
+
+    result = await server_simple.follow_up_agent(AGENT, "next", KEY)
+
+    assert result["status"] == "delivered"
+    assert "dispatch_epoch" not in (backend.resume_calls[0][0].extra or {})
+    assert "WIN_AGENT_TEAMS_DISPATCH_EPOCH" not in backend.envs[0]
+    record = server_simple._load_agents(SESSION)[0]
+    for field in ("interactive", "codex_home", "dispatch_epoch"):
+        assert field not in record
+    assert not (env.session_dir / "dispatch-epochs.json").exists()
