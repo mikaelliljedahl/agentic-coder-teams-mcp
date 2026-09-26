@@ -1,0 +1,17 @@
+Captured failing run — diagnostic excerpts:
+
+E       AttributeError: module 'claude_teams.native_wake' has no attribute 'CodexMemberWake'
+E       assert 'external_set_wake' in ['join_team', 'external_send', 'external_read', 'leave_team', 'list_backends']
+E        +  where ['join_team', 'external_send', 'external_read', 'leave_team', 'list_backends'] = <function loads at 0x7d4189cf68e0>('["join_team", "external_send", "external_read", "leave_team", "list_backends"]\n')
+E        +    where <function loads at 0x7d4189cf68e0> = json.loads
+E        +    and   '["join_team", "external_send", "external_read", "leave_team", "list_backends"]\n' = CompletedProcess(args=['/home/mikael/code/github/wt-native-session-wake/.venv/bin/python', '-c', 'import asyncio,json;...'], returncode=0, stdout='["join_team", "external_send", "external_read", "leave_team", "list_backends"]\n', stderr='').stdout
+E           AttributeError: module 'claude_teams.native_wake' has no attribute 'verify_codex_thread'
+
+ERROR tests/test_codex_member_wake.py::test_queue_agents_lock_free_and_member_lock_order
+ERROR tests/test_codex_member_wake.py::test_subswitch - AttributeError: modul...
+ERROR tests/test_codex_member_wake.py::test_reregister_while_first_queue_running
+ERROR tests/test_codex_member_wake.py::test_revalidate_before_subprocess[leave-coalesced]
+ERROR tests/test_codex_member_wake.py::test_revalidate_before_subprocess[change-stale_registration]
+ERROR tests/test_codex_member_wake.py::test_registration_send_stress_no_deadlock
+ERROR tests/test_codex_member_wake.py::test_verification_closed_before_queue
+10 failed, 17 errors in 1.63s

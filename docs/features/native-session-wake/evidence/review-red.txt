@@ -1,0 +1,22 @@
+Captured red diagnostic excerpts:
+
+E               AssertionError: host lookup on macOS
+E               AssertionError: unavailable channel read registry
+E           AssertionError: assert False
+E            +  where False = exists()
+E            +    where exists = PosixPath('/tmp/pytest-of-mikael/pytest-28/test_member_target_posts_catch0/s1/native-wake-member.member.lock').exists
+E           AssertionError: assert 1 == 2
+E            +  where 1 = len(['[win-agent-teams wake #1] 1 unread message(s) in your team inbox from: alice (1). Best-effort notice without content; call external_read with the member_token you saved to read them.'])
+
+E            +  where 1 = len(['[win-agent-teams wake #1] 1 unread message(s) in your team inbox from: alice (1). Best-effort notice without content; call external_read with the member_token you saved to read them.'])
+
+tests/test_native_wake.py:595: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_native_wake.py::test_macos_channel_unavailable_without_host_lookup
+FAILED tests/test_native_wake.py::test_unavailable_channel_drains_members_without_registry_reads[disabled]
+FAILED tests/test_native_wake.py::test_unavailable_channel_drains_members_without_registry_reads[no_socket]
+FAILED tests/test_native_wake.py::test_unavailable_channel_drains_members_without_registry_reads[host_not_claude]
+FAILED tests/test_native_wake.py::test_unavailable_channel_drains_members_without_registry_reads[unsupported_platform]
+FAILED tests/test_native_wake.py::test_member_target_posts_catchup_then_coalesced_growth
+FAILED tests/test_native_wake.py::test_lead_and_member_lock_names_cannot_collide
+7 failed, 1 passed, 42 deselected in 0.96s

@@ -1,0 +1,12 @@
+Captured failing run — diagnostic excerpts:
+
+E           AssertionError: assert 10 == 1
+E            +  where 10 = <Mock id='133812436441168'>.call_count
+E               OSError: snapshot unavailable
+E       KeyError: 'wake'
+
+=========================== short test summary info ============================
+FAILED tests/test_native_wake.py::test_unchanged_inbox_scans_only_on_deadline_or_activation
+FAILED tests/test_codex_member_wake.py::test_snapshot_failure_never_fails_successful_append
+FAILED tests/test_codex_member_wake.py::test_removed_member_between_append_and_snapshot_coalesces
+3 failed in 0.67s
