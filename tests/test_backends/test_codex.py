@@ -142,7 +142,7 @@ def test_trust_cwd_validates_the_same_resolved_key_it_emits(_make_request, monke
 
     def changing_resolve(path, *args, **kwargs):
         nonlocal calls
-        if str(path) == request.cwd:
+        if Path(path) == Path(request.cwd):
             calls += 1
             return Path("/workspace/safe" if calls == 1 else "/workspace/bad'key")
         return original_resolve(path, *args, **kwargs)
