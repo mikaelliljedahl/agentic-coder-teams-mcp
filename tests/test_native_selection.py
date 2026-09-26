@@ -5,8 +5,8 @@ later steps. What is pinned here is everything around them:
 
 - the N5 barrier, which reads the delivery store and holds regardless of any
   flag, so an unresolved native attempt can never be followed by a resume;
-- E0-E6 eligibility, evaluated before the idle gate (stage 1) and again under
-  the granted lease (stage 2);
+- E0-E5 eligibility (E6 lifted), evaluated before the idle gate (stage 1) and
+  again under the granted lease (stage 2);
 - the ``method``/``carrier`` row fields and their flag-gated public view;
 - that with no carrier implemented, every flag combination still resumes.
 
@@ -213,6 +213,14 @@ def _idle(env: SimpleNamespace) -> None:
 
 def _busy(env: SimpleNamespace) -> None:
     env.state.last_activity_at = 995.0
+
+
+def _running(env: SimpleNamespace) -> None:
+    """The hook marker of a child in the middle of a turn."""
+    (env.session_dir / f"state-{AGENT}.json").write_text(
+        json.dumps({"state": "running", "event": "UserPromptSubmit", "ts": 990.0}),
+        encoding="utf-8",
+    )
 
 
 def _set_agent(env: SimpleNamespace, **fields: object) -> None:
@@ -599,7 +607,7 @@ async def test_stage_two_checks_n5_before_re_evaluating_eligibility(env) -> None
 
     assert result["reason"] == server_simple.REASON_PRIOR_NATIVE_UNRESOLVED
     assert result["blocking_sender"] == "other-lead"
-    assert len(probes) == 1, "stage 2 stopped at N5, before E0-E6"
+    assert len(probes) == 1, "stage 2 stopped at N5, before E0-E5"
     assert dispatched == []
     assert env.backend.resume_calls == []
     row = _row()
@@ -639,7 +647,7 @@ async def test_same_key_retry_of_an_unresolved_native_attempt_is_not_resent(
 def _eligibility_case(
     env: SimpleNamespace, backend: str, *, prompt: str = "hello"
 ) -> dict:
-    """Arguments under which every E0-E6 holds for ``backend``."""
+    """Arguments under which every E0-E5 holds for ``backend``."""
     _all_on(env.monkeypatch)
     home = env.tmp_path / "codex-home"
     home.mkdir(exist_ok=True)
@@ -751,10 +759,6 @@ _CODEX_BREAKS = {
             server_simple, "_codex_queue_binary", lambda: ""
         ),
     ),
-    "E6-busy": (
-        "E6",
-        lambda env, case: (env.session_dir / f"state-{AGENT}.json").unlink(),
-    ),
     "E0-half-off": (
         "E0",
         lambda env, case: env.monkeypatch.setenv(
@@ -819,10 +823,21 @@ def test_each_false_condition_rules_out_claude(env, name: str) -> None:
 
 
 def test_busy_claude_target_is_still_a_candidate(env) -> None:
-    """Claude's poster enforces idleness itself; E6 is Codex-only."""
+    """Claude's poster enforces idleness itself."""
     case = _eligibility_case(env, "claude-code")
     (env.session_dir / f"state-{AGENT}.json").unlink()
     assert _candidate(case) == (ds.METHOD_CLAUDE_MAILBOX, "")
+
+
+@pytest.mark.parametrize("marker", ["running", "absent"])
+def test_busy_codex_target_is_a_candidate(env, marker: str) -> None:
+    """E6 is lifted (N2 passed live): ``codex queue`` waits behind the turn."""
+    case = _eligibility_case(env, "codex")
+    if marker == "running":
+        _running(env)
+    else:
+        (env.session_dir / f"state-{AGENT}.json").unlink()
+    assert _candidate(case) == (ds.METHOD_CODEX_QUEUE, "")
 
 
 def test_inline_limit_counts_encoded_bytes_marker_included(env) -> None:
@@ -939,19 +954,46 @@ async def test_codex_carrier_is_frozen_with_home_and_rollout(env) -> None:
 
 
 @pytest.mark.asyncio
-async def test_busy_codex_waits_under_e6(env) -> None:
+async def test_busy_codex_is_queued_behind_its_turn(env) -> None:
+    """E6 lifted: a busy Codex candidate dispatches at once, no wait loop."""
     case = _eligibility_case(env, "codex")
     _set_agent(env, **case["agent"])
     dispatched = _register_dispatcher(env, ds.METHOD_CODEX_QUEUE)
-    (env.session_dir / f"state-{AGENT}.json").unlink()
+    _running(env)
+    _busy(env)
+
+    result = await server_simple.follow_up_agent(AGENT, "next", KEY)
+
+    assert len(dispatched) == 1
+    assert env.clock.sleeps == 0, "a busy Codex candidate does not wait"
+    assert env.backend.resume_calls == []
+    assert result["method"] == ds.METHOD_CODEX_QUEUE
+    assert _row()[ds.METHOD_FIELD] == ds.METHOD_CODEX_QUEUE
+
+
+@pytest.mark.parametrize("ineligible", ["flags_off", "headless", "downstream_off"])
+@pytest.mark.asyncio
+async def test_busy_codex_without_native_still_waits(env, ineligible: str) -> None:
+    """Without a native carrier a busy Codex child keeps today's wait loop."""
+    case = _eligibility_case(env, "codex")
+    _set_agent(env, **case["agent"])
+    dispatched = _register_dispatcher(env, ds.METHOD_CODEX_QUEUE)
+    if ineligible == "flags_off":
+        _flags(env.monkeypatch)
+    elif ineligible == "downstream_off":
+        _flags(env.monkeypatch, NATIVE_WAKE="1")
+    else:
+        _set_agent(env, interactive=False)
+    _running(env)
     _busy(env)
 
     result = await server_simple.follow_up_agent(AGENT, "next", KEY)
 
     assert dispatched == []
     assert env.backend.resume_calls == []
+    assert env.clock.sleeps > 0, "the bounded wait ran"
     assert result["phase"] == ds.PHASE_PENDING
-    assert result["reason"] == "agent_busy"
+    assert result["reason"] in {"agent_busy", "call_budget_expired"}
 
 
 @pytest.mark.asyncio

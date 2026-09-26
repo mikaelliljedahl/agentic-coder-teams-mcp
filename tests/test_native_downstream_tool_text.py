@@ -60,6 +60,14 @@ def test_delivery_tools_describe_native_carriers(tools, name):
         assert literal in text, (name, literal)
 
 
+@pytest.mark.parametrize("name", ["follow_up_agent", "send_message", "delivery_status"])
+def test_busy_codex_child_is_described_as_queued_behind_its_turn(tools, name):
+    """E6 lifted: a busy Codex child is no longer waited for."""
+    text = _words(tools[name])
+    assert "busy Codex child gets it queued behind its current turn" in text
+    assert "busy Codex child is waited for" not in text
+
+
 @pytest.mark.parametrize(
     "name", ["follow_up_agent", "delivery_status", "kill_agent", "spawn_agent"]
 )

@@ -309,8 +309,8 @@ behavior and creates no notifier thread, lock file, or queue subprocess.
 With `WIN_AGENT_TEAMS_NATIVE_WAKE=1` and `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1`,
 `follow_up_agent` (and `send_message` to a child you spawned) puts the message
 into a live, interactive child's running session instead of killing and
-resuming it; the PID stays. A Codex child gets it through `codex queue` when
-idle. A Claude child gets it through a delivery mailbox that its own MCP server
+resuming it; the PID stays. A Codex child gets it through `codex queue`; if it
+is busy, the message is queued behind its current turn. A Claude child gets it through a delivery mailbox that its own MCP server
 posts to its own session channel at its next idle point. Results and
 `delivery_status` rows carry `method` (`resume`, `codex_queue`,
 `claude_mailbox`). Dead or headless children, Pi, messages over 16 KiB and

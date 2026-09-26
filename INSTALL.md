@@ -406,7 +406,8 @@ kills a live child and resumes it with the prompt. With
 in the lead's entry, a live, interactive child gets the message in its running
 session instead, keeping its PID:
 
-- **Codex child**: `codex queue` on its thread, when it is idle.
+- **Codex child**: `codex queue` on its thread. A busy child gets the message
+  queued behind its current turn, which is not interrupted.
 - **Claude Code child**: the lead offers the message in a mailbox file, and
   the child's own MCP server posts it to its own session channel at its next
   idle point. The child inherits the flags from the lead (6a.1).

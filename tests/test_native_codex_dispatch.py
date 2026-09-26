@@ -251,6 +251,39 @@ async def test_enqueued_without_a_receipt_is_native_unresolved(env) -> None:
     assert status["status"] == ds.STATUS_DELIVERED
 
 
+@pytest.mark.asyncio
+async def test_queued_behind_a_long_turn_past_the_budget_is_native_unresolved(
+    env,
+) -> None:
+    """E6 lifted: the receipt of a message queued behind a running turn may land
+    only after the call budget. That is ``unconfirmed``, never resume or failed.
+    """
+    _codex_target(env)
+    _sel._running(env)
+    _sel._busy(env)
+    queue = _install(env, _Queue(env.transcript, receipt=False))
+
+    result = await server_simple.follow_up_agent(AGENT, "next", KEY)
+
+    assert len(queue.calls) == 1, "queued at once, behind the running turn"
+    assert env.clock.now >= server_simple._DELIVERY_CALL_BUDGET_SECONDS, (
+        "the receipt was awaited for the whole budget"
+    )
+    assert result["status"] == ds.STATUS_QUEUED
+    assert result["phase"] == ds.PHASE_UNCONFIRMED
+    assert result["reason"] == server_simple.REASON_NATIVE_UNRESOLVED
+    assert result["method"] == ds.METHOD_CODEX_QUEUE
+    assert env.codex.resume_calls == []
+    assert ds.is_unresolved_native(_row())
+    assert _agent()[server_simple.PENDING_DELIVERY_FIELD]["carrier_ref"] == SUBMISSION
+
+    # The turn ends and the queued message is presented: delivered.
+    _append(env.transcript, _codex_user(queue.calls[0][0][-1]))
+    status = await server_simple.delivery_status(KEY)
+    assert status["status"] == ds.STATUS_DELIVERED
+    assert env.codex.resume_calls == []
+
+
 # ==========================================================================
 # §2.2.3 — the outcome table
 # ==========================================================================

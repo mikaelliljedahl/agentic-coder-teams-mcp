@@ -137,11 +137,13 @@ None}`:
 | E3 | channel proof | `verify_codex_thread(record.codex_home, backend_session_id)` | a fresh capability marker bound to this dispatch epoch and backend session (§2.3.3), owner lock held |
 | E4 | transport safety | native binary, not the `.cmd` shim | child channel `available` |
 | E5 | encoded message ≤ `NATIVE_INLINE_MAX` (§2.4) | ✓ | ✓ |
-| E6 | **Codex only:** the target is idle by marker, until N2 passes live (R2-10) | ✓ | — (the poster waits for idle itself) |
+| E6 | **Codex only:** the target is idle by marker, until N2 passes live (R2-10). **Lifted:** N2 passed on Linux, 2026-09-26 (`spikes.md`, L-1); a busy Codex target is queued behind its running turn. | ~~✓~~ lifted | — (the poster waits for idle itself) |
 
 - **Candidate found.** A Claude target that is busy or has
   `replace_if_idle=False` goes on to reserve the lease, and the poster enforces
   idleness. For Codex, E6 keeps today's wait loop for busy targets.
+  *(E6 lifted 2026-09-26: a busy Codex candidate now reserves the lease too,
+  and `codex queue` queues the message behind the running turn.)*
 - **No candidate.** Today's path runs unchanged.
 
 **Stage 2 — commit under the lease.** First N5 is re-checked, then E0–E6 are

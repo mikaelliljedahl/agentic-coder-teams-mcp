@@ -1538,13 +1538,14 @@ The first failing condition selects `resume`:
 | E1 | alive, binding bound, `backend_session_id` known |
 | E2 | the record's `interactive` is `true` (written at spawn/resume from `provides_tty`; missing ⇒ false) |
 | E5 | delivered text (prompt plus nonce marker) ≤ `NATIVE_INLINE_MAX`, 16 KiB of UTF-8 |
-| E6 | Codex only: the marker says `waiting`. A busy Codex child keeps today's wait loop. |
+| ~~E6~~ | *Lifted* (N2 passed live): a busy Codex child is eligible too; `codex queue` puts the message behind its running turn without aborting it. |
 | E4 | Codex: the discovered binary is not a `.cmd`/`.bat` shim. Claude: the child's channel is `available`. |
 | E3 | Codex: `verify_codex_thread(record.codex_home, backend_session_id)`. Claude: a fresh capability marker bound to this child (below). |
 
 A candidate skips the idle/replace gate: `replace_if_idle` governs only
-resume, and a busy Claude child is held by its poster until idle. **Stage 2**
-(`_native_still_eligible`) re-checks N5 and E0–E6 under the lease from a
+resume, a busy Claude child is held by its poster until idle, and a busy Codex
+child gets the message queued behind its current turn. **Stage 2**
+(`_native_still_eligible`) re-checks N5 and E0–E5 under the lease from a
 fresh registry load; a changed generation or backend session also fails it.
 Failing stage 2 gives up the lease and its FIFO position and re-enters the idle
 gate in the same budget, resume-only.
@@ -1571,6 +1572,11 @@ resume-only. Otherwise:
 |---|---|
 | `enqueued` (a submission id) | `carrier_ref` attached by CAS on `(sender, key, nonce, operation_id)`, then the receipt is awaited for the rest of the budget: `delivered`, else `unconfirmed(native_unresolved)` |
 | exit 0 without an id, non-zero exit, timeout, error after spawn | one scan; `delivered` if the nonce is already there, else `unconfirmed(native_unresolved)` |
+
+A message queued behind a long running turn is presented only when that turn
+ends, often after the call budget. That is the `enqueued` row without a
+receipt: `unconfirmed(native_unresolved)`, never resume and never `failed`; a
+later receipt settles it `delivered`.
 
 **B: Claude child, the delivery mailbox** (`src/claude_teams/delivery_mailbox.py`).
 `<session>/delivery-mailbox-<child>.json` is one strictly validated JSON

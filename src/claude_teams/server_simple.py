@@ -430,7 +430,8 @@ _NATIVE_DOWNSTREAM_NOTE = (
     "WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1 and a live interactive child; they "
     "put the message into its running session, same pid, and replace_if_idle "
     "does not apply. A busy Claude child gets it at its next idle point; a "
-    "busy Codex child is waited for. A dead, headless or unverifiable child, "
+    "busy Codex child gets it queued behind its current turn. A dead, "
+    "headless or unverifiable child, "
     "Pi, or a message over 16 KiB of UTF-8 uses resume. queued/unconfirmed "
     "with reason native_unresolved means it was handed over without a receipt "
     "yet: it may still run, even after kill_agent or a restart, so do NOT "
@@ -3373,14 +3374,16 @@ def _native_candidate(  # noqa: PLR0911 - one return per eligibility condition.
     backend_session_id: str,
     prompt: str,
 ) -> tuple[str | None, str]:
-    """Evaluate E0-E6 (plan §2.1): which native carrier may take this attempt.
+    """Evaluate E0-E5 (plan §2.1): which native carrier may take this attempt.
 
     Returns ``(method, "")`` when every condition holds, else ``(None, why)``
     naming the first one that failed. It decides only between carriers; the
     N5 barrier is separate and runs first, whatever the flags say.
 
-    E6 (idle by marker) applies to Codex only. A busy Claude target remains a
-    candidate because its poster waits for the next idle edge itself.
+    Neither carrier requires an idle target. A busy Claude target's poster
+    waits for the next idle edge itself; ``codex queue`` puts the message
+    behind a busy Codex target's running turn without aborting it. E6 (Codex
+    idle by marker) was lifted once N2 passed live.
     """
     native = _NATIVE_BACKENDS.get(backend_name)
     if native is None:
@@ -3396,16 +3399,6 @@ def _native_candidate(  # noqa: PLR0911 - one return per eligibility condition.
     if len(text.encode("utf-8")) > NATIVE_INLINE_MAX:
         return None, "E5_too_large"
     if method == METHOD_CODEX_QUEUE:
-        idle = (
-            _resolve_agent_state(
-                alive=True,
-                marker=_read_state_marker(session_id, name),
-                last_activity_at=None,
-            )
-            == "waiting"
-        )
-        if not idle:
-            return None, "E6_busy"
         binary = _codex_queue_binary()
         if not binary or Path(binary).suffix.lower() in {".cmd", ".bat"}:
             return None, "E4_transport_unsafe"
@@ -3509,7 +3502,7 @@ def _native_carrier(
 
 
 def _native_still_eligible(session_id: str, plan: _FollowUpPlan, prompt: str) -> bool:
-    """Stage 2 of plan §2.1: re-evaluate E0-E6 under the granted lease.
+    """Stage 2 of plan §2.1: re-evaluate E0-E5 under the granted lease.
 
     Read from a fresh registry load, because the record may have changed
     since phase 1 released the registry lock. Any change of generation or
@@ -5412,9 +5405,10 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
 
             # Stage 1 (plan §2.1): provisional native eligibility, ahead of the
             # idle/replace gate. A candidate skips that gate: a native carrier
-            # never replaces the process, and a Claude poster waits for idle
-            # itself (a busy Codex target already failed E6). A candidate with
-            # no implemented carrier is dropped here, so it resumes unchanged.
+            # never replaces the process, a Claude poster waits for idle itself
+            # and ``codex queue`` queues behind a busy Codex target's running
+            # turn. A candidate with no implemented carrier is dropped here, so
+            # it resumes unchanged.
             native_method = (
                 _selectable_native_method(
                     session_id,
@@ -5615,7 +5609,7 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             if prep.plan is not None:
                 if prep.plan.method != METHOD_RESUME:
                     # Stage 2 (plan §2.1): under the granted lease, N5 first,
-                    # then E0-E6. The commit in ``_mark_attempt_sent``
+                    # then E0-E5. The commit in ``_mark_attempt_sent``
                     # re-checks N5 atomically with the write; this one keeps a
                     # barrier from ever being reported as lost eligibility.
                     try:
