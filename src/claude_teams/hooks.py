@@ -104,19 +104,61 @@ def emit(session_dir: Path, agent: str) -> None:
     event_name = payload.get("hook_event_name")
     if not isinstance(event_name, str):
         return
-    state = _map_event_to_state(event_name)
-    if state is None:
+    if _map_event_to_state(event_name) is None:
         return
+    session_id = payload.get("session_id")
+    _record_event(
+        Path(session_dir),
+        agent,
+        event_name,
+        session_id if isinstance(session_id, str) else "",
+    )
 
+
+def _next_marker(prior: dict, event_name: str, session_id: str) -> dict:
+    """Derive the next marker from the prior one (counters are monotonic).
+
+    ``idle_seq`` counts ``waiting`` events and ``turn_seq`` counts submitted
+    prompts, so a whole turn that happens between two polls is still visible
+    as a larger ``idle_seq`` even though ``state`` looks unchanged.
+    """
+    state = _map_event_to_state(event_name)
+
+    def counter(name: str) -> int:
+        value = prior.get(name)
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    idle_seq = counter("idle_seq") + (1 if state == "waiting" else 0)
+    turn_seq = counter("turn_seq") + (1 if event_name == "UserPromptSubmit" else 0)
     # ``gen`` identifies this exact write so a watcher can acknowledge one park
     # and still wake for the next one (equality, never timestamp ordering).
-    marker = {
+    return {
         "state": state,
         "event": event_name,
         "ts": time.time(),
         "gen": uuid.uuid4().hex,
+        "idle_seq": idle_seq,
+        "turn_seq": turn_seq,
+        "backend_session_id": session_id,
     }
-    _write_marker_atomic(_marker_file(Path(session_dir), agent), marker)
+
+
+def _record_event(
+    session_dir: Path, agent: str, event_name: str, session_id: str
+) -> None:
+    """Read-modify-write the marker under its lock so no increment is lost."""
+    from claude_teams import filelock  # noqa: PLC0415 - keep hook import light.
+
+    path = _marker_file(session_dir, agent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with filelock.file_lock(path.with_name(f"state-{agent}.lock")):
+        try:
+            prior = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            prior = {}
+        if not isinstance(prior, dict):
+            prior = {}
+        _write_marker_atomic(path, _next_marker(prior, event_name, session_id))
 
 
 def _emit_command(session_dir: Path, agent: str) -> list[str]:
