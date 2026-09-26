@@ -236,3 +236,52 @@ remaining claim/idle/admission rules before approval.
 | R3-3 | MAJOR | ACCEPTED. The mailbox is initialised before the first `sent`. `publish` and `revoke` are CAS operations under the mailbox lock, so whichever runs first wins and the tombstone is the authority. Correctness does not depend on holder liveness. The claim is used only to avoid disrupting a live in-process call. | plan ?2.9 |
 | R3-4 | MAJOR | ACCEPTED and implemented (412ab23). Each path, compared case-insensitively, is reserved atomically before any I/O. Reservations count toward `MAX_PARKED`, and ownership passes to the parked entry without a gap. Tests cover concurrent same-path posts with mixed case, release on completion and on refusal, and the cap counting reservations. | `winpipe.py`, `tests/test_winpipe_logic.py` |
 | R3-5 | MINOR | ACCEPTED. The real platform command budget is checked on top of the 16 KiB limit. A pre-launch budget failure forces a resume through the idle gate. The Codex resume size limit is stated explicitly. | plan ?2.9 |
+
+## Round 4
+
+VERDICT: APPROVED_WITH_NITS
+
+Reviewed v3.1 at `59ca4c9`, runner/admission fixes at `412ab23`, marker work
+at `36f317e` and record fields at `91c7b79`. **No remaining correctness
+blocker was found in the amended design or the reviewed runner/F5 fixes.**
+Approval is for the plan, with A–D in one PR; it is not a declaration that the
+unfinished implementation or mandatory live gates have passed. The notes below
+can be handled during the planned TDD work without another plan redesign.
+
+### Round 3 finding status
+
+| Finding | Status | Verification |
+|---|---|---|
+| R3-1 | **Resolved in code** | Popen construction is separate from communicate. Post-launch exceptions stay uncertain and trigger cleanup (`native_wake.py:627-648`); legacy run-style exceptions never establish non-enqueue (`:613-621`). Tests distinguish constructor failure, communicate OSError and timeout. The former unsafe fallthrough is removed. |
+| R3-2 | **Resolved in the plan; implementation pending** | §2.9 requires epoch-bound markers, rejects older hooks, namespaces counters, advances idle only on transitions, and CAS-rolls back consumption owned by the failing nonce (`plan.md:452-481`). Atomic marker reads and hook-only state locking avoid the added lock inversion. Commit 36f317e implements the earlier counters, not these acknowledged amendments; finish the specified tests before enabling B. See implementation note R4-2. |
+| R3-3 | **Resolved in the plan** | The mailbox is initialized before sent. Publish and revoke serialize under the same lock; revoked tombstones exclude late publication independent of process/claim liveness (`plan.md:483-509`). In-process active-claim checks are an optimization, not a delivery proof. Retain attempt-identity CAS when folding the result into the delivery row, as already required by the design. |
+| R3-4 | **Resolved in code** | A case-folded path reservation and global slot are acquired atomically before I/O; parked storage is recorded before releasing the reservation (`winpipe.py:229-256,332-354`). Mixed-case concurrent posts, reservation release and reservation-aware cap tests cover the reproduced race. Temporary double-counting during transfer is conservative, not a safety gap. |
+| R3-5 | **Resolved in the plan, with a minor measurement correction** | Native command-budget rejection forces resume through its idle gate without reselecting native; Codex argv limits are explicit (`plan.md:511-527`). UTF-16 measurement and the baseline failure wording need R4-1; neither permits an ambiguous native attempt to fall back. |
+
+### Implementation notes
+
+1. [MINOR] `docs/features/native-downstream-delivery/plan.md:514-526` — Windows `len(subprocess.list2cmdline(argv))` counts Python code points, while CreateProcess limits UTF-16 units. Also `failed(message_too_large)` is a proposed precise pre-launch result, not literally the baseline's existing result: the baseline Codex argv path generally surfaces launch failure as resume_failed. **Fix:** measure `len(quoted_command.encode("utf-16-le")) // 2`, account for the terminating null, and describe message_too_large as a flag-on improvement while preserving flag-off golden behavior. For POSIX, count encoded arguments/environment including terminators and leave room for pointer overhead. Add the non-BMP/quote-heavy/long-path boundary and flag-off error-shape tests while implementing the budget guard. Keep every such rejection strictly before process launch and retain the forced-resume latch. No carrier-safety redesign is needed.
+
+2. [MINOR] `src/claude_teams/server_simple.py:2871-2894,3524,4375-4377`; `docs/features/native-downstream-delivery/plan.md:222-228,454-470` — The new record helper currently computes spawn epoch from `{}` and resume epoch only during finalization. The amendment also needs the **new** epoch in the actual child environment before its first hook runs. Name reuse and flag-off resume of a previously native record must not reuse stale marker/consumption namespaces or leave stale interactive/home facts eligible after flags are re-enabled. **Fix:** make epoch allocation part of preparation before launching, persist its revocation/watermark under the existing target serialization, and pass that same allocated value into request/env and finalization. Preserve a monotonically increasing epoch across removal/name reuse, or use an equivalent non-reused incarnation identifier with defined ordering. Keep fresh flag-off sessions byte-identical; maintain recovery metadata for records that already have native state. Extend TDD with actual request/env/record equality on spawn/resume, same-name replacement, launch failure, and on→off resume→on eligibility. This is completion of the stated epoch rules, not a new blocker for the plan.
+
+3. [NIT] `docs/features/native-downstream-delivery/plan.md:253-277,301-324,448-450` — §2.9 correctly overrides the old holder-death and every-waiting-event rules, but leaving both algorithms in the body makes implementation and later reviews unnecessarily error-prone. **Fix:** fold the accepted amendments into §2.3/§2.4 and retain §2.9 as an amendment summary or link. Remove the old implication that a resumed server must wait for the publisher process to die. Likewise label the existing hook implementation as the earlier counter version until the transition/epoch tests pass.
+
+### Validation
+
+The expanded snapshot run of pipe, runner, native-wake, hook and record suites
+returned **103 passed, 7 failed, 4 skipped**. All seven failures were in the
+hook tests for the acknowledged, in-progress §2.9 namespace/transition/epoch
+amendments; they are remaining implementation work, not a newly discovered
+plan blocker. Concurrent source/test edits were visible and were left untouched.
+
+The final stable-scope run, `uv run pytest tests/test_winpipe.py
+tests/test_winpipe_logic.py tests/test_codex_queue_runner.py
+tests/test_native_wake.py -q`, returned **91 passed, 4 skipped**. An intermediate
+run including the actively changing record-field suite returned **94 passed,
+3 failed, 4 skipped**; those failures concerned missing interactive fields and
+a helper-signature/test mismatch during concurrent implementation. Existing
+live gates remain required, and this approval does not claim that real Claude
+ingestion, flag propagation, or D wake smokes have passed.
+
+Round-4 counts: **0 BLOCKER, 0 MAJOR, 2 MINOR, 1 NIT**. Proceed with the planned
+implementation/TDD and merge gates in the single A–D PR.
