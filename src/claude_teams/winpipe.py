@@ -4,8 +4,10 @@ A blocking ``open()``/``write()`` on a pipe has no deadline: a host that stops
 reading wedges the writer forever, and ``Thread.join(timeout)`` only abandons
 it. Every write here is overlapped I/O with a real operation deadline: on
 expiry the write is cancelled with ``CancelIoEx`` and its completion awaited
-before the buffer is released, so nothing is left running and no late write
-can land after the call returns.
+for a bounded grace. A write whose completion is not observed in time is
+parked with its storage (it may still complete late, so the outcome stays
+uncertain); its path accepts no new write until it drains, and the process
+holds at most ``MAX_PARKED`` such writes.
 
 The server end is verified before any byte is written:
 ``GetNamedPipeServerProcessId`` must equal the expected host PID, which is a
@@ -18,7 +20,9 @@ on every platform.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -159,6 +163,7 @@ def _server_pid(handle: Any) -> int | None:
 class _Pending:
     """Kernel-referenced storage for one write; freed only after completion."""
 
+    path: str
     handle: Any
     event: Any
     buffer: Any
@@ -166,11 +171,14 @@ class _Pending:
     written: ctypes.c_uint32
 
 
-# Writes whose cancellation did not complete within the grace. Their storage
-# (and handle) must outlive the kernel's use of it, so they are parked here
-# instead of freed; a later ``post`` reaps any that have since completed.
+# Writes whose completion was not observed within the bounded drain. Their
+# storage and handles must outlive the kernel's use of them, so they are
+# parked instead of freed, and reaped once their event signals. While one is
+# parked for a path, that path accepts no new write (a late completion is
+# still possible), and the process holds at most ``MAX_PARKED`` of them.
 _PARKED: list[_Pending] = []
 _PARKED_LOCK = threading.Lock()
+MAX_PARKED = 8
 
 
 def _outcome(pending: _Pending, expected: int) -> str:
@@ -192,25 +200,55 @@ def _free(pending: _Pending) -> None:
     k.CloseHandle(pending.handle)
 
 
-def _reap_parked() -> None:
+def _park(pending: _Pending) -> None:
+    with _PARKED_LOCK:
+        _PARKED.append(pending)
+
+
+def reap_parked() -> int:
+    """Free parked writes whose completion has signalled; return how many remain.
+
+    Safe to call periodically (the notifier does, independent of new posts).
+    """
     k = _k()
     with _PARKED_LOCK:
         still: list[_Pending] = []
         for pending in _PARKED:
-            if k.WaitForSingleObject(pending.event, 0) == WAIT_OBJECT_0:
+            try:
+                done = k.WaitForSingleObject(pending.event, 0) == WAIT_OBJECT_0
+            except Exception:  # Keep it parked: storage safety beats cleanup.
+                done = False
+            if done:
                 _free(pending)
             else:
                 still.append(pending)
         _PARKED[:] = still
+        return len(still)
 
 
-def _write(handle: Any, payload: bytes, end: float) -> tuple[str, bool]:
-    """Return ``(reason, owns_handle)``; ``owns_handle`` False means parked."""
+def _admission(path: str) -> str:
+    """Refuse a write while this path has an undrained one, or at the cap."""
+    with _PARKED_LOCK:
+        if any(pending.path == path for pending in _PARKED):
+            return "channel_busy"
+        if len(_PARKED) >= MAX_PARKED:
+            return "parked_cap"
+    return ""
+
+
+def _write(path: str, handle: Any, payload: bytes, end: float) -> tuple[str, bool]:
+    """Return ``(reason, owns_handle)``; ``owns_handle`` False means parked.
+
+    After ``WriteFile`` is issued, every exit — including an exception from a
+    wait, cancel or completion query — either observes completion or parks the
+    storage; it never lets the OVERLAPPED/buffer be freed under pending I/O.
+    """
     k = _k()
     event = k.CreateEventW(None, 1, 0, None)
     if not event:
         return "event_failed", True
     pending = _Pending(
+        path,
         handle,
         event,
         ctypes.create_string_buffer(payload, len(payload)),
@@ -218,31 +256,42 @@ def _write(handle: Any, payload: bytes, end: float) -> tuple[str, bool]:
         ctypes.c_uint32(),
     )
     pending.overlapped.hEvent = event
-    started = k.WriteFile(
-        handle, pending.buffer, len(payload), None, ctypes.byref(pending.overlapped)
-    )
-    if not started and _last_error() != ERROR_IO_PENDING:
-        k.CloseHandle(event)
-        # Refused synchronously: no byte was accepted.
-        return "write_refused", True
-    waited = k.WaitForSingleObject(event, _remaining_ms(end))
-    if waited != WAIT_OBJECT_0:
-        # Deadline or wait failure: request cancellation, then allow a short,
-        # bounded drain. Cancellation can lose to a completed write, so the
-        # outcome is read from the completion, not assumed from the timeout.
-        k.CancelIoEx(handle, ctypes.byref(pending.overlapped))
-        if k.WaitForSingleObject(event, CANCEL_GRACE_MS) != WAIT_OBJECT_0:
-            with _PARKED_LOCK:
-                _PARKED.append(pending)
-            return "cancel_pending", False
-    reason = _outcome(pending, len(payload))
-    if reason and waited != WAIT_OBJECT_0:
-        reason = "timeout" if waited == WAIT_TIMEOUT else "wait_failed"
+    try:
+        started = k.WriteFile(
+            handle, pending.buffer, len(payload), None, ctypes.byref(pending.overlapped)
+        )
+        if not started and _last_error() != ERROR_IO_PENDING:
+            k.CloseHandle(event)
+            # Refused synchronously: no byte was accepted.
+            return "write_refused", True
+    except Exception:
+        # Unknown whether the write was issued: keep everything alive.
+        _park(pending)
+        return "cancel_pending", False
+    try:
+        waited = k.WaitForSingleObject(event, _remaining_ms(end))
+        if waited != WAIT_OBJECT_0:
+            # Deadline or wait failure: request cancellation, then allow a
+            # short, bounded drain. Cancellation can lose to a completed write,
+            # so the outcome is read from the completion, not assumed.
+            k.CancelIoEx(handle, ctypes.byref(pending.overlapped))
+            if k.WaitForSingleObject(event, CANCEL_GRACE_MS) != WAIT_OBJECT_0:
+                _park(pending)
+                return "cancel_pending", False
+        reason = _outcome(pending, len(payload))
+        if reason and waited != WAIT_OBJECT_0:
+            reason = "timeout" if waited == WAIT_TIMEOUT else "wait_failed"
+    except Exception:
+        # Parking below is what keeps the storage safe; cancel is best-effort.
+        with contextlib.suppress(Exception):
+            k.CancelIoEx(handle, ctypes.byref(pending.overlapped))
+        _park(pending)
+        return "cancel_pending", False
     k.CloseHandle(event)
     return reason, True
 
 
-def post(
+def post(  # noqa: PLR0911 - one return per refusal reason.
     path: str, payload: bytes, deadline: float, *, expected_pid: int | None
 ) -> PipeResult:
     """Write ``payload`` then close, within ``deadline`` (+ a bounded drain).
@@ -250,28 +299,34 @@ def post(
     With ``expected_pid``, nothing is written unless the server process of the
     very handle used for the write is exactly that PID (fail closed on a query
     error). ``write_started`` is True once ``WriteFile`` was issued: from then
-    on a failure is *uncertain* — the host may have accepted the bytes — and
-    must never be treated as proof of non-delivery. Errors are codes only,
-    never message text, because the payload carries a credential.
+    on a failure is *uncertain* — the host may have accepted the bytes, even
+    after this call returns if the write was parked — and must never be
+    treated as proof of non-delivery. Errors are codes only, never message
+    text, because the payload carries a credential.
     """
     if not is_pipe_path(path):
         return PipeResult(False, "socket_missing")
+    if not math.isfinite(deadline) or deadline <= 0:
+        return PipeResult(False, "invalid_deadline")
     end = time.monotonic() + deadline
+    owns = True
+    handle = None
     try:
-        _reap_parked()
+        reap_parked()
+        refused = _admission(path)
+        if refused:
+            return PipeResult(False, refused)
         handle, reason = _open(path, end)
         if handle is None:
             return PipeResult(False, reason)
-        owns = True
-        try:
-            if expected_pid is not None and _server_pid(handle) != expected_pid:
-                return PipeResult(False, "socket_not_owned")
-            reason, owns = _write(handle, payload, end)
-        finally:
-            if owns:
-                _k().CloseHandle(handle)
+        if expected_pid is not None and _server_pid(handle) != expected_pid:
+            return PipeResult(False, "socket_not_owned")
+        reason, owns = _write(path, handle, payload, end)
     except Exception as err:  # Never let transport errors escape.
-        return PipeResult(False, type(err).__name__, write_started=True)
+        return PipeResult(False, type(err).__name__, write_started=not owns)
+    finally:
+        if owns and handle is not None:
+            _k().CloseHandle(handle)
     return PipeResult(
         not reason,
         reason,

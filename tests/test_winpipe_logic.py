@@ -31,6 +31,7 @@ class FakeKernel:
         self.error = 0
         self.closed: list[int] = []
         self.calls: list[str] = []
+        self.wait_raises = False
 
     def CreateFileW(self, *args):
         self.calls.append("CreateFileW")
@@ -56,6 +57,8 @@ class FakeKernel:
 
     def WaitForSingleObject(self, handle, ms):
         self.calls.append(f"Wait({ms})")
+        if self.wait_raises:
+            raise OSError
         return self.waits.pop(0) if self.waits else winpipe.WAIT_OBJECT_0
 
     def CancelIoEx(self, handle, overlapped):
@@ -115,7 +118,7 @@ def test_undrained_cancel_is_parked_not_freed(kernel):
     assert fake.closed == []  # handle, event and buffer stay alive
     assert len(winpipe._PARKED) == 1
     fake.waits = [winpipe.WAIT_OBJECT_0]  # the parked write finally completed
-    winpipe._reap_parked()
+    winpipe.reap_parked()
     assert winpipe._PARKED == []
     assert sorted(fake.closed) == [10, 20]
 
@@ -155,3 +158,61 @@ def test_short_write_is_reported(kernel):
 
 def test_handle_width_is_pointer_sized():
     assert ctypes.sizeof(winpipe._Overlapped) in (20, 32)
+
+
+def test_parked_path_refuses_a_second_write(kernel):
+    fake = kernel(waits=[winpipe.WAIT_TIMEOUT, winpipe.WAIT_TIMEOUT])
+    first = winpipe.post(PIPE, b"abc", 0.1, expected_pid=77)
+    assert first.reason == "cancel_pending"
+    fake.waits = [winpipe.WAIT_TIMEOUT]  # the parked write is still pending
+    second = winpipe.post(PIPE, b"abc", 0.1, expected_pid=77)
+    assert (second.ok, second.reason, second.write_started) == (
+        False,
+        "channel_busy",
+        False,
+    )
+    assert fake.calls.count("WriteFile") == 1
+    assert len(winpipe._PARKED) == 1
+
+
+def test_global_parking_cap(kernel, monkeypatch):
+    monkeypatch.setattr(winpipe, "MAX_PARKED", 2)
+    fake = kernel()
+    fake.waits = [winpipe.WAIT_TIMEOUT] * 20
+    for index in range(2):
+        winpipe.post(f"{PIPE}-{index}", b"abc", 0.1, expected_pid=77)
+    assert len(winpipe._PARKED) == 2
+    result = winpipe.post(f"{PIPE}-other", b"abc", 0.1, expected_pid=77)
+    assert (result.ok, result.reason) == (False, "parked_cap")
+    assert fake.calls.count("WriteFile") == 2
+
+
+def test_exception_after_write_issued_parks_storage(kernel):
+    fake = kernel()
+    fake.wait_raises = True
+    result = winpipe.post(PIPE, b"abc", 1.0, expected_pid=77)
+    assert not result.ok
+    assert result.write_started
+    assert fake.closed == []
+    assert len(winpipe._PARKED) == 1
+    assert "CancelIoEx" in fake.calls
+
+
+@pytest.mark.parametrize("deadline", [float("nan"), float("inf"), 0.0, -1.0])
+def test_invalid_deadline_writes_nothing(kernel, deadline):
+    fake = kernel()
+    result = winpipe.post(PIPE, b"abc", deadline, expected_pid=77)
+    assert (result.ok, result.reason, result.write_started) == (
+        False,
+        "invalid_deadline",
+        False,
+    )
+    assert fake.calls == []
+
+
+def test_reaper_runs_without_a_new_post(kernel):
+    fake = kernel(waits=[winpipe.WAIT_TIMEOUT, winpipe.WAIT_TIMEOUT])
+    winpipe.post(PIPE, b"abc", 0.1, expected_pid=77)
+    fake.waits = [winpipe.WAIT_OBJECT_0]
+    assert winpipe.reap_parked() == 0
+    assert sorted(fake.closed) == [10, 20]

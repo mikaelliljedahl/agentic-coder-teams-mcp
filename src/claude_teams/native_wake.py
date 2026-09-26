@@ -366,6 +366,9 @@ class NativeWakeNotifier(threading.Thread):
         """Consume activation before reading the latest session snapshot."""
         activated = _activation.is_set()
         _activation.clear()
+        if sys.platform == "win32":
+            # Free parked pipe writes on the tick, not only on the next post.
+            winpipe.reap_parked()
         if self.channel.reason != "available" or not enabled("CLAUDE"):
             with _registry_lock:
                 _members.clear()
