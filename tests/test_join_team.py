@@ -872,6 +872,8 @@ def test_agent_status_backend_and_binding_na(
         "heartbeat_age_s",
         "stalled",
         "binding",
+        "no_marker_since_launch",
+        "startup_hint",
     }
     assert status["backend"] == "external"
 

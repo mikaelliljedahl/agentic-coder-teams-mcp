@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import threading
+from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -396,6 +397,85 @@ async def test_nonce_in_the_correct_transcript_is_delivered(
     assert backend.resume_calls[0][0].prompt.startswith("next prompt")
     assert backend.resume_calls[0][0].prompt.count(DELIVERY_MARKER_PREFIX) == 1
     assert _record()["pid"] == 789
+
+
+@pytest.mark.asyncio
+async def test_follow_up_launch_metadata_precedes_child_marker(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: dict[str, float] = {}
+    ticks = count(1000.0, 0.001)
+    monkeypatch.setattr(server_simple.time, "time", lambda: next(ticks))
+    monkeypatch.setattr(
+        server_simple.process_manager,
+        "health_check",
+        lambda handle, expected_token=None: (handle in {"123", "789"}, "ok"),
+    )
+    monkeypatch.setattr(server_simple.process_manager, "owns_process", lambda *a: True)
+
+    def stop_old_process(*args, **kwargs) -> bool:
+        observed["shutdown_ts"] = server_simple.time.time()
+        return True
+
+    monkeypatch.setattr(
+        server_simple.process_manager, "graceful_shutdown", stop_old_process
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: True
+    )
+    previous = _record()
+    previous.update(launch_started_at=1.0, hooks_wired=True, launch_interactive=False)
+    server_simple._save_agents(SESSION, [previous])
+    _write_waiting_marker(env)
+
+    def write_receipt_and_marker(nonce: str) -> None:
+        observed["marker_ts"] = server_simple.time.time()
+        server_simple._state_marker_file(SESSION, AGENT).write_text(
+            json.dumps({"state": "running", "ts": observed["marker_ts"]}),
+            encoding="utf-8",
+        )
+        _append(
+            env.transcript, _claude_user_record(f"next {DELIVERY_MARKER_PREFIX}{nonce}")
+        )
+
+    _install(monkeypatch, _FakeResumeBackend(write_receipt_and_marker))
+    result = await server_simple.follow_up_agent(AGENT, "next", "part-a-resume")
+    record = _record()
+    assert result["success"] is True, result
+    assert observed["shutdown_ts"] < record["launch_started_at"]
+    assert record["launch_started_at"] < observed["marker_ts"]
+    assert record["spawned_at"] >= record["launch_started_at"]
+    assert record["hooks_wired"] is False  # adapter has no optional capability
+    assert record["launch_interactive"] is True
+    assert (
+        server_simple._startup_diagnosis(
+            record, {"ts": observed["marker_ts"]}, True, 1060.0
+        )["no_marker_since_launch"]
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_follow_up_ignores_raising_optional_hook_capability(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RaisingHooksBackend(_FakeResumeBackend):
+        def state_hook_args(self, request: SpawnRequest) -> list[str]:
+            raise RuntimeError("boom")
+
+    def write_receipt(nonce: str) -> None:
+        _append(
+            env.transcript, _claude_user_record(f"next {DELIVERY_MARKER_PREFIX}{nonce}")
+        )
+
+    backend = RaisingHooksBackend(write_receipt)
+    _install(monkeypatch, backend)
+    _child_alive(monkeypatch, True)
+    result = await server_simple.follow_up_agent(AGENT, "next", "raising-hooks")
+
+    assert result["success"] is True
+    assert len(backend.resume_calls) == 1
+    assert _record()["hooks_wired"] is False
 
 
 @pytest.mark.asyncio
