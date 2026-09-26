@@ -308,3 +308,52 @@ diagnostics; pytest 2623 passed, 10 skipped. (One run by the implementer saw
 a single timing failure in the pre-existing stress test
 `test_codex_member_wake.py::test_registration_send_stress_no_deadlock`; it
 passed in isolation and on rerun.)
+
+
+## Round 4
+
+VERDICT: **APPROVED**
+
+Reviewed `git diff c1e78d1..9cf207b` and the lead's round-3 disposition.
+The round-3 MAJOR is resolved; withdrawing the tmux residual is appropriate.
+No new findings.
+
+- **Tmux recovery, master on and off:** repeated the round-3 reproduction
+  through the real Claude backend and tmux process manager, executing the
+  generated command in Git Bash with a simulated retained server epoch 6.
+  The initial unversioned pane still inherits 6, but recovery now exports
+  and persists epoch 7 under either flag setting. Real hooks/store/follow-up
+  code gives `marker_state=running`, `second_status=queued`, `resume_count=1`.
+  The inherited epoch no longer poisons replacement hooks. This is an
+  independent generated-command/recovery reproduction, not live tmux smoke.
+- **Ordinary flag-off compatibility:** independently resumed an ordinary
+  child after its real hook wrote an epoch-0 waiting marker. Request and
+  environment have no epoch, record has no native launch fields, and no
+  watermark file is created. Existing flag-off goldens also pass. A positive
+  marker now triggers recovery only where the old-hook fence requires it;
+  missing, malformed, noninteger, boolean, negative and zero marker epochs
+  do not create a positive recovery epoch by themselves.
+- **Kill/force fences:** independently seeded offered, taken and posting
+  mailbox entries at record epoch 3, with marker epoch 9. Both actual kill
+  and CLI force paths persisted record/watermark epoch 10 before the first
+  retract. Offered/taken became retracted; posting stayed posting and
+  unresolved. The existing fence-failure tests also pass. Record removal
+  still leaves the durable watermark for name reuse.
+- **Concurrency:** the marker is read through its existing atomic-file
+  reader without taking `state-<agent>.lock`; the watermark is still minted
+  under its lock. The fix introduces no lock-order inversion and preserves
+  the old-hook fence and native N5 barriers.
+
+Round-4 counts: **0 BLOCKER, 0 MAJOR, 0 MINOR, 0 NIT**.
+
+Validation at `9cf207b`: all **16 new regression cases passed**. The broader
+selection/record/lead-wake/flag-propagation/queue-runner/native-dispatch/
+poster/hooks/tool-text/flag-off-golden suites returned **669 passed,
+1 skipped**; operation-lease and kill suites returned **47 passed**.
+Repository-wide ruff format/check passed. `ty check` remains red with the
+same two pre-existing Windows `unresolved-attribute` diagnostics
+(`scripts/herdr_nested_check.py:152`, `tests/test_join_team.py:750`). The full
+pytest suite was not independently rerun this round; the lead's 2623-pass
+result above remains attributed to the lead. This approval covers the code
+review; required live Linux merge gates remain unverified here. Only this
+review file was edited; no source/tests or commits.
