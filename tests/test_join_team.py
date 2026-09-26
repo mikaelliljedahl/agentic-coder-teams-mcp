@@ -1308,5 +1308,10 @@ def test_session_info_availability_only(join_session, monkeypatch):
         "claude_channel": "available",
         "owner_verified": True,
         "notifier_owner": False,
+        "codex_lead": {
+            "status": "unregistered",
+            "generation": 0,
+            "thread_verified": False,
+        },
     }
     assert "secret" not in json.dumps(result)

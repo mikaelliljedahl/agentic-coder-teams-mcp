@@ -382,6 +382,35 @@ _NATIVE_RESTART_NOTE = (
     "Claude channel is available and unread messages are waiting, a backlog "
     "notice follows immediately."
 )
+
+
+def _lead_wake_instruction() -> str:
+    """Return the one-line Codex lead registration step (plan §2.6).
+
+    Shown to a Codex lead in its spawn and resume prompts and in the
+    ``session_info``/``resume_session`` recovery text, flag-on only. The tool
+    is named in full (PR #71) so Codex never picks a built-in.
+    """
+    return (
+        "win-agent-teams lead wake (Codex): to be woken when an agent you "
+        "spawned replies, run one shell command and pass both values to "
+        f"{codex_mcp_tool_name('set_lead_wake')}(codex_thread_id=..., "
+        'codex_home=...). Unix: echo "$CODEX_THREAD_ID '
+        '${CODEX_HOME:-$HOME/.codex}"; PowerShell: "$env:CODEX_THREAD_ID '
+        "$(if ($env:CODEX_HOME) {$env:CODEX_HOME} else "
+        "{Join-Path $HOME '.codex'})\". Register again after every restart or "
+        "resume of your Codex session. If the tool is absent, keep using the "
+        "watcher; this best-effort doorbell never replaces it."
+    )
+
+
+def _with_lead_wake_instruction(prompt: str, backend_name: str, lead: bool) -> str:
+    """Append the registration step for a flag-on Codex lead; else unchanged."""
+    if not (native_wake.enabled() and backend_name == "codex" and lead):
+        return prompt
+    return prompt + "\n\n" + _lead_wake_instruction()
+
+
 _NATIVE_TOOL_NOTES = {
     "send_message": (
         "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, a registered Codex external "
@@ -418,6 +447,10 @@ _NATIVE_TOOL_NOTES = {
         + _NATIVE_PLATFORM_NOTE
         + " "
         + _NATIVE_RESTART_NOTE
+        + " native_wake.codex_lead reports {status, generation, "
+        "thread_verified} for a Codex lead's set_lead_wake registration; status "
+        "is unregistered, provisional, active, cleared, or stale_host (made by "
+        "an earlier Codex host: register again). " + _lead_wake_instruction()
     ),
     "resume_session": (
         "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, the best-effort doorbell "
@@ -425,6 +458,16 @@ _NATIVE_TOOL_NOTES = {
         + _NATIVE_PLATFORM_NOTE
         + " "
         + _NATIVE_RESTART_NOTE
+        + " A restarted Codex lead re-registers with set_lead_wake. "
+        + _lead_wake_instruction()
+    ),
+    "spawn_agent": (
+        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, a codex child spawned with "
+        "enable_spawned_lead_wake=true gets a set_lead_wake registration step "
+        "in its spawn and resume prompts. Its registration stays provisional, "
+        "and is never queued, until its backend_session_id is bound and equal "
+        "to the registered thread; then codex queue wakes it when its own "
+        "children reply. This best-effort doorbell never replaces the watcher."
     ),
 }
 
@@ -3822,7 +3865,9 @@ async def spawn_agent(
                 session_id,
                 agent_name,
                 backend_name,
-                prompt,
+                _with_lead_wake_instruction(
+                    prompt, backend_name, enable_spawned_lead_wake
+                ),
                 correlation_id,
                 file_token=new_delivery_nonce(),
             )
@@ -4458,6 +4503,143 @@ async def external_set_wake(
     return await run_blocking(_set)
 
 
+#: This server's Codex host incarnation, resolved once it is found. A miss is
+#: retried at most once a minute: the Windows process walk runs PowerShell.
+_codex_host_cache: dict[str, Any] = {"value": None, "checked": -math.inf}
+_CODEX_HOST_RETRY_SECONDS = 60.0
+
+
+def _codex_lead_host() -> tuple[int, str | None] | None:
+    """Return ``(pid, creation token)`` of this server's nearest Codex host.
+
+    ``None`` when the nearest host is not Codex or its creation token cannot
+    be read: without a provable incarnation no registration may queue.
+    """
+    cached = _codex_host_cache["value"]
+    if cached is not None:
+        return cached
+    now = time.monotonic()
+    if now - _codex_host_cache["checked"] < _CODEX_HOST_RETRY_SECONDS:
+        return None
+    _codex_host_cache["checked"] = now
+    try:
+        host = procinfo.resolve_nearest_host().host
+    except Exception:
+        logger.debug("Could not resolve the nearest host", exc_info=True)
+        return None
+    if host is None or procinfo.host_kind(host) != "codex":
+        return None
+    token = process_manager.creation_token(str(host.pid))
+    if token is None:
+        return None
+    _codex_host_cache["value"] = (host.pid, token)
+    return _codex_host_cache["value"]
+
+
+def _codex_lead_binding(session_id: str, identity: str) -> str | None:
+    """Return a spawned lead's parent-bound backend session id, else ``None``.
+
+    The parent's server writes ``backend_session_id`` onto this lead's own
+    record only from a **bound** transcript binding, so it corroborates the
+    thread the lead supplied independently. A human-started lead has none.
+    """
+    if not _AGENT_NAME:
+        return None
+    try:
+        record = _find_agent(_load_agents(session_id), identity)
+    except (OSError, ValueError):
+        return None
+    if record is None or record.get("backend") != "codex":
+        return None
+    return _stored_backend_session_id(record)
+
+
+def _register_lead_wake_tool(fn):
+    """Expose the lead registration only under the import-time native opt-in."""
+    return _register_tool()(fn) if native_wake.enabled() else fn
+
+
+@_register_lead_wake_tool
+async def set_lead_wake(codex_thread_id: str, codex_home: str = "") -> dict:
+    """Register, replace, or clear this Codex lead's own wake doorbell.
+
+    Available only with WIN_AGENT_TEAMS_NATIVE_WAKE=1 at server startup. When
+    an agent you spawned replies, this server runs ``codex queue`` on your own
+    thread with a body-free notice asking you to call
+    mcp__win_agent_teams__read_messages. It is a best-effort doorbell: it never
+    confirms delivery and never replaces the watch; keep arming it.
+
+    Run one shell command and pass both values. Unix: echo "$CODEX_THREAD_ID
+    ${CODEX_HOME:-$HOME/.codex}". PowerShell: "$env:CODEX_THREAD_ID $(if
+    ($env:CODEX_HOME) {$env:CODEX_HOME} else {Join-Path $HOME '.codex'})".
+    codex_thread_id must be a canonical lowercase UUID; codex_home must be
+    absolute (blank defaults to ~/.codex). A blank thread clears the
+    registration. Invalid input returns success:false with
+    invalid_codex_thread_id or invalid_codex_home, without writing.
+
+    The server must be hosted by Codex (else host_not_codex), and the thread
+    must be verified, not archived, in that home (else unverified_thread with
+    detail). The registration records this Codex host's incarnation: after a
+    restart or resume of your Codex session the old registration is ignored,
+    so register again. An MCP server restart under the same host keeps it.
+
+    Returns {success, identity, lead_wake}; lead_wake is {thread_id,
+    codex_home, generation, host_pid, host_create_token, status, reason}.
+    Every call increases generation; clear keeps a cleared tombstone with null
+    thread_id and codex_home. A lead you started yourself is active at once.
+    A lead spawned by another agent is provisional, and is never queued, until
+    its parent-bound backend_session_id exists and equals the thread; then it
+    becomes active. A mismatch sets cleared with reason thread_mismatch.
+    session_info reports native_wake.codex_lead {status, generation,
+    thread_verified}.
+    """
+    thread_id = codex_thread_id.strip()
+    if thread_id:
+        try:
+            if str(uuid.UUID(thread_id)) != thread_id:
+                return {"success": False, "reason": "invalid_codex_thread_id"}
+        except ValueError:
+            return {"success": False, "reason": "invalid_codex_thread_id"}
+    home = codex_home.strip() or str(Path.home() / ".codex")
+    if thread_id and not Path(home).is_absolute():
+        return {"success": False, "reason": "invalid_codex_home"}
+
+    def _set() -> dict:
+        refusal = _require_resolved_identity()
+        if refusal is not None:
+            return refusal
+        host = _codex_lead_host()
+        if host is None:
+            return {"success": False, "reason": "host_not_codex"}
+        if thread_id:
+            verified, detail = native_wake.verify_codex_thread(home, thread_id)
+            if not verified:
+                return {
+                    "success": False,
+                    "reason": "unverified_thread",
+                    "detail": detail,
+                }
+        session_id = _active_session_id(create=True)
+        spawned = bool(_AGENT_NAME)
+        registration = native_wake.register_lead_wake(
+            _session_dir(session_id),
+            IDENTITY,
+            thread_id=thread_id,
+            codex_home=home,
+            host=host,
+            spawned=spawned,
+            bound=(
+                _codex_lead_binding(session_id, IDENTITY)
+                if spawned and thread_id
+                else None
+            ),
+        )
+        native_wake.session_activated(session_id)
+        return {"success": True, "identity": IDENTITY, "lead_wake": registration}
+
+    return await run_blocking(_set)
+
+
 @_register_tool(external=True)
 async def leave_team(member_token: str) -> dict:
     """Permanently revoke this external membership without killing a process.
@@ -4603,7 +4785,11 @@ def _build_resume_request(
         session_id,
         agent_name,
         backend_name,
-        prompt,
+        # A resumed nested Codex lead runs in a new host incarnation, which
+        # ignores its old registration until it registers again (plan §2.6).
+        _with_lead_wake_instruction(
+            prompt, backend_name, agent.get("enable_spawned_lead_wake") is True
+        ),
         correlation_id,
         file_token=nonce,
         delivery_nonce=nonce,
@@ -7293,6 +7479,17 @@ async def session_info() -> dict:
             "notifier_owner": bool(
                 _native_notifier and _native_notifier.owns(_native_wake_target())
             ),
+            "codex_lead": (
+                native_wake.codex_lead_status(
+                    _session_dir(session_id), IDENTITY, _codex_lead_host
+                )
+                if session_id and not _IDENTITY_UNRESOLVED
+                else {
+                    "status": "unregistered",
+                    "generation": 0,
+                    "thread_verified": False,
+                }
+            ),
         }
     return result
 
@@ -8189,11 +8386,18 @@ def _native_member_alive(session_id: str, name: str) -> bool:
 def main() -> None:
     """Run the MCP server."""
     global _native_notifier  # noqa: PLW0603 - one notifier per MCP server.
-    if native_wake.enabled("CLAUDE") and native_wake.claude_platform_supported():
+    # Each channel is gated again on every tick (plan §2.6): the Claude
+    # channel by its half and platform, the Codex lead by its half.
+    if (
+        native_wake.enabled("CLAUDE") and native_wake.claude_platform_supported()
+    ) or native_wake.enabled("CODEX"):
         _native_notifier = native_wake.NativeWakeNotifier(
             get_target=_native_wake_target,
             session_dir=_session_dir,
             member_alive=_native_member_alive,
+            codex_lead=native_wake.CodexLeadWake(
+                host=_codex_lead_host, binding=_codex_lead_binding
+            ),
         )
         _native_notifier.start()
     try:

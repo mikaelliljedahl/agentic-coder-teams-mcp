@@ -668,6 +668,9 @@ def test_macos_channel_unavailable_without_host_lookup(monkeypatch):
     )
     resolver.assert_not_called()
     monkeypatch.setattr(type(ss.mcp), "run", lambda self: None)
+    # The Codex lead half starts the notifier on any platform (plan §2.6);
+    # with it off, the unsupported Claude channel alone never does.
+    monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX", "0")
     monkeypatch.setattr(
         nw.NativeWakeNotifier,
         "start",

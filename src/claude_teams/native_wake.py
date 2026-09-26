@@ -318,6 +318,8 @@ class _Target:
     signature: tuple[Any, ...] | None = None
     snapshot: dict[str, dict[str, int]] = field(default_factory=dict)
     catchup: bool = True
+    # Codex lead only: the registered thread was verified in its home.
+    verified: bool = False
 
     def close(self) -> None:
         if self.handle is not None:
@@ -336,6 +338,211 @@ def _signature(directory: Path, reader: str) -> tuple[Any, ...]:
     return tuple(values)
 
 
+LEAD_WAKE_STATUSES = frozenset({"provisional", "active", "cleared"})
+
+
+def lead_wake_file(directory: Path, identity: str) -> Path:
+    """Return the Codex lead registration ``lead-wake-<identity>.json``."""
+    return directory / f"lead-wake-{identity}.json"
+
+
+def _valid_lead_wake(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    generation = value.get("generation")
+    host_pid = value.get("host_pid")
+    return (
+        isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and generation >= 1
+        and value.get("status") in LEAD_WAKE_STATUSES
+        and isinstance(value.get("thread_id"), str | None)
+        and isinstance(value.get("codex_home"), str | None)
+        and isinstance(host_pid, int)
+        and not isinstance(host_pid, bool)
+        and isinstance(value.get("host_create_token"), str | None)
+        and isinstance(value.get("reason"), str)
+        and (value.get("status") == "cleared" or bool(value.get("thread_id")))
+    )
+
+
+def read_lead_wake(directory: Path, identity: str) -> dict | None:
+    """Read a registration; a missing, corrupt or malformed file reads as absent."""
+    try:
+        value = json.loads(lead_wake_file(directory, identity).read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if _valid_lead_wake(value) else None
+
+
+def _update_lead_wake(
+    directory: Path, identity: str, change: Callable[[dict | None], dict | None]
+) -> dict | None:
+    """Apply ``change`` under ``lead-wake-<identity>.lock``; ``None`` writes nothing."""
+    path = lead_wake_file(directory, identity)
+    with filelock.file_lock(path.with_suffix(".lock")):
+        prior = read_lead_wake(directory, identity)
+        value = change(prior)
+        if value is None:
+            return prior
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(json.dumps(value, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        return value
+
+
+def register_lead_wake(
+    directory: Path,
+    identity: str,
+    *,
+    thread_id: str,
+    codex_home: str,
+    host: tuple[int, str | None],
+    spawned: bool,
+    bound: str | None,
+) -> dict:
+    """Register, replace or clear a Codex lead doorbell (plan §2.6, R2-6).
+
+    Every call bumps ``generation``; a blank thread writes a ``cleared``
+    tombstone. A human-started lead is ``active`` at once. A spawned lead is
+    ``provisional`` until the parent-bound ``bound`` backend session exists:
+    equal to the thread makes it ``active``, different makes it ``cleared``.
+    The host incarnation is recorded so a new host ignores the registration.
+    """
+
+    def change(prior: dict | None) -> dict:
+        generation = (prior or {}).get("generation", 0) + 1
+        if not thread_id:
+            status, reason = "cleared", "cleared_by_lead"
+        elif not spawned:
+            status, reason = "active", ""
+        elif not bound:
+            status, reason = "provisional", "awaiting_parent_binding"
+        elif bound == thread_id:
+            status, reason = "active", ""
+        else:
+            status, reason = "cleared", "thread_mismatch"
+        return {
+            "thread_id": thread_id or None,
+            "codex_home": codex_home if thread_id else None,
+            "generation": generation,
+            "host_pid": host[0],
+            "host_create_token": host[1],
+            "status": status,
+            "reason": reason,
+        }
+
+    stored = _update_lead_wake(directory, identity, change)
+    assert stored is not None  # noqa: S101 - change() always writes.
+    return stored
+
+
+def corroborate_lead_wake(
+    directory: Path, identity: str, generation: int, bound: str
+) -> dict | None:
+    """Settle a provisional registration against the parent-bound thread.
+
+    A CAS on ``(generation, provisional)``: a newer registration or one
+    already settled is left untouched and returned as it is.
+    """
+
+    def change(prior: dict | None) -> dict | None:
+        if (
+            prior is None
+            or prior["generation"] != generation
+            or prior["status"] != "provisional"
+        ):
+            return None
+        if bound == prior["thread_id"]:
+            return {**prior, "status": "active", "reason": ""}
+        return {**prior, "status": "cleared", "reason": "thread_mismatch"}
+
+    return _update_lead_wake(directory, identity, change)
+
+
+def codex_lead_status(
+    directory: Path,
+    identity: str,
+    host: Callable[[], tuple[int, str | None] | None],
+) -> dict:
+    """Report ``{status, generation, thread_verified}`` for ``session_info``.
+
+    ``status`` is the stored one, or ``unregistered``, or ``stale_host`` when
+    the registration belongs to another host incarnation. The host is looked
+    up only when a registration exists.
+    """
+    registration = read_lead_wake(directory, identity)
+    if registration is None:
+        return {"status": "unregistered", "generation": 0, "thread_verified": False}
+    status = registration["status"]
+    current = host()
+    if current is None or current != (
+        registration["host_pid"],
+        registration["host_create_token"],
+    ):
+        status = "stale_host"
+    verified = (
+        status == "active"
+        and verify_codex_thread(registration["codex_home"], registration["thread_id"])[
+            0
+        ]
+    )
+    return {
+        "status": status,
+        "generation": registration["generation"],
+        "thread_verified": verified,
+    }
+
+
+def codex_lead_notice(counts: Mapping[str, int], seq: int) -> str:
+    """Return a body-free lead doorbell naming the full Codex tool.
+
+    Sender names are reduced to ``[A-Za-z0-9_-]`` and the text avoids every
+    ``cmd.exe`` metacharacter, so it is safe even through an npm shim.
+    """
+    from claude_teams.backends.codex import (  # noqa: PLC0415 - backend import cycle.
+        codex_mcp_tool_name,
+    )
+
+    senders = " ".join(
+        f"{re.sub(r'[^A-Za-z0-9_-]', '_', sender)}:{count}"
+        for sender, count in sorted(counts.items())
+    )
+    return (
+        f"[win-agent-teams wake #{seq}] {sum(counts.values())} unread messages "
+        f"in your team inbox from {senders}. Best-effort notice without "
+        f"content; call {codex_mcp_tool_name('read_messages')} to read them."
+    )
+
+
+def _default_lead_queue(thread_id: str, home: str, text: str) -> QueueOutcome:
+    try:
+        binary = _discover_codex()
+    except Exception:
+        return QueueOutcome(False)
+    return codex_queue(binary, thread_id, home, text)
+
+
+@dataclass(frozen=True)
+class CodexLeadWake:
+    """The Codex lead channel's injected facts (plan §2.6).
+
+    ``host`` returns this MCP server's Codex host incarnation ``(pid,
+    creation token)``, or ``None`` when the nearest host is not Codex.
+    ``binding`` returns the parent-bound backend session of a spawned lead, or
+    ``None``. ``queue`` runs ``codex queue``; ``verify`` checks the thread.
+    """
+
+    host: Callable[[], tuple[int, str | None] | None]
+    binding: Callable[[str, str], str | None]
+    queue: Callable[[str, str, str], QueueOutcome] = _default_lead_queue
+    verify: Callable[[str, str], tuple[bool, str]] | None = None
+
+
 class NativeWakeNotifier(threading.Thread):
     """A daemon that owns reader locks and observes only explicit session state."""
 
@@ -349,6 +556,7 @@ class NativeWakeNotifier(threading.Thread):
         post: Callable[[ClaudeChannel, str], PostResult] = post_claude_notice,
         clock: Callable[[], float] = time.monotonic,
         poll: float | None = None,
+        codex_lead: CodexLeadWake | None = None,
     ) -> None:
         """Inject state readers, never recovery or MCP tool calls."""
         super().__init__(name="native-session-wake", daemon=True)
@@ -364,6 +572,10 @@ class NativeWakeNotifier(threading.Thread):
             _seconds("NATIVE_WAKE_RENOTIFY_SECONDS", 300.0),
         )
         self.targets: dict[tuple[str, str], _Target] = {}
+        self.codex_lead = codex_lead
+        # Keyed by (session, identity, generation, host pid, host token), so a
+        # session switch, re-registration or new host never inherits state.
+        self.codex_targets: dict[tuple[Any, ...], _Target] = {}
         self._stop_event = threading.Event()
 
     def run(self) -> None:
@@ -379,16 +591,20 @@ class NativeWakeNotifier(threading.Thread):
             self._release_targets()
 
     def tick(self) -> None:
-        """Consume activation before reading the latest session snapshot."""
+        """Consume activation, then run each channel under its own gate."""
         activated = _activation.is_set()
         _activation.clear()
         if sys.platform == "win32":
             # Free parked pipe writes on the tick, not only on the next post.
             winpipe.reap_parked()
+        self._tick_claude(activated)
+        self._tick_codex_lead(activated)
+
+    def _tick_claude(self, activated: bool) -> None:
         if self.channel.reason != "available" or not enabled("CLAUDE"):
             with _registry_lock:
                 _members.clear()
-            self._release_targets()
+            self._release_claude_targets()
             return
         lead = self.get_target()
         with _registry_lock:
@@ -433,28 +649,8 @@ class NativeWakeNotifier(threading.Thread):
                 target.acquire_after = now + 10.0
                 return
             target.handle = handle
-        signature = _signature(directory, key[1])
-        deadline = (
-            target.state.first_new is not None
-            and now >= target.state.first_new + self.cfg.coalesce
-        ) or (
-            target.state.last_success is not None
-            and now >= target.state.last_success + self.cfg.renotify
-        )
-        if activated or signature != target.signature or target.catchup or deadline:
-            target.snapshot = scan_inbox(directory, key[1])
-            target.signature = signature
-        if target.catchup:
-            target.state.notified = {s: r["cursor"] for s, r in target.snapshot.items()}
-        cfg = NoticeConfig(
-            0 if target.catchup else self.cfg.coalesce, self.cfg.renotify
-        )
-        target.state.observe(target.snapshot, now, cfg)
-        notice = plan_notice(
-            target.state, target.snapshot, now, cfg, member=key != lead
-        )
+        notice = self._plan(target, directory, key[1], now, activated, key != lead)
         if notice is None:
-            target.catchup = False
             return
         # Session changes during a scan cannot send to a dropped lead target.
         if (
@@ -474,16 +670,164 @@ class NativeWakeNotifier(threading.Thread):
         else:
             target.backoff.failed(self.clock())
 
+    def _plan(
+        self,
+        target: _Target,
+        directory: Path,
+        reader: str,
+        now: float,
+        activated: bool,
+        member: bool,
+    ) -> Notice | None:
+        """Rescan when needed and propose a notice; catch-up skips coalescing."""
+        signature = _signature(directory, reader)
+        deadline = (
+            target.state.first_new is not None
+            and now >= target.state.first_new + self.cfg.coalesce
+        ) or (
+            target.state.last_success is not None
+            and now >= target.state.last_success + self.cfg.renotify
+        )
+        if activated or signature != target.signature or target.catchup or deadline:
+            target.snapshot = scan_inbox(directory, reader)
+            target.signature = signature
+        if target.catchup:
+            target.state.notified = {s: r["cursor"] for s, r in target.snapshot.items()}
+        cfg = NoticeConfig(
+            0 if target.catchup else self.cfg.coalesce, self.cfg.renotify
+        )
+        target.state.observe(target.snapshot, now, cfg)
+        notice = plan_notice(target.state, target.snapshot, now, cfg, member=member)
+        if notice is None:
+            target.catchup = False
+        return notice
+
+    def _codex_lead_key(self, lead: tuple[str, str] | None) -> tuple[Any, ...] | None:
+        """Return the state key of a registration that may queue now, else None.
+
+        Only an ``active`` registration made by this host incarnation
+        qualifies. A ``provisional`` one is first settled against the
+        parent-bound backend session, when that exists.
+        """
+        if lead is None or self.codex_lead is None:
+            return None
+        session, identity = lead
+        directory = self.session_dir(session)
+        registration = read_lead_wake(directory, identity)
+        if registration is None or registration["status"] == "cleared":
+            return None
+        host = self.codex_lead.host()
+        if host is None or host != (
+            registration["host_pid"],
+            registration["host_create_token"],
+        ):
+            return None
+        if registration["status"] == "provisional":
+            bound = self.codex_lead.binding(session, identity)
+            if not bound:
+                return None
+            registration = corroborate_lead_wake(
+                directory, identity, registration["generation"], bound
+            )
+            if registration is None or registration["status"] != "active":
+                return None
+        return (session, identity, registration["generation"], *host)
+
+    def _tick_codex_lead(self, activated: bool) -> None:
+        if self.codex_lead is None or not enabled("CODEX"):
+            self._release_codex_targets()
+            return
+        key = self._codex_lead_key(self.get_target())
+        for old in self.codex_targets.keys() - {key}:
+            self.codex_targets.pop(old).close()
+        if key is None:
+            return
+        target = self.codex_targets.setdefault(key, _Target())
+        try:
+            self._check_codex_lead(key, target, activated)
+        except Exception as err:
+            target.backoff.failed(self.clock())
+            _LOG.warning("Codex lead wake failed: %s", type(err).__name__)
+
+    def _check_codex_lead(  # noqa: PLR0911 - one return per gate.
+        self, key: tuple[Any, ...], target: _Target, activated: bool
+    ) -> None:
+        assert self.codex_lead is not None  # noqa: S101 - gated by the caller.
+        now = self.clock()
+        if now < target.backoff.until:
+            return
+        session, identity = key[0], key[1]
+        directory = self.session_dir(session)
+        if target.handle is None:
+            if now < target.acquire_after:
+                return
+            handle = (directory / f"native-wake-codex-lead.{identity}.lock").open("a+b")
+            try:
+                owned = filelock.try_lock_handle(handle)
+            except Exception:
+                handle.close()
+                raise
+            if not owned:
+                handle.close()
+                target.acquire_after = now + 10.0
+                return
+            target.handle = handle
+        notice = self._plan(target, directory, identity, now, activated, member=False)
+        if notice is None:
+            return
+        registration = read_lead_wake(directory, identity)
+        if registration is None:
+            return
+        if not target.verified:
+            verify = self.codex_lead.verify or verify_codex_thread
+            target.verified, _ = verify(
+                registration["codex_home"], registration["thread_id"]
+            )
+            if not target.verified:
+                target.backoff.failed(self.clock())
+                return
+        # Revalidate target, generation and incarnation right before queueing.
+        if (
+            target.handle is None
+            or target.handle.closed
+            or self._codex_lead_key(self.get_target()) != key
+        ):
+            return
+        current = read_lead_wake(directory, identity)
+        if current is None or current["thread_id"] != registration["thread_id"]:
+            return
+        outcome = self.codex_lead.queue(
+            current["thread_id"],
+            current["codex_home"],
+            codex_lead_notice(notice.counts, target.state.seq + 1),
+        )
+        if outcome.enqueued:
+            target.state.succeeded(target.snapshot, self.clock())
+            target.backoff.reset()
+            target.catchup = False
+        else:
+            # Uncertain or failed: the notice may still arrive; retry spaced.
+            target.backoff.failed(self.clock())
+
     def owns(self, key: tuple[str, str] | None) -> bool:
         """Report ownership without claiming notice delivery."""
         target = self.targets.get(key) if key else None
         handle = target.handle if target is not None else None
         return bool(handle and not handle.closed)
 
-    def _release_targets(self) -> None:
+    def _release_claude_targets(self) -> None:
         for target in self.targets.values():
             target.close()
         self.targets.clear()
+
+    def _release_codex_targets(self) -> None:
+        for target in self.codex_targets.values():
+            target.close()
+        self.codex_targets.clear()
+
+    def _release_targets(self) -> None:
+        self._release_claude_targets()
+        self._release_codex_targets()
 
     def close(self) -> None:
         """Stop the daemon and release its lifetime locks."""
