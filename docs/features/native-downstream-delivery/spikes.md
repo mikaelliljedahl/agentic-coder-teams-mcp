@@ -135,3 +135,25 @@ skip agents whose channel is unavailable.
 
 **Still not run:** N7 with a human-started lead (Codex TUI or Desktop; the
 user is running it) and the other items listed above.
+
+### Codex Desktop, human-started (2026-09-26, 20:40 to 20:43 UTC)
+
+Codex Desktop was opened in `C:\code`, the same workspace as this Claude
+lead, so its win-agent-teams server resolved to the **same session**
+(`bcba8d19…`) with the **same identity**, `team-lead`.
+
+| Smoke | Result | Evidence |
+|---|---|---|
+| N7, human-started Codex lead | **wake: pass; body: taken by the other lead** | `set_lead_wake` returned `active` at once (no provisional step), generation 1, `thread_verified=true`, host pid 4796. It spawned `n7child-2`, whose reply at 20:41:18 woke **both** leads: Codex Desktop received `[win-agent-teams wake #1] 1 unread messages in your team inbox from n7child-2:1` with no polling or watcher; this Claude lead received `wake #3` through the pipe. The Claude lead read the message first, which advanced the shared `team-lead` cursor, so Codex Desktop's `read_messages` came back empty. |
+| External Codex member (`codexdesk`), member → lead | **pass** | The same Desktop thread joined as `codexdesk` via a join ticket and `external_set_wake`. Its `external_send` woke the Claude lead through the pipe (`wake #4`, `wake #5`). |
+| External Codex member, lead → member | **round trip: pass; wake source ambiguous** | `send_message(to="codexdesk")` returned `wake: {method: codex_queue, status: queued}`, and `EXT-ACK codexdesk` came back at 20:42:42. The wake text Codex quoted was the **lead** notice (`… from codexdesk:1 … call read_messages`), not the member notice: the same thread was registered both as lead `team-lead` and as member `codexdesk`, so the member's own upstream message also woke it in its lead role. |
+
+**Finding (pre-existing, made visible by D): two human-started leads in one
+workspace share `team-lead`.** Session and identity are derived from the
+workspace, so a Claude lead and a Codex lead started in the same directory
+share the inbox, the read cursor and the wake. Each is woken; whichever
+reads first takes the message. This is not introduced by this feature, but
+with lead wake on both hosts it now shows. **Follow-up:** give each
+human-started lead its own identity or session, or refuse a second live lead
+registration for the same identity. **For a clean N7:** open the Codex lead
+in its own directory.
