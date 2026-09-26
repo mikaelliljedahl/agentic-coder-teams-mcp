@@ -218,3 +218,93 @@ unverified. Only this review file was edited; no source/tests or commits.
 
 Gates: ruff format/check clean; ty only the 2 pre-existing Windows
 diagnostics; pytest 2607 passed, 10 skipped.
+
+
+## Round 3
+
+VERDICT: **CHANGES_REQUESTED**
+
+Reviewed `git diff 57e4341..c1e78d1` and the lead's round-2 disposition.
+The original round-2 finding is fixed when the epoch is in the MCP process's
+ambient environment: an unversioned child gets a blank override, a minted
+child epoch takes precedence, and pristine launches without an ambient epoch
+add no key. Blank is correctly interpreted as epoch 0. Re-running the nested
+spawn through the real Claude backend and Windows process manager, with only
+process creation/window effects faked, gives `initial_child_epoch=""`,
+`first_resume_epoch=1`, `marker_state=running`, `resume_count=1`; the busy
+follow-up queues. No additional regression in the changed branch was found.
+The accepted tmux residual remains a correctness failure, as detailed below.
+
+1. **MAJOR - The accepted tmux-server residual still lets a busy replacement be resumed again.**
+   `src/claude_teams/backends/process_base.py:121`,
+   `src/claude_teams/backends/process_manager.py:1561`,
+   `src/claude_teams/server_simple.py:3050`,
+   `src/claude_teams/hooks.py:145`.
+
+   A tmux server started from an epoch-bearing agent can retain epoch 6.
+   A later MCP process without that variable launches a pristine child into
+   that server with the master flag off. The new conditional supplies no
+   blank export; the pane inherits the server's 6 while the child's record
+   and epoch watermark have no epoch. Its `Stop` writes a waiting marker at
+   6. Enable native wake and resume the child: `_next_dispatch_epoch` consults
+   only the record and watermark, allocating 1. The replacement's
+   `UserPromptSubmit` at 1 is dropped behind marker 6. A further follow-up
+   therefore treats the busy replacement as waiting and shuts it down/resumes
+   it again. Accepting this residual leaves the round-2 failure reachable on
+   a supported launcher.
+
+   **Reproduction:** run the real `ClaudeCodeBackend._spawn_with_command`
+   and `TmuxProcessManager.spawn_process` with no MCP ambient epoch, faking
+   only the tmux subprocess/availability and selecting an existing session.
+   Execute the resulting shell command with Git Bash under an inherited
+   epoch-6 environment to model the pane's tmux-server environment: it prints
+   6; neither the tmux client environment nor the shell's exports supplies
+   an epoch override. Then use real hooks, store and follow-up code in the
+   temporary `test_native_selection.env` fixture. Observed
+   `first_resume_epoch=1`, `marker_state=waiting`, `marker_epoch=6`,
+   `second_status=delivered`, `resume_count=2`. This tests the generated shell
+   command and recovery path; it is not a live Linux/tmux smoke test.
+
+   **Suggested fix:** preserve pristine flag-off launch bytes, but make a
+   subsequent minted recovery epoch outrank the existing valid state-marker
+   epoch as well as the record/watermark, persisting that higher watermark.
+   The marker already represents native recovery state. Alternatively,
+   detect and clear a retained launcher epoch before launch. Closing this
+   failure does not require adding an environment key to every pristine
+   launch. Keep the old-hook fence; add a server-only inherited epoch followed by
+   flag-on resume regression which checks that the running hook is accepted
+   and the busy replacement cannot be resumed again.
+
+Round-3 counts: **0 BLOCKER, 1 MAJOR, 0 MINOR, 0 NIT**.
+
+Validation at `c1e78d1`: all **9 new regression cases passed**. Broader
+selection/record/lead-wake/flag-propagation/queue-runner/native-dispatch/
+poster/hooks/tool-text/flag-off-golden suites returned **653 passed,
+1 skipped**. Repository-wide ruff format/check passed. `ty check` remains
+red with the same two previously documented Windows `unresolved-attribute`
+diagnostics (`scripts/herdr_nested_check.py:152`, `tests/test_join_team.py:750`).
+The full pytest suite was not rerun independently this round; the lead's
+2607-pass result above is attributed to the lead. Live Linux merge gates
+remain unverified (WSL is not installed here). Only this review file was
+edited; no source/tests or commits.
+
+## Disposition (lead, round 3)
+
+1. **Accepted, fixed; the round-2 residual is withdrawn.** `_next_dispatch_epoch`
+   now mints `max(high-water, record dispatch_epoch, marker dispatch_epoch) + 1`,
+   reading `state-<name>.json` defensively (missing, unreadable or non-positive
+   int ignored). `_dispatch_extra` also mints with the flag off when the marker
+   carries a nonzero epoch: such a marker is native recovery metadata, and a
+   replacement at epoch 0 would otherwise have every hook dropped behind it.
+   Launches with no marker epoch (including ordinary flag-off children, whose
+   hooks write 0) are unchanged. Kill/force fences use the same function, so
+   they also land above the marker. Regression:
+   `test_flag_on_resume_mints_above_an_inherited_marker_epoch` (the tmux case),
+   `test_flag_off_resume_of_pristine_record_mints_above_inherited_marker`, and
+   mint unit tests.
+
+Gates: ruff format/check clean; ty only the 2 pre-existing Windows
+diagnostics; pytest 2623 passed, 10 skipped. (One run by the implementer saw
+a single timing failure in the pre-existing stress test
+`test_codex_member_wake.py::test_registration_send_stress_no_deadlock`; it
+passed in isolation and on rerun.)

@@ -1341,3 +1341,158 @@ async def test_flag_off_nested_spawn_does_not_inherit_the_parents_epoch(
     busy = await server_simple.follow_up_agent(AGENT, "second", "k-2")
     assert busy["status"] != "delivered"
     assert len(backend.resume_calls) == 1
+
+
+# ==========================================================================
+# A retained launcher epoch never outranks the next mint (review round 3)
+# ==========================================================================
+
+
+def _inherited_marker(env: SimpleNamespace, epoch: str = "6") -> None:
+    """A pristine child whose pane inherited ``epoch`` parks at that epoch.
+
+    Models a tmux server started from an epoch-bearing agent: the pane's shell
+    carries the server's epoch although the child's record and the session's
+    watermark never saw it minted.
+    """
+    record = server_simple._load_agents(SESSION)[0]
+    assert server_simple._record_epoch(record) is None
+    assert not (env.session_dir / "dispatch-epochs.json").exists()
+    _hook(env, "Stop", epoch)
+    marker = _state_marker()
+    assert marker["state"] == "waiting"
+    assert marker["dispatch_epoch"] == int(epoch)
+
+
+@pytest.mark.asyncio
+async def test_flag_on_resume_mints_above_an_inherited_marker_epoch(env) -> None:
+    """tmux residual → flag-on resume: the replacement's hooks are accepted."""
+    backend = _EnvCapturingBackend(env.transcript, env.monkeypatch)
+    env.monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
+    env.monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: True
+    )
+    _inherited_marker(env)
+
+    _all_on(env.monkeypatch)
+    first = await server_simple.follow_up_agent(AGENT, "first", KEY)
+
+    assert first["status"] == "delivered"
+    assert len(backend.resume_calls) == 1
+    assert (backend.resume_calls[0][0].extra or {}).get("dispatch_epoch") == "7"
+    assert backend.envs[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] == "7"
+    assert server_simple._load_agents(SESSION)[0]["dispatch_epoch"] == 7
+    stored = json.loads((env.session_dir / "dispatch-epochs.json").read_text())
+    assert stored[AGENT] == 7
+
+    _hook(env, "UserPromptSubmit", backend.envs[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"])
+    marker = _state_marker()
+    assert marker["state"] == "running"
+    assert marker["dispatch_epoch"] == 7
+
+    busy = await server_simple.follow_up_agent(AGENT, "second", "k-2")
+    assert busy["status"] != "delivered"
+    assert len(backend.resume_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_flag_off_resume_of_pristine_record_mints_above_inherited_marker(
+    env,
+) -> None:
+    """A nonzero marker epoch is native recovery metadata even on a pristine record.
+
+    With the flag off the replacement would otherwise run at epoch 0 and every
+    one of its hooks would be dropped behind the inherited marker at 6.
+    """
+    backend = _EnvCapturingBackend(env.transcript, env.monkeypatch)
+    env.monkeypatch.setattr(server_simple, "registry", _FakeRegistry(backend))
+    env.monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: False
+    )
+    _inherited_marker(env)
+
+    first = await server_simple.follow_up_agent(AGENT, "first", KEY)
+
+    assert first["status"] == "delivered"
+    assert len(backend.resume_calls) == 1
+    assert (backend.resume_calls[0][0].extra or {}).get("dispatch_epoch") == "7"
+    assert backend.envs[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"] == "7"
+    assert server_simple._load_agents(SESSION)[0]["dispatch_epoch"] == 7
+    assert "WIN_AGENT_TEAMS_NATIVE_WAKE" not in backend.envs[0]
+
+    _hook(env, "UserPromptSubmit", backend.envs[0]["WIN_AGENT_TEAMS_DISPATCH_EPOCH"])
+    marker = _state_marker()
+    assert marker["state"] == "running"
+    assert marker["dispatch_epoch"] == 7
+
+    busy = await server_simple.follow_up_agent(AGENT, "second", "k-2")
+    assert busy["status"] != "delivered"
+    assert len(backend.resume_calls) == 1
+
+
+def _write_raw_marker(env: SimpleNamespace, text: str) -> None:
+    (env.session_dir / f"state-{AGENT}.json").write_text(text, encoding="utf-8")
+
+
+def test_mint_outranks_a_marker_above_the_watermark(env) -> None:
+    (env.session_dir / "dispatch-epochs.json").write_text(
+        json.dumps({AGENT: 3}), encoding="utf-8"
+    )
+    _write_raw_marker(env, json.dumps({"state": "waiting", "dispatch_epoch": 9}))
+
+    assert (
+        server_simple._next_dispatch_epoch(SESSION, AGENT, {"dispatch_epoch": 2}) == 10
+    )
+    stored = json.loads((env.session_dir / "dispatch-epochs.json").read_text())
+    assert stored[AGENT] == 10
+
+
+def test_mint_keeps_the_watermark_when_it_outranks_the_marker(env) -> None:
+    (env.session_dir / "dispatch-epochs.json").write_text(
+        json.dumps({AGENT: 8}), encoding="utf-8"
+    )
+    _write_raw_marker(env, json.dumps({"state": "waiting", "dispatch_epoch": 4}))
+
+    assert server_simple._next_dispatch_epoch(SESSION, AGENT, {}) == 9
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "{not json",
+        json.dumps(["not", "a", "dict"]),
+        json.dumps({"state": "waiting", "dispatch_epoch": "9"}),
+        json.dumps({"state": "waiting", "dispatch_epoch": True}),
+        json.dumps({"state": "waiting", "dispatch_epoch": -4}),
+        json.dumps({"state": "waiting"}),
+    ],
+)
+def test_mint_ignores_a_missing_or_unusable_marker(env, raw: str | None) -> None:
+    if raw is not None:
+        _write_raw_marker(env, raw)
+
+    assert (
+        server_simple._next_dispatch_epoch(SESSION, AGENT, {"dispatch_epoch": 2}) == 3
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "{not json",
+        json.dumps({"state": "waiting", "event": "Stop", "ts": 950.0}),
+        json.dumps({"state": "waiting", "dispatch_epoch": 0}),
+        json.dumps({"state": "waiting", "dispatch_epoch": "6"}),
+    ],
+)
+def test_pristine_flag_off_dispatch_extra_without_marker_epoch_mints_nothing(
+    env, raw: str | None
+) -> None:
+    if raw is not None:
+        _write_raw_marker(env, raw)
+    record = server_simple._load_agents(SESSION)[0]
+
+    assert server_simple._dispatch_extra(SESSION, AGENT, record) == {}
+    assert not (env.session_dir / "dispatch-epochs.json").exists()

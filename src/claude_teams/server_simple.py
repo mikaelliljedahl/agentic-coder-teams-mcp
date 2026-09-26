@@ -3032,12 +3032,30 @@ def _effective_codex_home() -> str:
     return os.environ.get("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
 
 
+def _marker_epoch(session_id: str, name: str) -> int | None:
+    """Return the positive ``dispatch_epoch`` in ``name``'s state marker, if any.
+
+    A missing, unreadable or malformed marker, or a non-int / non-positive
+    epoch, yields ``None``.
+    """
+    marker = _read_state_marker(session_id, name)
+    epoch = marker.get("dispatch_epoch") if marker is not None else None
+    if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > 0:
+        return epoch
+    return None
+
+
 def _next_dispatch_epoch(session_id: str, name: str, prior: dict) -> int:
     """Mint the next dispatch epoch for ``name``, monotonic across name reuse.
 
     The high-water mark lives in ``dispatch-epochs.json`` (not the agent
     record), so a same-name successor spawned after a kill never reuses an
     epoch that an old offer, poster or late hook could still carry.
+
+    The new epoch also outranks the agent's current state marker: a host can
+    stamp its marker with an epoch it was never minted (a tmux pane inheriting
+    the tmux server's environment), and hooks below the marker's epoch are
+    dropped as stale, so minting under it would make a busy child look idle.
     """
     path = _session_dir(session_id) / "dispatch-epochs.json"
     with file_lock(path.with_suffix(".lock")):
@@ -3047,9 +3065,17 @@ def _next_dispatch_epoch(session_id: str, name: str, prior: dict) -> int:
             stored = {}
         if not isinstance(stored, dict):
             stored = {}
-        candidates = [stored.get(name), prior.get("dispatch_epoch")]
+        candidates = [
+            stored.get(name),
+            prior.get("dispatch_epoch"),
+            _marker_epoch(session_id, name),
+        ]
         high = max(
-            (value for value in candidates if isinstance(value, int) and value >= 0),
+            (
+                value
+                for value in candidates
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            ),
             default=0,
         )
         stored[name] = high + 1
@@ -3060,13 +3086,19 @@ def _next_dispatch_epoch(session_id: str, name: str, prior: dict) -> int:
 def _dispatch_extra(session_id: str, name: str, prior: dict) -> dict[str, str]:
     """Spawn/resume ``extra`` carrying the new epoch.
 
-    Minted with the master flag on, and also with it off for a record that
-    already carries native recovery metadata (a ``dispatch_epoch``): its marker
-    namespace is epoch-fenced, so a new host running with epoch 0 would have
-    every hook dropped behind the predecessor's marker. A pristine record with
-    the flag off gets nothing, keeping its request, env and record unchanged.
+    Minted with the master flag on, and also with it off when native recovery
+    metadata already exists: a record ``dispatch_epoch``, or a nonzero epoch in
+    the agent's state marker (e.g. inherited from a tmux server's environment).
+    The marker namespace is epoch-fenced, so a new host running with epoch 0
+    would have every hook dropped behind that marker. A pristine record with no
+    marker epoch and the flag off gets nothing, keeping its request, env and
+    record unchanged.
     """
-    if not native_wake.enabled() and _record_epoch(prior) is None:
+    if (
+        not native_wake.enabled()
+        and _record_epoch(prior) is None
+        and _marker_epoch(session_id, name) is None
+    ):
         return {}
     return {"dispatch_epoch": str(_next_dispatch_epoch(session_id, name, prior))}
 
