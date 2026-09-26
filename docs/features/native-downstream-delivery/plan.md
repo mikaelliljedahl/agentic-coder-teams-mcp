@@ -445,6 +445,87 @@ tools are decorated:
 
 The flag-off descriptions are golden.
 
+### 2.9 Round-3 amendments (v3.1)
+
+The rules below override the corresponding text in §2.3–§2.4.
+
+**R3-2: markers are bound to an epoch, and `idle_seq` counts transitions.**
+
+- **Epoch in the environment and the marker.** Spawn and resume pass
+  `WIN_AGENT_TEAMS_DISPATCH_EPOCH=<record.dispatch_epoch>` in the child's
+  environment. Hooks inherit it from the `claude` or `codex` process, and the
+  marker records it as `dispatch_epoch`.
+- **Old hooks lose.** When a hook's epoch is lower than the prior marker's, it
+  drops the write, so a late hook from an old host cannot overwrite a new
+  incarnation's marker.
+- **A new epoch starts a new namespace.** When the epoch differs from the prior
+  marker's, `idle_seq` and `turn_seq` restart from 0.
+- **`idle_seq` counts transitions only.** It increases only when a `waiting`
+  event follows a non-`waiting` state, or when the epoch is new. A duplicate
+  `Stop` within one idle period does not increase it.
+- **When the poster may post.** It requires
+  `marker.dispatch_epoch == entry.dispatch_epoch`, together with
+  `backend_session_id` and `idle_seq` as before.
+- **Consumption is per epoch.** It is stored as
+  `consumed[epoch] = {seq, nonce}`.
+- **Rollback.** `failed_before_write` rolls the consumption back to the previous
+  value, with a CAS, only when `consumed[epoch].nonce` is still this entry's
+  nonce. An uncertain write keeps it.
+- **Locking.** The poster reads the marker without a lock (the marker is
+  replaced atomically). `state-<agent>.lock` is taken only by hooks, so it
+  never nests inside `agents.lock`.
+- **New tests:**
+  - a resume within the same backend session, with an old waiting marker;
+  - a late hook write from the old host;
+  - a duplicate `Stop`;
+  - begin → pre-write failure → rollback → retry.
+
+**R3-3: recovery is serialised by the mailbox lock, not by holder liveness.**
+
+- **The mailbox exists before the first attempt.** It is created (an empty,
+  valid document) under its lock **before** the first attempt to that child is
+  marked `sent`. From then on:
+  - a missing mailbox *file* means **unknown**;
+  - a valid mailbox with no entry for the nonce means **no entry**.
+- **Publishing and revoking are both CAS operations under the mailbox lock.**
+  - `publish` requires that there is no entry and no tombstone for the nonce,
+    that the row is `sent`, and that `operation_id` matches.
+  - `revoke` requires that the row is `sent` and that there is no entry. It
+    writes the tombstone.
+  - Whichever runs first wins. After a successful `revoke`, the row goes to
+    `pending`. A live holder that later tries to publish sees the tombstone
+    and returns `queued(pending)`.
+- **Safe regardless of the holder.** Correctness does not depend on whether the
+  holder is alive, has released its claim, or has no token. The claim is used
+  only to avoid disrupting a call in progress: recovery is skipped while an
+  `active_holder` claim is held by a *live* call in this process
+  (`_ACTIVE_CLAIM_IDS`).
+- **New tests:**
+  - a completed call in a live server;
+  - a removed holder;
+  - a failed holder release;
+  - a holder without a token;
+  - the first publication failing;
+  - revoke racing publish in both orders.
+
+**R3-5: the inline limit plus a real command budget.**
+
+- **16 KiB stays** the limit on the delivered text.
+- **Codex also checks the full command.** Before launching, it checks the real
+  command, not just the text:
+  - **Windows:** `len(subprocess.list2cmdline(argv))` must be at most 32 000.
+  - **POSIX:** each argument must be under 128 KiB, and argv plus the
+    environment must fit within `sysconf(SC_ARG_MAX)` minus a 4 KiB margin.
+    If `sysconf` is unavailable, the check assumes 128 KiB.
+- **Pre-launch failure.** When the budget check fails, the attempt is marked
+  `native_ineligible_this_call`. It then goes through the idle gate as a
+  forced resume, so it does not loop back into native.
+- **Size limits on resume.**
+  - Codex resume passes the prompt through argv, so the same budget applies. A
+    message that fits neither path fails before launch with
+    `failed(message_too_large)`, which is the same as on `main`.
+  - Claude resume keeps its sidecar transport.
+
 ## 3. Files affected
 
 - `src/claude_teams/winpipe.py`, `native_wake.py`: done for C and the runner.
