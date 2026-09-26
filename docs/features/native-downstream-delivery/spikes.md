@@ -174,3 +174,29 @@ With separate workspaces, every direction works on Windows without a watcher:
 Claude lead ↔ Codex child, Codex lead ← Codex child, and Claude lead ↔
 external Codex member. The earlier ambiguity came only from the
 shared-identity collision described above.
+
+### Claude children on Windows: N3 and N4 (2026-09-26, after `claude /login`)
+
+**First attempt: B never engaged (bug, fixed in 6f7ef3b).** The claude-code
+child `n3probe` ran in a Windows Terminal tab. Its record `pid` was the in-tab
+PowerShell launcher (1236), while the child's poster reported the `claude.exe`
+host that owns the pipe (17208, a direct child of 1236). `_record_hosts` had no
+Windows launcher resolution, so E3 never matched. Two follow-ups went to
+`method: resume` with a new pid, although the capability marker said
+`channel: available`. That fallback was safe but meant B was never used on
+Windows. Unit tests and the review missed it because they used fake PIDs.
+**Fix:** for claude-code records on Windows, `_record_hosts` also accepts the
+single direct `claude.exe` child of a token-verified wrapper, created no
+earlier than it. The lead's E3 and the poster's `take`/`begin` binding both
+read this set.
+
+**After the fix** (server restarted; fresh child `n3b`, haiku, WT tab):
+
+| Smoke | Result | Evidence |
+|---|---|---|
+| N3: idle Claude child | **pass** | `n3b-first`: `status: delivered`, `method: claude_mailbox`, pid 2656, `replaced_existing: false`. The child answered `ACK-N3`. Afterwards the mailbox had no entries (retention removed the settled entry) and `consumed["1"] = {seq: 1}`. |
+| N4: busy Claude child | **pass** | `n4-busy-task` (native) started a turn at 21:13:57 UTC. The child's harness blocked a foreground `Start-Sleep`, so it backgrounded it and ended the turn at 21:14:10. `n4-while-busy` was sent at about 21:14:01 while the marker said `running`. The poster held it and posted at 21:14:11, right after the idle transition. The transcript has exactly one user record with the prompt, and the child answered `ACK-N4` at 21:14:12. `consumed["1"]` moved to `seq: 3`. The busy window was about 10 s rather than the planned 25 s, but the hold-until-idle behaviour is shown. |
+
+Socket-posted messages appear in the child as a user turn prefixed "Another
+Claude session sent a message:", with the delivery marker intact. The receipt
+scanner found them, and both deliveries settled `delivered`.
