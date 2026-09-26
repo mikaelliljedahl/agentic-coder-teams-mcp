@@ -51,6 +51,29 @@ def downstream_enabled(half: str, environ: Mapping[str, str] | None = None) -> b
     )
 
 
+_PROPAGATED_SUB_FLAGS = (
+    "WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM",
+    "WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE",
+    "WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX",
+)
+
+
+def propagated_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return the native flags a spawned child's MCP server must see (plan §2.7).
+
+    Empty unless the master flag is effectively on, so flag-off spawns stay
+    byte-identical. Otherwise the master is passed as ``1`` and the downstream
+    flag and both half switches as their current values; an absent flag stays
+    absent, so nothing is ever turned on implicitly.
+    """
+    values = os.environ if environ is None else environ
+    if not enabled(environ=values):
+        return {}
+    env = {"WIN_AGENT_TEAMS_NATIVE_WAKE": "1"}
+    env.update({key: values[key] for key in _PROPAGATED_SUB_FLAGS if key in values})
+    return env
+
+
 def claude_platform_supported() -> bool:
     """Linux (/proc host walk, AF_UNIX) and Windows (toolhelp walk, named pipe).
 

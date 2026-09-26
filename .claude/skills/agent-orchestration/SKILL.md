@@ -126,6 +126,7 @@ Caveats:
 
 - **Use `follow_up_agent`, not `send_message`, to reach a worker.** `send_message` *to* a spawned worker may go unread (a Codex worker never polls its inbox). To send clarification or the next iteration to the **same logical worker** (e.g. "fix and re-review", "continue — requirement X is unmet"), use `mcp__win-agent-teams__follow_up_agent` (`name: <AGENT-NAME>`, `prompt: ...`). It preserves the logical worker (so it can reference its own prior work) instead of spawning a fresh one — and is the reliable way to push new input to it.
 - A **naturally dead or idle** worker stays listable and resumable via `follow_up_agent`; a **live busy** worker is refused with `agent_busy`. Set `replace_if_idle: true` only when you intentionally want to override an idle run.
+- **Native downstream delivery (opt-in).** With `WIN_AGENT_TEAMS_NATIVE_WAKE=1` and `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1` on the coordinator's MCP entry (children inherit them), a follow-up to a live interactive worker goes into its running session (`method: codex_queue` or `claude_mailbox`, same PID) instead of a kill and resume. Messages over 16 KiB, dead/headless workers and Pi still resume. If the result is `queued`/`unconfirmed` with reason `native_unresolved`, **do not resend** under a new key or by another route: it may still run. Poll `delivery_status(idempotency_key)`. Until it settles, other messages to that worker return `prior_native_attempt_unresolved` with `blocking_key`; only a receipt or the operator's `win-agent-teams deliveries release-native` clears it.
 - Repeat the **reporting protocol** in every follow-up prompt (with the new deliverable name), so the resumed worker signals completion again.
 - `send_message` *is* the direction a **worker** uses to report **to** the coordinator (`to: "lead"`) — that is what the reporting protocol relies on.
 
@@ -134,6 +135,7 @@ Caveats:
 `mcp__win-agent-teams__kill_agent(name)` is **terminal removal**: it deletes the agent record (the worker disappears from `list_agents`; a later `follow_up_agent` returns `agent_not_found`) and cleans its marker/inbox. It is **not** a pause/park.
 
 - Use it only to retire a worker for good, or to free a name for a clean respawn.
+- A kill does not cancel a native message already handed to the worker's session. With the native flags on, the result lists those keys in `native_unresolved`; they keep blocking the name, including a same-name respawn, until they settle or are released.
 - To *pause and later continue* a worker, do nothing and resume later with `follow_up_agent` — a naturally-dead worker stays resumable until you kill it.
 - **Don't kill the MCP server to stop a worker.** On Windows, workers break away from the server's job object and survive server death (the server restarts on the next tool call, markers persist on disk). Stop a worker with `kill_agent`.
 

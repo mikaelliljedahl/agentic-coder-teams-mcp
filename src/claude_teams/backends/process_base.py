@@ -102,6 +102,9 @@ class BaseBackend:
                 raise InvalidEnvVarNameError(key)
 
         if native_wake.enabled():
+            # Explicit, because some launchers (tmux, terminal tabs) do not
+            # inherit this process's environment (plan §2.7).
+            env_vars.update(native_wake.propagated_env())
             env_vars["CLAUDE_CODE_MESSAGING_SOCKET"] = ""
             env_vars["CLAUDE_CODE_MESSAGING_TOKEN"] = ""
             # The child's hooks stamp their state markers with this epoch, so a

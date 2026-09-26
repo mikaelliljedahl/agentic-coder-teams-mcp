@@ -420,6 +420,30 @@ def _with_lead_wake_instruction(prompt: str, backend_name: str, lead: bool) -> s
     return prompt + "\n\n" + _lead_wake_instruction()
 
 
+#: Plan §2.8: the native downstream contract, shared by every tool that sends
+#: to or reports on a spawned child. Master-flag text; the carriers themselves
+#: also need WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1, but the barrier does not.
+_NATIVE_DOWNSTREAM_NOTE = (
+    "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, delivery results and "
+    "delivery_status rows carry method: resume (restart with the prompt), "
+    "codex_queue or claude_mailbox. The native two need "
+    "WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1 and a live interactive child; they "
+    "put the message into its running session, same pid, and replace_if_idle "
+    "does not apply. A busy Claude child gets it at its next idle point; a "
+    "busy Codex child is waited for. A dead, headless or unverifiable child, "
+    "Pi, or a message over 16 KiB of UTF-8 uses resume. queued/unconfirmed "
+    "with reason native_unresolved means it was handed over without a receipt "
+    "yet: it may still run, even after kill_agent or a restart, so do NOT "
+    "resend it under a new key or by another route; retry the same key or "
+    "poll delivery_status. Until it settles, every other message to that "
+    "agent, from any sender and whatever the flags, returns queued/pending "
+    "reason prior_native_attempt_unresolved with blocking_key (the unresolved "
+    "key) and is not sent. Only a receipt (delivered) or an operator's "
+    "`win-agent-teams deliveries release-native <session_id> <key> --token "
+    "...` settles it; the latter gives failed/operator_released, and the "
+    "message may still run."
+)
+
 _NATIVE_TOOL_NOTES = {
     "send_message": (
         "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, a registered Codex external "
@@ -427,6 +451,19 @@ _NATIVE_TOOL_NOTES = {
         "failed|timeout|unavailable|unverified_thread|stale_registration|disabled,"
         "detail?}. This best-effort doorbell never fails the send or confirms "
         "delivery; keep arming the watcher. Cleared registrations omit wake."
+        "\n\n" + _NATIVE_DOWNSTREAM_NOTE
+    ),
+    "follow_up_agent": _NATIVE_DOWNSTREAM_NOTE,
+    "delivery_status": _NATIVE_DOWNSTREAM_NOTE,
+    "kill_agent": (
+        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, the result also has "
+        "native_unresolved: the idempotency keys of native deliveries "
+        "(codex_queue, claude_mailbox) this kill could not settle. Their "
+        "carrier outlives the process, so they may still run; they stay "
+        "queued/unconfirmed and keep every new message to this name, a "
+        "same-name respawn included, at prior_native_attempt_unresolved until "
+        "a receipt or an operator's `win-agent-teams deliveries release-native`. "
+        "Offers the child had not begun posting are withdrawn."
     ),
     "read_messages": (
         "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, a [win-agent-teams wake #n] "
@@ -471,7 +508,12 @@ _NATIVE_TOOL_NOTES = {
         + _lead_wake_instruction()
     ),
     "spawn_agent": (
-        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, a codex child spawned with "
+        "Only with WIN_AGENT_TEAMS_NATIVE_WAKE=1, the agent record (agents.json, "
+        "list_agents full=True) also has interactive (the child got a terminal, "
+        "so native delivery may reach it), dispatch_epoch (raised by every "
+        "kill, resume and same-name respawn; a native offer from an older "
+        "epoch is void) and, for codex, codex_home (where codex queue finds "
+        "its thread). Also, a codex child spawned with "
         "enable_spawned_lead_wake=true gets a set_lead_wake registration step "
         "in its spawn and resume prompts. Its registration stays provisional, "
         "and is never queued, until its backend_session_id is bound and equal "
@@ -2829,6 +2871,8 @@ def _write_mcp_config(session_id: str, agent_name: str, parent_name: str) -> Pat
         "AGENT_SESSION_ID": session_id,
         "AGENT_NAME": agent_name,
         "AGENT_PARENT_NAME": parent_name,
+        # Native flags as values; empty with the master flag off (plan §2.7).
+        **native_wake.propagated_env(),
     }
     config = {
         "mcpServers": {

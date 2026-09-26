@@ -133,7 +133,7 @@ doorbell** never confirms delivery: on a `win-agent-teams:` notice call
 before ending a long wait. Closed/unloaded Desktop queue persistence and dispatch
 after a busy turn remain unverified.
 
-Claude session wake is Linux-only; on native Windows and macOS the watcher
+Claude session wake works on Linux and native Windows; on macOS the watcher
 is the wake path. Codex queue wake works on all platforms. After a lead MCP
 restart, call `session_info` or `resume_session` first; when the Claude channel
 is available and unread messages wait, a backlog notice follows immediately.

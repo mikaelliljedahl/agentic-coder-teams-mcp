@@ -14,8 +14,11 @@ Setup is always **two parts**:
    `enable_spawned_lead_wake=true` to `spawn_agent` instead.
 
 Optionally, **native session wake** (section 6a) lets messages wake idle
-sessions directly, including Codex Desktop members. It is off unless every
-participating MCP entry sets `WIN_AGENT_TEAMS_NATIVE_WAKE=1`.
+sessions directly, including Codex Desktop members and Codex leads. With
+`WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1` as well, a follow-up reaches a live child
+in its running session instead of restarting it. It is off unless the lead's
+MCP entry (and each external member's) sets `WIN_AGENT_TEAMS_NATIVE_WAKE=1`;
+spawned children inherit the lead's flags.
 
 ---
 
@@ -304,7 +307,9 @@ session directly, without a watcher or a human nudge:
 | Direction | Mechanism | Platforms |
 |---|---|---|
 | Lead → Codex member (Codex TUI or **Codex Desktop**) | `codex queue` on the member's registered thread | Linux, Windows |
-| Member/child → Claude Code lead | Body-free notice on Claude Code's own session inbox socket | **Linux only** (Windows and macOS report `unsupported_platform`) |
+| Member/child → Claude Code lead | Body-free notice on Claude Code's own session channel: a Unix socket on Linux, a named pipe on Windows | Linux, **native Windows** (macOS reports `unsupported_platform`) |
+| Child → Codex lead | `codex queue` on the lead's thread, registered with `set_lead_wake` (6a.3) | Linux, Windows |
+| Lead → live Codex or Claude child | The follow-up itself goes into the child's running session instead of a kill and resume (6a.4) | Linux, Windows |
 
 It is **off by default**. Without the flag the server behaves exactly as before:
 the same tool list, the same join prompt and the same results. The feature is
@@ -353,8 +358,13 @@ An external-only member entry (section 4a) needs the flag too, next to
 quit it fully and start it again), because the flag is read at server
 startup.
 
-A Claude child spawned by a flag-on lead does **not** inherit the flag. Its own
-wake is controlled by its own MCP entry.
+Spawned agents inherit the flags from their lead. A flag-on lead passes
+`WIN_AGENT_TEAMS_NATIVE_WAKE=1`, and `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM`,
+`WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE` and `WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX`
+with the values the lead has, to every Claude and Codex child it spawns or
+resumes. A flag the lead does not have stays unset in the child, and a
+flag-off lead passes nothing. For spawned children you only configure the
+lead's entry; an external member still needs the flag in its own entry.
 
 ### 6a.2 Codex members register their thread
 
@@ -364,11 +374,66 @@ prints `CODEX_THREAD_ID` and `CODEX_HOME`, and to pass both to
 `external_set_wake(member_token, codex_thread_id, codex_home)`. The member then
 ends its turn. The next lead `send_message` queues a wake on that thread.
 
-### 6a.3 Verify
+### 6a.3 A Codex lead registers its own thread
 
-1. `session_info` on the lead returns a `native_wake` object. On Linux under
-   Claude Code, `claude_channel` should be `available`. On Windows it is
-   `unsupported_platform`, which is expected.
+A Claude Code lead is woken through its own session channel. A Codex lead is
+woken by `codex queue` on its own thread, which it registers once with
+`set_lead_wake(codex_thread_id, codex_home)`. The tool exists only with the
+flag on. With the flag on, `session_info` and `resume_session` (and, for a
+Codex child spawned with `enable_spawned_lead_wake=true`, its spawn and resume
+prompts) tell the lead to run one shell command and pass the two values it
+prints:
+
+```bash
+echo "$CODEX_THREAD_ID ${CODEX_HOME:-$HOME/.codex}"
+```
+
+```powershell
+"$env:CODEX_THREAD_ID $(if ($env:CODEX_HOME) {$env:CODEX_HOME} else {Join-Path $HOME '.codex'})"
+```
+
+A lead you started yourself is active at once. A lead spawned by another agent
+stays `provisional`, and is never queued, until its own thread is confirmed by
+its parent's binding. Register again after every restart or resume of the
+Codex session; `session_info.native_wake.codex_lead.status` reads
+`stale_host` until you do.
+
+### 6a.4 Native downstream delivery (`WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1`)
+
+Without it, `follow_up_agent` (and `send_message` to a child you spawned)
+kills a live child and resumes it with the prompt. With
+`WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1` next to `WIN_AGENT_TEAMS_NATIVE_WAKE=1`
+in the lead's entry, a live, interactive child gets the message in its running
+session instead, keeping its PID:
+
+- **Codex child**: `codex queue` on its thread, when it is idle.
+- **Claude Code child**: the lead offers the message in a mailbox file, and
+  the child's own MCP server posts it to its own session channel at its next
+  idle point. The child inherits the flags from the lead (6a.1).
+
+A dead or headless child, a Pi child, a message over 16 KiB, or a child whose
+channel cannot be proven still resumes as before.
+`WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE=0` or `WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX=0`
+turns off one half, here and for wake.
+
+A native message whose receipt has not appeared yet is reported as
+`queued`/`unconfirmed` with reason `native_unresolved`. It can still run, even
+after a kill or a reboot, so later messages to that child wait
+(`prior_native_attempt_unresolved`) until it is seen or you release it. To give
+up on one, use the `lead_token` that `session_info` returns:
+
+```bash
+win-agent-teams deliveries release-native <session_id> <idempotency_key> --token <lead_token>
+```
+
+The row becomes `failed(operator_released)`. The message may still run.
+
+### 6a.5 Verify
+
+1. `session_info` on the lead returns a `native_wake` object. Under Claude Code
+   on Linux or Windows, `claude_channel` should be `available`. On macOS it is
+   `unsupported_platform`, which is expected. A Codex lead sees
+   `native_wake.codex_lead`, with status `active` after registration.
 2. The member's tool list contains `external_set_wake`. If it is missing,
    the member's entry lacks the flag or the client was not restarted.
 3. `list_agents(full=true)` on the lead shows a `codex_wake` block on the
@@ -376,12 +441,19 @@ ends its turn. The next lead `send_message` queues a wake on that thread.
 4. `send_message` to the member returns
    `wake: {method: "codex_queue", status: "queued"}`, and the idle Codex thread
    starts a new turn by itself.
+5. With `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1`, `list_agents(full=true)` shows
+   `interactive: true` and a `dispatch_epoch` on a child spawned afterwards. A
+   `follow_up_agent` to it while idle returns `method: "codex_queue"` or
+   `"claude_mailbox"`, and its `pid` does not change.
 
-### 6a.4 Disable
+### 6a.6 Disable
 
 Remove the variable, or set it to anything other than `1`, and restart the
 clients. `WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE=0` or
-`WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX=0` turns off one half only.
+`WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX=0` turns off one half only. Removing
+`WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM` alone keeps wake and returns follow-ups to
+resume. Native messages that are already unresolved keep blocking their
+target until they settle or are released, even with every flag off.
 
 ## 7. Upgrading an existing install
 

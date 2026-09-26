@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import ClassVar
 
+from claude_teams import native_wake
 from claude_teams.agent_output import CORRELATION_FIELD, correlated_prompt
 from claude_teams.backends._agent_discovery import discover_codex_style_agents
 from claude_teams.backends.base import (
@@ -517,18 +518,24 @@ class CodexBackend(BaseBackend):
         Passing the env as a per-process ``-c`` override (highest config
         precedence) keeps identity bound to this exact Codex process via its
         own argv, with no shared mutable file and no race window.
+
+        The native flags ride the same table (plan §2.7), since Codex does not
+        pass its process env to the MCP server. With the master flag off
+        nothing is added, so the override stays byte-identical.
         """
         launcher_env = nested_linux_launcher_env()
+        native_env = native_wake.propagated_env()
         env = {
             **launcher_env,
             "CLAUDE_TEAMS_PERMISSION_MODE": "bypass",
             "AGENT_NAME": request.name,
             "AGENT_SESSION_ID": request.team_name,
             "AGENT_PARENT_NAME": request.lead_session_id,
+            **native_env,
         }
 
         def render_value(key: str, value: str) -> str:
-            if key in launcher_env:
+            if key in launcher_env or key in native_env:
                 return self._toml_basic_string(value, key)
             return self._toml_literal(value)
 

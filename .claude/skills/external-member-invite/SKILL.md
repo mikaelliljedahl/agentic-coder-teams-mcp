@@ -100,8 +100,8 @@ woken instead of polling:
 
 Set `WIN_AGENT_TEAMS_NATIVE_WAKE=1` in both lead and member MCP entries. The
 flag-on join prompt includes `external_set_wake` and shell commands for the
-Codex thread/home. Claude session wake is Linux-only; native
-Windows and macOS use the watcher. Codex queue wake works on all platforms. Inbound
+Codex thread/home. Claude session wake works on Linux and native Windows;
+macOS uses the watcher. Codex queue wake works on all platforms. Inbound
 Claude policy can silently hold/refuse notices and Codex needs a loaded thread;
 keep the watcher steps above.
 

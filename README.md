@@ -254,11 +254,18 @@ the member session's configured key.
 ### Native session wake (opt-in)
 
 With `WIN_AGENT_TEAMS_NATIVE_WAKE=1`, each Claude-hosted MCP server can post a
-body-free notice to its own host's session inbox socket. Claude wake is
-**Linux-only**; native Windows and macOS report `unsupported_platform` and
-keep the watcher wake path. A nearest-host check and socket PID check refuse
-stale inherited channels. Spawn and resume explicitly empty the inherited
-socket/token variables; a spawned Claude host must export its own fresh socket.
+body-free notice to its own host's session channel: a Unix socket on Linux, a
+named pipe on native Windows (the pipe's server PID is checked on every post,
+and writes are bounded and cancellable). macOS reports `unsupported_platform`
+and keeps the watcher wake path. A nearest-host check and socket PID check
+refuse stale inherited channels. Spawn and resume explicitly empty the
+inherited socket/token variables; a spawned Claude host must export its own
+fresh socket. Spawned Claude and Codex children inherit the lead's native flags
+(as values; an unset flag stays unset).
+
+A Codex lead registers its own thread with `set_lead_wake(codex_thread_id,
+codex_home)` and is then woken by `codex queue` when a child replies.
+`session_info.native_wake.codex_lead` reports its status.
 
 A Codex external member may register its shell's `CODEX_THREAD_ID` and absolute
 `CODEX_HOME` with `external_set_wake(member_token, codex_thread_id, codex_home)`.
@@ -285,8 +292,9 @@ channel availability and notifier ownership, never delivery.
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `WIN_AGENT_TEAMS_NATIVE_WAKE` | off | Exactly `1` enables the feature |
-| `WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE` | `1` | `0` disables Claude notices |
-| `WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX` | `1` | `0` disables Codex queue notices |
+| `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM` | off | Exactly `1` (with the master flag) enables native downstream delivery |
+| `WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE` | `1` | `0` disables Claude notices and Claude native delivery |
+| `WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX` | `1` | `0` disables Codex queue notices, Codex lead wake and Codex native delivery |
 | `WIN_AGENT_TEAMS_NATIVE_WAKE_POLL_SECONDS` | `1` | Notifier tick |
 | `WIN_AGENT_TEAMS_NATIVE_WAKE_COALESCE_SECONDS` | `2` | Claude burst coalesce; activation catch-up is immediate |
 | `WIN_AGENT_TEAMS_NATIVE_WAKE_RENOTIFY_SECONDS` | `300` | Outstanding notice repeat floor |
@@ -295,6 +303,28 @@ channel availability and notifier ownership, never delivery.
 Seconds accept only finite positive values; invalid settings use the defaults.
 Flag off preserves the tool list, descriptions, prompts, results, and spawn
 behavior and creates no notifier thread, lock file, or queue subprocess.
+
+### Native downstream delivery (opt-in)
+
+With `WIN_AGENT_TEAMS_NATIVE_WAKE=1` and `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1`,
+`follow_up_agent` (and `send_message` to a child you spawned) puts the message
+into a live, interactive child's running session instead of killing and
+resuming it; the PID stays. A Codex child gets it through `codex queue` when
+idle. A Claude child gets it through a delivery mailbox that its own MCP server
+posts to its own session channel at its next idle point. Results and
+`delivery_status` rows carry `method` (`resume`, `codex_queue`,
+`claude_mailbox`). Dead or headless children, Pi, messages over 16 KiB and
+unprovable channels still resume.
+
+A native message without a receipt yet stays `queued`/`unconfirmed`
+(`native_unresolved`), even across a kill or a reboot, because it may still
+run. While it is unresolved, other messages to that child return
+`prior_native_attempt_unresolved` with `blocking_key` and are not sent, whatever
+the flags. Only its receipt or `win-agent-teams deliveries release-native
+<session_id> <key> --token <lead_token>` (which settles it
+`failed(operator_released)`; the message may still run) clears it. Details:
+[docs/reference/agent-messaging-protocol.md](docs/reference/agent-messaging-protocol.md)
+section 4d and INSTALL section 6a.4.
 
 ### Registry backend labels
 

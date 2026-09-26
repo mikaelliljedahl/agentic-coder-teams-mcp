@@ -37,8 +37,11 @@ recoverable: whether a nonce could have reached the child.
 Lock order is ``agents.lock`` ⇒ ``delivery-mailbox-<child>.lock`` ⇒
 ``deliveries.lock``. The callbacks passed to :func:`publish`, :func:`revoke`,
 :func:`take` and :func:`begin` run *inside* the mailbox lock, so they may take
-``deliveries.lock`` but must never take ``agents.lock`` (read ``agents.json``
-without its lock instead: it is replaced atomically).
+``deliveries.lock`` but must never take ``agents.lock``. They read
+``agents.json`` without its lock instead. That file is rewritten in place, not
+replaced atomically, so such a read can see a truncated or partial document.
+It then fails to parse, the callback raises, and the transition reports
+``unknown`` with nothing written: a torn read fails closed.
 
 This module is pure storage: it never inspects processes, markers or the
 delivery store itself. Everything it must not guess, the caller supplies.
