@@ -79,6 +79,42 @@ def _record(session_id: str, name: str = "worker") -> dict:
 
 
 @pytest.mark.asyncio
+async def test_launch_metadata_precedes_marker_from_minimal_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An adapter without the optional hook capability still launches."""
+    backend = _session(tmp_path, monkeypatch)
+    original_spawn = backend.spawn
+    observed: dict[str, float] = {}
+
+    def spawn_with_marker(request: SpawnRequest) -> SimpleNamespace:
+        observed["marker_ts"] = server_simple.time.time()
+        marker = server_simple._state_marker_file(request.team_name, request.name)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps({"state": "running", "ts": observed["marker_ts"]}),
+            encoding="utf-8",
+        )
+        return original_spawn(request)
+
+    monkeypatch.setattr(backend, "spawn", spawn_with_marker)
+    result = await server_simple.spawn_agent(
+        "task", name="worker", backend="claude-code", cwd=str(tmp_path)
+    )
+    record = _record(result["session_id"])
+    assert record["launch_started_at"] <= observed["marker_ts"]
+    assert record["hooks_wired"] is False
+    assert isinstance(record["launch_interactive"], bool)
+    assert record["spawned_at"] >= record["launch_started_at"]
+    assert (
+        server_simple._startup_diagnosis(
+            record, {"ts": observed["marker_ts"]}, True, observed["marker_ts"] + 60
+        )["no_marker_since_launch"]
+        is False
+    )
+
+
+@pytest.mark.asyncio
 async def test_spawned_lead_wake_defaults_off_and_is_persisted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

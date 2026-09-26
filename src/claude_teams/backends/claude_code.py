@@ -263,6 +263,10 @@ class ClaudeCodeBackend(BaseBackend):
             return []
         return ["--settings", settings_path]
 
+    def state_hook_args(self, request: SpawnRequest) -> list[str]:
+        """Return exactly the state-hook settings argv used by the command."""
+        return self._hooks_settings_args(request)
+
     def _prompt_arg(self, request: SpawnRequest) -> str:
         """Return the initial Claude prompt argument.
 

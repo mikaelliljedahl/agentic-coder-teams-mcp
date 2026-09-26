@@ -919,6 +919,9 @@ async def test_spawn_agent_persists_output_lookup_metadata(
             "parent": server_simple.IDENTITY,
             "status": "running",
             "spawned_at": before,
+            "launch_started_at": before,
+            "launch_interactive": True,
+            "hooks_wired": False,
             "cwd": str(cwd),
             "model": "model",
             "permission_mode": "bypass",
@@ -1173,6 +1176,8 @@ async def test_check_agent_returns_stable_empty_fallback_for_unknown_agent(
         "full_len": 0,
         "heartbeat_age_s": None,
         "stalled": False,
+        "no_marker_since_launch": None,
+        "startup_hint": None,
     }
 
     full_result = await server_simple.check_agent("missing", full=True)
@@ -1226,6 +1231,8 @@ async def test_check_agent_skips_rollout_for_legacy_agent_record(
         "full_len": 0,
         "heartbeat_age_s": None,
         "stalled": False,
+        "no_marker_since_launch": None,
+        "startup_hint": None,
         "binding": "legacy",
         "binding_retriable": False,
     }

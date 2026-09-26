@@ -479,6 +479,10 @@ class CodexBackend(BaseBackend):
             return []
         return [*args, "--dangerously-bypass-hook-trust"]
 
+    def state_hook_args(self, request: SpawnRequest) -> list[str]:
+        """Return exactly the hook override argv used by the command."""
+        return self._hook_override_args(request)
+
     @staticmethod
     def _codex_hooks_enabled() -> bool:
         """Return whether Codex state hooks are enabled for this process.

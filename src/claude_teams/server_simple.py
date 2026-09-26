@@ -279,6 +279,41 @@ def _idle_seconds() -> float:
 
 
 STALL_SECONDS: float = 300.0
+FIRST_MARKER_SECONDS: float = 45.0
+
+
+def _first_marker_seconds() -> float:
+    """Return the first-marker threshold, defaulting to 45 seconds."""
+    raw = os.environ.get("WIN_AGENT_TEAMS_FIRST_MARKER_SECONDS", "").strip()
+    if not raw:
+        return FIRST_MARKER_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return FIRST_MARKER_SECONDS
+    return value if math.isfinite(value) and value >= 0 else FIRST_MARKER_SECONDS
+
+
+def _state_hook_args(backend: object, request: SpawnRequest) -> list[str]:
+    """Ask an optional backend capability for the exact state-hook argv."""
+    try:
+        capability = getattr(backend, "state_hook_args", None)
+        return capability(request) if callable(capability) else []
+    except Exception:
+        logger.debug("Optional state-hook capability failed", exc_info=True)
+        return []
+
+
+def _launch_mode_fields(
+    backend_name: str, backend: object, request: SpawnRequest
+) -> dict:
+    """Inspect the command's mode and hook argv before launching it."""
+    return {
+        "launch_interactive": process_manager.provides_tty(
+            backend_name, is_interactive=bool(getattr(backend, "is_interactive", False))
+        ),
+        "hooks_wired": bool(_state_hook_args(backend, request)),
+    }
 
 
 def _stall_seconds() -> float:
@@ -1805,6 +1840,8 @@ def _empty_agent_check(name: str, *, full: bool = False) -> dict:
         "full_len": 0,
         "heartbeat_age_s": None,
         "stalled": False,
+        "no_marker_since_launch": None,
+        "startup_hint": None,
     }
     if not full:
         return compact
@@ -1961,6 +1998,7 @@ def _compact_check_view(
     name: str,
     internal: dict,
     *,
+    agent: dict,
     max_chars: int = _DEFAULT_LAST_LINE_MAX_CHARS,
 ) -> dict:
     """Project the rich internal check payload to the compact public shape."""
@@ -1997,6 +2035,7 @@ def _compact_check_view(
         "full_len": full_len,
         "heartbeat_age_s": heartbeat_age_s,
         "stalled": stalled,
+        **_startup_diagnosis(agent, marker, bool(internal.get("alive")), time.time()),
         "binding": internal.get("binding"),
         "binding_retriable": internal.get("binding_retriable"),
     }
@@ -3478,6 +3517,8 @@ async def spawn_agent(
                 extra=extra,
             )
 
+            launch_fields = _launch_mode_fields(backend_name, b, request)
+            launch_started_at = time.time()
             result = b.spawn(request)
             pid = int(result.process_handle)
             # Capture the PID's creation token now, from the just-spawned live
@@ -3500,6 +3541,8 @@ async def spawn_agent(
                     "parent": IDENTITY,
                     "status": "running",
                     "spawned_at": time.time(),
+                    "launch_started_at": launch_started_at,
+                    **launch_fields,
                     "cwd": agent_cwd,
                     "model": resolved_model,
                     "permission_mode": permission_mode,
@@ -4135,7 +4178,8 @@ async def check_agent(
 
     Default (``full=False``) returns a compact status peek: ``{name, state,
     alive, pid, backend, last_activity_at, unread_count, last_line, seq,
-    truncated, full_len, heartbeat_age_s, stalled}``. ``state`` is
+    truncated, full_len, heartbeat_age_s, stalled, no_marker_since_launch,
+    startup_hint}``. ``state`` is
     ``running``/``waiting``/``idle``/``dead``. ``last_line`` is the last
     non-empty line of the agent's most recent assistant message, clipped to
     ``max_chars`` (default 200); ``truncated`` signals clipping happened and
@@ -4150,6 +4194,17 @@ async def check_agent(
     stall threshold (``STALL_SECONDS``, default 300s, env-overridable via
     ``WIN_AGENT_TEAMS_STALL_SECONDS``). Answers "alive but hung" from disk
     alone, with zero transcript bytes.
+
+    ``no_marker_since_launch`` is ``True`` exactly when the agent is alive,
+    state hooks were wired for this launch, at least 45 seconds have passed
+    since ``launch_started_at`` (env ``WIN_AGENT_TEAMS_FIRST_MARKER_SECONDS``),
+    and the raw marker has no numeric ``ts`` at or after launch. It is
+    ``False`` before that threshold, for a dead agent, when hooks were not
+    wired, or when a post-launch marker exists; ``None`` for legacy/external
+    records. ``startup_hint`` is a hedged, backend-aware heuristic only when
+    ``True``: an interactive Codex folder-trust prompt is one possible cause.
+    Clock changes can mislead this wall-clock comparison. Neither field
+    changes ``state``, ``stalled``, or ``heartbeat_age_s``.
 
     Pass ``full=True`` to restore the full ``last_message`` (bounded to 1000
     chars) and ``backend_session_id`` for follow-up/resume workflows.
@@ -4171,7 +4226,9 @@ async def check_agent(
             if _sync_backend_session_id(agent, binding):
                 _save_agents_transaction(session_id, agents)
             internal = _agent_check_payload(name, agent, alive, binding)
-            view = _compact_check_view(session_id, name, internal, max_chars=max_chars)
+            view = _compact_check_view(
+                session_id, name, internal, agent=agent, max_chars=max_chars
+            )
             if full:
                 view.update(
                     {
@@ -4271,6 +4328,7 @@ def _finalize_follow_up(
     plan: _FollowUpPlan,
     outcome: DeliveryOutcome,
     new_pid: int | None,
+    launch_metadata: dict | None = None,
 ) -> dict:
     """Phase 3 — CAS the record back under the lock, then release the lease.
 
@@ -4341,6 +4399,7 @@ def _finalize_follow_up(
                 "session_id": session_id,
                 "status": "running",
                 "spawned_at": time.time(),
+                **(launch_metadata or {}),
                 "cwd": plan.agent_cwd,
                 "backend_session_id": plan.backend_session_id,
                 "model": plan.model,
@@ -4790,7 +4849,11 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             ):
                 process_manager.kill_process(plan.old_pid)
 
+            launch_fields = _launch_mode_fields(
+                plan.backend_name, plan.backend, plan.request
+            )
             try:
+                launch_started_at = time.time()
                 result = plan.backend.resume(plan.request, plan.backend_session_id)
             except Exception:
                 logger.debug("Failed resuming backend session", exc_info=True)
@@ -4798,7 +4861,11 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                     session_id,
                     record,
                     _finalize_follow_up(
-                        session_id, plan, _DELIVERY_RESUME_FAILED, None
+                        session_id,
+                        plan,
+                        _DELIVERY_RESUME_FAILED,
+                        None,
+                        {"launch_started_at": launch_started_at, **launch_fields},
                     ),
                     plan,
                 )
@@ -4819,7 +4886,13 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             return _record_outcome(
                 session_id,
                 record,
-                _finalize_follow_up(session_id, plan, outcome, new_pid),
+                _finalize_follow_up(
+                    session_id,
+                    plan,
+                    outcome,
+                    new_pid,
+                    {"launch_started_at": launch_started_at, **launch_fields},
+                ),
                 plan,
             )
         finally:
@@ -6288,6 +6361,63 @@ def _marker_timestamp(marker: dict | None) -> float | None:
     return None
 
 
+def _startup_diagnosis(
+    agent: dict, marker: dict | None, alive: bool, now: float
+) -> dict[str, bool | None | str]:
+    """Diagnose a missing post-launch marker; heuristic clock changes can mislead.
+
+    This uses only the raw marker and persisted launch metadata. A child hook
+    timestamp older than the parent's wall-clock capture can be genuine after
+    a backward clock step, so this is not proof of a trust prompt.
+    """
+    started = agent.get("launch_started_at")
+    wired = agent.get("hooks_wired")
+    if (
+        agent.get("backend") == "external"
+        or not isinstance(started, int | float)
+        or isinstance(started, bool)
+        or not isinstance(wired, bool)
+    ):
+        return {"no_marker_since_launch": None, "startup_hint": None}
+    elapsed = now - float(started)
+    marker_ts = _marker_timestamp(marker)
+    missing = marker_ts is None or marker_ts < started
+    flagged = alive and wired and elapsed >= _first_marker_seconds() and missing
+    if not flagged:
+        return {"no_marker_since_launch": False, "startup_hint": None}
+    age = f"{elapsed:.0f}s"
+    if not agent.get("launch_interactive"):
+        hint = (
+            f"No state marker since launch {age} ago: CLI startup problem or "
+            "hook failure. Check the log."
+        )
+    else:
+        backend = agent.get("backend")
+        cwd = agent.get("cwd") or "the working directory"
+        if backend == "codex":
+            cause = (
+                f"Codex's folder-trust prompt for {cwd} "
+                "(look at the agent's terminal and answer it)"
+            )
+        elif backend == "claude-code":
+            cause = (
+                f"Claude Code's workspace-trust dialog for {cwd} "
+                "(look at the agent's terminal and answer it)"
+            )
+        elif backend == "pi":
+            cause = (
+                f"Pi's project-trust selector for {cwd} "
+                "(look at the agent's terminal and answer it)"
+            )
+        else:
+            cause = "an interactive startup prompt"
+        hint = (
+            f"No state marker since launch {age} ago. Likely causes: {cause}, "
+            "a login prompt, or a slow start. Hooks may also have failed."
+        )
+    return {"no_marker_since_launch": True, "startup_hint": hint}
+
+
 def _public_agent_record(agent: dict) -> dict:
     """Return registry fields with every credential-bearing field omitted."""
     return {key: value for key, value in agent.items() if key not in CREDENTIAL_FIELDS}
@@ -6328,6 +6458,7 @@ def _list_agents_row(session_id: str, agent: dict, alive: bool) -> dict:
         # ``state``: "this process is running" and "we know which transcript
         # is its" are independent facts.
         "binding": binding_outcome,
+        **_startup_diagnosis(agent, marker, alive, time.time()),
     }
 
 
@@ -6337,11 +6468,23 @@ async def list_agents(full: bool = False) -> list[dict]:
     """List all agents with compact status rows.
 
     Default (``full=False``) rows are ``{name, state, alive, pid, backend,
-    last_activity_at, unread_count, binding}`` — no transcript bodies. Pass
+    last_activity_at, unread_count, binding, no_marker_since_launch,
+    startup_hint}`` — no transcript bodies. Pass
     ``full=True`` to restore each agent's sanitized registry fields
     (credential fields omitted) plus
     ``last_line`` (the last non-empty line of its most recent message),
     ``truncated``, and ``full_len`` (the untruncated character count).
+
+    ``no_marker_since_launch`` is ``True`` exactly when the agent is alive,
+    state hooks were wired for this launch, at least 45 seconds have passed
+    since ``launch_started_at`` (env ``WIN_AGENT_TEAMS_FIRST_MARKER_SECONDS``),
+    and the raw marker has no numeric ``ts`` at or after launch. It is
+    ``False`` before that threshold, for a dead agent, when hooks were not
+    wired, or when a post-launch marker exists; ``None`` for legacy/external
+    records. ``startup_hint`` is a hedged, backend-aware heuristic only when
+    ``True``: an interactive Codex folder-trust prompt is one possible cause.
+    Clock changes can mislead this wall-clock comparison. Neither field
+    changes ``state``.
 
     Recovery: if this returns empty right after a restart and you expected
     agents, call ``session_info()`` — a prior session for this workspace may
@@ -6369,6 +6512,12 @@ async def list_agents(full: bool = False) -> list[dict]:
                 {
                     **_public_agent_record(agent),
                     "alive": alive,
+                    **_startup_diagnosis(
+                        agent,
+                        _read_state_marker(session_id, str(agent.get("name") or "")),
+                        alive,
+                        time.time(),
+                    ),
                     "last_line": last_line,
                     "truncated": truncated,
                     "full_len": full_len,
@@ -6433,6 +6582,7 @@ def _agent_status_row(session_id: str, agent: dict) -> dict:
         "heartbeat_age_s": heartbeat_age_s,
         "stalled": stalled,
         "binding": binding_outcome,
+        **_startup_diagnosis(agent, marker, alive, time.time()),
     }
 
 
@@ -6442,7 +6592,8 @@ async def agent_status(names: list[str] | None = None) -> list[dict]:
     """Return cheap per-agent status rows: no bodies, no transcript scan.
 
     Each row is exactly ``{name, backend, state, last_activity_ts,
-    unread_count, seq, heartbeat_age_s, stalled, binding}``.
+    unread_count, seq, heartbeat_age_s, stalled, binding,
+    no_marker_since_launch, startup_hint}``.
     ``seq``/``unread_count`` are the caller's
     per-sender count for messages FROM that named agent. ``names=None``
     returns all agents in the session; otherwise only the named agents
@@ -6456,6 +6607,17 @@ async def agent_status(names: list[str] | None = None) -> list[dict]:
     stall threshold (``STALL_SECONDS``, default 300s, env-overridable via
     ``WIN_AGENT_TEAMS_STALL_SECONDS``). Answers "alive but hung" from disk
     alone, with zero transcript bytes.
+
+    ``no_marker_since_launch`` is ``True`` exactly when the agent is alive,
+    state hooks were wired for this launch, at least 45 seconds have passed
+    since ``launch_started_at`` (env ``WIN_AGENT_TEAMS_FIRST_MARKER_SECONDS``),
+    and the raw marker has no numeric ``ts`` at or after launch. It is
+    ``False`` before that threshold, for a dead agent, when hooks were not
+    wired, or when a post-launch marker exists; ``None`` for legacy/external
+    records. ``startup_hint`` is a hedged, backend-aware heuristic only when
+    ``True``: an interactive Codex folder-trust prompt is one possible cause.
+    Clock changes can mislead this wall-clock comparison. Neither field
+    changes ``state``, ``stalled``, or ``heartbeat_age_s``.
 
     Cost model: one state-marker read + one cursor read + one liveness check
     per agent. The marker (written by a Stop/SessionStart/etc. hook) is used
