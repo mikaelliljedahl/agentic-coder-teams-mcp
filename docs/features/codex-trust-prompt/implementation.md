@@ -185,7 +185,7 @@ The run after `ef1b370` recorded 2873 passed, 10 skipped, against 2874 passed, 9
 
 ## Windows transport smoke W1-W5 (2026-09-27)
 
-Host: Windows 11 Pro 26200, native `codex.exe` (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`), no npm `codex.cmd` installed. Code under test: `ef1b370` (merge + CI fix; the later review commits change only native metadata and tests). Harness: [`evidence/trust_smoke.py`](evidence/trust_smoke.py). For every step it starts a **fresh** win-agent-teams MCP server over stdio with that step's environment (the documented "restart the lead/server" step), in its own lead workspace so it gets its own session. It follows the setup above: an isolated `CODEX_HOME` with copied `auth.json`/`config.toml`, the cwd `trust smoke space ;%!&^` with lowercase and uppercase `untrusted` project entries, and `fc.exe /b` against the saved copy after every spawn and follow-up. W5 uses a minimal `codex.cmd` (`@echo off` + native exe `%*`) alone in a fresh directory prepended to `PATH`, because no installed shim exists; `discover_binary()` then resolves the `.cmd` since no `node_modules` sits next to it.
+Host: Windows 11 Pro 26200, native `codex.exe` (`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`), no npm `codex.cmd` installed. Code under test: merge commit `45c89cd` (the primary checkout was fast-forwarded to `ef1b370` only afterwards; `ef1b370` changes only how `process_manager` reads the direct-launch flag, which is equivalent on Windows). W1 was re-run on `0c55c08` after `cee9d98` changed native metadata; see below. Harness: [`evidence/trust_smoke.py`](evidence/trust_smoke.py). For every step it starts a **fresh** win-agent-teams MCP server over stdio with that step's environment (the documented "restart the lead/server" step), in its own lead workspace so it gets its own session. It follows the setup above: an isolated `CODEX_HOME` with copied `auth.json`/`config.toml`, the cwd `trust smoke space ;%!&^` with lowercase and uppercase `untrusted` project entries, and `fc.exe /b` against the saved copy after every spawn and follow-up. W5 uses a minimal `codex.cmd` (`@echo off` + native exe `%*`) alone in a fresh directory prepended to `PATH`, because no installed shim exists; `discover_binary()` then resolves the `.cmd` since no `node_modules` sits next to it.
 
 | Step | Environment | Result |
 |---|---|---|
@@ -203,6 +203,17 @@ W1 and W3 ran twice, once per follow-up path:
 The real `~/.codex/config.toml` was byte-identical before and after every run. The disposable home and shim directory were removed by the harness.
 
 Reproduce: `.venv\Scripts\python.exe docs\features\codex-trust-prompt\evidence\trust_smoke.py [W1 W2 W3 W4 W5]` (set `SMOKE_RESUME=1` for the resume path). W1 opens a Windows Terminal tab and W3 a console window.
+
+### W1 re-run on `0c55c08` (2026-09-27)
+
+`cee9d98` changed how native records store `CODEX_HOME` after the W1-W5 run, so W1 was repeated on `0c55c08` in both follow-up modes. Both PASS:
+
+| Mode | Follow-up | Result |
+|---|---|---|
+| Native flags on (Desktop config) | `method: "codex_queue"`, `replaced_existing: false`, same PID | Child printed the isolated `CODEX_HOME`; `binding: bound`; `SECOND` received; `fc.exe` exit 0 after spawn and follow-up. |
+| `SMOKE_RESUME=1` (flags unset) | resume, `replaced_existing: true`, new PID, same backend session | Same checks, all pass. |
+
+The real `~/.codex/config.toml` was unchanged after both runs. A `codex_queue` delivery requires native thread verification to accept the recorded home, so the native-mode pass also shows that the metadata written by `cee9d98` works live. The harness passes an absolute `CODEX_HOME`, so the relative-path case fixed by `cee9d98` is covered by `tests/test_native_record_fields.py`, not by this smoke.
 
 ## Linux smoke after merging main (2026-09-27)
 
