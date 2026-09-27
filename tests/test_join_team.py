@@ -743,7 +743,8 @@ def test_two_process_external_read_exactly_once(
         ),
         encoding="utf-8",
     )
-    context = multiprocessing.get_context("fork")
+    # Any: on Windows the stubs type get_context("fork") as BaseContext.
+    context = cast(Any, multiprocessing.get_context("fork"))
     barrier = context.Barrier(2)
     queue = context.Queue()
     processes = [
@@ -1310,5 +1311,10 @@ def test_session_info_availability_only(join_session, monkeypatch):
         "claude_channel": "available",
         "owner_verified": True,
         "notifier_owner": False,
+        "codex_lead": {
+            "status": "unregistered",
+            "generation": 0,
+            "thread_verified": False,
+        },
     }
     assert "secret" not in json.dumps(result)

@@ -1,5 +1,6 @@
 """Runtime BaseBackend process-manager operation tests."""
 
+import base64
 import json
 import subprocess
 import sys
@@ -842,12 +843,14 @@ class TestWindowsTerminalTabSpawn:
         assert tab.wrapper_path is None
         assert tab.backend == "codex"
 
-    def test_escape_wt_passthrough_escapes_only_semicolons(self):
+    def test_wt_escape_delimiters_escapes_only_semicolons(self):
         # Pure string logic; wt strips the leading backslash so codex receives a
         # literal ';'. Other chars (quotes, braces, commas) are left untouched.
-        out = process_manager_mod.WindowsProcessManager._escape_wt_passthrough(
-            ["a;b", "no-semi", "x;y;z", "{k='v'}"]
-        )
+        # (Full wt round-trip coverage lives in test_wt_command_line.py.)
+        out = [
+            process_manager_mod._wt_escape_delimiters(token)
+            for token in ["a;b", "no-semi", "x;y;z", "{k='v'}"]
+        ]
         assert out == [r"a\;b", "no-semi", r"x\;y\;z", "{k='v'}"]
 
     def test_codex_tab_escapes_semicolons_in_prompt(
@@ -1055,7 +1058,12 @@ class TestWindowsTerminalTail:
             "--title",
             "worker@team",
         ]
-        assert f"Get-Content -LiteralPath '{log_path}' -Wait -Tail 80" in command
+        # The script rides as -EncodedCommand so the log path never reaches
+        # wt's command-line parser (see test_wt_command_line.py).
+        assert command[6:10] == ["--", "powershell", "-NoExit", "-EncodedCommand"]
+        script = base64.b64decode(command[10]).decode("utf-16-le")
+        quoted = process_manager_mod._powershell_quote(str(log_path))
+        assert script == f"Get-Content -LiteralPath {quoted} -Wait -Tail 80"
         # The tail only displays a file; inheriting this server's stdin would
         # hand a long-lived child the JSON-RPC pipe. The stdin ratchet in
         # tests/test_subprocess_stdin.py covers subprocess.run only, so this

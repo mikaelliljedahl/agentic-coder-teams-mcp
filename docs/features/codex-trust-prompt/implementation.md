@@ -119,3 +119,15 @@ uv run pytest                  # pass: 1933 passed, 6 skipped
 ### CI fix (Windows), Part B
 
 The first CI run of PR #73 failed six `tests/test_backends/test_codex.py` Part B tests on `tests-windows`. All six were test portability bugs; the production behavior was correct. The tests expected POSIX separators and non-drive-rooted paths, and one expected mixed case where Windows builds the ASCII-lowercased key. On Windows the key is the resolved native path (backslashes, drive letter), lowercased to match Codex's lookup, and `CODEX_HOME` is forwarded as an absolute (drive-rooted) path. The tests now derive their expectations the same way, or compare separators neutrally. No production change. A second CI run caught one more case: a fake `Path.resolve` matched `str(path)` against a POSIX string. It now compares `Path` objects. Linux gates were re-run: format, ruff and ty pass; pytest 1933 passed, 6 skipped.
+
+### Merge with `main` (native downstream delivery, #74)
+
+`main` gained native downstream delivery (the follow-up split into `_prepare` / `_commit_attempt` with native carriers such as `codex_queue`) and the Windows Terminal quoting hardening. Resolution:
+
+- `spawn_agent` and `_build_resume_request` keep both the `codex_trust_*` extras and `_dispatch_extra(...)`.
+- In `_prepare`, native eligibility is computed first; the `trust_cwd` preflight runs only when `native_method is None`, i.e. when the follow-up relaunches Codex through resume. A native carrier never restarts Codex, so it is not refused by trust checks. The resume-request build keeps the PR's lease-releasing `try/except`, and the trust `extra` is added only when a request exists.
+- In `_commit_attempt`, the trust re-check runs only for `METHOD_RESUME` plans (native plans have `request=None`) and still runs before the attempt is marked sent.
+- `_release_lease_or_warn` keeps the PR's `(session_id, agent_name, operation_id)` signature because `_prepare` releases before a plan exists; `main`'s three stage-2 call sites pass `prep.plan.agent_name, prep.plan.operation_id`.
+- `process_manager` takes `main`'s direct-launch block (blocker check, `_wt_argv`) but gates it with the PR's `codex_direct_launch_enabled()`, which the trust preflight uses too. A direct-launch request is still refused for `trust_cwd` even though `main` may fall back to the wrapper at runtime.
+
+Gates after the merge (Windows): `ruff format --check` pass, `ruff check` pass, `ty check` pass, `pytest` 2874 passed, 9 skipped.

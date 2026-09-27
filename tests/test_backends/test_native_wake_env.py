@@ -10,6 +10,12 @@ from claude_teams.backends.process_base import BaseBackend, process_manager
 @pytest.mark.parametrize("operation", ["spawn", "resume"])
 def test_spawn_resume_scrub(backend, operation, monkeypatch):
     monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", "1")
+    for key in (
+        "WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM",
+        "WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE",
+        "WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX",
+    ):
+        monkeypatch.delenv(key, raising=False)
     from claude_teams.backends.claude_code import ClaudeCodeBackend
     from claude_teams.backends.codex import CodexBackend
     from claude_teams.backends.pi import PiBackend
@@ -46,6 +52,8 @@ def test_spawn_resume_scrub(backend, operation, monkeypatch):
     assert observed == [
         {
             "EXAMPLE": "value",
+            # The effective master flag propagates (plan §2.7).
+            "WIN_AGENT_TEAMS_NATIVE_WAKE": "1",
             "CLAUDE_CODE_MESSAGING_SOCKET": "",
             "CLAUDE_CODE_MESSAGING_TOKEN": "",
         }
