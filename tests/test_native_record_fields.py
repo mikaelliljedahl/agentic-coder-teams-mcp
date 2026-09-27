@@ -65,6 +65,35 @@ async def test_flag_on_codex_record_pins_effective_home(tmp_path, monkeypatch):
     assert record["codex_home"] == str(tmp_path / "codex-home")
 
 
+@pytest.mark.asyncio
+async def test_relative_codex_home_is_pinned_resolved(tmp_path, monkeypatch):
+    """A relative CODEX_HOME is recorded as the resolved home the child uses.
+
+    Launch (``CodexBackend.build_env``) and rollout readers resolve it against
+    the server's cwd; ``verify_codex_thread`` rejects a relative home as
+    ``home_missing``, so the native record must carry the same absolute path.
+    """
+    from claude_teams.codex_home import codex_home
+    from claude_teams.native_wake import verify_codex_thread
+
+    monkeypatch.setenv("WIN_AGENT_TEAMS_NATIVE_WAKE", "1")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", "isolated-home")
+    thread_id = "019a0000-0000-7000-8000-000000000001"
+    rollout_dir = tmp_path / "isolated-home" / "sessions" / "2026" / "09" / "27"
+    rollout_dir.mkdir(parents=True)
+    (rollout_dir / f"rollout-2026-09-27T00-00-00-{thread_id}.jsonl").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        server_simple.process_manager, "provides_tty", lambda *a, **k: False
+    )
+    record = await _spawn(tmp_path, monkeypatch, "codex")
+    assert record["codex_home"] == str(codex_home())
+    assert Path(record["codex_home"]) == (tmp_path / "isolated-home").resolve()
+    assert verify_codex_thread(record["codex_home"], thread_id) == (True, "")
+
+
 def test_default_codex_home(monkeypatch):
     monkeypatch.delenv("CODEX_HOME", raising=False)
     assert server_simple._effective_codex_home() == str(Path.home() / ".codex")
@@ -146,7 +175,7 @@ def test_recovery_metadata_is_recorded_with_the_flag_off(monkeypatch):
     assert fields == {
         "interactive": False,
         "dispatch_epoch": 6,
-        "codex_home": "/new-home",
+        "codex_home": str(Path("/new-home").resolve()),
     }
 
 

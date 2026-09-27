@@ -71,6 +71,7 @@ from claude_teams.backends.process_manager import (
     process_manager,
 )
 from claude_teams.backends.registry import registry
+from claude_teams.codex_home import codex_home as _resolved_codex_home
 from claude_teams.delivery import (
     DELIVERY_DELIVERED,
     DELIVERY_FAILED,
@@ -3105,8 +3106,13 @@ def _write_prompt_file(
 
 
 def _effective_codex_home() -> str:
-    """Return the ``CODEX_HOME`` a spawned Codex child inherits from this server."""
-    return os.environ.get("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
+    """Return the absolute ``CODEX_HOME`` a spawned Codex child runs under.
+
+    Uses the shared resolver the launch environment and rollout readers use,
+    so a relative ``CODEX_HOME`` is pinned resolved against the server's cwd;
+    ``verify_codex_thread`` rejects a relative home as ``home_missing``.
+    """
+    return str(_resolved_codex_home())
 
 
 def _marker_epoch(session_id: str, name: str) -> int | None:
