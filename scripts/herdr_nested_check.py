@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 SESSION = "nested"
 CHILD = "herdr-grandchild"
@@ -149,7 +150,8 @@ async def run_checks() -> int:
     # Read the pane only after the CLI has had a chance to paint; reading
     # immediately captures the command line we just typed, not a running TUI.
     await asyncio.sleep(PANE_PAINT_SECONDS)
-    pane_id = pm.process_manager._processes[str(spawned["pid"])].pane_id
+    info = cast(pm.HerdrProcessInfo, pm.process_manager._processes[str(spawned["pid"])])
+    pane_id = info.pane_id
     pane_text = herdr("pane", "read", pane_id, "--source", "visible", "--lines", "40")
     say("--- pane ---\n" + pane_text[-1200:] + "\n--- end pane ---")
     # Deliberately weak on its own: the command line also contains "codex".
