@@ -931,6 +931,7 @@ async def test_spawn_agent_persists_output_lookup_metadata(
             "permission_mode": "bypass",
             "reasoning_effort": None,
             "enable_spawned_lead_wake": False,
+            "trust_cwd": False,
             "prompt_transport": "argv",
             "spawned_by": "team-lead",
             "spawned_by_source": "spawn",
@@ -2876,6 +2877,56 @@ def test_binding_codex_rollout_bound_by_token(
     assert result.output is not None
     assert result.output.backend_session_id == "codex-mine"
     assert result.output.last_message == "codex answer"
+
+
+@pytest.mark.parametrize("relative_home", [False, True])
+def test_codex_rollout_readers_use_isolated_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative_home: bool
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+    isolated = tmp_path / "isolated"
+    monkeypatch.setenv("CODEX_HOME", "isolated" if relative_home else str(isolated))
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    day = datetime.fromtimestamp(_LADDER_SPAWNED_AT, tz=UTC)
+    rollout = (
+        isolated
+        / "sessions"
+        / f"{day.year:04d}"
+        / f"{day.month:02d}"
+        / f"{day.day:02d}"
+        / "rollout-isolated.jsonl"
+    )
+    _write_jsonl(
+        rollout,
+        [
+            _codex_meta(cwd, session_id="codex-isolated"),
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": correlation_marker_token("corr-own"),
+                        }
+                    ],
+                },
+            },
+            _codex_message("isolated answer"),
+        ],
+        _LADDER_SPAWNED_AT + 10,
+    )
+
+    output = read_codex_output(_LADDER_SPAWNED_AT, str(cwd))
+    assert output is not None
+    assert output.rollout_path == str(rollout)
+    binding = _bind(_claude_record(cwd, backend="codex"))
+    assert binding.outcome == ao.BINDING_BOUND
+    assert binding.output is not None
+    assert binding.output.rollout_path == str(rollout)
 
 
 # ---- A6: consumer decisions for the five outcomes -------------------------

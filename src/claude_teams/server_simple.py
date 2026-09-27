@@ -57,7 +57,11 @@ from claude_teams.agent_output import (
 )
 from claude_teams.async_utils import run_blocking
 from claude_teams.backends import process_manager as process_manager_module
-from claude_teams.backends.codex import CodexBackend, codex_mcp_tool_name
+from claude_teams.backends.codex import (
+    CodexBackend,
+    codex_mcp_tool_name,
+    unsafe_trust_path,
+)
 from claude_teams.backends.contracts import SpawnRequest
 from claude_teams.backends.pi import MAX_ARGV_PROMPT_CHARS
 from claude_teams.backends.process_manager import (
@@ -67,6 +71,7 @@ from claude_teams.backends.process_manager import (
     process_manager,
 )
 from claude_teams.backends.registry import registry
+from claude_teams.codex_home import codex_home as _resolved_codex_home
 from claude_teams.delivery import (
     DELIVERY_DELIVERED,
     DELIVERY_FAILED,
@@ -336,6 +341,41 @@ def _launch_mode_fields(
         ),
         "hooks_wired": bool(_state_hook_args(backend, request)),
     }
+
+
+def _trust_cwd_preflight(
+    backend_name: str,
+    cwd: str,
+    interactive: bool,
+    binary: str = "",
+    raw_cwd: str = "",
+) -> str | None:
+    """Return the first unsafe trust condition in launch precedence order."""
+    if backend_name != "codex":
+        return "trust_cwd_unsupported_backend"
+    if not interactive:
+        return "trust_cwd_headless"
+    if CodexBackend._launches_via_cmd_shim(binary):
+        return "trust_cwd_unsafe_transport"
+    if process_manager_module.codex_direct_launch_enabled():
+        return "trust_cwd_unsafe_transport"
+    if unsafe_trust_path(cwd) or (raw_cwd and unsafe_trust_path(raw_cwd)):
+        return "trust_cwd_unsafe_path"
+    return None
+
+
+_TRUST_CWD_REMEDY = {
+    "trust_cwd_unsupported_backend": "Use trust_cwd only with the codex backend.",
+    "trust_cwd_headless": "Use an interactive Codex launch with a TTY.",
+    "trust_cwd_unsafe_transport": (
+        "Use the native Codex binary and the standard terminal wrapper."
+    ),
+    "trust_cwd_binary_changed": "Codex resolution changed during the call; retry.",
+    "trust_cwd_unsafe_path": "Choose a cwd without quotes or control characters.",
+    "trust_cwd_launch_mode_changed": (
+        "Restore the agent's original interactive launch mode."
+    ),
+}
 
 
 def _stall_seconds() -> float:
@@ -3066,8 +3106,13 @@ def _write_prompt_file(
 
 
 def _effective_codex_home() -> str:
-    """Return the ``CODEX_HOME`` a spawned Codex child inherits from this server."""
-    return os.environ.get("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
+    """Return the absolute ``CODEX_HOME`` a spawned Codex child runs under.
+
+    Uses the shared resolver the launch environment and rollout readers use,
+    so a relative ``CODEX_HOME`` is pinned resolved against the server's cwd;
+    ``verify_codex_thread`` rejects a relative home as ``home_missing``.
+    """
+    return str(_resolved_codex_home())
 
 
 def _marker_epoch(session_id: str, name: str) -> int | None:
@@ -3986,6 +4031,7 @@ async def spawn_agent(
     reasoning_effort: str = "",
     expected_outputs: list[str] | None = None,
     enable_spawned_lead_wake: bool = False,
+    trust_cwd: bool = False,
 ) -> dict:
     """Spawn a new agent process.
 
@@ -4031,6 +4077,23 @@ async def spawn_agent(
     permission_mode: ``bypass`` (the autonomous default), ``default``, or
     ``require_approval``. These are win-agent-teams modes, not backend-native
     values such as Claude Code's ``acceptEdits``.
+
+    trust_cwd (codex only, interactive launches only, default False): asks
+    Codex to treat ``cwd`` as a trusted project for this launch and its
+    follow-ups, via a per-process ``-c projects=...`` override; nothing is
+    written to ``~/.codex/config.toml``. Without it, an interactive Codex
+    stops on its folder-trust prompt for a new cwd and no state marker appears
+    until a human answers. Trusting runs repository-controlled code:
+    ``<cwd>/.codex/config.toml`` (MCP servers, model providers), project hooks
+    (which can run before your prompt is handled) and exec policies; for a
+    linked worktree, main-checkout hooks may also load. Ancestor ``.codex``
+    directories are not trusted by it. It is intended to override a user-level
+    ``untrusted`` entry for the cwd (Windows: not yet verified for mixed-case
+    entries), and managed policy can override it, in which case the prompt
+    still shows. Refused with a structured error for other backends, headless
+    launches, the ``codex.cmd`` shim, ``WIN_AGENT_TEAMS_CODEX_DIRECT_LAUNCH=1``,
+    a cwd containing quotes or control characters, and on follow-up when the
+    launch mode changed. Use only for checkouts you trust.
 
     expected_outputs (optional): the exact file paths you are instructing the
     agent to create. Echoed back verbatim in the result so you can watch
@@ -4089,6 +4152,36 @@ async def spawn_agent(
             # An unresolved child must never create an orphan session or launch
             # a subprocess with the sentinel identity in its env.
             return refusal
+        agent_cwd = cwd.strip() or str(Path.cwd())
+        trust_binary = ""
+        if trust_cwd:
+            backend_name = (
+                registry.resolve_name(backend)
+                if backend.strip()
+                else registry.default_backend()
+            )
+            if backend_name != "codex":
+                reason = "trust_cwd_unsupported_backend"
+            else:
+                candidate = registry.get(backend_name)
+                interactive = process_manager.provides_tty(
+                    backend_name,
+                    is_interactive=bool(getattr(candidate, "is_interactive", False)),
+                )
+                trust_binary = candidate.discover_binary() if interactive else ""
+                reason = _trust_cwd_preflight(
+                    backend_name,
+                    agent_cwd,
+                    interactive,
+                    trust_binary,
+                    raw_cwd=cwd,
+                )
+            if reason is not None:
+                return {
+                    "success": False,
+                    "reason": reason,
+                    "remedy": _TRUST_CWD_REMEDY[reason],
+                }
         session_id = _active_session_id(create=True)
         with _agents_transaction(session_id) as agents:
             tickets = _load_join_tickets_unlocked(session_id)
@@ -4113,7 +4206,6 @@ async def spawn_agent(
 
             mcp_config_path = _write_mcp_config(session_id, agent_name, IDENTITY)
 
-            agent_cwd = cwd.strip() or str(Path.cwd())
             # Generated before backend.spawn: the id must already be inside the
             # final initial prompt, which is materialized on the next line.
             correlation_id = new_correlation_id()
@@ -4146,6 +4238,15 @@ async def spawn_agent(
                     backend_name,
                     enable_spawned_lead_wake,
                 ),
+                **(
+                    {
+                        "codex_trust_cwd": "1",
+                        "codex_trust_binary": trust_binary,
+                        "codex_trust_interactive": "1",
+                    }
+                    if trust_cwd
+                    else {}
+                ),
                 **_dispatch_extra(session_id, agent_name, {}),
             }
 
@@ -4165,6 +4266,8 @@ async def spawn_agent(
             )
 
             launch_fields = _launch_mode_fields(backend_name, b, request)
+            if trust_cwd:
+                launch_fields["launch_interactive"] = True
             launch_started_at = time.time()
             result = b.spawn(request)
             pid = int(result.process_handle)
@@ -4195,6 +4298,7 @@ async def spawn_agent(
                     "permission_mode": permission_mode,
                     "reasoning_effort": effort,
                     "enable_spawned_lead_wake": enable_spawned_lead_wake,
+                    "trust_cwd": trust_cwd,
                     "create_token": create_token,
                     CORRELATION_FIELD: correlation_id,
                     PROMPT_TRANSPORT_FIELD: _prompt_transport(prompt_extra),
@@ -5092,6 +5196,7 @@ def _build_resume_request(
             backend_name,
             agent.get("enable_spawned_lead_wake") is True,
         ),
+        **({"codex_trust_cwd": "1"} if agent.get("trust_cwd") is True else {}),
         **_dispatch_extra(session_id, agent_name, agent),
     }
     request = SpawnRequest(
@@ -5291,7 +5396,9 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
     happen before any waiting for response loss to be recoverable.
     """
 
-    def _prepare(ticket: str | None, native_allowed: bool) -> _FollowUpPrep:  # noqa: PLR0911
+    def _prepare(  # noqa: PLR0911, PLR0912
+        ticket: str | None, native_allowed: bool
+    ) -> _FollowUpPrep:
         """Phase 1 — validate, reserve the lease, and build the request.
 
         ``native_allowed`` is cleared for the rest of a call once a native
@@ -5481,6 +5588,38 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                 else None
             )
 
+            # trust_cwd guards the relaunch only: a native carrier never
+            # restarts Codex, so it needs no trust preflight.
+            trust_binary = ""
+            if native_method is None and agent.get("trust_cwd") is True:
+                agent_cwd = str(agent.get("cwd") or Path.cwd())
+                interactive = process_manager.provides_tty(
+                    backend_name,
+                    is_interactive=bool(getattr(backend, "is_interactive", False)),
+                )
+                if agent.get("launch_interactive") is not interactive:
+                    reason = "trust_cwd_launch_mode_changed"
+                else:
+                    trust_binary = backend.discover_binary() if interactive else ""
+                    reason = _trust_cwd_preflight(
+                        backend_name, agent_cwd, interactive, trust_binary
+                    )
+                if reason is not None:
+                    if changed:
+                        _save_agents_transaction(session_id, agents)
+                    return _FollowUpPrep(
+                        refusal=_with_public_status(
+                            _follow_up_failure(
+                                reason,
+                                name,
+                                status,
+                                retriable=True,
+                                detail=_TRUST_CWD_REMEDY[reason],
+                            ),
+                            record,
+                        )
+                    )
+
             if alive and native_method is None:
                 last_activity_at = status.get("last_activity_at")
                 # A hook-written "waiting" marker is an authoritative idle
@@ -5571,27 +5710,41 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                     ticket=reservation.ticket, queue_position=reservation.position
                 )
 
-            (
-                model,
-                permission_mode,
-                effort,
-                correlation_id,
-                request,
-                prompt_extra,
-            ) = (
-                _build_resume_request(
-                    session_id,
-                    agent,
-                    agent_name,
-                    agent_cwd,
-                    backend,
-                    backend_name,
-                    prompt,
-                    nonce,
+            try:
+                (
+                    model,
+                    permission_mode,
+                    effort,
+                    correlation_id,
+                    request,
+                    prompt_extra,
+                ) = (
+                    _build_resume_request(
+                        session_id,
+                        agent,
+                        agent_name,
+                        agent_cwd,
+                        backend,
+                        backend_name,
+                        prompt,
+                        nonce,
+                    )
+                    if native_method is None
+                    else _native_plan_fields(agent)
                 )
-                if native_method is None
-                else _native_plan_fields(agent)
-            )
+                if request is not None and agent.get("trust_cwd") is True:
+                    request_extra = cast("dict[str, str]", request.extra)
+                    request_extra.update(
+                        codex_trust_binary=trust_binary,
+                        codex_trust_interactive="1",
+                    )
+                    # Validate the full command while the old process is alive.
+                    cast("Any", backend).build_resume_command(
+                        request, str(backend_session_id)
+                    )
+            except Exception:
+                _release_lease_or_warn(session_id, agent_name, operation_id)
+                raise
 
             # Anchored BEFORE the resume, on the last COMPLETE record: that is
             # what makes the later scan an observation of *this* attempt rather
@@ -5675,10 +5828,14 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                             session_id, prep.plan, prompt
                         )
                     except Exception:
-                        _release_lease_or_warn(session_id, prep.plan)
+                        _release_lease_or_warn(
+                            session_id, prep.plan.agent_name, prep.plan.operation_id
+                        )
                         raise
                     if blocking is not None:
-                        _release_lease_or_warn(session_id, prep.plan)
+                        _release_lease_or_warn(
+                            session_id, prep.plan.agent_name, prep.plan.operation_id
+                        )
                         return _native_barrier(session_id, name, record, blocking)
                     if not kept:
                         # Stage 2 lost eligibility (plan §2.1). Give up the
@@ -5687,7 +5844,9 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                         # and meet today's idle/replace gate for the rest of
                         # the call. A native branch never resumes directly,
                         # and the budget is the original one.
-                        _release_lease_or_warn(session_id, prep.plan)
+                        _release_lease_or_warn(
+                            session_id, prep.plan.agent_name, prep.plan.operation_id
+                        )
                         native_allowed = False
                         if _delivery_clock() >= deadline:
                             return _pending_tail(
@@ -5723,7 +5882,7 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
                 return _pending_tail(session_id, name, record, waited_for, position)
             _delivery_sleep(_DELIVERY_POLL_SECONDS)
 
-    def _commit_attempt(plan: _FollowUpPlan) -> dict | None:
+    def _commit_attempt(plan: _FollowUpPlan) -> dict | None:  # noqa: PLR0911
         """Phase 2 — commit the leased attempt, then carry it.
 
         Returns the call's answer, or ``None`` when a native carrier proved
@@ -5735,6 +5894,43 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
         block every registry reader on the machine.
         """
         try:
+            # Re-checked before the attempt is marked sent, and only for a
+            # resume: a native carrier never relaunches Codex.
+            if (
+                plan.method == METHOD_RESUME
+                and plan.request is not None
+                and plan.agent_snapshot.get("trust_cwd") is True
+            ):
+                current_interactive = process_manager.provides_tty(
+                    plan.backend_name,
+                    is_interactive=bool(getattr(plan.backend, "is_interactive", False)),
+                )
+                pinned = (plan.request.extra or {}).get("codex_trust_binary", "")
+                current_binary = (
+                    plan.backend.discover_binary() if current_interactive else ""
+                )
+                reason = (
+                    "trust_cwd_launch_mode_changed"
+                    if not current_interactive
+                    else _trust_cwd_preflight(
+                        plan.backend_name,
+                        plan.agent_cwd,
+                        current_interactive,
+                        current_binary,
+                    )
+                )
+                if reason is None and current_binary != pinned:
+                    reason = "trust_cwd_binary_changed"
+                if reason is not None:
+                    return _with_public_status(
+                        _follow_up_failure(
+                            reason,
+                            plan.agent_name,
+                            retriable=True,
+                            detail=_TRUST_CWD_REMEDY[reason],
+                        ),
+                        record,
+                    )
             # Crash-recovery window "after spawn, before sent": the nonce is
             # durable BEFORE the resume, so a crash here still leaves a
             # searchable receipt marker rather than an attempt nobody can
@@ -5781,6 +5977,8 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             launch_fields = _launch_mode_fields(
                 plan.backend_name, plan.backend, cast("SpawnRequest", plan.request)
             )
+            if plan.agent_snapshot.get("trust_cwd") is True:
+                launch_fields["launch_interactive"] = True
             try:
                 launch_started_at = time.time()
                 result = plan.backend.resume(plan.request, plan.backend_session_id)
@@ -5844,13 +6042,13 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             # back to clear it. One retry costs nothing here and closes the
             # transient case; a persistent failure is logged loudly and needs
             # the CLI operator escape, which is what it is for.
-            _release_lease_or_warn(session_id, plan)
+            _release_lease_or_warn(session_id, plan.agent_name, plan.operation_id)
 
     return _do_follow_up()
 
 
-def _release_lease_or_warn(session_id: str, plan: _FollowUpPlan) -> bool:
-    """Release ``plan``'s lease, retrying once, and report whether it is gone.
+def _release_lease_or_warn(session_id: str, agent_name: str, operation_id: str) -> bool:
+    """Release a named lease, retrying once, and report whether it is gone.
 
     ``release_lease`` returns ``False`` both when the lease was already gone
     (finalize won the CAS — the normal case) and when the write was lost. Only
@@ -5860,16 +6058,16 @@ def _release_lease_or_warn(session_id: str, plan: _FollowUpPlan) -> bool:
     path = _leases_file(session_id)
     for attempt in range(2):
         try:
-            release_lease(path, plan.agent_name, plan.operation_id)
-            still_held = active_lease(path, plan.agent_name)
+            release_lease(path, agent_name, operation_id)
+            still_held = active_lease(path, agent_name)
         except LeaseStoreError:
             logger.warning(
                 "Lease store unusable while releasing %s",
-                plan.agent_name,
+                agent_name,
                 exc_info=True,
             )
             continue
-        if still_held is None or still_held.operation_id != plan.operation_id:
+        if still_held is None or still_held.operation_id != operation_id:
             return True
         if attempt == 0:
             continue
@@ -5877,8 +6075,8 @@ def _release_lease_or_warn(session_id: str, plan: _FollowUpPlan) -> bool:
         "Could not release the lease on %s held by operation %s. Until it is "
         "cleared (`win-agent-teams lease force`), deliveries to this agent "
         "queue and kill_agent refuses.",
-        plan.agent_name,
-        plan.operation_id,
+        agent_name,
+        operation_id,
     )
     return False
 

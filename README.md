@@ -98,6 +98,20 @@ Spawned Codex agents need the Codex setup below only when they must call MCP
 tools themselves, for example to `send_message` back to lead. Passive Codex
 workers can still be observed through `check_agent` output fallback.
 
+For a Codex worker in a folder you trust, `spawn_agent(..., backend="codex",
+trust_cwd=True)` can clear Codex's interactive folder-trust prompt for that
+launch and its follow-ups. It passes a process-only project trust override and
+does not change `~/.codex/config.toml`. Trusting a checkout allows its Codex
+configuration, hooks and exec policies to load. Use the flag only for a
+checkout you trust; managed policy may still show the prompt. The flag is
+refused for headless launches, unsafe paths and Windows transports that cannot
+carry the override safely.
+
+When `CODEX_HOME` is set on the MCP server, Codex workers receive its absolute
+path (relative values are resolved from the server's cwd). Rollout lookup uses
+that same home, including for follow-ups. If it is unset, Codex uses
+`~/.codex`.
+
 ### Setup — Codex as Lead (or as Spawned Agent)
 
 Add to `~/.codex/config.toml` (Windows: `C:\Users\<you>\.codex\config.toml`) so

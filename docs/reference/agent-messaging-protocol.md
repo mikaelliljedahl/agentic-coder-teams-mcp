@@ -163,7 +163,29 @@ appended text, not the raw docstring in the source, is what a calling agent
 actually reads, so a change there changes the contract those agents see. It must
 sit below the `@mcp.tool()` decorator to take effect.
 
-### `spawn_agent(prompt, name, backend, model, cwd, permission_mode, reasoning_effort, expected_outputs, enable_spawned_lead_wake)`
+### `spawn_agent(prompt, name, backend, model, cwd, permission_mode, reasoning_effort, expected_outputs, enable_spawned_lead_wake, trust_cwd)`
+
+`trust_cwd` defaults to `false`. For an interactive Codex worker, `true` adds
+one process-only `-c "projects={ '<resolved-cwd>' = { trust_level = 'trusted' } }"`
+argument before the prompt. The path key is ASCII-lowercased on Windows to
+match Codex's project lookup. The choice is recorded on the agent and carried
+to follow-ups; it never writes `config.toml`. Trust permits repository-controlled
+Codex configuration, project hooks and exec policies to load, including possible
+main-checkout hooks for a linked worktree. Managed policy can still require the
+folder-trust prompt. The tool description names this security scope in full.
+
+Preflight refuses `trust_cwd=true` before session creation for other backends,
+headless Codex, the `codex.cmd` shim, Windows direct WT launch, or paths with
+quotes, C0 controls or DEL. Its structured result gives a reason and remedy.
+On follow-up, receipt reconciliation runs first. A changed interactive mode,
+binary or unsafe transport then refuses before an old PID is stopped; the
+pending delivery row stays retryable with its public status and identity. The
+resolved binary and mode are pinned into the request, and the full resume
+command is built while the old PID is alive. A request-build exception releases
+the lease with retry and read-back.
+When the server has `CODEX_HOME` set, `CodexBackend.build_env` exports it to
+the child, including the Windows Terminal `.ps1` wrapper path. This lets an
+isolated-home smoke test exercise the intended config in an existing terminal.
 
 **Mechanically**, under the `agents.json` file lock
 (`src/claude_teams/server_simple.py:1227`):

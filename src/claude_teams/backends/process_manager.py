@@ -54,6 +54,13 @@ _NO_WT_TABS_ENV = "WIN_AGENT_TEAMS_NO_WT_TABS"
 # keeps the prompt off wt's command line. Kept as a fallback in case a future
 # codex build regresses the (now-verified) wrapper compatibility.
 _CODEX_DIRECT_LAUNCH_ENV = "WIN_AGENT_TEAMS_CODEX_DIRECT_LAUNCH"
+
+
+def codex_direct_launch_enabled() -> bool:
+    """Whether Windows Terminal uses the legacy Codex argv transport."""
+    return os.name == "nt" and _env_flag(_CODEX_DIRECT_LAUNCH_ENV)
+
+
 _WT_TAB_PID_TIMEOUT_SECONDS = 12.0
 _WT_TAB_PID_POLL_SECONDS = 0.1
 # How long a freshly-launched WT tab agent must stay alive to be considered a
@@ -1242,6 +1249,8 @@ class WindowsProcessManager(_PidOwnershipMixin):
         # and the wrapper's ``exit 0`` auto-closes the tab on kill/error instead
         # of leaving a lingering ``[process exited]`` tab. Baking the argv into
         # the .ps1 also keeps the prompt off wt's command line entirely.
+        # The raw flag (not ``codex_direct_launch_enabled()``): this WT-tab
+        # path is Windows-only in production, and tests drive it on Linux CI.
         codex_direct = backend_type == "codex" and _env_flag(_CODEX_DIRECT_LAUNCH_ENV)
         if codex_direct:
             skip_reason = self._codex_direct_launch_blocker(cmd, request.cwd)
