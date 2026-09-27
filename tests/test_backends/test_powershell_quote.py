@@ -235,7 +235,9 @@ def test_terminal_tail_quotes_log_path(monkeypatch, tmp_path):
 
     manager._open_windows_terminal_tail("team", "worker", log_path)
 
-    script = popen_mock.call_args.args[0][-1]
+    # The script travels as ``-EncodedCommand`` (Base64 UTF-16LE) so the log
+    # path never reaches wt's command-line parser; decode it back.
+    script = base64.b64decode(popen_mock.call_args.args[0][-1]).decode("utf-16-le")
     prefix = "Get-Content -LiteralPath "
     assert script.startswith(prefix)
     value, end = _ps_scan_single_quoted(script, len(prefix))
