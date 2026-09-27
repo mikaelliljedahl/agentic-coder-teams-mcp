@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -10,6 +11,7 @@ import re
 import socket
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -17,9 +19,9 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, TypeGuard
 
-from claude_teams import filelock, messaging, procinfo
+from claude_teams import filelock, messaging, procinfo, winpipe
 
 _LOG = logging.getLogger(__name__)
 _activation = threading.Event()
@@ -35,9 +37,51 @@ def enabled(half: str = "", environ: Mapping[str, str] | None = None) -> bool:
     )
 
 
+def downstream_enabled(half: str, environ: Mapping[str, str] | None = None) -> bool:
+    """Return whether new downstream deliveries may use ``half``'s native carrier.
+
+    Needs the master flag, ``WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1`` and a half
+    switch that is not ``0``. It gates new attempts only: it never lifts the
+    barrier on native attempts that are already unresolved.
+    """
+    values = os.environ if environ is None else environ
+    return (
+        enabled(half, values)
+        and values.get("WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM", "").strip() == "1"
+    )
+
+
+_PROPAGATED_SUB_FLAGS = (
+    "WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM",
+    "WIN_AGENT_TEAMS_NATIVE_WAKE_CLAUDE",
+    "WIN_AGENT_TEAMS_NATIVE_WAKE_CODEX",
+)
+
+
+def propagated_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return the native flags a spawned child's MCP server must see (plan §2.7).
+
+    Empty unless the master flag is effectively on, so flag-off spawns stay
+    byte-identical. Otherwise the master is passed as ``1`` and the downstream
+    flag and both half switches as their current values; an absent flag stays
+    absent, so nothing is ever turned on implicitly.
+    """
+    values = os.environ if environ is None else environ
+    if not enabled(environ=values):
+        return {}
+    env = {"WIN_AGENT_TEAMS_NATIVE_WAKE": "1"}
+    env.update({key: values[key] for key in _PROPAGATED_SUB_FLAGS if key in values})
+    return env
+
+
 def claude_platform_supported() -> bool:
-    """Require Linux: nearest-host discovery currently depends on /proc."""
-    return os.name != "nt" and sys.platform == "linux"
+    """Linux (/proc host walk, AF_UNIX) and Windows (toolhelp walk, named pipe).
+
+    macOS stays unsupported: nearest-host discovery cannot resolve ``claude``.
+    """
+    if os.name == "nt":
+        return sys.platform == "win32"
+    return sys.platform == "linux"
 
 
 def positive_seconds(raw: str, default: float) -> float:
@@ -61,6 +105,8 @@ class ClaudeChannel:
     path: str = ""
     token: str = field(default="", repr=False)
     owner_verified: bool = False
+    # Windows: every post requires the pipe's server process to be this PID.
+    host_pid: int = 0
 
 
 @dataclass(frozen=True)
@@ -69,6 +115,9 @@ class PostResult:
 
     ok: bool
     reason: str = ""
+    # True once the user line may have reached the host: a failure after this
+    # point is uncertain and never proves non-delivery.
+    write_started: bool = False
 
 
 def resolve_claude_channel(  # noqa: PLR0911 - H-row decision table.
@@ -88,6 +137,12 @@ def resolve_claude_channel(  # noqa: PLR0911 - H-row decision table.
         host = resolve_host().host
         if host is None or not procinfo.is_claude_host(host):
             return ClaudeChannel("host_not_claude")
+        if sys.platform == "win32":
+            # H3-W/H4-W: a local pipe that exists. Ownership is proved per post
+            # (server PID == host PID) because a pipe name carries no PID.
+            if not winpipe.is_pipe_path(path) or not winpipe.pipe_exists(path):
+                return ClaudeChannel("socket_missing")
+            return ClaudeChannel("available", path, token, False, host.pid)
         match = re.fullmatch(r"(\d+)\.sock", Path(path).name)
         if match and int(match[1]) != host.pid:
             return ClaudeChannel("socket_not_owned")
@@ -95,38 +150,44 @@ def resolve_claude_channel(  # noqa: PLR0911 - H-row decision table.
             return ClaudeChannel("socket_missing")
     except (OSError, ValueError):
         return ClaudeChannel("socket_missing")
-    return ClaudeChannel("available", path, token, bool(match))
+    return ClaudeChannel("available", path, token, bool(match), host.pid)
 
 
 def post_claude_notice(
     channel: ClaudeChannel, text: str, deadline: float = 5.0
 ) -> PostResult:
-    """Write auth and user JSON lines with a real total POSIX operation deadline."""
-    if (
-        sys.platform == "win32"
-        or not claude_platform_supported()
-        or channel.reason != "available"
-    ):
+    """Write auth and user JSON lines with a real total operation deadline."""
+    if not claude_platform_supported() or channel.reason != "available":
         return PostResult(False, channel.reason)
+    wire = json.dumps({"type": "auth", "token": channel.token}) + "\n"
+    wire += (
+        json.dumps({"type": "user", "message": {"role": "user", "content": text}})
+        + "\n"
+    )
+    if sys.platform == "win32":
+        if not channel.host_pid:
+            return PostResult(False, "socket_not_owned")
+        piped = winpipe.post(
+            channel.path,
+            wire.encode("utf-8"),
+            deadline,
+            expected_pid=channel.host_pid,
+        )
+        return PostResult(piped.ok, piped.reason, piped.write_started)
+    started = False
     try:
         end = time.monotonic() + deadline
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(deadline)
             connection.connect(channel.path)
             connection.settimeout(max(0.001, end - time.monotonic()))
-            wire = json.dumps({"type": "auth", "token": channel.token}) + "\n"
-            wire += (
-                json.dumps(
-                    {"type": "user", "message": {"role": "user", "content": text}}
-                )
-                + "\n"
-            )
+            started = True
             connection.sendall(wire.encode("utf-8"))
             connection.shutdown(socket.SHUT_WR)
     except Exception as err:
         # Never include transport text: an exception may echo a credential.
-        return PostResult(False, type(err).__name__)
-    return PostResult(True)
+        return PostResult(False, type(err).__name__, started)
+    return PostResult(True, "", True)
 
 
 @dataclass(frozen=True)
@@ -280,6 +341,8 @@ class _Target:
     signature: tuple[Any, ...] | None = None
     snapshot: dict[str, dict[str, int]] = field(default_factory=dict)
     catchup: bool = True
+    # Codex lead only: the ``(thread_id, codex_home)`` verified for this key.
+    verified: tuple[str, str] | None = None
 
     def close(self) -> None:
         if self.handle is not None:
@@ -298,6 +361,235 @@ def _signature(directory: Path, reader: str) -> tuple[Any, ...]:
     return tuple(values)
 
 
+LEAD_WAKE_STATUSES = frozenset({"provisional", "active", "cleared"})
+
+
+def lead_wake_file(directory: Path, identity: str) -> Path:
+    """Return the Codex lead registration ``lead-wake-<identity>.json``."""
+    return directory / f"lead-wake-{identity}.json"
+
+
+def _valid_lead_wake(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    generation = value.get("generation")
+    host_pid = value.get("host_pid")
+    return (
+        isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and generation >= 1
+        and value.get("status") in LEAD_WAKE_STATUSES
+        and isinstance(value.get("thread_id"), str | None)
+        and isinstance(value.get("codex_home"), str | None)
+        and isinstance(host_pid, int)
+        and not isinstance(host_pid, bool)
+        and isinstance(value.get("host_create_token"), str | None)
+        and isinstance(value.get("reason"), str)
+        and (value.get("status") == "cleared" or bool(value.get("thread_id")))
+    )
+
+
+def read_lead_wake(directory: Path, identity: str) -> dict | None:
+    """Read a registration; a missing, corrupt or malformed file reads as absent."""
+    try:
+        value = json.loads(lead_wake_file(directory, identity).read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if _valid_lead_wake(value) else None
+
+
+def _lead_wake_lock(directory: Path, identity: str) -> Path:
+    """Return ``lead-wake-<identity>.lock``, serializing every registration write."""
+    return lead_wake_file(directory, identity).with_suffix(".lock")
+
+
+def _registration_is(
+    registration: dict | None, key: tuple[Any, ...]
+) -> TypeGuard[dict]:
+    """Return whether ``registration`` is the active one the state ``key`` names.
+
+    ``key`` is ``(session, identity, generation, host_pid, host_create_token)``.
+    Every registration write bumps ``generation`` except corroboration, which
+    only settles ``provisional``; so an ``active`` registration at the key's
+    generation and host is exactly the one the key was minted for.
+    """
+    return (
+        registration is not None
+        and registration["status"] == "active"
+        and registration["generation"] == key[2]
+        and (registration["host_pid"], registration["host_create_token"])
+        == tuple(key[3:])
+    )
+
+
+def _update_lead_wake(
+    directory: Path, identity: str, change: Callable[[dict | None], dict | None]
+) -> dict | None:
+    """Apply ``change`` under ``lead-wake-<identity>.lock``; ``None`` writes nothing."""
+    path = lead_wake_file(directory, identity)
+    with filelock.file_lock(_lead_wake_lock(directory, identity)):
+        prior = read_lead_wake(directory, identity)
+        value = change(prior)
+        if value is None:
+            return prior
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(json.dumps(value, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        return value
+
+
+def register_lead_wake(
+    directory: Path,
+    identity: str,
+    *,
+    thread_id: str,
+    codex_home: str,
+    host: tuple[int, str | None],
+    spawned: bool,
+    bound: str | None,
+) -> dict:
+    """Register, replace or clear a Codex lead doorbell (plan §2.6, R2-6).
+
+    Every call bumps ``generation``; a blank thread writes a ``cleared``
+    tombstone. A human-started lead is ``active`` at once. A spawned lead is
+    ``provisional`` until the parent-bound ``bound`` backend session exists:
+    equal to the thread makes it ``active``, different makes it ``cleared``.
+    The host incarnation is recorded so a new host ignores the registration.
+    """
+
+    def change(prior: dict | None) -> dict:
+        generation = (prior or {}).get("generation", 0) + 1
+        if not thread_id:
+            status, reason = "cleared", "cleared_by_lead"
+        elif not spawned:
+            status, reason = "active", ""
+        elif not bound:
+            status, reason = "provisional", "awaiting_parent_binding"
+        elif bound == thread_id:
+            status, reason = "active", ""
+        else:
+            status, reason = "cleared", "thread_mismatch"
+        return {
+            "thread_id": thread_id or None,
+            "codex_home": codex_home if thread_id else None,
+            "generation": generation,
+            "host_pid": host[0],
+            "host_create_token": host[1],
+            "status": status,
+            "reason": reason,
+        }
+
+    stored = _update_lead_wake(directory, identity, change)
+    assert stored is not None  # noqa: S101 - change() always writes.
+    return stored
+
+
+def corroborate_lead_wake(
+    directory: Path, identity: str, generation: int, bound: str
+) -> dict | None:
+    """Settle a provisional registration against the parent-bound thread.
+
+    A CAS on ``(generation, provisional)``: a newer registration or one
+    already settled is left untouched and returned as it is.
+    """
+
+    def change(prior: dict | None) -> dict | None:
+        if (
+            prior is None
+            or prior["generation"] != generation
+            or prior["status"] != "provisional"
+        ):
+            return None
+        if bound == prior["thread_id"]:
+            return {**prior, "status": "active", "reason": ""}
+        return {**prior, "status": "cleared", "reason": "thread_mismatch"}
+
+    return _update_lead_wake(directory, identity, change)
+
+
+def codex_lead_status(
+    directory: Path,
+    identity: str,
+    host: Callable[[], tuple[int, str | None] | None],
+) -> dict:
+    """Report ``{status, generation, thread_verified}`` for ``session_info``.
+
+    ``status`` is the stored one, or ``unregistered``, or ``stale_host`` when
+    the registration belongs to another host incarnation. The host is looked
+    up only when a registration exists.
+    """
+    registration = read_lead_wake(directory, identity)
+    if registration is None:
+        return {"status": "unregistered", "generation": 0, "thread_verified": False}
+    status = registration["status"]
+    current = host()
+    if current is None or current != (
+        registration["host_pid"],
+        registration["host_create_token"],
+    ):
+        status = "stale_host"
+    verified = (
+        status == "active"
+        and verify_codex_thread(registration["codex_home"], registration["thread_id"])[
+            0
+        ]
+    )
+    return {
+        "status": status,
+        "generation": registration["generation"],
+        "thread_verified": verified,
+    }
+
+
+def codex_lead_notice(counts: Mapping[str, int], seq: int) -> str:
+    """Return a body-free lead doorbell naming the full Codex tool.
+
+    Sender names are reduced to ``[A-Za-z0-9_-]`` and the text avoids every
+    ``cmd.exe`` metacharacter, so it is safe even through an npm shim.
+    """
+    from claude_teams.backends.codex import (  # noqa: PLC0415 - backend import cycle.
+        codex_mcp_tool_name,
+    )
+
+    senders = " ".join(
+        f"{re.sub(r'[^A-Za-z0-9_-]', '_', sender)}:{count}"
+        for sender, count in sorted(counts.items())
+    )
+    return (
+        f"[win-agent-teams wake #{seq}] {sum(counts.values())} unread messages "
+        f"in your team inbox from {senders}. Best-effort notice without "
+        f"content; call {codex_mcp_tool_name('read_messages')} to read them."
+    )
+
+
+def _default_lead_queue(thread_id: str, home: str, text: str) -> QueueOutcome:
+    try:
+        binary = _discover_codex()
+    except Exception:
+        return QueueOutcome(False)
+    return codex_queue(binary, thread_id, home, text)
+
+
+@dataclass(frozen=True)
+class CodexLeadWake:
+    """The Codex lead channel's injected facts (plan §2.6).
+
+    ``host`` returns this MCP server's Codex host incarnation ``(pid,
+    creation token)``, or ``None`` when the nearest host is not Codex.
+    ``binding`` returns the parent-bound backend session of a spawned lead, or
+    ``None``. ``queue`` runs ``codex queue``; ``verify`` checks the thread.
+    """
+
+    host: Callable[[], tuple[int, str | None] | None]
+    binding: Callable[[str, str], str | None]
+    queue: Callable[[str, str, str], QueueOutcome] = _default_lead_queue
+    verify: Callable[[str, str], tuple[bool, str]] | None = None
+
+
 class NativeWakeNotifier(threading.Thread):
     """A daemon that owns reader locks and observes only explicit session state."""
 
@@ -311,8 +603,14 @@ class NativeWakeNotifier(threading.Thread):
         post: Callable[[ClaudeChannel, str], PostResult] = post_claude_notice,
         clock: Callable[[], float] = time.monotonic,
         poll: float | None = None,
+        codex_lead: CodexLeadWake | None = None,
+        delivery: Any | None = None,
     ) -> None:
-        """Inject state readers, never recovery or MCP tool calls."""
+        """Inject state readers, never recovery or MCP tool calls.
+
+        ``delivery`` is the child's ``DeliveryPoster`` (plan §2.3.4), a second
+        target kind ticked here under its own gate and owner lock.
+        """
         super().__init__(name="native-session-wake", daemon=True)
         self.get_target = get_target
         self.session_dir = session_dir
@@ -326,6 +624,11 @@ class NativeWakeNotifier(threading.Thread):
             _seconds("NATIVE_WAKE_RENOTIFY_SECONDS", 300.0),
         )
         self.targets: dict[tuple[str, str], _Target] = {}
+        self.codex_lead = codex_lead
+        # Keyed by (session, identity, generation, host pid, host token), so a
+        # session switch, re-registration or new host never inherits state.
+        self.codex_targets: dict[tuple[Any, ...], _Target] = {}
+        self.delivery = delivery
         self._stop_event = threading.Event()
 
     def run(self) -> None:
@@ -341,13 +644,29 @@ class NativeWakeNotifier(threading.Thread):
             self._release_targets()
 
     def tick(self) -> None:
-        """Consume activation before reading the latest session snapshot."""
+        """Consume activation, then run each channel under its own gate."""
         activated = _activation.is_set()
         _activation.clear()
+        if sys.platform == "win32":
+            # Free parked pipe writes on the tick, not only on the next post.
+            winpipe.reap_parked()
+        self._tick_claude(activated)
+        self._tick_codex_lead(activated)
+        self._tick_delivery()
+
+    def _tick_delivery(self) -> None:
+        if self.delivery is None:
+            return
+        try:
+            self.delivery.tick()
+        except Exception as err:
+            _LOG.warning("Delivery poster failed: %s", type(err).__name__)
+
+    def _tick_claude(self, activated: bool) -> None:
         if self.channel.reason != "available" or not enabled("CLAUDE"):
             with _registry_lock:
                 _members.clear()
-            self._release_targets()
+            self._release_claude_targets()
             return
         lead = self.get_target()
         with _registry_lock:
@@ -392,28 +711,8 @@ class NativeWakeNotifier(threading.Thread):
                 target.acquire_after = now + 10.0
                 return
             target.handle = handle
-        signature = _signature(directory, key[1])
-        deadline = (
-            target.state.first_new is not None
-            and now >= target.state.first_new + self.cfg.coalesce
-        ) or (
-            target.state.last_success is not None
-            and now >= target.state.last_success + self.cfg.renotify
-        )
-        if activated or signature != target.signature or target.catchup or deadline:
-            target.snapshot = scan_inbox(directory, key[1])
-            target.signature = signature
-        if target.catchup:
-            target.state.notified = {s: r["cursor"] for s, r in target.snapshot.items()}
-        cfg = NoticeConfig(
-            0 if target.catchup else self.cfg.coalesce, self.cfg.renotify
-        )
-        target.state.observe(target.snapshot, now, cfg)
-        notice = plan_notice(
-            target.state, target.snapshot, now, cfg, member=key != lead
-        )
+        notice = self._plan(target, directory, key[1], now, activated, key != lead)
         if notice is None:
-            target.catchup = False
             return
         # Session changes during a scan cannot send to a dropped lead target.
         if (
@@ -433,16 +732,173 @@ class NativeWakeNotifier(threading.Thread):
         else:
             target.backoff.failed(self.clock())
 
+    def _plan(
+        self,
+        target: _Target,
+        directory: Path,
+        reader: str,
+        now: float,
+        activated: bool,
+        member: bool,
+    ) -> Notice | None:
+        """Rescan when needed and propose a notice; catch-up skips coalescing."""
+        signature = _signature(directory, reader)
+        deadline = (
+            target.state.first_new is not None
+            and now >= target.state.first_new + self.cfg.coalesce
+        ) or (
+            target.state.last_success is not None
+            and now >= target.state.last_success + self.cfg.renotify
+        )
+        if activated or signature != target.signature or target.catchup or deadline:
+            target.snapshot = scan_inbox(directory, reader)
+            target.signature = signature
+        if target.catchup:
+            target.state.notified = {s: r["cursor"] for s, r in target.snapshot.items()}
+        cfg = NoticeConfig(
+            0 if target.catchup else self.cfg.coalesce, self.cfg.renotify
+        )
+        target.state.observe(target.snapshot, now, cfg)
+        notice = plan_notice(target.state, target.snapshot, now, cfg, member=member)
+        if notice is None:
+            target.catchup = False
+        return notice
+
+    def _codex_lead_key(self, lead: tuple[str, str] | None) -> tuple[Any, ...] | None:
+        """Return the state key of a registration that may queue now, else None.
+
+        Only an ``active`` registration made by this host incarnation
+        qualifies. A ``provisional`` one is first settled against the
+        parent-bound backend session, when that exists.
+        """
+        if lead is None or self.codex_lead is None:
+            return None
+        session, identity = lead
+        directory = self.session_dir(session)
+        registration = read_lead_wake(directory, identity)
+        if registration is None or registration["status"] == "cleared":
+            return None
+        host = self.codex_lead.host()
+        if host is None or host != (
+            registration["host_pid"],
+            registration["host_create_token"],
+        ):
+            return None
+        if registration["status"] == "provisional":
+            bound = self.codex_lead.binding(session, identity)
+            if not bound:
+                return None
+            registration = corroborate_lead_wake(
+                directory, identity, registration["generation"], bound
+            )
+            if registration is None or registration["status"] != "active":
+                return None
+        return (session, identity, registration["generation"], *host)
+
+    def _tick_codex_lead(self, activated: bool) -> None:
+        if self.codex_lead is None or not enabled("CODEX"):
+            self._release_codex_targets()
+            return
+        key = self._codex_lead_key(self.get_target())
+        for old in self.codex_targets.keys() - {key}:
+            self.codex_targets.pop(old).close()
+        if key is None:
+            return
+        target = self.codex_targets.setdefault(key, _Target())
+        try:
+            self._check_codex_lead(key, target, activated)
+        except Exception as err:
+            target.backoff.failed(self.clock())
+            _LOG.warning("Codex lead wake failed: %s", type(err).__name__)
+
+    def _check_codex_lead(  # noqa: PLR0911 - one return per gate.
+        self, key: tuple[Any, ...], target: _Target, activated: bool
+    ) -> None:
+        assert self.codex_lead is not None  # noqa: S101 - gated by the caller.
+        now = self.clock()
+        if now < target.backoff.until:
+            return
+        session, identity = key[0], key[1]
+        directory = self.session_dir(session)
+        if target.handle is None:
+            if now < target.acquire_after:
+                return
+            handle = (directory / f"native-wake-codex-lead.{identity}.lock").open("a+b")
+            try:
+                owned = filelock.try_lock_handle(handle)
+            except Exception:
+                handle.close()
+                raise
+            if not owned:
+                handle.close()
+                target.acquire_after = now + 10.0
+                return
+            target.handle = handle
+        notice = self._plan(target, directory, identity, now, activated, member=False)
+        if notice is None:
+            return
+        registration = read_lead_wake(directory, identity)
+        if not _registration_is(registration, key):
+            return
+        snapshot = (registration["thread_id"], registration["codex_home"])
+        if target.verified != snapshot:
+            verify = self.codex_lead.verify or verify_codex_thread
+            ok, _ = verify(snapshot[1], snapshot[0])
+            if not ok:
+                target.backoff.failed(self.clock())
+                return
+            target.verified = snapshot
+        if target.handle is None or target.handle.closed:
+            return
+        # The dispatch decision and the queue run under the registration lock,
+        # so a replacement or clear either lands first (and is seen here) or
+        # waits until this notice is queued: it can never slip in between the
+        # check and the queue. Held across ``codex queue`` on purpose; that
+        # call only enqueues (bounded by its timeout) and the only contenders
+        # are this identity's own set_lead_wake/corroboration writes.
+        with filelock.file_lock(_lead_wake_lock(directory, identity)):
+            current = read_lead_wake(directory, identity)
+            if (
+                self.get_target() != (session, identity)
+                or self.codex_lead.host() != tuple(key[3:])
+                or not _registration_is(current, key)
+                or (current["thread_id"], current["codex_home"]) != snapshot
+            ):
+                return
+            outcome = self.codex_lead.queue(
+                snapshot[0],
+                snapshot[1],
+                codex_lead_notice(notice.counts, target.state.seq + 1),
+            )
+        if outcome.enqueued:
+            target.state.succeeded(target.snapshot, self.clock())
+            target.backoff.reset()
+            target.catchup = False
+        else:
+            # Uncertain or failed: the notice may still arrive; retry spaced.
+            target.backoff.failed(self.clock())
+
     def owns(self, key: tuple[str, str] | None) -> bool:
         """Report ownership without claiming notice delivery."""
         target = self.targets.get(key) if key else None
         handle = target.handle if target is not None else None
         return bool(handle and not handle.closed)
 
-    def _release_targets(self) -> None:
+    def _release_claude_targets(self) -> None:
         for target in self.targets.values():
             target.close()
         self.targets.clear()
+
+    def _release_codex_targets(self) -> None:
+        for target in self.codex_targets.values():
+            target.close()
+        self.codex_targets.clear()
+
+    def _release_targets(self) -> None:
+        self._release_claude_targets()
+        self._release_codex_targets()
+        if self.delivery is not None:
+            self.delivery.close()
 
     def close(self) -> None:
         """Stop the daemon and release its lifetime locks."""
@@ -496,6 +952,200 @@ def _discover_codex() -> str:
     return CodexBackend().discover_binary()
 
 
+_SUBMISSION_RE = re.compile(
+    r"Queued message ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+@dataclass(frozen=True)
+class QueueOutcome:
+    """One ``codex queue`` run. Only an exec failure proves nothing was queued.
+
+    ``started`` means a codex process may have run. From then on, anything but
+    exit 0 with a parsed submission id is uncertain: the turn may be queued
+    durably (it survives the process and a reboot) even when the CLI reports a
+    failure, so callers must never treat it as proof of non-delivery.
+    """
+
+    started: bool
+    exit: int | None = None
+    submission_id: str = ""
+    timed_out: bool = False
+    stderr_tail: str = field(default="", repr=False)
+
+    @property
+    def enqueued(self) -> bool:
+        """Return whether the CLI confirmed a queued submission."""
+        return self.exit == 0 and bool(self.submission_id)
+
+    @property
+    def provably_not_enqueued(self) -> bool:
+        """Return whether no codex process ever started."""
+        return not self.started
+
+
+#: Largest command line handed to ``CreateProcess``, in UTF-16 code units and
+#: including the terminating null. The API limit is 32 767; the margin covers
+#: whatever a launcher adds (plan §2.9 R3-5).
+WINDOWS_COMMAND_BUDGET = 32_000
+#: Linux ``MAX_ARG_STRLEN``: one argument or environment string, null included.
+POSIX_ARG_STRLEN_MAX = 128 * 1024
+#: Assumed ``ARG_MAX`` when ``sysconf`` cannot say.
+POSIX_ARG_MAX_FALLBACK = 128 * 1024
+#: Kept free of ``ARG_MAX`` for the loader's own use (auxv, the exec path).
+POSIX_ARG_MARGIN = 4 * 1024
+_WINDOWS = os.name == "nt"
+
+
+def _posix_arg_max() -> int:
+    """Return ``sysconf(SC_ARG_MAX)``, or the fallback when it cannot say."""
+    sysconf = getattr(os, "sysconf", None)  # absent on Windows
+    if sysconf is None:
+        return POSIX_ARG_MAX_FALLBACK
+    try:
+        value = int(sysconf("SC_ARG_MAX"))
+    except (ValueError, OSError):
+        return POSIX_ARG_MAX_FALLBACK
+    return value if value > 0 else POSIX_ARG_MAX_FALLBACK
+
+
+def command_fits(
+    argv: list[str],
+    env: Mapping[str, str] | None = None,
+    *,
+    windows: bool | None = None,
+    arg_max: int | None = None,
+) -> bool:
+    """Return whether ``argv`` (and ``env``) can be launched on this platform.
+
+    Checked before a launch whose failure would otherwise be ambiguous, so the
+    caller can choose another route while nothing has run yet.
+
+    - **Windows:** the quoted command line, as ``subprocess`` builds it,
+      measured in UTF-16 code units (a non-BMP character is two) plus the
+      terminating null, must be at most :data:`WINDOWS_COMMAND_BUDGET`.
+    - **POSIX:** every argument and ``KEY=value`` string, encoded and
+      null-terminated, must fit ``MAX_ARG_STRLEN``; all of them plus one
+      pointer each (and the two terminating null pointers) must fit
+      ``sysconf(SC_ARG_MAX)`` less :data:`POSIX_ARG_MARGIN`.
+    """
+    on_windows = _WINDOWS if windows is None else windows
+    if on_windows:
+        line = subprocess.list2cmdline(argv)
+        units = len(line.encode("utf-16-le", "surrogatepass")) // 2
+        return units + 1 <= WINDOWS_COMMAND_BUDGET
+    values = os.environ if env is None else env
+    strings = [*argv, *(f"{key}={value}" for key, value in values.items())]
+    pointer = struct.calcsize("P")
+    total = 2 * pointer
+    for text in strings:
+        size = len(os.fsencode(text)) + 1
+        if size > POSIX_ARG_STRLEN_MAX:
+            return False
+        total += size + pointer
+    limit = _posix_arg_max() if arg_max is None else arg_max
+    return total <= limit - POSIX_ARG_MARGIN
+
+
+def codex_queue_argv(binary: str, thread_id: str, message: str) -> list[str]:
+    """Return the exact ``codex queue`` command :func:`codex_queue` launches."""
+    return [binary, "queue", "--thread", thread_id, "--message", message]
+
+
+def queue_environment(home: str) -> dict[str, str]:
+    """Scrub identity/channel variables and pin ``CODEX_HOME`` for a queue run."""
+    environ = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("AGENT_")
+        and key
+        not in {
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "WIN_AGENT_TEAMS_SESSION_DIR",
+        }
+    }
+    environ["CODEX_HOME"] = home
+    return environ
+
+
+def _outcome_from(returncode: int, stdout: str, stderr: str) -> QueueOutcome:
+    match = _SUBMISSION_RE.search(stdout or "")
+    return QueueOutcome(
+        True,
+        returncode,
+        match[1] if match and returncode == 0 else "",
+        stderr_tail=(stderr or "")[-200:],
+    )
+
+
+def codex_queue(  # noqa: PLR0911 - one return per staged outcome.
+    binary: str,
+    thread_id: str,
+    home: str,
+    message: str,
+    *,
+    popen: Callable[..., Any] = subprocess.Popen,
+    runner: Callable[..., Any] | None = None,
+    timeout: float | None = None,
+) -> QueueOutcome:
+    """Run ``codex queue`` with a real timeout; ``cwd`` is home, not CODEX_HOME.
+
+    Process creation and communication are separate stages on purpose: only a
+    failure to *construct* the process proves nothing was queued. Once a
+    process object exists, every error (including an ``OSError`` from
+    ``communicate``) is uncertain, because the turn may already be queued.
+    ``runner`` is a legacy ``subprocess.run``-style seam; it cannot tell the
+    stages apart, so none of its failures are ever reported as unstarted.
+    """
+    argv = codex_queue_argv(binary, thread_id, message)
+    limit = timeout or _seconds("CODEX_QUEUE_TIMEOUT_SECONDS", 15.0)
+    options: dict[str, Any] = {
+        "env": queue_environment(home),
+        "cwd": Path.home(),
+        "stdin": subprocess.DEVNULL,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if runner is not None:
+        try:
+            completed = runner(
+                argv, capture_output=True, timeout=limit, check=False, **options
+            )
+        except subprocess.TimeoutExpired:
+            return QueueOutcome(True, timed_out=True)
+        except (OSError, subprocess.SubprocessError):
+            return QueueOutcome(True)
+        return _outcome_from(
+            completed.returncode,
+            getattr(completed, "stdout", "") or "",
+            getattr(completed, "stderr", "") or "",
+        )
+    try:
+        process = popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
+    except (OSError, ValueError):
+        # Construction failed: no codex process ever ran.
+        return QueueOutcome(False)
+    try:
+        stdout, stderr = process.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        _reap(process)
+        return QueueOutcome(True, timed_out=True)
+    except Exception:
+        _reap(process)
+        return QueueOutcome(True)
+    return _outcome_from(process.returncode, stdout, stderr)
+
+
+def _reap(process: Any) -> None:
+    """Kill and collect a queue process without letting cleanup raise."""
+    with contextlib.suppress(Exception):
+        process.kill()
+    with contextlib.suppress(Exception):
+        process.communicate(timeout=5)
+
+
 @dataclass
 class _CodexState:
     generation: int
@@ -510,7 +1160,7 @@ class CodexMemberWake:
     def __init__(
         self,
         *,
-        runner: Callable[..., Any] = subprocess.run,
+        runner: Callable[..., Any] | None = None,
         discover: Callable[[], str] = _discover_codex,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -607,41 +1257,17 @@ class CodexMemberWake:
             f"{codex_mcp_tool_name('external_read', server=external_key)} "
             "with your member_token using your configured MCP key"
         )
-        environ = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith("AGENT_")
-            and key
-            not in {
-                "CLAUDE_CODE_MESSAGING_SOCKET",
-                "CLAUDE_CODE_MESSAGING_TOKEN",
-                "WIN_AGENT_TEAMS_SESSION_DIR",
-            }
-        }
-        environ["CODEX_HOME"] = registration["codex_home"]
-        try:
-            completed = self.runner(
-                [
-                    binary,
-                    "queue",
-                    "--thread",
-                    registration["thread_id"],
-                    "--message",
-                    notice,
-                ],
-                env=environ,
-                cwd=Path.home(),
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=_seconds("CODEX_QUEUE_TIMEOUT_SECONDS", 15.0),
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
+        outcome = codex_queue(
+            binary,
+            registration["thread_id"],
+            registration["codex_home"],
+            notice,
+            runner=self.runner,
+        )
+        if outcome.timed_out:
             return {**result, "status": "timeout"}
-        except (OSError, subprocess.SubprocessError):
+        if outcome.exit is None:
             return {**result, "status": "failed"}
-        if completed.returncode != 0:
-            return {**result, "status": "failed", "detail": completed.stderr[-200:]}
+        if outcome.exit != 0:
+            return {**result, "status": "failed", "detail": outcome.stderr_tail}
         return result
