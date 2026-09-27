@@ -260,8 +260,12 @@ def _windows_command_lines() -> dict[int, tuple[str, ...]]:
     return result
 
 
-def _windows_snapshot() -> dict[int, ProcessInfo]:
-    """Capture all Windows processes with one Toolhelp snapshot."""
+def _windows_snapshot(*, with_argv: bool = True) -> dict[int, ProcessInfo]:
+    """Capture all Windows processes with one Toolhelp snapshot.
+
+    ``with_argv=False`` skips the (slow, PowerShell/CIM) command-line query
+    and leaves every ``argv`` empty: image name and parent PID only.
+    """
 
     class PROCESSENTRY32W(ctypes.Structure):
         _fields_ = [
@@ -294,7 +298,7 @@ def _windows_snapshot() -> dict[int, ProcessInfo]:
     kernel32.CloseHandle.restype = ctypes.c_int
 
     snapshot = _create_toolhelp_snapshot(kernel32)
-    command_lines = _windows_command_lines()
+    command_lines = _windows_command_lines() if with_argv else {}
     result: dict[int, ProcessInfo] = {}
     try:
         entry = PROCESSENTRY32W()
@@ -312,6 +316,21 @@ def _windows_snapshot() -> dict[int, ProcessInfo]:
     finally:
         kernel32.CloseHandle(snapshot)
     return result
+
+
+def windows_process_table() -> dict[int, ProcessInfo]:
+    """Return the Windows process table by image name and parent PID only.
+
+    One Toolhelp snapshot without the command-line query, so every ``argv``
+    is empty and a host is recognized by its image name alone. Empty off
+    Windows or when the snapshot fails.
+    """
+    if os.name != "nt":
+        return {}
+    try:
+        return _windows_snapshot(with_argv=False)
+    except OSError:
+        return {}
 
 
 def resolve_nearest_host(start_pid: int | None = None) -> HostResolution:
