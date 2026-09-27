@@ -154,8 +154,18 @@ More about how it runs:
   and `%USERNAME%` was not expanded.
 - PASS: `expand`. wt expanded `%WTV_PROBE%` and re-split argv into
   `['x a', 'b y']`, and the direct-launch guard refused the `%` pair.
-- NOT EXECUTED: `wt->native(rust)`, because `rustc` was not on PATH. The
-  native-consumer evidence is therefore Python only.
+- NOT EXECUTED in that first run: `wt->native(rust)`, because `rustc` was
+  not on PATH.
+
+Rerun on the same day with rustc 1.98.1 (toolchain
+`stable-x86_64-pc-windows-gnu`, installed via rustup) on PATH: **28 passed,
+0 failed, 0 not executed.** Exit code 0.
+
+- The isolated Terminal process and the Rust recorder were both present.
+- `wt->native(rust)` passed for all 5 argv sets in both fresh-window and
+  existing-window modes. The Rust recorder's argv matched the Python
+  recorder's exactly.
+- All the other cases passed again.
 
 ## Remaining separate boundaries (not changed)
 
