@@ -21,3 +21,6 @@ FORK_INTEGRATION_ARCHITECTURE_PLAN.md
 
 # Local machine-specific Claude Code hooks (absolute venv paths; written by install_lead_wake)
 .claude/settings.json
+
+# Local Pi agent session state
+.pi-glla/
