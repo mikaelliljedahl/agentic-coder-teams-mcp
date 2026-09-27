@@ -245,3 +245,32 @@ The Claude lead ran branch 9009aa7 with both flags on. `n2win` (Codex, cheapest)
 | Settlement | `delivered` inside the 45 s budget. A longer turn would end `unconfirmed/native_unresolved` and settle on the later receipt (unit-tested) |
 
 This matches Linux L-1: **E6 is lifted on both platforms.**
+
+## Linux live smokes (2026-09-27)
+
+Omarchy (Arch) Linux, codex-cli 0.157.1, Claude Code 2.1.283. The MCP ran from
+this branch @ f6b9b25 with `WIN_AGENT_TEAMS_NATIVE_WAKE=1` and
+`WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1` in both the Claude Code and the Codex
+config. `session_info` reports `native_wake` (`claude_channel: available`,
+`owner_verified: true`), and `set_lead_wake` is listed. Children: `s2probe`
+(claude-code) and `cxprobe` (codex, tier `cheapest`), interactive, spawned by
+a Claude Code lead.
+
+**Gates (Linux):** `ruff format --check` clean (108 files), `ruff check`
+clean, `pytest` 2640 passed / 12 skipped. **`ty check`: 1 diagnostic**,
+`unresolved-attribute` at `tests/test_winpipe.py:69` (`ctypes.get_last_error`
+is Windows-only). The file is new on this branch, so CI will fail.
+
+| Smoke | Result | Evidence |
+|---|---|---|
+| L-3 (S-2) re-run | Pass | `s2probe` MCP env: `WIN_AGENT_TEAMS_NATIVE_WAKE=1`, `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1` (both missing on `main`), `CLAUDE_CODE_MESSAGING_SOCKET=/run/user/1000/cc-socks/2447908.sock` = the child's own `claude` PID, token present. |
+| L-5 (N1) idle Codex | Pass | `method: codex_queue`, `delivered`, pid 2449016 unchanged, `replaced_existing: false`; reply `L5-ACK`. |
+| L-6 (N3) idle Claude | Pass | `method: claude_mailbox`, `delivered`, pid 2447908 unchanged, `replaced_existing: false`, no approval prompt (bypass); reply `L6-ACK`. |
+| L-7 (N4) busy Claude | Pass | Sent during a 41 s generation turn (marker `running`/`UserPromptSubmit`); `claude_mailbox`, same pid. The transcript has the turn ending at 12:25:38 and the held message posted at 12:25:39, **1** user record; reply `L7D-BUSY-ACK-4e8`. Earlier attempts using `sleep` did not count: the child's harness blocks foreground sleeps, so the child was not really busy. |
+| Busy Codex (E6 lifted) | Pass | Sent during a 40 s `sleep` turn: `codex_queue`, same pid. The running turn finished (`CXB-TURN-DONE` 12:23:03), and the message was presented once, as the next turn (12:23:03), reply `CXB-BUSY-ACK-9d2`. No `turn_aborted`. |
+| L-8 (N5) Claude | Pass | Child process killed (SIGTERM). Next follow-up: `method: resume`, new pid 2488164 (`claude --resume <same session>`), reply `L8-RESUME-ACK`. The message after that: `claude_mailbox`, same pid 2488164, reply `L8-NATIVE-AGAIN-ACK`. Each presented once. |
+| L-8 (N5) Codex | Pass | Killed pid 2449016. `resume` gives new pid 2491746 (reply `L8CX-RESUME-ACK`), then `codex_queue` on the same pid (reply `L8CX-NATIVE-AGAIN-ACK`). Each presented once. |
+| L-9 (N7) | Not run | Passed on Windows. |
+| L-10 (N8) | Not run | Passed on Windows. |
+
+`kill_agent` on both probes returned `native_unresolved: []`.
