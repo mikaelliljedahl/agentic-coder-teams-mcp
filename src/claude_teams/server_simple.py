@@ -63,6 +63,7 @@ from claude_teams.backends.pi import MAX_ARGV_PROMPT_CHARS
 from claude_teams.backends.process_manager import (
     OWNERSHIP_NOT_OURS,
     OWNERSHIP_OURS,
+    _powershell_quote,  # shared on purpose: one PowerShell quoting rule
     process_manager,
 )
 from claude_teams.backends.registry import registry
@@ -1821,10 +1822,7 @@ def _watch_command_powershell(
     session_dir: str | Path, timeout: float | None = None
 ) -> str:
     """Render the watch argv for PowerShell."""
-    quoted = [
-        "'" + token.replace("'", "''") + "'"
-        for token in _watch_argv(session_dir, timeout)
-    ]
+    quoted = [_powershell_quote(token) for token in _watch_argv(session_dir, timeout)]
     return "& " + " ".join(quoted)
 
 

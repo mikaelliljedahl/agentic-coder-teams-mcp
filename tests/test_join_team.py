@@ -743,7 +743,8 @@ def test_two_process_external_read_exactly_once(
         ),
         encoding="utf-8",
     )
-    context = multiprocessing.get_context("fork")
+    # Any: on Windows the stubs type get_context("fork") as BaseContext.
+    context = cast(Any, multiprocessing.get_context("fork"))
     barrier = context.Barrier(2)
     queue = context.Queue()
     processes = [

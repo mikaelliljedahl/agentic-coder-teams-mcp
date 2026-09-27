@@ -1,5 +1,6 @@
 """Platform process lifecycle management for agent backends."""
 
+import base64
 import contextlib
 import ctypes
 import hashlib
@@ -157,9 +158,106 @@ def _build_posix_shell_command(cwd: str, cmd: list[str], env: dict[str, str]) ->
     return f"cd {shlex.quote(cwd)} && {export_prefix}exec {shlex.join(cmd)}"
 
 
+# Every character PowerShell's tokenizer treats as a single quote
+# (``CharTraits.IsSingleQuote``): ASCII ``'`` plus U+2018, U+2019, U+201A and
+# U+201B. Each one both delimits a verbatim literal and escapes itself when
+# doubled, so escaping only ASCII ``'`` lets e.g. ``x\u2019; calc`` break out.
+_POWERSHELL_SINGLE_QUOTES = frozenset("'\u2018\u2019\u201a\u201b")
+
+# A bare ``$env:<name>`` reference is only safe for a plain identifier.
+_POWERSHELL_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
 def _powershell_quote(value: str) -> str:
-    """Quote a value as a PowerShell single-quoted literal (``'`` -> ``''``)."""
-    return "'" + str(value).replace("'", "''") + "'"
+    """Quote a value as a PowerShell single-quoted (verbatim) literal.
+
+    Inside a single-quoted literal the tokenizer (``ScanStringLiteral``) ends
+    the string at any unpaired single-quote character, and reads a PAIR of
+    them as one literal quote -- keeping the second. Doubling each of the five
+    quote characters with itself therefore preserves the value exactly while
+    leaving no unpaired quote before the closing ``'``. Nothing else is special
+    in a verbatim literal: no ``$`` expansion, no backtick escapes, newlines
+    are content. This is parser-level safety only; it says nothing about how a
+    value survives a native command line, ``wt``'s ``;`` splitting, or CMD.
+    """
+    escaped = "".join(
+        ch * 2 if ch in _POWERSHELL_SINGLE_QUOTES else ch for ch in str(value)
+    )
+    return "'" + escaped + "'"
+
+
+# Windows Terminal parses its own command line before any child sees it
+# (microsoft/terminal @ 8c0a234f; docs/features/wt-semicolon-hardening):
+#   1. every argv element -- AFTER Windows quote removal, so quoting does not
+#      protect -- is split into a new sub-command at each ``;`` not preceded
+#      by ``\`` (``AppCommandlineArgs::_addCommandsForArg``);
+#   2. ``Commandline::AddArg`` then turns every ``\;`` back into ``;``;
+#   3. the args after ``--`` are re-joined into the child's command line with
+#      spaces, wrapped in ``"..."`` only when they contain a space and with no
+#      other escaping (``_getNewTerminalArgs``);
+#   4. ``ExpandEnvironmentStringsW`` runs over that whole command line before
+#      ``CreateProcessW`` (``ConptyConnection.cpp``), in the environment of
+#      whichever Terminal process handles the request -- not necessarily ours.
+_BATCH_SUFFIXES = (".bat", ".cmd")
+# ``ExpandEnvironmentStringsW`` needs a ``%name%`` pair to substitute anything.
+_WT_EXPANSION_MIN_PERCENTS = 2
+
+
+def _wt_escape_delimiters(token: str) -> str:
+    r"""Escape wt's ``;`` sub-command delimiter in one argv element.
+
+    Exact: every ``;`` gets one inserted ``\`` directly before it, so wt never
+    splits, and its left-to-right ``\;`` -> ``;`` removes exactly those
+    backslashes (an original ``\;`` travels as ``\\;`` and comes back as
+    ``\;``).
+    """
+    return token.replace(";", r"\;")
+
+
+def _wt_child_arg(arg: str) -> str:
+    r"""Encode one child argv element for wt's re-join (stage 3) and split (1).
+
+    ``subprocess.list2cmdline`` gives the canonical Windows quoting the child
+    parses back to ``arg``. wt re-adds the outer quotes itself when ``arg``
+    has a space, so those are stripped here; otherwise (bare, ``\\"``-escaped,
+    or self-quoted for a tab or an empty arg) wt emits the token untouched.
+    Assumes an ordinary argument: no NUL, and for argv[0] a normal executable
+    path.
+    """
+    encoded = subprocess.list2cmdline([arg])
+    if " " in arg:
+        encoded = encoded[1:-1]
+    return _wt_escape_delimiters(encoded)
+
+
+def _wt_argv(wt: str, options: list[str], child: list[str]) -> list[str]:
+    """Build a full ``wt.exe`` argv: escaped options, ``--``, encoded child.
+
+    ``wt`` itself is the executable ``Popen`` launches and is left as is.
+    """
+    return [
+        wt,
+        *(_wt_escape_delimiters(option) for option in options),
+        "--",
+        *(_wt_child_arg(arg) for arg in child),
+    ]
+
+
+def _wt_may_expand(values: list[str]) -> bool:
+    """Whether wt's environment expansion (stage 4) could rewrite ``values``.
+
+    ``ExpandEnvironmentStringsW`` only substitutes a ``%name%`` pair, so fewer
+    than two ``%`` across everything that lands on the child command line is
+    safe whatever environment the handling Terminal process has. Counted
+    across all values because a pair can span two arguments.
+    """
+    percents = sum(value.count("%") for value in values)
+    return percents >= _WT_EXPANSION_MIN_PERCENTS
+
+
+def _powershell_encoded(script: str) -> str:
+    """Return ``script`` as a PowerShell ``-EncodedCommand`` payload."""
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
 
 def _force_kill_pid(handle: str) -> None:
@@ -570,6 +668,27 @@ class WindowsTerminalTabSpawnError(RuntimeError):
         )
 
 
+class WindowsTerminalTabUnsafeCommandLineError(RuntimeError):
+    """Raised BEFORE a tab launch whose wt command line wt could rewrite.
+
+    Windows Terminal expands ``%name%`` over the child command line it builds
+    and nothing can escape a ``%``, so a launch whose wt-visible values carry a
+    ``%`` pair is refused before anything is written or started. Nothing ran,
+    so the caller can safely fall back to a new console window, which starts
+    the agent with ``CreateProcessW`` directly (no wt, no expansion). Not a
+    :class:`WindowsTerminalTabSpawnError`: that one means "launched, PID
+    unknown", where a retry could run the agent twice.
+    """
+
+    def __init__(self, title: str, value: str) -> None:
+        """Record the tab and the value that would have been rewritten."""
+        super().__init__(
+            f"Windows Terminal tab {title!r} not launched: {value!r} contains a "
+            "'%' pair that Windows Terminal would expand as an environment "
+            "variable (set WIN_AGENT_TEAMS_LOG_DIR to a path without '%')"
+        )
+
+
 class WindowsTerminalTabImmediateExitError(WindowsTerminalTabSpawnError):
     """Raised when a WT tab agent starts but exits within the settle window.
 
@@ -724,10 +843,18 @@ class WindowsProcessManager(_PidOwnershipMixin):
                         wt=wt,
                         creationflags=creationflags,
                     )
-                except WindowsTerminalTabImmediateExitError as err:
-                    # The tab opened and ran the wrapper but the agent exited
-                    # within the settle window — a degraded WT window that gives
-                    # the tab no usable console, so codex's TUI aborts at once.
+                except (
+                    WindowsTerminalTabImmediateExitError,
+                    WindowsTerminalTabUnsafeCommandLineError,
+                ) as err:
+                    # Unsafe command line: the tab was refused before anything
+                    # was written or started (a '%' pair wt would expand), so
+                    # the console fallback below cannot double-run the agent.
+                    #
+                    # Immediate exit: the tab opened and ran the wrapper but the
+                    # agent exited within the settle window — a degraded WT
+                    # window that gives the tab no usable console, so codex's
+                    # TUI aborts at once.
                     # The process is confirmed dead, so a retry cannot
                     # double-run it: fall back to a dedicated new console
                     # window, which always allocates a real TTY. Reopen the log
@@ -1052,19 +1179,18 @@ class WindowsProcessManager(_PidOwnershipMixin):
         if wt is None:
             return
         title = f"{agent_name}@{team_name}"
-        command = [
+        script = (
+            f"Get-Content -LiteralPath {_powershell_quote(str(log_path))} "
+            "-Wait -Tail 80"
+        )
+        # ``-EncodedCommand`` keeps the log path off wt's command line: Base64
+        # has no ``;``, ``%``, quote or space for wt to split, re-quote or
+        # expand (see the wt notes at ``_wt_escape_delimiters``).
+        command = _wt_argv(
             wt,
-            "-w",
-            "0",
-            "nt",
-            "--title",
-            title,
-            "--",
-            "powershell",
-            "-NoExit",
-            "-Command",
-            f"Get-Content -LiteralPath '{log_path}' -Wait -Tail 80",
-        ]
+            ["-w", "0", "nt", "--title", title],
+            ["powershell", "-NoExit", "-EncodedCommand", _powershell_encoded(script)],
+        )
         subprocess.Popen(  # noqa: S603 - opens log tail in Windows Terminal only.
             command,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
@@ -1094,15 +1220,12 @@ class WindowsProcessManager(_PidOwnershipMixin):
         handle, so ``health_check``/``kill``/token liveness all work.
         """
         sidecar_path = log_path.with_name(f"{log_path.stem}.pid")
-        with contextlib.suppress(OSError):
-            sidecar_path.unlink()
         title = f"{request.name}@{request.team_name}"
         window_id = self._tab_window_id(request.team_name)
         # Shared across both backends. ``--suppressApplicationTitle`` keeps the
         # tab labelled with the agent name (the agent CLI otherwise rewrites the
         # console title at runtime, reverting the tab to a generic name).
-        wt_head = [
-            wt,
+        wt_options = [
             "-w",
             window_id,
             "nt",
@@ -1120,7 +1243,21 @@ class WindowsProcessManager(_PidOwnershipMixin):
         # of leaving a lingering ``[process exited]`` tab. Baking the argv into
         # the .ps1 also keeps the prompt off wt's command line entirely.
         codex_direct = backend_type == "codex" and _env_flag(_CODEX_DIRECT_LAUNCH_ENV)
-        wrapper_path: Path | None = None
+        if codex_direct:
+            skip_reason = self._codex_direct_launch_blocker(cmd, request.cwd)
+            if skip_reason is not None:
+                # Direct launch would put this argv on wt's command line where
+                # it cannot be passed exactly; the wrapper keeps it off it.
+                log_handle.write(f"[wt direct launch skipped] {skip_reason}\n")
+                codex_direct = False
+        launch_path = log_path.with_name(f"{log_path.stem}.launch.ps1")
+        if not codex_direct and _wt_may_expand([str(launch_path)]):
+            # Checked before the sidecar is cleared or the wrapper written:
+            # nothing has happened yet, so the caller can fall back cleanly.
+            raise WindowsTerminalTabUnsafeCommandLineError(title, str(launch_path))
+        wrapper_path: Path | None = None if codex_direct else launch_path
+        with contextlib.suppress(OSError):
+            sidecar_path.unlink()
         if codex_direct:
             # ``codex.exe`` launched directly; recover the agent PID afterwards
             # by scanning for the ``codex.exe`` whose argv carries the unique
@@ -1128,27 +1265,26 @@ class WindowsProcessManager(_PidOwnershipMixin):
             # itself also gets ``-C <cwd>`` in build_command).
             #
             # The codex argv sits directly on the wt command line, so wt's own
-            # parser sees it. wt treats ``;`` as a sub-command delimiter and
-            # splits on it *even inside a quoted token*, which truncates a prompt
-            # at its first ``;`` and spawns a junk tab per trailing fragment.
-            # Escaping ``;`` -> ``\;`` passes a literal ``;`` to codex intact.
-            safe = self._escape_wt_passthrough(cmd)
-            wt_cmd = [*wt_head, "-d", request.cwd, "--", *safe]
+            # parser sees it: ``_wt_argv`` escapes its ``;`` delimiter and
+            # pre-encodes each element for wt's naive re-join, and
+            # ``_codex_direct_launch_blocker`` already ruled out ``%`` pairs.
+            wt_cmd = _wt_argv(wt, [*wt_options, "-d", request.cwd], cmd)
         else:
             if backend_type == "claude-code":
                 cmd = self._with_debug_file(cmd, log_path)
-            wrapper_path = log_path.with_name(f"{log_path.stem}.launch.ps1")
-            self._write_tab_wrapper(wrapper_path, request.cwd, cmd, env, sidecar_path)
-            wt_cmd = [
-                *wt_head,
-                "--",
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(wrapper_path),
-            ]
+            self._write_tab_wrapper(launch_path, request.cwd, cmd, env, sidecar_path)
+            wt_cmd = _wt_argv(
+                wt,
+                wt_options,
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(launch_path),
+                ],
+            )
         log_handle.write(
             f"[windows terminal tab] window={window_id!r} title={title!r}\n"
             f"[wt command] {subprocess.list2cmdline(wt_cmd)}\n"
@@ -1220,19 +1356,24 @@ class WindowsProcessManager(_PidOwnershipMixin):
         return SpawnResult(process_handle=handle, backend_type=backend_type)
 
     @staticmethod
-    def _escape_wt_passthrough(cmd: list[str]) -> list[str]:
-        r"""Escape wt.exe's ``;`` command-delimiter in a passthrough argv.
+    def _codex_direct_launch_blocker(cmd: list[str], cwd: str) -> str | None:
+        """Return why the codex direct launch cannot be exact, else ``None``.
 
-        ``wt … -- <argv>`` puts ``<argv>`` on wt's own command line, where ``;``
-        starts a new sub-command (a new tab) -- and wt splits on it even inside
-        the double-quoted token ``subprocess`` produces. For a codex agent whose
-        prompt contains ``;`` this truncates the prompt at the first ``;`` and
-        opens a junk tab for each trailing fragment. wt strips a leading
-        backslash, so ``\;`` reaches the child as a literal ``;`` without
-        splitting. Applied only to the direct codex launch; the claude launch
-        bakes its argv into a ``.ps1`` wrapper and never exposes it to wt.
+        Direct launch puts the whole argv (and ``-d <cwd>``) on wt's command
+        line. Two things there cannot be passed through exactly: a batch file
+        as ``cmd[0]`` (the npm ``.cmd`` shim fallback -- ``CreateProcessW``
+        would hand it to a CMD parser this encoding does not cover) and a
+        ``%`` pair that wt would expand as an environment variable. wt does not
+        expand ``-d`` itself; the separate ``cwd`` check is defensive (codex
+        also receives the cwd as ``-C <cwd>``, which is in ``cmd``).
         """
-        return [token.replace(";", r"\;") for token in cmd]
+        if cmd and cmd[0].lower().endswith(_BATCH_SUFFIXES):
+            return f"{cmd[0]!r} is a batch file, not a native executable"
+        if _wt_may_expand(cmd):
+            return "a '%' pair in the argv would be expanded by wt"
+        if _wt_may_expand([cwd]):
+            return "a '%' pair in the cwd (defensive check)"
+        return None
 
     def _write_tab_wrapper(
         self,
@@ -1251,6 +1392,12 @@ class WindowsProcessManager(_PidOwnershipMixin):
         baked in as PowerShell single-quoted literals, so the free-form prompt
         argument needs no fragile cross-shell quoting.
         """
+        for key in env:
+            if not _POWERSHELL_ENV_NAME.fullmatch(key):
+                raise ValueError(  # noqa: TRY003
+                    f"refusing to write {key!r} into the tab wrapper: not a "
+                    "plain environment variable name"
+                )
         lines = ["$ErrorActionPreference = 'Stop'"]
         lines.extend(
             f"$env:{key} = {_powershell_quote(value)}" for key, value in env.items()
