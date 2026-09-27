@@ -204,6 +204,41 @@ The real `~/.codex/config.toml` was byte-identical before and after every run. T
 
 Reproduce: `.venv\Scripts\python.exe docs\features\codex-trust-prompt\evidence\trust_smoke.py [W1 W2 W3 W4 W5]` (set `SMOKE_RESUME=1` for the resume path). W1 opens a Windows Terminal tab and W3 a console window.
 
+## Linux smoke after merging main (2026-09-27)
+
+The earlier Linux smokes ran on 2026-09-26, before `origin/main` (#74, #75
+native downstream) was merged in. This re-run covers the merged code.
+
+- **Host:** Linux (Omarchy), codex-cli 0.157.1, herdr launcher
+  (`WIN_AGENT_TEAMS_LINUX_LAUNCHER=herdr`).
+- **Code under test:** `0c55c08`.
+- **Harness:** [`evidence/trust_smoke_linux.py`](evidence/trust_smoke_linux.py).
+  It is the Linux counterpart of `trust_smoke.py`, and each step starts a
+  fresh MCP server over stdio. The setup:
+  - an isolated `CODEX_HOME`, with copies of `auth.json` and `config.toml`;
+  - the cwd `trust smoke space ;%!&^`, with an explicit
+    `trust_level = 'untrusted'` entry;
+  - a byte comparison of the isolated `config.toml` after every spawn and
+    follow-up.
+
+| Step | Setup | Result |
+|---|---|---|
+| L0 | Control: no `trust_cwd` | PASS. After 75 s: no marker, `no_marker_since_launch: true`, and the folder-trust hint names the cwd. The prompt really does block, so the flag is what unblocks it. |
+| L1 | `trust_cwd=True`, native flags on | PASS. The child printed the isolated `CODEX_HOME` and `FIRST`, with `binding: bound`. The follow-up was `delivered` via `method: "codex_queue"` (`replaced_existing: false`, same PID), then `SECOND`. The config was byte-identical after both steps. |
+| L1R | `trust_cwd=True`, native flags off | PASS. The follow-up took the resume path (`replaced_existing: true`, new PID, same backend session), then `SECOND`. The config was byte-identical. |
+| L2 | `backend=claude-code` | PASS. Refused with `trust_cwd_unsupported_backend`, and no agent was registered. |
+| L4 | cwd containing U+2019 | PASS. Refused with `trust_cwd_unsafe_path`, and no agent was registered. |
+
+The real `~/.codex/config.toml` was byte-identical before and after
+(`real_config_unchanged: true`; SHA-256 unchanged). All agents were killed,
+and the disposable home was removed by the harness.
+
+Reproduce:
+
+```bash
+.venv/bin/python docs/features/codex-trust-prompt/evidence/trust_smoke_linux.py [L0 L1 L1R L2 L4]
+```
+
 ## Merge re-review
 
 The Codex re-review of `cee9d98`/`72bc7ca`/`758e3cf` approved with 0 new findings ([merge-rereview.md](merge-rereview.md)). CI on `758e3cf`: `qa` and `tests-windows` pass.
