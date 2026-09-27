@@ -232,3 +232,16 @@ Notes on step b:
 | L-2 (S-6) | **fail.** The Codex TUI does not host MCP servers itself: they run under the shared `codex app-server --managed-daemon`, one per thread, whose environment has neither `CODEX_THREAD_ID` nor `CODEX_HOME`. | As designed: D keeps explicit registration (the shell command plus `set_lead_wake`). Self-registration stays out. |
 | L-3 (S-2) | **socket: pass. Flag: missing on `main`.** The child's MCP server had `CLAUDE_CODE_MESSAGING_SOCKET` named after the child's own `claude` PID (no leak of the lead's socket) and the token present. `WIN_AGENT_TEAMS_NATIVE_WAKE` was absent in the child's MCP env although the lead had it. | Expected: the Linux MCP install ran `main`, where children never inherit the flag. The branch's §2.7 propagation fixes it and was verified live on Windows (N1, N8a). Re-run L-3 with the branch installed to close it on Linux. |
 | L-4 (S-3) | **pass** at 100, 16 000 and 60 000 characters. Each time the child took a turn and replied `S3-ACK`, the text arrived intact, and `receipt_nonces(record, "claude-code")` found the nonce. | The 16 KiB inline limit (§2.4) is conservative; the socket accepted 60 KB. |
+
+### E6 lifted: busy Codex child on Windows (2026-09-27, after 9009aa7)
+
+The Claude lead ran branch 9009aa7 with both flags on. `n2win` (Codex, cheapest) was given a turn that ran `Start-Sleep -Seconds 40; echo SLEEP-DONE` (`n2win-busy`, `codex_queue`). At 08:27:00 UTC, with the marker `running`, the lead sent `n2win-queued` ("Reply with exactly QUEUED-ACK").
+
+| Check | Result |
+|---|---|
+| Selection | `method: codex_queue`, pid 3388 unchanged, `replaced_existing: false`: no wait loop, no resume |
+| Running turn | Not aborted: `SLEEP-DONE` at 08:27:39.8 and `TURN-1-DONE` with `task_complete` at 08:27:41.6 |
+| Queued message | Presented at 08:27:41.96 as the next turn, one `role: user` record, answered `QUEUED-ACK` |
+| Settlement | `delivered` inside the 45 s budget. A longer turn would end `unconfirmed/native_unresolved` and settle on the later receipt (unit-tested) |
+
+This matches Linux L-1: **E6 is lifted on both platforms.**
