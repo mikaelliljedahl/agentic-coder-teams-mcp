@@ -102,6 +102,8 @@ class TestCheckAgentCompactShape:
             "full_len",
             "heartbeat_age_s",
             "stalled",
+            "no_marker_since_launch",
+            "startup_hint",
             "binding",
             "binding_retriable",
         }
@@ -321,6 +323,8 @@ class TestListAgentsCompactRows:
             "last_activity_at",
             "unread_count",
             "binding",
+            "no_marker_since_launch",
+            "startup_hint",
         }
         assert "model" not in row
         assert "permission_mode" not in row
@@ -449,6 +453,8 @@ class TestAgentStatus:
             "heartbeat_age_s",
             "stalled",
             "binding",
+            "no_marker_since_launch",
+            "startup_hint",
         }
         assert row["name"] == "worker"
         assert row["state"] == "waiting"

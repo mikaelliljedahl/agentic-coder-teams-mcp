@@ -17,8 +17,15 @@ from tests import test_join_team
 join_session = test_join_team.join_session
 
 GOLDEN = json.loads(
-    (Path(__file__).parent / "fixtures/native_wake/flag_off.json").read_text()
+    (Path(__file__).parent / "fixtures/native_wake/flag_off.json").read_text(
+        encoding="utf-8"
+    )
 )
+
+
+def test_golden_is_ascii_for_windows_default_encoding() -> None:
+    fixture = Path(__file__).parent / "fixtures/native_wake/flag_off.json"
+    assert fixture.read_bytes().isascii()
 
 
 @pytest.fixture(params=[None, "0", "true", ""])
