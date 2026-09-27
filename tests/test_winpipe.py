@@ -66,7 +66,8 @@ class PipeServer:
         ok = self.k.ConnectNamedPipe(self.handle, None)
         # A client that connected (or even wrote and closed) before this call
         # yields PIPE_CONNECTED / NO_DATA; its bytes are still buffered.
-        if not ok and ctypes.get_last_error() not in (
+        last_error = getattr(ctypes, "get_last_error")()  # noqa: B009
+        if not ok and last_error not in (
             ERROR_PIPE_CONNECTED,
             ERROR_NO_DATA,
         ):
