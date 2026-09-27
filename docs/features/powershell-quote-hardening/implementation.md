@@ -86,8 +86,14 @@ Prints `PSVersion` and PASS/FAIL per shell; exits 0 only if all pass.
 global tool): 0 failures. The control created the sentinel; all literals and
 the wrapper argv round-tripped. Both the reviewer and I ran this independently.
 
-**Still open: not yet run on Windows** (Windows PowerShell 5.1 and pwsh 7 on
-Windows). Record the observed output here before relying on the 5.1 claim.
+**Windows run (2026-09-27, after merging `origin/main` 18be2a1):**
+Windows 11 Pro 10.0.26200,
+`C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe` PSVersion
+5.1.26100.7920: **PASS** (57 literals + wrapper), exit code 0.
+
+**Still open:** pwsh 7 on Windows was not installed and was not exercised.
+Production hard-codes `powershell` (5.1), so the evidence covers the
+production shell.
 
 ## Follow-ups (out of scope, see plan "Separate boundaries")
 

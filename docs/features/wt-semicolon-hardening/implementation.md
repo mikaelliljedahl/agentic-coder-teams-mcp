@@ -134,7 +134,28 @@ More about how it runs:
   a pre-existing, separate boundary.
 - A run without `rustc` only has Python native-consumer evidence.
 
-**Status:** not yet run on Windows. Record the output here, as observed.
+**Status:** run on Windows on 2026-09-27, after merging `origin/main`
+(18be2a1): **18 passed, 0 failed, 1 not executed.** Exit code 0.
+
+- Environment: Windows 11 Pro 10.0.26200; `wt.exe` at
+  `%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe`; `WindowsTerminal.exe`
+  1.24.2607.10001 (package 1.24.11911.0); PowerShell 5.1.26100.7920;
+  Python 3.12.14.
+- Isolated Terminal process: True. So `expand` and the `-w 0` tail case
+  ran.
+- PASS: `wt->native(py)`, all 5 argv sets in both fresh-window and
+  existing-window modes.
+- PASS: `inject`. The positive control ran `mk.cmd`, and an encoded `;`
+  stayed data.
+- PASS: `wt->ps-file`. Real tab spawn with a hostile log dir, using the
+  args `a;b`, `say "hi"`, `x'’y` and `tab\tz`.
+- PASS: `console-fallback`, a `%` pair in the log dir.
+- PASS: `wt->tail`, in a named window and with `-w 0`. The path was exact,
+  and `%USERNAME%` was not expanded.
+- PASS: `expand`. wt expanded `%WTV_PROBE%` and re-split argv into
+  `['x a', 'b y']`, and the direct-launch guard refused the `%` pair.
+- NOT EXECUTED: `wt->native(rust)`, because `rustc` was not on PATH. The
+  native-consumer evidence is therefore Python only.
 
 ## Remaining separate boundaries (not changed)
 
