@@ -1,4 +1,37 @@
+import os
+
 import pytest
+
+# Ambient variables a developer shell can inherit (Claude Desktop's MCP config
+# exports WIN_AGENT_TEAMS_NATIVE_WAKE/NATIVE_DOWNSTREAM; spawned agents carry
+# identity and session-dir variables). CI sets none of them, so strip them to
+# make local runs match CI.
+_AMBIENT_AGENT_ENV_EXACT = frozenset(
+    {
+        "AGENT_NAME",
+        "AGENT_SESSION_ID",
+        "AGENT_PARENT_NAME",
+        "CODEX_HOME",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+    }
+)
+_AMBIENT_AGENT_ENV_PREFIXES = ("WIN_AGENT_TEAMS_", "CLAUDE_TEAMS_")
+
+
+def is_ambient_agent_env(key: str) -> bool:
+    """Return whether ``key`` is agent/win-agent-teams state a test must not inherit."""
+    return key in _AMBIENT_AGENT_ENV_EXACT or key.startswith(
+        _AMBIENT_AGENT_ENV_PREFIXES
+    )
+
+
+# Scrub at conftest load, before any ``claude_teams`` import: several modules
+# read these at import time (``server_simple`` identity and EXTERNAL_ONLY tool
+# registration, ``process_manager`` launcher selection), and module/session
+# scoped fixtures run before the function-scoped autouse fixture below.
+for _key in [k for k in os.environ if is_ambient_agent_env(k)]:
+    del os.environ[_key]
 
 pytest_plugins = ["tests.test_backends._base_support"]
 
@@ -14,17 +47,15 @@ def _clear_inherited_agent_env(monkeypatch: pytest.MonkeyPatch) -> None:
     Tests that only reset ``server_simple._session_id`` would then still
     recover the real session id via ``_recover_session_id``, corrupting
     lead-mode session creation/recovery tests. Clear both the env vars and
-    the captured module global before every test.
+    the captured module globals before every test. The load-time scrub above
+    handles import-time reads; this per-test pass catches anything a test or
+    fixture wrote straight into ``os.environ`` without monkeypatch.
     """
-    monkeypatch.delenv("AGENT_SESSION_ID", raising=False)
-    monkeypatch.delenv("AGENT_NAME", raising=False)
-    monkeypatch.delenv("AGENT_PARENT_NAME", raising=False)
-    monkeypatch.delenv("WIN_AGENT_TEAMS_LEAD_WAKE", raising=False)
-    monkeypatch.delenv("WIN_AGENT_TEAMS_LEAD_WAKE_BASELINE", raising=False)
-    monkeypatch.delenv("WIN_AGENT_TEAMS_MEMBER_WAKE", raising=False)
-    monkeypatch.delenv("WIN_AGENT_TEAMS_DISPATCH_EPOCH", raising=False)
+    for key in [k for k in os.environ if is_ambient_agent_env(k)]:
+        monkeypatch.delenv(key)
     from claude_teams import server_simple
 
+    monkeypatch.setattr(server_simple, "_AGENT_NAME", "")
     monkeypatch.setattr(server_simple, "_AGENT_SESSION_ID", "")
     monkeypatch.setattr(server_simple, "_AGENT_PARENT_NAME", "")
     monkeypatch.setattr(server_simple, "IDENTITY", server_simple.ROOT_LEAD_NAME)
