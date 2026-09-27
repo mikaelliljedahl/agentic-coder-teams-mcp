@@ -1249,7 +1249,9 @@ class WindowsProcessManager(_PidOwnershipMixin):
         # and the wrapper's ``exit 0`` auto-closes the tab on kill/error instead
         # of leaving a lingering ``[process exited]`` tab. Baking the argv into
         # the .ps1 also keeps the prompt off wt's command line entirely.
-        codex_direct = backend_type == "codex" and codex_direct_launch_enabled()
+        # The raw flag (not ``codex_direct_launch_enabled()``): this WT-tab
+        # path is Windows-only in production, and tests drive it on Linux CI.
+        codex_direct = backend_type == "codex" and _env_flag(_CODEX_DIRECT_LAUNCH_ENV)
         if codex_direct:
             skip_reason = self._codex_direct_launch_blocker(cmd, request.cwd)
             if skip_reason is not None:
