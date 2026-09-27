@@ -132,3 +132,53 @@ The first CI run of PR #73 failed six `tests/test_backends/test_codex.py` Part B
 - CI fix after the merge: the first resolution gated the `process_manager` block with `codex_direct_launch_enabled()`. `main`'s `tests/test_backends/test_wt_command_line.py` drives the WT-tab path on Linux by setting only the env flag, so the added `os.name` check turned direct launch off on Linux and the `qa` job failed 5 tests (`test_direct_launch_encodes_cwd_and_prompt`, the 3 `test_direct_launch_with_percent_pair_uses_wrapper_tab` cases, and `test_percent_pair_in_direct_and_wrapper_falls_back_to_classic_console`). Windows passed. Restoring `main`'s `_env_flag(...)` gate fixes it with no production change, because the WT-tab path runs only on Windows. Red was reproduced on Windows by making `process_manager.os.name` report `"posix"` through a pytest plugin (5 failed, 53 passed), and those tests then passed (58 passed).
 
 Gates after the merge (Windows): `ruff format --check` pass, `ruff check` pass, `ty check` pass, `pytest` 2874 passed, 9 skipped.
+
+## Merge review findings
+
+An independent Codex review of the merge resolution (`45c89cd` + `ef1b370`) is saved as [merge-review.md](merge-review.md). Verdict: approve with non-blocking issues; 0 blocker, 0 major, 2 minor. Both minor findings are accepted and addressed.
+
+### Finding 1 (minor, accepted): native metadata used the raw `CODEX_HOME`
+
+`server_simple._effective_codex_home()` (sole caller: `_native_record_fields`, which pins `codex_home` on the agent record for the `codex_queue` carrier) returned the raw, stripped `CODEX_HOME`. The launch environment (`CodexBackend.build_env`) and the rollout readers use the shared `codex_home()` resolver, which resolves a relative value against the server's cwd. `verify_codex_thread()` rejects a relative home as `home_missing`, so with a relative `CODEX_HOME` native delivery was silently dropped and follow-up fell back to resume.
+
+Fix: `_effective_codex_home()` now returns `str(codex_home())`. Compatibility:
+- `CODEX_HOME` unset or empty: unchanged, `str(Path.home() / ".codex")` (pinned by `test_default_codex_home`).
+- Absolute `CODEX_HOME`: the resolved form of the same path. On Windows a rooted path without a drive (`/new-home`) now becomes `C:\new-home`, which is what the child actually uses; `test_recovery_metadata_is_recorded_with_the_flag_off` now expects `str(Path("/new-home").resolve())`, so it holds on Linux and Windows.
+- Whitespace-only `CODEX_HOME`: previously stripped to the default; now resolved like the launch path does (the child inherits the same value), so the record matches the child instead of disagreeing with it.
+
+Red/green:
+- Red: the new `tests/test_native_record_fields.py::test_relative_codex_home_is_pinned_resolved` (relative `CODEX_HOME=isolated-home`, spawn through `spawn_agent`, assert the record equals `str(codex_home())` and `verify_codex_thread` accepts it) failed with `assert 'isolated-home' == 'C:\...\isolated-home'`.
+- Green: after the fix, `tests/test_native_record_fields.py` 19 passed; together with native selection, Codex dispatch, agent output and the Codex backend tests, 406 passed.
+
+### Finding 2 (minor, accepted): trust_cwd x native carrier boundaries were unpinned
+
+New file `tests/test_trust_cwd_native.py`, built on the fixtures of `tests/test_native_codex_dispatch.py` / `tests/test_native_selection.py` (real delivery and lease stores, the real `codex queue` runner with a fake `Popen`). The target is an eligible `codex_queue` Codex agent with `trust_cwd=True, launch_interactive=True`.
+
+| Case | Test | Pins |
+| --- | --- | --- |
+| a | `test_trusted_native_delivery_skips_the_relaunch_preflight[launch_mode_changed]`, `[direct_launch]` | Delivered via `codex_queue` while the resume environment would be refused (`provides_tty` false, or `codex_direct_launch_enabled()` true, patched so it runs on Linux CI); no binary discovery, no resume, same PID/token/epoch, trust fields kept, lease released, 1 attempt. |
+| b | `test_stage_two_loss_then_trust_refusal_never_resumes` | Thread verification lost at stage 2; the retry meets `_prepare`'s preflight: `trust_cwd_launch_mode_changed`, row `pending`, 0 attempts, no resume request built, no queue run, old child untouched, lease released. |
+| c | `test_not_enqueued_native_attempt_then_trust_refusal` | `Popen` construction fails (`native_not_enqueued`); the retry is refused by `_prepare`: row `pending`, reason `native_not_enqueued`, 1 attempt (the reverted native one), not unresolved-native, no resume request built, old child untouched, lease released. |
+| d | `test_resume_fallback_carries_trust_extras_and_a_new_epoch` | Same native failure, safe environment: resume request carries `codex_trust_cwd`, `codex_trust_binary`, `codex_trust_interactive` and a `dispatch_epoch` above the old one; record keeps `trust_cwd`/`launch_interactive` and takes the new epoch; 2 attempts, method `resume`. |
+| e | `test_changed_binary_at_fallback_commit_is_refused` | Binary pinned in `_prepare` differs at commit: `trust_cwd_binary_changed`, discovery called exactly twice, no resume, 1 attempt, old child untouched, lease released. |
+
+These pin existing behaviour, so they passed on first run (6 passed; also 6 passed with `WIN_AGENT_TEAMS_NATIVE_WAKE=1 WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM=1` in the environment). Guard evidence, each mutation applied alone to `server_simple.py` and reverted (restored byte-identical):
+
+| Mutation | Result |
+| --- | --- |
+| M1: drop `native_method is None and` from the `_prepare` trust preflight | 5 failed (a x2, b, c, e), 1 passed |
+| M2: skip the `_prepare` preflight on the resume retry (`... and native_allowed and ...`) | 4 failed (b, c, d, e), 2 passed |
+| M3: drop the commit-time `current_binary != pinned` recheck | 1 failed (e) |
+| M4: drop `codex_trust_binary` pinning of the resume request extras | 1 failed (d) |
+
+### Gates (Windows, after both findings)
+
+- `uv run ruff format --check .`: pass (116 files).
+- `uv run ruff check .`: pass.
+- `uv run ty check`: pass.
+- `uv run pytest` with `WIN_AGENT_TEAMS_NATIVE_WAKE` / `WIN_AGENT_TEAMS_NATIVE_DOWNSTREAM` unset: 2881 passed, 9 skipped (2874 + 7 new tests).
+- With both flags set to `1` in the environment: 5 failed, 2876 passed, 9 skipped. The same 5 fail identically on `ef1b370`'s `server_simple.py`, so they are pre-existing and not caused by this change: `test_agent_output.py::test_spawn_agent_persists_output_lookup_metadata`, `test_backends/test_base_runtime.py::TestBaseBackendSpawn::test_calls_process_manager_with_command_and_env` and `::test_env_values_are_passed_unquoted_to_process_manager`, `test_backends/test_codex.py::TestCodexMcpIdentity::test_build_command_injects_identity_env_override`, `test_join_team.py::test_external_only_mode`. They assert exact env/record contents and do not clear the ambient native flags; CI never sets them. Recommended follow-up (separate PR): an autouse fixture that clears the native flags for tests that do not opt in.
+
+### Skip count 9 vs 10
+
+The run after `ef1b370` recorded 2873 passed, 10 skipped, against 2874 passed, 9 skipped after `45c89cd`. `ef1b370` changes no test and no skip condition. The extra skip is `tests/test_watch_command_discovery.py::test_watch_command_bash_executes_and_times_out_quietly`, which probes `bash -c "exit 0"` at runtime and skips when bash is not usable. Reproduced: run from PowerShell (no `bash` on PATH) it skips (17 passed, 1 skipped); run from Git Bash it passes (18 passed). The difference is the shell the suite was launched from, not the change. It is expected, and CI on Linux always has bash.
