@@ -5779,8 +5779,9 @@ def _guaranteed_delivery(  # noqa: PLR0915 - three phases of one bounded call.
             ):
                 process_manager.kill_process(plan.old_pid)
 
+            # Only native methods leave ``request`` unset, and they returned above.
             launch_fields = _launch_mode_fields(
-                plan.backend_name, plan.backend, plan.request
+                plan.backend_name, plan.backend, cast("SpawnRequest", plan.request)
             )
             try:
                 launch_started_at = time.time()
