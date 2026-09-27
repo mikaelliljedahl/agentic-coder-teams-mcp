@@ -259,7 +259,8 @@ a Claude Code lead.
 **Gates (Linux):** `ruff format --check` clean (108 files), `ruff check`
 clean, `pytest` 2640 passed / 12 skipped. **`ty check`: 1 diagnostic**,
 `unresolved-attribute` at `tests/test_winpipe.py:69` (`ctypes.get_last_error`
-is Windows-only). The file is new on this branch, so CI will fail.
+is Windows-only). The file is new on this branch. Fixed in the next commit with the file's existing
+`getattr(ctypes, ...)` idiom; after that all four gates are green on Linux.
 
 | Smoke | Result | Evidence |
 |---|---|---|
