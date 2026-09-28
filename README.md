@@ -127,6 +127,12 @@ Without `CLAUDE_TEAMS_BACKENDS`, the server auto-detects the connecting client a
   (Herdr) or headless mode, and a small loopback web console. Single native
   binary, no runtime install. Linux is tested; Windows works in early beta;
   macOS is in progress.
+- [win-agent-teams](https://github.com/mikaelliljedahl/agentic-coder-teams-mcp):
+  a fork of a fork of this project that stays on the same Python codebase. It
+  adds Windows terminal tabs, Codex backend support, native session wake for
+  the lead and external members joining a team by ticket. Worth a look if you
+  want those changes without switching foundations; it is no longer actively
+  developed now that AgentTeamForge has taken over.
 
 ## License
 
