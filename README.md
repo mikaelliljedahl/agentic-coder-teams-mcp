@@ -6,10 +6,13 @@
 >
 > - Migration guide (tool-by-tool mapping):
 >   [docs/migrating-from-win-agent-teams.md](https://github.com/PRFactory-app/agent-team-forge/blob/main/docs/migrating-from-win-agent-teams.md)
-> - The agent skills that used to live here (`agent-orchestration`,
->   `external-member-invite`, `external-member-join`) now live in AgentTeamForge's
+> - The agent skills (`agent-orchestration`, `external-member-invite`,
+>   `external-member-join`) are kept here in [`.claude/skills`](.claude/skills) for
+>   the legacy MCP; AgentTeamForge has its own copies in its
 >   [`.claude/skills`](https://github.com/PRFactory-app/agent-team-forge/tree/main/.claude/skills)
 >   (added in [PR #8](https://github.com/PRFactory-app/agent-team-forge/pull/8)).
+> - Full legacy documentation (tools, backends, configuration, wake, messaging):
+>   [docs/README-legacy.md](docs/README-legacy.md).
 >
 > No new features or fixes will be made here.
 
