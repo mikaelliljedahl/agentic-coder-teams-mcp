@@ -137,20 +137,15 @@ class CodexBackend(BaseBackend):
     #   cheapest -> Luna  @ high    (cheapest/fastest)
     #   low      -> Luna  @ xhigh   (quick/low-stakes)
     #   medium   -> Luna  @ max     (token-efficient general default)
-    #   high     -> Sol   @ high
-    #   xhigh    -> Astra @ low     (hard problems, tricky code review)
+    #   high     -> Sol   @ medium
+    #   xhigh    -> Sol   @ high    (hard problems, tricky code review)
     #   max      -> Astra @ medium  (top)
-    # Luna, Sol and Astra are the GPT-6 models (``gpt-6-luna``/``gpt-6-sol``/
-    # ``gpt-6-astra``). GPT-6 needs more reasoning effort than GPT-5.6 did at
-    # the same tier, so ``cheapest``..``high`` each sit one effort step above
-    # their GPT-5.6 predecessor on the same model (DeepSWE v1.1: Sol @ medium
-    # 56.6% vs Sol @ high 65.3%).
-    # ``xhigh`` switches to Astra @ low: Sol @ xhigh (66.6%) barely separates
-    # from Sol @ high, while Astra @ low (67.0%) gives the tier a stronger base
-    # model for hard cross-file work such as tricky code review. On coding
-    # evals Astra used ~1/3 the tokens of GPT-5.6 Sol, keeping more code inside
-    # the 272k window. It costs 5x Sol per token (~1.6x per task), acceptable
-    # for an infrequent tier. Astra @ medium (72.8%) is the top tier.
+    # Luna and Astra are GPT-6 (``gpt-6-luna``/``gpt-6-astra``); Sol is
+    # GPT-6.1 (``gpt-6.1-sol``), which replaced ``gpt-6-sol``. GPT-6 needs more
+    # reasoning effort than GPT-5.6 did at the same tier, so the Luna tiers
+    # sit one effort step above their GPT-5.6 predecessors. GPT-6.1 Sol again
+    # needs less effort, so ``high``/``xhigh`` return to Sol @ medium/high and
+    # Astra is kept only for the top tier (Astra @ medium).
     # Codex runs with a 272k default context window (its 872k maximum is not
     # enabled here); Luna @ max at ``medium`` is untested against that window
     # on long, complex tasks — reach for ``high`` (Sol) when Luna runs out.
@@ -159,8 +154,8 @@ class CodexBackend(BaseBackend):
         "cheapest": ("gpt-6-luna", "high"),
         "low": ("gpt-6-luna", "xhigh"),
         "medium": ("gpt-6-luna", "max"),
-        "high": ("gpt-6-sol", "high"),
-        "xhigh": ("gpt-6-astra", "low"),
+        "high": ("gpt-6.1-sol", "medium"),
+        "xhigh": ("gpt-6.1-sol", "high"),
         "max": ("gpt-6-astra", "medium"),
     }
 

@@ -36,8 +36,8 @@ _LOCAL_PATH_CLS = type(Path.cwd())
 _PI_PROVIDER = "openai-codex"
 _PI_UPGRADE_HINT = (
     "Upgrade pi: npm install -g @earendil-works/pi-coding-agent@latest "
-    "(GPT-6 Sol/Luna need pi >= 0.87.1; or add the model to your provider "
-    "config)"
+    "(GPT-6 Luna needs pi >= 0.87.1, GPT-6.1 Sol a pi that lists it; or add "
+    "the model to your provider config)"
 )
 
 # ``pi``'s npm bin script hands off to this entry under the package root. We
@@ -180,14 +180,14 @@ class PiBackend(BaseBackend):
     #   cheapest    -> Luna  @ high
     #   low         -> Luna  @ xhigh
     #   medium      -> Luna  @ max     (token-efficient general default)
-    #   medium-fast -> Sol   @ medium  (pi only; latency sibling of ``medium``)
-    #   high        -> Sol   @ high
-    #   xhigh       -> Astra @ low
+    #   medium-fast -> Sol   @ low     (pi only; latency sibling of ``medium``)
+    #   high        -> Sol   @ medium
+    #   xhigh       -> Sol   @ high
     #   max         -> Astra @ medium  (top)
     # The six shared tiers are identical to the Codex ladder; see there for why
-    # the Luna/Sol tiers sit one effort step up for GPT-6 and why ``xhigh`` is
-    # Astra @ low. Luna and Sol need pi >= 0.87.1; the Astra tiers (``xhigh``,
-    # ``max``) also work on older pi.
+    # the Luna tiers sit one effort step up for GPT-6 while GPT-6.1 Sol runs
+    # ``high``/``xhigh`` at medium/high. Luna and Sol need a pi that lists
+    # them; the Astra tier (``max``) also works on older pi.
     #
     # ``medium-fast`` exists only here. Sol runs faster than Luna, so it is the
     # low-latency pick when turnaround dominates — a different model, not
@@ -196,9 +196,9 @@ class PiBackend(BaseBackend):
         "cheapest": ("gpt-6-luna", "high"),
         "low": ("gpt-6-luna", "xhigh"),
         "medium": ("gpt-6-luna", "max"),
-        "medium-fast": ("gpt-6-sol", "medium"),
-        "high": ("gpt-6-sol", "high"),
-        "xhigh": ("gpt-6-astra", "low"),
+        "medium-fast": ("gpt-6.1-sol", "low"),
+        "high": ("gpt-6.1-sol", "medium"),
+        "xhigh": ("gpt-6.1-sol", "high"),
         "max": ("gpt-6-astra", "medium"),
     }
 

@@ -4049,12 +4049,12 @@ async def spawn_agent(
       - ``cheapest`` -> Luna (``gpt-6-luna``) @ high : fastest/cheapest tasks
       - ``low``      -> Luna (``gpt-6-luna``) @ xhigh : quick, low-stakes tasks
       - ``medium``   -> Luna (``gpt-6-luna``) @ max : token-efficient default
-      - ``high``     -> Sol (``gpt-6-sol``) @ high : backend dev, code review
-      - ``xhigh``    -> Astra (``gpt-6-astra``) @ low : hard problems, tricky review
+      - ``high``     -> Sol (``gpt-6.1-sol``) @ medium : backend dev, code review
+      - ``xhigh``    -> Sol (``gpt-6.1-sol``) @ high : hard problems, tricky review
       - ``max``      -> Astra (``gpt-6-astra``) @ medium : hardest (top tier)
     codex and pi use this identical ladder. pi only, one extra low-latency
     subtier sits beside ``medium``; Sol runs faster than Luna:
-      - ``medium-fast`` -> Sol (``gpt-6-sol``) @ medium : beside ``medium``
+      - ``medium-fast`` -> Sol (``gpt-6.1-sol``) @ low : beside ``medium``
     Reach for it when turnaround dominates. It is a different model, not a
     drop-in for ``medium`` on every input, and codex does not offer it. The
     former pi tier ``high-fast`` was removed (``high`` is now Sol itself);
@@ -4063,11 +4063,11 @@ async def spawn_agent(
     unavailable, both codex
     and pi raise ``BackendModelUnavailableError`` with a backend-specific
     upgrade command (``npm install -g @openai/codex@latest`` or
-    ``npm install -g @earendil-works/pi-coding-agent@latest``; GPT-6 Sol/Luna
-    need pi >= 0.87.1); tiers never silently downgrade. Raw slugs pass
-    through; pi retains its soft fallback for an unavailable raw slug. For
-    claude-code, ``model`` is haiku/sonnet/opus/fable and defaults to ``opus``
-    when omitted.
+    ``npm install -g @earendil-works/pi-coding-agent@latest``; GPT-6 Luna needs
+    pi >= 0.87.1, GPT-6.1 Sol a pi that lists it); tiers never silently
+    downgrade. Raw slugs pass through; pi retains its soft fallback for an
+    unavailable raw slug. For claude-code, ``model`` is
+    haiku/sonnet/opus/fable and defaults to ``opus`` when omitted.
 
     reasoning_effort: for claude-code, sets the effort (low/medium/high/xhigh/
     max). For codex/pi it is silently ignored when ``model`` is a capability
